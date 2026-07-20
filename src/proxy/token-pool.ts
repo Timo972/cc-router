@@ -47,8 +47,12 @@ function limitingReset(a: Account): number {
  * window expires, `status` flips back to `"allowed"`. The callback fires
  * once per recovery so the dashboard can surface it.
  */
-function clearExpiredCooldown(a: Account, onExpired?: (a: Account) => void): void {
-  const nowSec = Math.floor(Date.now() / 1000);
+function clearExpiredRateLimitWindows(
+  a: Account,
+  nowMs: number,
+  onExpired?: (a: Account) => void,
+): void {
+  const nowSec = Math.floor(nowMs / 1000);
   const r = a.rateLimits;
   let changed = false;
   let recovered = false;
@@ -79,7 +83,7 @@ function clearExpiredCooldown(a: Account, onExpired?: (a: Account) => void): voi
     }
   }
 
-  if (changed) r.lastUpdated = Date.now();
+  if (changed) r.lastUpdated = nowMs;
   if (recovered && onExpired) onExpired(a);
 }
 
@@ -102,16 +106,29 @@ export interface AccountPatch {
   weeklyLimitPercent?: number;
 }
 
+export interface AccountLease {
+  readonly account: Account;
+  readonly fallback: boolean;
+  release(): void;
+}
+
+export interface TokenPoolOptions {
+  now?: () => number;
+}
+
 export class TokenPool {
-  private accounts: Account[];
+  private readonly inFlight = new Map<string, number>();
+  private readonly cooldownUntil = new Map<string, number>();
+  private readonly now: () => number;
   private currentIndex = 0;
 
-  constructor(accounts: Account[]) {
-    this.accounts = accounts;
+  constructor(private readonly accounts: Account[], options: TokenPoolOptions = {}) {
+    this.now = options.now ?? Date.now;
   }
 
   /**
-   * Round-robin selection among accounts that are:
+   * Compatibility wrapper for request sites that do not yet retain leases.
+   * Selection considers accounts that are:
    *   • healthy
    *   • not busy
    *   • not rate-limited by Anthropic
@@ -125,57 +142,174 @@ export class TokenPool {
    *      ban that would leave Claude Code with no working account. The fallback
    *      is logged via the optional onCapBypass callback so the dashboard can
    *      surface it instead of silently exceeding the cap.
-   *   3. accounts[0] as a last resort (only if every account is unhealthy).
+   *   3. Any account as a last resort (only if every account is unhealthy).
+   *
+   * Fallback sets prefer the lowest in-flight load, then the earliest reset.
    *
    * Throws `EmptyPoolError` when there are no accounts at all — callers in
    * the request path should map this to a 503. The DELETE endpoint guards
    * against this state by refusing to remove the last account.
    */
   getNext(): Account {
+    const lease = this.acquireBest(new Map());
+    lease.release();
+    return lease.account;
+  }
+
+  /**
+   * Acquire the best eligible account using load, session affinity pressure,
+   * rate-limit headroom, and a rotating tie-break, in that order.
+   */
+  acquireBest(activeSessions: ReadonlyMap<string, number>): AccountLease {
     if (this.accounts.length === 0) {
       throw new EmptyPoolError("token pool is empty — add an account first");
     }
 
-    // Sweep expired cooldowns before filtering — otherwise rate_limited accounts
-    // whose reset window has passed would never re-enter rotation.
-    for (const a of this.accounts) clearExpiredCooldown(a, this.onCooldownExpired);
+    this.sweepExpiredCooldowns();
+    const eligible = this.accounts.filter(account => this.isEligibleWithoutSweep(account));
 
-    const available = this.accounts.filter(a =>
-      a.healthy &&
-      !a.busy &&
-      a.rateLimits.status !== "rate_limited" &&
-      isUsable(a)
-    );
-
-    if (available.length === 0) {
-      const healthyUsable = this.accounts.filter(a => a.healthy && isUsable(a));
-      if (healthyUsable.length > 0) {
-        return healthyUsable.reduce((best, a) =>
-          earliestReset(a) < earliestReset(best) ? a : best
-        );
-      }
-      const healthy = this.accounts.filter(a => a.healthy);
-      if (healthy.length === 0) {
-        return this.accounts[0];
-      }
-      // All healthy accounts are either busy, rate-limited, or over user caps.
-      // Fall back to the one that'll reset soonest — see docstring. Notify
-      // the listener so the bypass becomes visible in the dashboard.
-      const fallback = healthy.reduce((best, a) =>
-        earliestReset(a) < earliestReset(best) ? a : best
-      );
-      const someCapped = this.accounts.some(a => a.healthy && overUserCap(a));
-      if (someCapped && this.onCapBypass) {
-        this.onCapBypass(fallback);
-      }
-      return fallback;
+    if (eligible.length > 0) {
+      const account = this.selectEligible(eligible, activeSessions);
+      this.advanceCursor(account);
+      return this.createLease(account, false);
     }
 
-    const account = available[this.currentIndex % available.length];
-    this.currentIndex = (this.currentIndex + 1) % available.length;
+    const healthyUsable = this.accounts.filter(account => account.healthy && isUsable(account));
+    const healthy = this.accounts.filter(account => account.healthy);
+    const fallbackCandidates = healthyUsable.length > 0
+      ? healthyUsable
+      : healthy.length > 0
+        ? healthy
+        : this.accounts;
+    const account = this.selectFallback(fallbackCandidates);
+    this.advanceCursor(account);
+    if (overUserCap(account)) this.onCapBypass?.(account);
+    return this.createLease(account, true);
+  }
+
+  /** Acquire a specific account for an existing sticky session. */
+  tryAcquire(accountId: string): AccountLease | null {
+    const account = this.findById(accountId);
+    if (!account) return null;
+    clearExpiredRateLimitWindows(account, this.now(), this.onCooldownExpired);
+    if (!this.isEligibleWithoutSweep(account)) return null;
+    return this.createLease(account, false);
+  }
+
+  isEligible(accountId: string): boolean {
+    const account = this.findById(accountId);
+    if (!account) return false;
+    clearExpiredRateLimitWindows(account, this.now(), this.onCooldownExpired);
+    return this.isEligibleWithoutSweep(account);
+  }
+
+  getInFlight(accountId: string): number {
+    return this.inFlight.get(accountId) ?? 0;
+  }
+
+  setCooldown(accountId: string, durationMs: number): void {
+    if (!this.findById(accountId)) return;
+    if (durationMs <= 0) {
+      this.cooldownUntil.delete(accountId);
+      return;
+    }
+    this.cooldownUntil.set(accountId, this.now() + durationMs);
+  }
+
+  isCoolingDown(accountId: string): boolean {
+    const until = this.cooldownUntil.get(accountId);
+    if (until === undefined) return false;
+    if (this.now() < until) return true;
+    this.cooldownUntil.delete(accountId);
+    return false;
+  }
+
+  private isEligibleWithoutSweep(account: Account): boolean {
+    return account.healthy &&
+      !account.busy &&
+      !this.isCoolingDown(account.id) &&
+      account.rateLimits.status !== "rate_limited" &&
+      isUsable(account);
+  }
+
+  private selectEligible(
+    candidates: Account[],
+    activeSessions: ReadonlyMap<string, number>,
+  ): Account {
+    return candidates.reduce((best, account) => {
+      const comparison = this.compareTuple(
+        [
+          this.getInFlight(account.id),
+          activeSessions.get(account.id) ?? 0,
+          this.headroomScore(account),
+          this.circularDistance(account),
+        ],
+        [
+          this.getInFlight(best.id),
+          activeSessions.get(best.id) ?? 0,
+          this.headroomScore(best),
+          this.circularDistance(best),
+        ],
+      );
+      return comparison < 0 ? account : best;
+    });
+  }
+
+  private selectFallback(candidates: Account[]): Account {
+    return candidates.reduce((best, account) => {
+      const comparison = this.compareTuple(
+        [this.getInFlight(account.id), earliestReset(account), this.circularDistance(account)],
+        [this.getInFlight(best.id), earliestReset(best), this.circularDistance(best)],
+      );
+      return comparison < 0 ? account : best;
+    });
+  }
+
+  private headroomScore(account: Account): number {
+    const fiveHourCap = account.sessionLimitPercent / 100;
+    const sevenDayCap = account.weeklyLimitPercent / 100;
+    const fiveHourUtil = Number.isFinite(account.rateLimits.fiveHourUtil)
+      ? Math.max(0, account.rateLimits.fiveHourUtil)
+      : 0;
+    const sevenDayUtil = Number.isFinite(account.rateLimits.sevenDayUtil)
+      ? Math.max(0, account.rateLimits.sevenDayUtil)
+      : 0;
+    return Math.max(fiveHourUtil / fiveHourCap, sevenDayUtil / sevenDayCap);
+  }
+
+  private circularDistance(account: Account): number {
+    const index = this.accounts.indexOf(account);
+    return (index - this.currentIndex + this.accounts.length) % this.accounts.length;
+  }
+
+  private compareTuple(left: number[], right: number[]): number {
+    for (let i = 0; i < left.length; i++) {
+      if (left[i] !== right[i]) return left[i] - right[i];
+    }
+    return 0;
+  }
+
+  private advanceCursor(account: Account): void {
+    const index = this.accounts.indexOf(account);
+    this.currentIndex = (index + 1) % this.accounts.length;
+  }
+
+  private createLease(account: Account, fallback: boolean): AccountLease {
+    this.inFlight.set(account.id, this.getInFlight(account.id) + 1);
     account.requestCount++;
-    account.lastUsed = Date.now();
-    return account;
+    account.lastUsed = this.now();
+    let released = false;
+    return {
+      account,
+      fallback,
+      release: () => {
+        if (released) return;
+        released = true;
+        const remaining = Math.max(0, this.getInFlight(account.id) - 1);
+        if (remaining === 0) this.inFlight.delete(account.id);
+        else this.inFlight.set(account.id, remaining);
+      },
+    };
   }
 
   /** Optional listener fired when a request is routed to a capped account
@@ -192,7 +326,11 @@ export class TokenPool {
    * poll loop so the UI reflects recovery without waiting for a new request.
    */
   sweepExpiredCooldowns(): void {
-    for (const a of this.accounts) clearExpiredCooldown(a, this.onCooldownExpired);
+    const now = this.now();
+    for (const a of this.accounts) {
+      clearExpiredRateLimitWindows(a, now, this.onCooldownExpired);
+      this.isCoolingDown(a.id);
+    }
   }
 
   getAll(): Account[] {
@@ -208,6 +346,8 @@ export class TokenPool {
       id: a.id,
       healthy: a.healthy,
       busy: a.busy,
+      inFlightRequests: this.getInFlight(a.id),
+      coolingDown: this.isCoolingDown(a.id),
       requestCount: a.requestCount,
       errorCount: a.errorCount,
       expiresInMs: a.tokens.expiresAt - Date.now(),
@@ -294,6 +434,8 @@ export class TokenPool {
     const idx = this.accounts.findIndex(a => a.id === id);
     if (idx === -1) return false;
     this.accounts.splice(idx, 1);
+    this.inFlight.delete(id);
+    this.cooldownUntil.delete(id);
     if (this.accounts.length > 0) {
       this.currentIndex = this.currentIndex % this.accounts.length;
     } else {

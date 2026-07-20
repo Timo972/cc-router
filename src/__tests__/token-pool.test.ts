@@ -56,6 +56,142 @@ describe("TokenPool — round-robin", () => {
   });
 });
 
+describe("TokenPool — request leases", () => {
+  it("tracks a request until its lease is released exactly once", () => {
+    const pool = new TokenPool([makeAccount("a")]);
+    const lease = pool.acquireBest(new Map());
+
+    expect(lease.account.id).toBe("a");
+    expect(pool.getInFlight("a")).toBe(1);
+
+    lease.release();
+    lease.release();
+    expect(pool.getInFlight("a")).toBe(0);
+  });
+
+  it("prefers the account with fewer in-flight requests", () => {
+    const pool = new TokenPool([makeAccount("a"), makeAccount("b")]);
+    const first = pool.tryAcquire("a");
+    expect(first).not.toBeNull();
+
+    const next = pool.acquireBest(new Map());
+    expect(next.account.id).toBe("b");
+
+    first!.release();
+    next.release();
+  });
+
+  it("uses active session count after in-flight load ties", () => {
+    const pool = new TokenPool([makeAccount("a"), makeAccount("b")]);
+    const lease = pool.acquireBest(new Map([["a", 2], ["b", 1]]));
+    expect(lease.account.id).toBe("b");
+    lease.release();
+  });
+
+  it("uses relative rate-limit headroom after load and binding ties", () => {
+    const a = makeAccount("a");
+    const b = makeAccount("b");
+    a.sessionLimitPercent = 80;
+    a.rateLimits.fiveHourUtil = 0.6;
+    b.sessionLimitPercent = 80;
+    b.rateLimits.fiveHourUtil = 0.2;
+    const pool = new TokenPool([a, b]);
+
+    const lease = pool.acquireBest(new Map([["a", 1], ["b", 1]]));
+    expect(lease.account.id).toBe("b");
+    lease.release();
+  });
+
+  it("uses the worse of five-hour and seven-day headroom ratios", () => {
+    const a = makeAccount("a");
+    const b = makeAccount("b");
+    a.rateLimits.fiveHourUtil = 0.1;
+    a.rateLimits.sevenDayUtil = 0.7;
+    b.rateLimits.fiveHourUtil = 0.5;
+    b.rateLimits.sevenDayUtil = 0.2;
+    const pool = new TokenPool([a, b]);
+
+    const lease = pool.acquireBest(new Map());
+    expect(lease.account.id).toBe("b");
+    lease.release();
+  });
+
+  it("rotates exact ties only after selection", () => {
+    const pool = new TokenPool([
+      makeAccount("a"),
+      makeAccount("b"),
+      makeAccount("c"),
+    ]);
+
+    const ids = Array.from({ length: 4 }, () => {
+      const lease = pool.acquireBest(new Map());
+      lease.release();
+      return lease.account.id;
+    });
+
+    expect(ids).toEqual(["a", "b", "c", "a"]);
+  });
+
+  it("allows a valid sticky acquisition despite existing in-flight work", () => {
+    let now = 2_000;
+    const pool = new TokenPool([makeAccount("a")], { now: () => now });
+    const first = pool.tryAcquire("a");
+    now = 2_500;
+    const second = pool.tryAcquire("a");
+
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(pool.getInFlight("a")).toBe(2);
+    expect(pool.getAll()[0].requestCount).toBe(2);
+    expect(pool.getAll()[0].lastUsed).toBe(2_500);
+
+    first!.release();
+    second!.release();
+  });
+
+  it("chooses the lowest in-flight account for all-unavailable fallback", () => {
+    const a = makeAccount("a");
+    const b = makeAccount("b");
+    const pool = new TokenPool([a, b]);
+    const first = pool.tryAcquire("a");
+    a.enabled = false;
+    b.enabled = false;
+
+    const fallback = pool.acquireBest(new Map());
+    expect(fallback.account.id).toBe("b");
+    expect(fallback.fallback).toBe(true);
+
+    first!.release();
+    fallback.release();
+  });
+});
+
+describe("TokenPool — timestamp cooldown", () => {
+  it("keeps an account unavailable until its timestamp cooldown expires", () => {
+    let now = 1_000;
+    const pool = new TokenPool(
+      [makeAccount("a"), makeAccount("b")],
+      { now: () => now },
+    );
+    pool.setCooldown("a", 500);
+    expect(pool.isEligible("a")).toBe(false);
+    expect(pool.isCoolingDown("a")).toBe(true);
+
+    now = 1_500;
+    expect(pool.isEligible("a")).toBe(true);
+    expect(pool.isCoolingDown("a")).toBe(false);
+  });
+
+  it("treats zero-percent caps as ineligible", () => {
+    const a = makeAccount("a");
+    a.sessionLimitPercent = 0;
+    const pool = new TokenPool([a, makeAccount("b")]);
+
+    expect(pool.isEligible("a")).toBe(false);
+    expect(pool.tryAcquire("a")).toBeNull();
+  });
+});
+
 describe("TokenPool — unhealthy accounts", () => {
   it("skips unhealthy accounts", () => {
     const pool = new TokenPool([
@@ -128,6 +264,18 @@ describe("TokenPool — stats", () => {
     expect(s.enabled).toBe(true);
     expect(s.sessionLimitPercent).toBe(100);
     expect(s.weeklyLimitPercent).toBe(100);
+  });
+
+  it("getStats() includes current in-flight and cooldown state", () => {
+    const pool = new TokenPool([makeAccount("a")]);
+    const lease = pool.acquireBest(new Map());
+    pool.setCooldown("a", 1_000);
+
+    const s = pool.getStats()[0];
+    expect(s.inFlightRequests).toBe(1);
+    expect(s.coolingDown).toBe(true);
+
+    lease.release();
   });
 });
 
