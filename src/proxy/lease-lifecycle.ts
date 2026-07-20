@@ -62,6 +62,20 @@ export function routeReasonDetails(route: RouteSummary): string {
   return route.fallback ? `${route.reason}:fallback` : route.reason;
 }
 
+export type RouteFailureReason =
+  | "token-invalid"
+  | "rate-limited"
+  | "service-overloaded"
+  | "proxy-error";
+
+/** Retain bounded routing context when a later failure updates the log. */
+export function routeFailureDetails(
+  route: RouteSummary,
+  failure: RouteFailureReason,
+): string {
+  return `${routeReasonDetails(route)}:${failure}`;
+}
+
 /** Acquire and immediately bind a routed lease to its response lifecycle. */
 export function acquireRequestRoute<T extends RoutedRequestLease>(
   sessionHeader: unknown,

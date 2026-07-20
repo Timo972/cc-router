@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   needsRefresh,
+  refreshAccountsOnce,
   refreshAccountIfCurrent,
   refreshAccountToken,
+  reserveAccountForDeletion,
 } from "../proxy/token-refresher.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
@@ -275,5 +277,76 @@ describe("refreshAccountToken", () => {
     expect(await pending).toBe(false);
     expect(persist).not.toHaveBeenCalled();
     expect(replacement.tokens.refreshToken).toBe("replacement-refresh");
+  });
+
+  it("retries durability without another upstream refresh after persistence fails", async () => {
+    const account = makeAccount(Date.now() + 5 * 60 * 1000);
+    const pool = new TokenPool([account]);
+    vi.mocked(fetch).mockResolvedValue(successfulRefreshResponse("ROTATED"));
+    const persist = vi.fn()
+      .mockImplementationOnce(() => { throw new Error("disk full"); })
+      .mockImplementationOnce(() => undefined);
+
+    await expect(refreshAccountIfCurrent(account, pool, { persist }))
+      .rejects.toThrow("disk full");
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(account.tokens.refreshToken).toBe("sk-ant-ort01-ROTATED");
+    expect(needsRefresh(account)).toBe(true);
+
+    expect(await refreshAccountIfCurrent(account, pool, { persist })).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(persist).toHaveBeenCalledTimes(2);
+    expect(account.tokens.refreshToken).toBe("sk-ant-ort01-ROTATED");
+    expect(needsRefresh(account)).toBe(false);
+  });
+
+  it("scheduled and foreground refresh share ownership and refuse stale persistence", async () => {
+    const oldAccount = makeAccount(Date.now() + 5 * 60 * 1000);
+    const accounts = [oldAccount];
+    const pool = new TokenPool(accounts);
+    const response = deferred<Response>();
+    vi.mocked(fetch).mockImplementation(() => response.promise);
+    const persist = vi.fn();
+
+    const scheduled = refreshAccountsOnce(accounts, { persist });
+    const foreground = refreshAccountIfCurrent(oldAccount, pool, { persist });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    pool.removeAccount(oldAccount.id);
+    const replacement = pool.addAccount({
+      id: oldAccount.id,
+      accessToken: "replacement-access",
+      refreshToken: "replacement-refresh",
+      expiresAt: Date.now() + 60_000,
+      scopes: ["user:inference"],
+    });
+    response.resolve(successfulRefreshResponse("STALE"));
+
+    await scheduled;
+    expect(await foreground).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(persist).not.toHaveBeenCalled();
+    expect(replacement.tokens.refreshToken).toBe("replacement-refresh");
+  });
+
+  it("keeps an exact account blocked until every deletion reservation releases", async () => {
+    const account = makeAccount(Date.now() + 5 * 60 * 1000);
+    const pool = new TokenPool([account]);
+    vi.mocked(fetch).mockResolvedValue(successfulRefreshResponse("AFTER"));
+    const persist = vi.fn();
+
+    const [releaseFirst, releaseSecond] = await Promise.all([
+      reserveAccountForDeletion(account),
+      reserveAccountForDeletion(account),
+    ]);
+
+    expect(await refreshAccountToken(account)).toBe(false);
+    expect(await refreshAccountIfCurrent(account, pool, { persist })).toBe(false);
+    releaseFirst();
+    releaseFirst();
+    expect(await refreshAccountToken(account)).toBe(false);
+    releaseSecond();
+    expect(await refreshAccountToken(account)).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

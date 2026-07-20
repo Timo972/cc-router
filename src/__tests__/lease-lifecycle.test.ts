@@ -4,6 +4,7 @@ import {
   acquireRequestRoute,
   applyUpstreamFailureRouting,
   attachLeaseLifecycle,
+  routeFailureDetails,
   routeReasonDetails,
 } from "../proxy/lease-lifecycle.js";
 import { SessionRouter } from "../proxy/session-router.js";
@@ -126,6 +127,22 @@ describe("routeReasonDetails", () => {
     expect(details).not.toContain("private-fallback-session");
     route.release();
   });
+
+  it.each(["rate-limited", "proxy-error"] as const)(
+    "retains fallback routing details after a %s failure without exposing the session",
+    (failure) => {
+      const account = makeAccount("account-a");
+      account.healthy = false;
+      const router = new SessionRouter(new TokenPool([account]));
+      const route = router.acquire("private-fallback-session");
+
+      const details = routeFailureDetails(route, failure);
+
+      expect(details).toBe(`new-session:fallback:${failure}`);
+      expect(details).not.toContain("private-fallback-session");
+      route.release();
+    },
+  );
 });
 
 describe("applyUpstreamFailureRouting", () => {

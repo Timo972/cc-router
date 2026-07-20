@@ -1,13 +1,27 @@
 import type { SessionRouter } from "./session-router.js";
 import type { TokenPool } from "./token-pool.js";
 import type { Account } from "./types.js";
-import { waitForAccountRefresh } from "./token-refresher.js";
+import { reserveAccountForDeletion } from "./token-refresher.js";
+
+export class AccountDeletionConflictError extends Error {
+  constructor(id: string) {
+    super(`Account "${id}" changed during deletion`);
+    this.name = "AccountDeletionConflictError";
+  }
+}
 
 export class LastAccountDeletionError extends Error {
   constructor() {
     super("Cannot remove the last account — at least one must remain");
     this.name = "LastAccountDeletionError";
   }
+}
+
+export function accountDeletionStatusCode(error: unknown): 409 | 500 {
+  return error instanceof AccountDeletionConflictError ||
+    error instanceof LastAccountDeletionError
+    ? 409
+    : 500;
 }
 
 export interface DeleteAnthropicAccountOptions {
@@ -24,20 +38,24 @@ export async function deleteAnthropicAccountTransaction(
   const account = options.pool.findById(options.id);
   if (!account) throw new Error(`Account "${options.id}" not found`);
 
-  await waitForAccountRefresh(account);
-  if (options.pool.findById(options.id) !== account) {
-    throw new Error(`Account "${options.id}" changed during deletion`);
-  }
-  if (options.pool.getAll().length <= 1) {
-    throw new LastAccountDeletionError();
-  }
+  const releaseReservation = await reserveAccountForDeletion(account);
+  try {
+    if (options.pool.findById(options.id) !== account) {
+      throw new AccountDeletionConflictError(options.id);
+    }
+    if (options.pool.getAll().length <= 1) {
+      throw new LastAccountDeletionError();
+    }
 
-  const prospective = options.pool.getAll().filter(candidate => candidate !== account);
-  options.persist(prospective);
+    const prospective = options.pool.getAll().filter(candidate => candidate !== account);
+    options.persist(prospective);
 
-  if (!options.pool.removeAccount(options.id)) {
-    throw new Error(`Account "${options.id}" disappeared during deletion`);
+    if (!options.pool.removeAccount(options.id)) {
+      throw new AccountDeletionConflictError(options.id);
+    }
+    options.sessionRouter.invalidateAccount(options.id);
+    return account;
+  } finally {
+    releaseReservation();
   }
-  options.sessionRouter.invalidateAccount(options.id);
-  return account;
 }

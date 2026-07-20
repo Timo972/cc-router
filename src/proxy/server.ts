@@ -30,12 +30,13 @@ import type { RoutedAccountLease } from "./session-router.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
 import {
   applyUpstreamFailureRouting,
+  routeFailureDetails,
   routeReasonDetails,
 } from "./lease-lifecycle.js";
 import { persistProviderEnabledState } from "./provider-routing.js";
 import {
+  accountDeletionStatusCode,
   deleteAnthropicAccountTransaction,
-  LastAccountDeletionError,
 } from "./account-deletion.js";
 import {
   createAnthropicRefreshMiddleware,
@@ -636,7 +637,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (err instanceof LastAccountDeletionError) {
+      const status = accountDeletionStatusCode(err);
+      if (status === 409) {
         res.status(409).json({ error: message });
         return;
       }
@@ -755,7 +757,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           stats.totalErrors++;
           account.errorCount++;
           pendingLog.type = "error";
-          pendingLog.details = "token invalid";
+          pendingLog.details = route
+            ? routeFailureDetails(route, "token-invalid")
+            : "token-invalid";
           logError(account.id, 401, "Token invalid — scheduling background refresh");
 
           void refreshAccountIfCurrent(account, pool).catch(console.error);
@@ -765,14 +769,18 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           account.errorCount++;
           const retryAfter = cooldownSeconds ?? 60;
           pendingLog.type = "error";
-          pendingLog.details = `rate limited — cooldown ${retryAfter}s`;
+          pendingLog.details = route
+            ? routeFailureDetails(route, "rate-limited")
+            : "rate-limited";
           logError(account.id, 429, `Rate limited — cooldown ${retryAfter}s`);
         } else if (status === 529) {
           // Anthropic service overloaded — short cooldown on this account.
           stats.totalErrors++;
           account.errorCount++;
           pendingLog.type = "error";
-          pendingLog.details = "service overloaded — cooldown 30s";
+          pendingLog.details = route
+            ? routeFailureDetails(route, "service-overloaded")
+            : "service-overloaded";
           logError(account.id, 529, "Service overloaded — cooldown 30s");
         }
 
@@ -855,7 +863,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         if (pendingLog) {
           pendingLog.type = "error";
           pendingLog.statusCode = 0;
-          pendingLog.details = err.message;
+          pendingLog.details = request._ccRoute
+            ? routeFailureDetails(request._ccRoute, "proxy-error")
+            : "proxy-error";
           if (request._startTime) {
             pendingLog.durationMs = Date.now() - request._startTime;
           }

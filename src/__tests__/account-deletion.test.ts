@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  AccountDeletionConflictError,
+  accountDeletionStatusCode,
   deleteAnthropicAccountTransaction,
   LastAccountDeletionError,
 } from "../proxy/account-deletion.js";
 import { SessionRouter } from "../proxy/session-router.js";
 import { TokenPool } from "../proxy/token-pool.js";
-import { refreshAccountToken } from "../proxy/token-refresher.js";
+import {
+  refreshAccountIfCurrent,
+  refreshAccountToken,
+} from "../proxy/token-refresher.js";
 import type { Account } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
 
@@ -52,6 +57,12 @@ function successfulRefreshResponse(): Response {
 }
 
 describe("deleteAnthropicAccountTransaction", () => {
+  it("maps typed deletion conflicts to 409 and persistence failures to 500", () => {
+    expect(accountDeletionStatusCode(new AccountDeletionConflictError("a"))).toBe(409);
+    expect(accountDeletionStatusCode(new LastAccountDeletionError())).toBe(409);
+    expect(accountDeletionStatusCode(new Error("disk full"))).toBe(500);
+  });
+
   it("leaves the exact runtime state untouched when prospective persistence fails", async () => {
     let now = 0;
     const first = makeAccount("a");
@@ -77,6 +88,16 @@ describe("deleteAnthropicAccountTransaction", () => {
     expect(pool.getInFlight("a")).toBe(1);
     expect(pool.isCoolingDown("a")).toBe(true);
     expect(router.getActiveSessionCount("a")).toBe(1);
+
+    const refreshAfterFailure = vi.fn(async () => true);
+    const persistAfterFailure = vi.fn();
+    expect(await refreshAccountIfCurrent(first, pool, {
+      refresh: refreshAfterFailure,
+      persist: persistAfterFailure,
+    })).toBe(true);
+    expect(refreshAfterFailure).toHaveBeenCalledWith(first);
+    expect(persistAfterFailure).toHaveBeenCalledWith([first, second]);
+
     now = 60_000;
     const sticky = router.acquire("session-a");
     expect(sticky.account).toBe(first);
@@ -174,7 +195,7 @@ describe("deleteAnthropicAccountTransaction", () => {
       response.resolve(successfulRefreshResponse());
       await refresh;
 
-      await expect(deletion).rejects.toThrow(/changed during deletion/);
+      await expect(deletion).rejects.toBeInstanceOf(AccountDeletionConflictError);
       expect(persist).not.toHaveBeenCalled();
       expect(pool.findById("a")).toBe(replacement);
       expect(replacement.tokens.refreshToken).toBe("replacement-refresh");
@@ -212,5 +233,54 @@ describe("deleteAnthropicAccountTransaction", () => {
     expect(rejected?.status === "rejected" ? rejected.reason : undefined)
       .toBeInstanceOf(LastAccountDeletionError);
     expect(pool.getAll()).toHaveLength(1);
+  });
+
+  it("blocks a P2 refresh reaction until P1 persistence and deletion complete", async () => {
+    const first = makeAccount("a");
+    const second = makeAccount("b");
+    const pool = new TokenPool([first, second]);
+    const router = new SessionRouter(pool);
+    const p1Gate = deferred<boolean>();
+    const p2Refresh = vi.fn(async () => true);
+    const events: string[] = [];
+    let persistedRotatedToken = "";
+
+    const p1 = refreshAccountIfCurrent(first, pool, {
+      refresh: async (account) => {
+        await p1Gate.promise;
+        account.tokens.refreshToken = "rotated-refresh";
+        return true;
+      },
+      persist: (accounts) => {
+        expect(pool.findById("a")).toBe(first);
+        persistedRotatedToken = accounts[0].tokens.refreshToken;
+        events.push("p1-persist");
+      },
+    });
+    const p2 = p1.then(() => refreshAccountIfCurrent(first, pool, {
+      refresh: p2Refresh,
+      persist: () => events.push("p2-persist"),
+    }));
+    const deletion = deleteAnthropicAccountTransaction({
+      id: "a",
+      pool,
+      sessionRouter: router,
+      persist: () => events.push("delete-persist"),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const removedBeforeP1Completed = pool.findById("a") === null;
+
+    p1Gate.resolve(true);
+    const [p1Result, p2Result, removed] = await Promise.all([p1, p2, deletion]);
+
+    expect(removedBeforeP1Completed).toBe(false);
+    expect(p1Result).toBe(true);
+    expect(p2Result).toBe(false);
+    expect(p2Refresh).not.toHaveBeenCalled();
+    expect(removed).toBe(first);
+    expect(persistedRotatedToken).toBe("rotated-refresh");
+    expect(events).toEqual(["p1-persist", "delete-persist"]);
+    expect(pool.findById("a")).toBeNull();
   });
 });
