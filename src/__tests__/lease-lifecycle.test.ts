@@ -7,6 +7,7 @@ import {
   routeReasonDetails,
 } from "../proxy/lease-lifecycle.js";
 import { SessionRouter } from "../proxy/session-router.js";
+import type { RoutedAccountLease } from "../proxy/session-router.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
@@ -205,6 +206,27 @@ describe("applyUpstreamFailureRouting", () => {
     const sticky = router.acquire("session-a");
     expect(sticky.reason).toBe("sticky");
     expect(sticky.bindingGeneration).toBe(rebound.bindingGeneration);
+    sticky.release();
+  });
+
+  it("does not invalidate a binding when a malformed scoped route omits its generation", () => {
+    const pool = new TokenPool([makeAccount("a")]);
+    const router = new SessionRouter(pool);
+    const current = router.acquire("session-a");
+    current.release();
+    const malformedRoute = {
+      account: current.account,
+      reason: "sticky",
+      sessionId: current.sessionId,
+      fallback: false,
+      release: vi.fn(),
+    } as unknown as RoutedAccountLease;
+
+    applyUpstreamFailureRouting(401, undefined, malformedRoute, router, pool);
+
+    const sticky = router.acquire("session-a");
+    expect(sticky.reason).toBe("sticky");
+    expect(sticky.bindingGeneration).toBe(current.bindingGeneration);
     sticky.release();
   });
 

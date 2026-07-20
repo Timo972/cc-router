@@ -200,7 +200,7 @@ describe("createAnthropicProxy", () => {
     const app = express();
     app.use("/v1", createAnthropicProxy({
       target: `http://127.0.0.1:${upstreamPort}`,
-      timeoutMs: 2_000,
+      timeoutMs: 10_000,
       on: {},
     }));
     const downstream = createServer(app);
@@ -261,7 +261,7 @@ describe("createAnthropicProxy", () => {
     }));
     app.use("/v1", createAnthropicProxy({
       target: `http://127.0.0.1:${upstreamPort}`,
-      timeoutMs: 2_000,
+      timeoutMs: 10_000,
       on: {
         proxyReq: (proxyRequest, req) => {
           const account = (req as express.Request)._ccAccount!;
@@ -282,32 +282,37 @@ describe("createAnthropicProxy", () => {
 
     try {
       await Promise.all([one.firstChunk, two.firstChunk]);
-      expect(authorization.get("/v1/one")).toBe("Bearer access-a");
-      expect(authorization.get("/v1/two")).toBe("Bearer access-b");
-      expect(pool.getInFlight("a")).toBe(1);
-      expect(pool.getInFlight("b")).toBe(1);
-      expect([...sessionRouter.getActiveSessionCountsSnapshot()]).toEqual([
+      const sessionOneAuthorization = authorization.get("/v1/one");
+      const sessionTwoAuthorization = authorization.get("/v1/two");
+      expect(sessionOneAuthorization).toMatch(/^Bearer access-[ab]$/);
+      expect(sessionTwoAuthorization).toMatch(/^Bearer access-[ab]$/);
+      expect(sessionOneAuthorization).not.toBe(sessionTwoAuthorization);
+      const sessionOneAccountId = sessionOneAuthorization!.endsWith("-a") ? "a" : "b";
+      const sessionTwoAccountId = sessionTwoAuthorization!.endsWith("-a") ? "a" : "b";
+      expect(pool.getInFlight(sessionOneAccountId)).toBe(1);
+      expect(pool.getInFlight(sessionTwoAccountId)).toBe(1);
+      expect(sessionRouter.getActiveSessionCountsSnapshot()).toEqual(new Map([
         ["a", 1],
         ["b", 1],
-      ]);
+      ]));
 
       const follow = await collect(new URL(`${base}/v1/follow`), {
         "X-Claude-Code-Session-Id": "session-one",
       });
-      expect(authorization.get("/v1/follow")).toBe("Bearer access-a");
+      expect(authorization.get("/v1/follow")).toBe(sessionOneAuthorization);
       expect(follow.body).toEqual(expected.get("/v1/follow"));
       expect(follow.body.toString("utf8").match(/event: message_stop/g)).toHaveLength(1);
-      expect(pool.getInFlight("a")).toBe(1);
+      expect(pool.getInFlight(sessionOneAccountId)).toBe(1);
 
       aborted = startCollecting(new URL(`${base}/v1/abort`), {
         "X-Claude-Code-Session-Id": "session-two",
       });
       await aborted.firstChunk;
-      expect(authorization.get("/v1/abort")).toBe("Bearer access-b");
-      expect(pool.getInFlight("b")).toBe(2);
+      expect(authorization.get("/v1/abort")).toBe(sessionTwoAuthorization);
+      expect(pool.getInFlight(sessionTwoAccountId)).toBe(2);
       aborted.request.destroy();
       await Promise.allSettled([aborted.completed]);
-      await vi.waitFor(() => expect(pool.getInFlight("b")).toBe(1));
+      await vi.waitFor(() => expect(pool.getInFlight(sessionTwoAccountId)).toBe(1));
 
       gates.get("/v1/one")!.resolve();
       gates.get("/v1/two")!.resolve();

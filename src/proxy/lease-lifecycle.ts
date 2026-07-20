@@ -102,7 +102,9 @@ export function applyUpstreamFailureRouting<TAccount extends { readonly id: stri
 ): number | undefined {
   if (status !== 401 && status !== 429 && status !== 529) return undefined;
 
-  router.invalidate(route.sessionId, route.account.id, route.bindingGeneration);
+  if (route.sessionId !== undefined && route.bindingGeneration !== undefined) {
+    router.invalidate(route.sessionId, route.account.id, route.bindingGeneration);
+  }
   if (status === 429) {
     const seconds = retryAfterSeconds(retryAfterHeader);
     pool.setCooldownForAccount(route.account, seconds * 1_000);

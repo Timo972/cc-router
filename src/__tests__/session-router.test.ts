@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { SessionRouter, normalizeSessionId } from "../proxy/session-router.js";
+import type { RoutedAccountLease } from "../proxy/session-router.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
@@ -27,6 +28,18 @@ function makeAccount(id: string): Account {
   };
 }
 
+if (false) {
+  // @ts-expect-error A scoped route cannot compile without a binding generation.
+  const scopedRouteMissingGeneration: RoutedAccountLease = {
+    account: makeAccount("compile-only"),
+    fallback: false,
+    release: () => undefined,
+    reason: "sticky",
+    sessionId: "session-a",
+  };
+  void scopedRouteMissingGeneration;
+}
+
 describe("session ID normalization", () => {
   it("normalizes one bounded string header", () => {
     expect(normalizeSessionId("  session-a  ")).toBe("session-a");
@@ -52,6 +65,30 @@ describe("SessionRouter", () => {
     expect(second.reason).toBe("sticky");
     first.release();
     second.release();
+  });
+
+  it("returns both identity fields on every scoped route and neither on unscoped routes", () => {
+    const a = makeAccount("a");
+    const pool = new TokenPool([a, makeAccount("b")]);
+    const router = new SessionRouter(pool);
+    const created = router.acquire("session-a");
+    const sticky = router.acquire("session-a");
+    a.enabled = false;
+    const failover = router.acquire("session-a");
+    const unscoped = router.acquire(undefined);
+
+    for (const route of [created, sticky, failover]) {
+      expect(route.sessionId).toBe("session-a");
+      expect(typeof route.bindingGeneration).toBe("number");
+    }
+    expect(unscoped.reason).toBe("unscoped");
+    expect("sessionId" in unscoped).toBe(false);
+    expect("bindingGeneration" in unscoped).toBe(false);
+
+    created.release();
+    sticky.release();
+    failover.release();
+    unscoped.release();
   });
 
   it("binds simultaneous new sessions to separate idle accounts", () => {

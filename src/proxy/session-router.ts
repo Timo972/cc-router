@@ -6,12 +6,21 @@ const DEFAULT_MAX_ENTRIES = 10_000;
 const MAX_SESSION_ID_BYTES = 256;
 
 export type RouteReason = "sticky" | "new-session" | "unscoped" | "failover";
+export type ScopedRouteReason = Exclude<RouteReason, "unscoped">;
 
-export interface RoutedAccountLease extends AccountLease {
-  readonly reason: RouteReason;
-  readonly sessionId?: string;
-  readonly bindingGeneration?: number;
+export interface UnscopedRoutedAccountLease extends AccountLease {
+  readonly reason: "unscoped";
+  readonly sessionId?: never;
+  readonly bindingGeneration?: never;
 }
+
+export interface ScopedRoutedAccountLease extends AccountLease {
+  readonly reason: ScopedRouteReason;
+  readonly sessionId: string;
+  readonly bindingGeneration: number;
+}
+
+export type RoutedAccountLease = UnscopedRoutedAccountLease | ScopedRoutedAccountLease;
 
 export interface SessionRouterOptions {
   now?: () => number;
@@ -73,7 +82,7 @@ export class SessionRouter {
     this.sweepExpiredBindings(now);
 
     if (!sessionId) {
-      return this.wrap(this.pool.acquireBest(this.activeSessionCounts), "unscoped");
+      return this.wrapUnscoped(this.pool.acquireBest(this.activeSessionCounts));
     }
 
     const existing = this.bindings.get(sessionId);
@@ -81,14 +90,14 @@ export class SessionRouter {
       const stickyLease = this.pool.tryAcquire(existing.accountId);
       if (stickyLease) {
         existing.lastSeen = now;
-        return this.wrap(stickyLease, "sticky", sessionId, existing.generation);
+        return this.wrapScoped(stickyLease, "sticky", sessionId, existing.generation);
       }
       this.removeBinding(sessionId);
     }
 
     const lease = this.pool.acquireBest(this.activeSessionCounts);
     const binding = this.insertBinding(sessionId, lease.account.id, now);
-    return this.wrap(
+    return this.wrapScoped(
       lease,
       existing ? "failover" : "new-session",
       sessionId,
@@ -143,19 +152,28 @@ export class SessionRouter {
     return new Map(this.activeSessionCounts);
   }
 
-  private wrap(
+  private wrapUnscoped(lease: AccountLease): UnscopedRoutedAccountLease {
+    return {
+      account: lease.account,
+      fallback: lease.fallback,
+      release: lease.release,
+      reason: "unscoped",
+    };
+  }
+
+  private wrapScoped(
     lease: AccountLease,
-    reason: RouteReason,
-    sessionId?: string,
-    bindingGeneration?: number,
-  ): RoutedAccountLease {
+    reason: ScopedRouteReason,
+    sessionId: string,
+    bindingGeneration: number,
+  ): ScopedRoutedAccountLease {
     return {
       account: lease.account,
       fallback: lease.fallback,
       release: lease.release,
       reason,
-      ...(sessionId === undefined ? {} : { sessionId }),
-      ...(bindingGeneration === undefined ? {} : { bindingGeneration }),
+      sessionId,
+      bindingGeneration,
     };
   }
 
