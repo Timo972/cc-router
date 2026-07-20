@@ -8,6 +8,10 @@ import {
 } from "../proxy/anthropic-routing.js";
 import { SessionRouter } from "../proxy/session-router.js";
 import { TokenPool } from "../proxy/token-pool.js";
+import {
+  needsRefresh,
+  refreshAccountIfCurrent,
+} from "../proxy/token-refresher.js";
 import type { Account } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
 
@@ -59,6 +63,19 @@ function deferred<T>(): {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(done => { resolve = done; });
   return { promise, resolve };
+}
+
+function successfulRefreshResponse(): Response {
+  return {
+    ok: true,
+    json: async () => ({
+      access_token: "rotated-access",
+      refresh_token: "rotated-refresh",
+      expires_in: 28800,
+      scope: "user:inference",
+      token_type: "Bearer",
+    }),
+  } as Response;
 }
 
 function send(options: Parameters<typeof request>[0]): Promise<{
@@ -165,6 +182,76 @@ describe("production Anthropic routing middleware", () => {
     } finally {
       refreshResult.resolve(true);
       client?.destroy();
+      await close(server);
+    }
+  });
+
+  it("joins an active forced refresh before forwarding a far-future token retry", async () => {
+    const account = makeAccount("a");
+    account.tokens.expiresAt = Date.now() + 2 * 60 * 60 * 1000;
+    const pool = new TokenPool([account]);
+    const sessionRouter = new SessionRouter(pool);
+    const refreshResponse = deferred<Response>();
+    vi.stubGlobal("fetch", vi.fn(() => refreshResponse.promise));
+    let persisted = false;
+    const persist = vi.fn(() => { persisted = true; });
+    const forcedRefresh = refreshAccountIfCurrent(account, pool, { persist });
+    const preparationCheck = deferred<boolean>();
+    let joinedRefresh: Promise<boolean> | undefined;
+    let tokenAtForward = "";
+    let persistedAtForward = false;
+    const forwarded = vi.fn();
+
+    const app = express();
+    app.use(createAnthropicRoutingMiddleware({ sessionRouter }));
+    app.use(createAnthropicRefreshMiddleware({
+      needsRefresh: selected => {
+        const required = needsRefresh(selected);
+        preparationCheck.resolve(required);
+        return required;
+      },
+      refresh: selected => {
+        joinedRefresh = refreshAccountIfCurrent(selected, pool, { persist });
+        return joinedRefresh;
+      },
+      onRefreshFailure: vi.fn(),
+    }));
+    app.use((_req, res) => {
+      forwarded();
+      tokenAtForward = account.tokens.accessToken;
+      persistedAtForward = persisted;
+      res.end("forwarded");
+    });
+    const server = createServer(app);
+    const port = await listen(server);
+    const retry = send({
+      host: "127.0.0.1",
+      port,
+      path: "/v1/messages",
+      headers: { "X-Claude-Code-Session-Id": "session-a" },
+    });
+
+    try {
+      const preparationNeeded = await preparationCheck.promise;
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(preparationNeeded).toBe(true);
+      expect(forwarded).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledTimes(1);
+
+      refreshResponse.resolve(successfulRefreshResponse());
+      expect(await forcedRefresh).toBe(true);
+      expect((await retry).status).toBe(200);
+
+      expect(joinedRefresh).toBe(forcedRefresh);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(persist).toHaveBeenCalledTimes(1);
+      expect(tokenAtForward).toBe("rotated-access");
+      expect(persistedAtForward).toBe(true);
+    } finally {
+      refreshResponse.resolve(successfulRefreshResponse());
+      await Promise.allSettled([forcedRefresh, retry]);
+      vi.unstubAllGlobals();
       await close(server);
     }
   });

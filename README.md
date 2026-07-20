@@ -547,7 +547,7 @@ Then start the interceptor:
 cc-router client start-desktop
 ```
 
-Open Claude Desktop and send a message. The request will be intercepted and redirected to CC-Router, which applies the same cache-aware account routing used for Claude Code traffic.
+Open Claude Desktop and send a message. The request will be intercepted and redirected to CC-Router. Requests carrying exactly one valid `X-Claude-Code-Session-Id` receive cache-aware sticky affinity; requests without one valid session header use load-aware **unscoped** routing and do not receive sticky affinity. Claude Desktop traffic normally follows the unscoped path.
 
 ### Stopping / removing Desktop interception
 

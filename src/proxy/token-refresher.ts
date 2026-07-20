@@ -37,7 +37,8 @@ function isReservedForDeletion(account: Account): boolean {
 }
 
 export function needsRefresh(account: Account): boolean {
-  return pendingDurability.has(account) ||
+  return ownedRefreshLocks.has(account) ||
+    pendingDurability.has(account) ||
     (account.tokens.expiresAt - Date.now()) < REFRESH_BUFFER_MS;
 }
 
