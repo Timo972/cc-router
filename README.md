@@ -64,7 +64,7 @@ All standard Claude Code features work transparently on the Claude route: stream
 
 ### Cache-aware Claude account routing
 
-CC-Router keeps requests from one Claude Code session on the same healthy Anthropic subscription account. This session affinity preserves prompt-cache locality instead of scattering a conversation's shared prefix across account-specific caches. New sessions prefer the account with the fewest in-flight requests, then the fewest bound sessions, then the most rate-limit headroom.
+CC-Router keeps requests from one Claude Code session on the same healthy Anthropic subscription account. This session affinity preserves prompt-cache locality instead of scattering a conversation's shared prefix across account-specific caches. New sessions prefer the account with the fewest in-flight requests, then the fewest bound sessions, then the most rate-limit headroom; exact ties use a rotating round-robin order.
 
 If an upstream account returns 401, 429, or 529, CC-Router passes that response through unchanged and invalidates the session's affinity. The client's next retry can then select another usable account; the router never retries after response bytes have started. Affinity mappings exist only in process memory, expire after one hour of inactivity, and are capped in size. Session IDs are never persisted or logged.
 
