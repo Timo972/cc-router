@@ -25,11 +25,20 @@ import { mountMessagesCrossProviderRoute } from "./messages-cross-route.js";
 import { mountModelsRoute } from "./models-server.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 import chalk from "chalk";
+import { SessionRouter } from "./session-router.js";
+import type { RoutedAccountLease } from "./session-router.js";
+import { createAnthropicProxy } from "./anthropic-proxy.js";
+import {
+  acquireRequestRoute,
+  applyUpstreamFailureRouting,
+} from "./lease-lifecycle.js";
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
   interface Request {
     _ccAccount?: Account;
+    _ccRoute?: RoutedAccountLease;
+    _ccReleaseLease?: () => void;
     _startTime?: number;
     _pendingLog?: Partial<LogEntry>;
   }
@@ -264,6 +273,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   }
 
   const pool = new TokenPool(accounts);
+  const sessionRouter = new SessionRouter(pool);
   const pickOpenAIAccount = createOpenAIAccountPicker(openAIAccounts);
   const initialConfig = readConfig();
   const modelRouting = initialConfig.modelRouting ?? {};
@@ -386,6 +396,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       if (provider === "anthropic_subscription") {
         for (const account of pool.getAll()) {
           pool.updateAccount(account.id, { enabled });
+          if (!enabled) sessionRouter.invalidateAccount(account.id);
         }
       } else {
         for (const account of openAIAccounts) {
@@ -485,6 +496,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       res.status(500).json({ error: `Failed to persist accounts.json: ${result.message}` });
       return;
     }
+    if (patch.enabled === false) sessionRouter.invalidateAccount(id);
     res.json({ account: publicAnthropicAccountView(updated) });
   });
 
@@ -565,6 +577,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       res.status(500).json({ error: `Failed to persist accounts.json: ${result.message}` });
       return;
     }
+    sessionRouter.invalidateAccount(id);
     res.json({ ok: true, id });
   });
 
@@ -599,15 +612,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // ─── Proxy middleware ──────────────────────────────────────────────────────
   // IMPORTANT: selfHandleResponse must be false (default) for SSE streaming to
   // work transparently. Setting it to true breaks streaming.
-  const proxy = createProxyMiddleware<Request, ServerResponse>({
+  const proxy = createAnthropicProxy({
     target,
-    changeOrigin: true,
-    // Express strips the /v1 mount prefix from req.url before passing it to middleware.
-    // pathRewrite restores it so the proxy forwards /v1/messages, not /messages.
-    pathRewrite: (path) => `/v1${path}`,
-    // Long timeouts — Claude Code requests can be >5min (thinking, agents)
-    proxyTimeout: proxyRequestTimeoutMs,
-    timeout: proxyRequestTimeoutMs,
+    timeoutMs: proxyRequestTimeoutMs,
     on: {
       proxyReq: (proxyReq, req) => {
         const account = (req as Request)._ccAccount;
@@ -647,6 +654,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
       proxyRes: (proxyRes, req) => {
         const account = (req as Request)._ccAccount;
+        const route = (req as Request)._ccRoute;
         if (!account) return;
 
         const status = proxyRes.statusCode ?? 0;
@@ -663,6 +671,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         };
         pendingLog.statusCode = status;
         if (durationMs !== undefined) pendingLog.durationMs = durationMs;
+
+        const cooldownSeconds = route
+          ? applyUpstreamFailureRouting(
+              status,
+              proxyRes.headers["retry-after"],
+              route,
+              sessionRouter,
+              pool,
+            )
+          : undefined;
 
         if (status === 401) {
           // Token invalid or expired mid-request.
@@ -681,13 +699,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           // Rate limited — put account on cooldown for Retry-After seconds.
           stats.totalErrors++;
           account.errorCount++;
-          const retryAfter = Number(proxyRes.headers["retry-after"] ?? 60);
+          const retryAfter = cooldownSeconds ?? 60;
           pendingLog.type = "error";
           pendingLog.details = `rate limited — cooldown ${retryAfter}s`;
           logError(account.id, 429, `Rate limited — cooldown ${retryAfter}s`);
-
-          account.busy = true;
-          setTimeout(() => { account.busy = false; }, retryAfter * 1_000);
         } else if (status === 529) {
           // Anthropic service overloaded — short cooldown on this account.
           stats.totalErrors++;
@@ -695,9 +710,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           pendingLog.type = "error";
           pendingLog.details = "service overloaded — cooldown 30s";
           logError(account.id, 529, "Service overloaded — cooldown 30s");
-
-          account.busy = true;
-          setTimeout(() => { account.busy = false; }, 30_000);
         }
 
         // ── Capture rate limit utilization from response headers ────────────
@@ -769,17 +781,19 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       },
 
       error: (err: Error, _req: IncomingMessage, res: ServerResponse | Socket) => {
+        const request = _req as Request;
+        request._ccReleaseLease?.();
         stats.totalErrors++;
         logError("proxy", 0, err.message);
 
         // Complete the pending log entry for connection-level errors
-        const pendingLog = (_req as Request)._pendingLog;
+        const pendingLog = request._pendingLog;
         if (pendingLog) {
           pendingLog.type = "error";
           pendingLog.statusCode = 0;
           pendingLog.details = err.message;
-          if ((_req as Request)._startTime) {
-            pendingLog.durationMs = Date.now() - (_req as Request)._startTime!;
+          if (request._startTime) {
+            pendingLog.durationMs = Date.now() - request._startTime;
           }
           stats.addLog(pendingLog as LogEntry);
         }
@@ -801,9 +815,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // CRITICAL: Do NOT use express.json() here — it consumes the body stream
   // and breaks SSE streaming passthrough.
   app.use("/v1", async (req, res, next) => {
-    let account: Account;
+    let selected: { route: RoutedAccountLease; release: () => void; details: string };
     try {
-      account = pool.getNext();
+      selected = acquireRequestRoute(
+        req.headers["x-claude-code-session-id"],
+        res,
+        sessionRouter,
+      );
     } catch (err) {
       if (err instanceof EmptyPoolError) {
         stats.totalErrors++;
@@ -814,28 +832,41 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         });
         return;
       }
-      throw err;
+      next(err);
+      return;
     }
 
-    // Synchronous refresh if token expires within the buffer window
-    if (needsRefresh(account)) {
-      const ok = await refreshAccountToken(account);
-      if (ok) saveAccounts(pool.getAll());
-      if (!ok) {
-        stats.totalErrors++;
-        logError(account.id, 401, "Token refresh failed");
-        res.status(401).json({
-          type: "error",
-          error: {
-            type: "authentication_error",
-            message: "Anthropic subscription token refresh failed",
-          },
-        });
-        return;
-      }
-    }
-
+    const { route } = selected;
+    req._ccRoute = route;
+    req._ccReleaseLease = selected.release;
+    const account = route.account;
     req._ccAccount = account;
+
+    try {
+      // Synchronous refresh if token expires within the buffer window
+      if (needsRefresh(account)) {
+        const ok = await refreshAccountToken(account);
+        if (ok) saveAccounts(pool.getAll());
+        if (!ok) {
+          req._ccReleaseLease();
+          stats.totalErrors++;
+          logError(account.id, 401, "Token refresh failed");
+          res.status(401).json({
+            type: "error",
+            error: {
+              type: "authentication_error",
+              message: "Anthropic subscription token refresh failed",
+            },
+          });
+          return;
+        }
+      }
+    } catch (err) {
+      req._ccReleaseLease();
+      next(err);
+      return;
+    }
+
     req._startTime = Date.now();
     const source = req.headers["x-claude-code-session-id"]
       ? "cli" as const
@@ -851,6 +882,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       method: req.method,
       path: req.path,
       source,
+      details: selected.details,
     };
     stats.totalRequests++;
 
