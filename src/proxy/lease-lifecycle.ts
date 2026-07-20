@@ -8,6 +8,7 @@ export interface Releasable {
 
 export interface RouteSummary {
   readonly reason: "sticky" | "new-session" | "unscoped" | "failover";
+  readonly fallback?: boolean;
   readonly sessionId?: string;
   readonly bindingGeneration?: number;
 }
@@ -58,7 +59,7 @@ export function attachLeaseLifecycle(
 
 /** Keep route diagnostics useful without ever copying a session ID to logs. */
 export function routeReasonDetails(route: RouteSummary): string {
-  return route.reason;
+  return route.fallback ? `${route.reason}:fallback` : route.reason;
 }
 
 /** Acquire and immediately bind a routed lease to its response lifecycle. */

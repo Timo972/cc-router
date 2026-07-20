@@ -6,7 +6,7 @@ import type { IncomingMessage } from "http";
 import type { Socket } from "net";
 import type { Request } from "express";
 import { TokenPool } from "./token-pool.js";
-import { needsRefresh, refreshAccountToken, saveAccounts, startRefreshLoop } from "./token-refresher.js";
+import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccounts, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
@@ -30,9 +30,13 @@ import type { RoutedAccountLease } from "./session-router.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
 import {
   applyUpstreamFailureRouting,
+  routeReasonDetails,
 } from "./lease-lifecycle.js";
 import { persistProviderEnabledState } from "./provider-routing.js";
-import { deleteAnthropicAccountTransaction } from "./account-deletion.js";
+import {
+  deleteAnthropicAccountTransaction,
+  LastAccountDeletionError,
+} from "./account-deletion.js";
 import {
   createAnthropicRefreshMiddleware,
   createAnthropicRoutingMiddleware,
@@ -609,7 +613,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     });
   });
 
-  accountsRouter.delete("/:id", (req, res) => {
+  accountsRouter.delete("/:id", async (req, res) => {
     const { id } = req.params;
     // Refuse to remove the last account — downstream /v1/* would have no
     // token to route with and the pool would throw EmptyPoolError on the
@@ -624,7 +628,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       return;
     }
     try {
-      deleteAnthropicAccountTransaction({
+      await deleteAnthropicAccountTransaction({
         id,
         pool,
         sessionRouter,
@@ -632,6 +636,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof LastAccountDeletionError) {
+        res.status(409).json({ error: message });
+        return;
+      }
       logError("accounts", 0, `Failed to persist accounts.json: ${message}`);
       res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
       return;
@@ -750,9 +758,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           pendingLog.details = "token invalid";
           logError(account.id, 401, "Token invalid — scheduling background refresh");
 
-          refreshAccountToken(account).then(ok => {
-            if (ok) saveAccounts(pool.getAll());
-          }).catch(console.error);
+          void refreshAccountIfCurrent(account, pool).catch(console.error);
         } else if (status === 429) {
           // Rate limited — put account on cooldown for Retry-After seconds.
           stats.totalErrors++;
@@ -884,11 +890,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     },
   }), createAnthropicRefreshMiddleware({
     needsRefresh,
-    refresh: async (account) => {
-      const ok = await refreshAccountToken(account);
-      if (ok) saveAccounts(pool.getAll());
-      return ok;
-    },
+    refresh: account => refreshAccountIfCurrent(account, pool),
     onRefreshFailure: (account) => {
       stats.totalErrors++;
       logError(account.id, 401, "Token refresh failed");
@@ -911,7 +913,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       method: req.method,
       path: req.path,
       source,
-      details: route.reason,
+      details: routeReasonDetails(route),
     };
     stats.totalRequests++;
 

@@ -112,6 +112,20 @@ describe("routeReasonDetails", () => {
     response.emit("close");
     expect(route.release).toHaveBeenCalledTimes(1);
   });
+
+  it("marks emergency fallback in bounded route details without exposing the session", () => {
+    const account = makeAccount("account-a");
+    account.enabled = false;
+    const router = new SessionRouter(new TokenPool([account]));
+    const route = router.acquire("private-fallback-session");
+
+    const details = routeReasonDetails(route);
+
+    expect(route.fallback).toBe(true);
+    expect(details).toBe("new-session:fallback");
+    expect(details).not.toContain("private-fallback-session");
+    route.release();
+  });
 });
 
 describe("applyUpstreamFailureRouting", () => {

@@ -22,8 +22,8 @@ const REFRESH_BUFFER_MS = 10 * 60 * 1000;
 /** Check every 5 minutes */
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
-/** Per-account refresh locks — prevent concurrent refreshes for the same account */
-const refreshLocks = new Map<string, Promise<boolean>>();
+/** Exact-object refresh locks prevent stale account incarnations from sharing work. */
+const refreshLocks = new Map<Account, Promise<boolean>>();
 
 export function needsRefresh(account: Account): boolean {
   return (account.tokens.expiresAt - Date.now()) < REFRESH_BUFFER_MS;
@@ -31,16 +31,45 @@ export function needsRefresh(account: Account): boolean {
 
 export async function refreshAccountToken(account: Account): Promise<boolean> {
   // Deduplicate concurrent refresh calls for the same account
-  const existing = refreshLocks.get(account.id);
+  const existing = refreshLocks.get(account);
   if (existing) return existing;
 
   const promise = _doRefresh(account);
-  refreshLocks.set(account.id, promise);
+  refreshLocks.set(account, promise);
   try {
     return await promise;
   } finally {
-    refreshLocks.delete(account.id);
+    if (refreshLocks.get(account) === promise) refreshLocks.delete(account);
   }
+}
+
+/** Wait for refresh work owned by this exact account incarnation, if any. */
+export async function waitForAccountRefresh(account: Account): Promise<void> {
+  const activeRefresh = refreshLocks.get(account);
+  if (activeRefresh) await activeRefresh;
+}
+
+export interface AccountOwnershipView {
+  findById(id: string): Account | null;
+  getAll(): Account[];
+}
+
+export interface RefreshAccountIfCurrentOptions {
+  refresh?: (account: Account) => Promise<boolean>;
+  persist?: (accounts: Account[]) => void;
+}
+
+/** Refresh and persist only while the pool still owns this exact object. */
+export async function refreshAccountIfCurrent(
+  account: Account,
+  pool: AccountOwnershipView,
+  options: RefreshAccountIfCurrentOptions = {},
+): Promise<boolean> {
+  if (pool.findById(account.id) !== account) return false;
+  const ok = await (options.refresh ?? refreshAccountToken)(account);
+  if (!ok || pool.findById(account.id) !== account) return false;
+  (options.persist ?? saveAccounts)(pool.getAll());
+  return true;
 }
 
 async function _doRefresh(account: Account): Promise<boolean> {
