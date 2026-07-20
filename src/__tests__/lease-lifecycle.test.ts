@@ -112,7 +112,17 @@ describe("applyUpstreamFailureRouting", () => {
     expect(setCooldown).toHaveBeenCalledWith("account-a", 12_500);
   });
 
-  it.each([undefined, "not-a-number", "-1", "Infinity", ["1", "2"]])(
+  it.each([
+    undefined,
+    "",
+    "   ",
+    "not-a-number",
+    "-1",
+    "Infinity",
+    "1e308",
+    ["1"],
+    ["1", "2"],
+  ])(
     "uses the 60-second 429 fallback for an unsafe Retry-After value %j",
     (retryAfter) => {
       const invalidate = vi.fn();

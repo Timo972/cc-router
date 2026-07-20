@@ -32,6 +32,7 @@ import {
   acquireRequestRoute,
   applyUpstreamFailureRouting,
 } from "./lease-lifecycle.js";
+import { persistProviderEnabledState } from "./provider-routing.js";
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
@@ -385,6 +386,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       res.status(400).json({ error: "enabled must be boolean" });
       return;
     }
+    const enabled = body.enabled;
 
     const provider = providerParam;
     const snapshots = {
@@ -396,7 +398,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       if (provider === "anthropic_subscription") {
         for (const account of pool.getAll()) {
           pool.updateAccount(account.id, { enabled });
-          if (!enabled) sessionRouter.invalidateAccount(account.id);
         }
       } else {
         for (const account of openAIAccounts) {
@@ -415,10 +416,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       }
     };
 
-    applyRuntime(body.enabled);
+    applyRuntime(enabled);
     try {
-      const changed = setProviderAccountsEnabled(provider, body.enabled, accountsPath);
-      res.json({ provider, enabled: body.enabled, changed });
+      const changed = persistProviderEnabledState({
+        provider,
+        enabled,
+        accountIds: pool.getAll().map(account => account.id),
+        persist: () => setProviderAccountsEnabled(provider, enabled, accountsPath),
+        invalidateAccount: accountId => sessionRouter.invalidateAccount(accountId),
+      });
+      res.json({ provider, enabled, changed });
     } catch (err) {
       rollback();
       const message = err instanceof Error ? err.message : String(err);

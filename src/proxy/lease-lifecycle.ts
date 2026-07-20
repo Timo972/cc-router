@@ -70,10 +70,16 @@ export function acquireRequestRoute<T extends RoutedRequestLease>(
 }
 
 function retryAfterSeconds(value: unknown): number {
-  const candidate = Array.isArray(value)
-    ? value.length === 1 ? Number(value[0]) : Number.NaN
-    : Number(value);
-  return Number.isFinite(candidate) && candidate >= 0 ? candidate : 60;
+  if (typeof value !== "string" && typeof value !== "number") return 60;
+  if (typeof value === "string" && value.trim().length === 0) return 60;
+
+  const candidate = Number(value);
+  const milliseconds = candidate * 1_000;
+  return Number.isFinite(candidate) &&
+    candidate >= 0 &&
+    Number.isFinite(milliseconds)
+    ? candidate
+    : 60;
 }
 
 /**
