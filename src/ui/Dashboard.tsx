@@ -29,6 +29,8 @@ interface AccountStat {
   provider?: "anthropic_subscription" | "openai_subscription";
   healthy: boolean;
   busy: boolean;
+  inFlightRequests?: number;
+  activeSessions?: number;
   requestCount: number;
   errorCount: number;
   expiresInMs: number;
@@ -878,6 +880,9 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
         <Text color={expiryColor}>{expiryLabel.padEnd(8)}</Text>
         <Text color="gray">  last </Text>
         <Text color="gray">{formatAgo(a.lastUsedMs)}</Text>
+        {a.provider !== "openai_subscription" && (
+          <Text color="gray">  {a.activeSessions ?? 0} active / {a.inFlightRequests ?? 0} streams</Text>
+        )}
         {capsHint && <Text color="yellow">{capsHint}</Text>}
       </Box>
       {rl.lastUpdated > 0 && (

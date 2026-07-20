@@ -56,11 +56,47 @@ describe("createHealthAccountViews", () => {
     expect(views[1]).toMatchObject({
       healthy: true,
       busy: false,
+      inFlightRequests: 0,
+      activeSessions: 0,
       requestCount: 0,
       errorCount: 0,
       enabled: true,
     });
+    expect(views[0]).toMatchObject({
+      inFlightRequests: 0,
+      activeSessions: 0,
+    });
     expect(views[1].rateLimits).toBeUndefined();
+  });
+
+  it("includes safe routing counters without exposing session identifiers", () => {
+    const openAIAccount: OpenAISubscriptionAccount = {
+      id: "openai-primary",
+      provider: "openai_subscription",
+      accessToken: "openai-access",
+      refreshToken: "openai-refresh",
+      expiresAt: Date.now() + 120_000,
+      enabled: true,
+    };
+
+    const views = createHealthAccountViews(
+      [makeAnthropicAccount()],
+      [openAIAccount],
+      accountId => accountId === "max-account-1"
+        ? { inFlightRequests: 2, activeSessions: 3, coolingDown: true }
+        : { inFlightRequests: 0, activeSessions: 0, coolingDown: false },
+    );
+
+    expect(views[0]).toMatchObject({
+      busy: true,
+      inFlightRequests: 2,
+      activeSessions: 3,
+    });
+    expect(views[1]).toMatchObject({
+      inFlightRequests: 0,
+      activeSessions: 0,
+    });
+    expect(JSON.stringify(views)).not.toContain("session-a");
   });
 
   it("does not count disabled Anthropic accounts as healthy", () => {

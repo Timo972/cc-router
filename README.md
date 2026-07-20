@@ -10,7 +10,7 @@ Distribute Claude Code requests across Claude subscriptions, and expose an OpenA
 
 ### Features
 
-- **Round-robin token rotation** — distribute requests across 2-20 Claude Max accounts automatically
+- **Cache-aware session routing** — keep each Claude Code session on one account while distributing new sessions across 2-20 Claude Max accounts
 - **Multi-provider routing** — route `openai/*` models to OpenAI ChatGPT/Codex subscription accounts and Claude models to Claude subscriptions
 - **Transparent Claude proxy** — Claude Code works normally; streaming, thinking, tool use, prompt caching all pass through
 - **Codex CLI support** — configure Codex to use CC-Router as a Responses-compatible provider
@@ -62,6 +62,14 @@ Claude Desktop  ─[mitmproxy]─┐  (optional — intercepts api.anthropic.com
 
 All standard Claude Code features work transparently on the Claude route: streaming, extended thinking, tool use, prompt caching. OpenAI subscription routing is available for Codex-compatible Responses requests and Claude Code cross-routing with the limitations documented below.
 
+### Cache-aware Claude account routing
+
+CC-Router keeps requests from one Claude Code session on the same healthy Anthropic subscription account. This session affinity preserves prompt-cache locality instead of scattering a conversation's shared prefix across account-specific caches. New sessions prefer the account with the fewest in-flight requests, then the fewest bound sessions, then the most rate-limit headroom.
+
+If an upstream account returns 401, 429, or 529, CC-Router passes that response through unchanged and invalidates the session's affinity. The client's next retry can then select another usable account; the router never retries after response bytes have started. Affinity mappings exist only in process memory, expire after one hour of inactivity, and are capped in size. Session IDs are never persisted or logged.
+
+Streaming remains byte-transparent. In particular, CC-Router never appends a synthetic `message_stop` event. `proxyRequestTimeoutMs` is only a transport safety limit for an upstream request that stops making progress; increasing it may allow a genuinely long request to finish, but does not fix an upstream or forwarding path that failed to deliver its terminal event.
+
 **Claude Desktop support** is opt-in and requires a small interceptor (mitmproxy) because Claude Desktop doesn't expose a custom API endpoint setting. See [Claude Desktop support](#claude-desktop-support).
 
 ---
@@ -76,7 +84,7 @@ With two accounts you double your effective rate limit. With three, you triple i
 
 ```text
 1 account  →  hit limit, wait 60s, continue
-3 accounts →  request rotates across all three, limit effectively tripled
+3 accounts →  new sessions spread across all three; each session stays cache-local
 ```
 
 ---
@@ -170,7 +178,7 @@ server {
 }
 ```
 
-For longer requests, set `proxyRequestTimeoutMs` in `~/.cc-router/config.json` (milliseconds) and keep `proxy_read_timeout` at least as high.
+For longer requests, set `proxyRequestTimeoutMs` in `~/.cc-router/config.json` (milliseconds) and keep `proxy_read_timeout` at least as high. This timeout is a transport safety limit, not a repair for a missing upstream terminal event; CC-Router does not synthesize `message_stop` when it expires.
 
 Each developer then points to:
 ```json
@@ -539,7 +547,7 @@ Then start the interceptor:
 cc-router client start-desktop
 ```
 
-Open Claude Desktop and send a message. The request will be intercepted, redirected to CC-Router, and round-robinned across your accounts just like Claude Code traffic.
+Open Claude Desktop and send a message. The request will be intercepted and redirected to CC-Router, which applies the same cache-aware account routing used for Claude Code traffic.
 
 ### Stopping / removing Desktop interception
 

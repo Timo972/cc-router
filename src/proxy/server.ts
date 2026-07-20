@@ -58,6 +58,8 @@ export interface HealthAccountView {
   enabled: boolean;
   healthy: boolean;
   busy: boolean;
+  inFlightRequests: number;
+  activeSessions: number;
   requestCount: number;
   errorCount: number;
   expiresInMs: number;
@@ -67,6 +69,20 @@ export interface HealthAccountView {
   sessionLimitPercent?: number;
   weeklyLimitPercent?: number;
 }
+
+export interface AccountRoutingMetrics {
+  inFlightRequests: number;
+  activeSessions: number;
+  coolingDown: boolean;
+}
+
+type RoutingMetricsResolver = (accountId: string) => AccountRoutingMetrics;
+
+const zeroRoutingMetrics: RoutingMetricsResolver = () => ({
+  inFlightRequests: 0,
+  activeSessions: 0,
+  coolingDown: false,
+});
 
 export interface OperationalStatus {
   mode: string;
@@ -150,14 +166,20 @@ export function createOperationalStatus(opts: {
 export function createHealthAccountViews(
   anthropicAccounts: Account[],
   openAIAccounts: OpenAISubscriptionAccount[],
+  resolveRoutingMetrics: RoutingMetricsResolver = zeroRoutingMetrics,
 ): HealthAccountView[] {
   return [
-    ...anthropicAccounts.map(publicAnthropicAccountView),
+    ...anthropicAccounts.map(account => (
+      publicAnthropicAccountView(account, resolveRoutingMetrics(account.id))
+    )),
     ...openAIAccounts.map(publicOpenAIAccountView),
   ];
 }
 
-function publicAnthropicAccountView(a: Account): HealthAccountView {
+function publicAnthropicAccountView(
+  a: Account,
+  metrics: AccountRoutingMetrics,
+): HealthAccountView {
   return {
     id: a.id,
     provider: "anthropic_subscription",
@@ -165,7 +187,9 @@ function publicAnthropicAccountView(a: Account): HealthAccountView {
     sessionLimitPercent: a.sessionLimitPercent,
     weeklyLimitPercent: a.weeklyLimitPercent,
     healthy: a.enabled !== false && a.healthy,
-    busy: a.busy,
+    busy: a.busy || metrics.coolingDown,
+    inFlightRequests: metrics.inFlightRequests,
+    activeSessions: metrics.activeSessions,
     requestCount: a.requestCount,
     errorCount: a.errorCount,
     expiresInMs: a.tokens.expiresAt - Date.now(),
@@ -183,6 +207,8 @@ function publicOpenAIAccountView(a: OpenAISubscriptionAccount): HealthAccountVie
     enabled: a.enabled !== false,
     healthy: a.enabled !== false && expiresInMs > 0,
     busy: false,
+    inFlightRequests: 0,
+    activeSessions: 0,
     requestCount: 0,
     errorCount: 0,
     expiresInMs,
@@ -275,6 +301,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   const pool = new TokenPool(accounts);
   const sessionRouter = new SessionRouter(pool);
+  const resolveRoutingMetrics: RoutingMetricsResolver = accountId => ({
+    inFlightRequests: pool.getInFlight(accountId),
+    activeSessions: sessionRouter.getActiveSessionCount(accountId),
+    coolingDown: pool.isCoolingDown(accountId),
+  });
   const pickOpenAIAccount = createOpenAIAccountPicker(openAIAccounts);
   const initialConfig = readConfig();
   const modelRouting = initialConfig.modelRouting ?? {};
@@ -337,7 +368,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // Sweep expired cooldowns on each poll so the dashboard reflects recovery
     // even during idle periods when no /v1 request would trigger getNext().
     pool.sweepExpiredCooldowns();
-    const accountViews = createHealthAccountViews(pool.getAll(), openAIAccounts);
+    const accountViews = createHealthAccountViews(
+      pool.getAll(),
+      openAIAccounts,
+      resolveRoutingMetrics,
+    );
     res.json({
       status: accountViews.some(a => a.healthy) ? "ok" : "degraded",
       mode,
@@ -371,7 +406,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   // Shape returned to clients — NEVER includes access/refresh tokens.
   accountsRouter.get("/", (_req, res) => {
-    res.json({ accounts: createHealthAccountViews(pool.getAll(), openAIAccounts) });
+    res.json({
+      accounts: createHealthAccountViews(
+        pool.getAll(),
+        openAIAccounts,
+        resolveRoutingMetrics,
+      ),
+    });
   });
 
   accountsRouter.patch("/providers/:provider", (req, res) => {
@@ -504,7 +545,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       return;
     }
     if (patch.enabled === false) sessionRouter.invalidateAccount(id);
-    res.json({ account: publicAnthropicAccountView(updated) });
+    res.json({
+      account: publicAnthropicAccountView(updated, resolveRoutingMetrics(updated.id)),
+    });
   });
 
   accountsRouter.post("/", (req, res) => {
@@ -552,7 +595,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       res.status(500).json({ error: `Failed to persist accounts.json: ${result.message}` });
       return;
     }
-    res.status(201).json({ account: publicAnthropicAccountView(added) });
+    res.status(201).json({
+      account: publicAnthropicAccountView(added, resolveRoutingMetrics(added.id)),
+    });
   });
 
   accountsRouter.delete("/:id", (req, res) => {
