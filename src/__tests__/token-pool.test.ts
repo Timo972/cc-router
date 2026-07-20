@@ -164,6 +164,30 @@ describe("TokenPool — request leases", () => {
     first!.release();
     fallback.release();
   });
+
+  it("does not let an old lease release a replacement account incarnation", () => {
+    const pool = new TokenPool([makeAccount("a")]);
+    const oldLease = pool.tryAcquire("a");
+    expect(oldLease).not.toBeNull();
+
+    pool.removeAccount("a");
+    pool.addAccount({
+      id: "a",
+      accessToken: "sk-ant-oat01-replacement",
+      refreshToken: "sk-ant-ort01-replacement",
+      expiresAt: Date.now() + 3_600_000,
+      scopes: ["user:inference"],
+    });
+    const replacementLease = pool.tryAcquire("a");
+    expect(replacementLease).not.toBeNull();
+    expect(pool.getInFlight("a")).toBe(1);
+
+    oldLease!.release();
+    expect(pool.getInFlight("a")).toBe(1);
+
+    replacementLease!.release();
+    expect(pool.getInFlight("a")).toBe(0);
+  });
 });
 
 describe("TokenPool — timestamp cooldown", () => {
@@ -189,6 +213,19 @@ describe("TokenPool — timestamp cooldown", () => {
 
     expect(pool.isEligible("a")).toBe(false);
     expect(pool.tryAcquire("a")).toBeNull();
+  });
+
+  it("does not shorten an existing cooldown with a later shorter cooldown", () => {
+    let now = 1_000;
+    const pool = new TokenPool([makeAccount("a")], { now: () => now });
+    pool.setCooldown("a", 60_000);
+    pool.setCooldown("a", 30_000);
+
+    now = 32_000;
+    expect(pool.isCoolingDown("a")).toBe(true);
+
+    now = 61_000;
+    expect(pool.isCoolingDown("a")).toBe(false);
   });
 });
 

@@ -209,11 +209,10 @@ export class TokenPool {
 
   setCooldown(accountId: string, durationMs: number): void {
     if (!this.findById(accountId)) return;
-    if (durationMs <= 0) {
-      this.cooldownUntil.delete(accountId);
-      return;
-    }
-    this.cooldownUntil.set(accountId, this.now() + durationMs);
+    if (!Number.isFinite(durationMs) || durationMs <= 0) return;
+    const proposedExpiry = this.now() + durationMs;
+    const existingExpiry = this.cooldownUntil.get(accountId) ?? 0;
+    this.cooldownUntil.set(accountId, Math.max(existingExpiry, proposedExpiry));
   }
 
   isCoolingDown(accountId: string): boolean {
@@ -305,6 +304,10 @@ export class TokenPool {
       release: () => {
         if (released) return;
         released = true;
+        // IDs may be reused after an account is removed. A lease belongs to
+        // the exact Account instance it acquired and must never decrement a
+        // replacement account's load counter.
+        if (this.findById(account.id) !== account) return;
         const remaining = Math.max(0, this.getInFlight(account.id) - 1);
         if (remaining === 0) this.inFlight.delete(account.id);
         else this.inFlight.set(account.id, remaining);
