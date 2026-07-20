@@ -5,9 +5,9 @@ import { timingSafeEqual } from "crypto";
 import type { IncomingMessage } from "http";
 import type { Socket } from "net";
 import type { Request } from "express";
-import { TokenPool, EmptyPoolError } from "./token-pool.js";
+import { TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountToken, saveAccounts, startRefreshLoop } from "./token-refresher.js";
-import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccounts, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, serialize, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccounts, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
@@ -29,10 +29,14 @@ import { SessionRouter } from "./session-router.js";
 import type { RoutedAccountLease } from "./session-router.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
 import {
-  acquireRequestRoute,
   applyUpstreamFailureRouting,
 } from "./lease-lifecycle.js";
 import { persistProviderEnabledState } from "./provider-routing.js";
+import { deleteAnthropicAccountTransaction } from "./account-deletion.js";
+import {
+  createAnthropicRefreshMiddleware,
+  createAnthropicRoutingMiddleware,
+} from "./anthropic-routing.js";
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
@@ -301,11 +305,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   const pool = new TokenPool(accounts);
   const sessionRouter = new SessionRouter(pool);
-  const resolveRoutingMetrics: RoutingMetricsResolver = accountId => ({
-    inFlightRequests: pool.getInFlight(accountId),
-    activeSessions: sessionRouter.getActiveSessionCount(accountId),
-    coolingDown: pool.isCoolingDown(accountId),
-  });
+  const createRoutingMetricsResolver = (): RoutingMetricsResolver => {
+    const activeSessionCounts = sessionRouter.getActiveSessionCountsSnapshot();
+    return accountId => ({
+      inFlightRequests: pool.getInFlight(accountId),
+      activeSessions: activeSessionCounts.get(accountId) ?? 0,
+      coolingDown: pool.isCoolingDown(accountId),
+    });
+  };
   const pickOpenAIAccount = createOpenAIAccountPicker(openAIAccounts);
   const initialConfig = readConfig();
   const modelRouting = initialConfig.modelRouting ?? {};
@@ -368,6 +375,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // Sweep expired cooldowns on each poll so the dashboard reflects recovery
     // even during idle periods when no /v1 request would trigger getNext().
     pool.sweepExpiredCooldowns();
+    const resolveRoutingMetrics = createRoutingMetricsResolver();
     const accountViews = createHealthAccountViews(
       pool.getAll(),
       openAIAccounts,
@@ -406,6 +414,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   // Shape returned to clients — NEVER includes access/refresh tokens.
   accountsRouter.get("/", (_req, res) => {
+    const resolveRoutingMetrics = createRoutingMetricsResolver();
     res.json({
       accounts: createHealthAccountViews(
         pool.getAll(),
@@ -546,7 +555,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     }
     if (patch.enabled === false) sessionRouter.invalidateAccount(id);
     res.json({
-      account: publicAnthropicAccountView(updated, resolveRoutingMetrics(updated.id)),
+      account: publicAnthropicAccountView(updated, createRoutingMetricsResolver()(updated.id)),
     });
   });
 
@@ -596,7 +605,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       return;
     }
     res.status(201).json({
-      account: publicAnthropicAccountView(added, resolveRoutingMetrics(added.id)),
+      account: publicAnthropicAccountView(added, createRoutingMetricsResolver()(added.id)),
     });
   });
 
@@ -614,22 +623,19 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       res.status(404).json({ error: `Account "${id}" not found` });
       return;
     }
-    // Snapshot for rollback. serialize() gives us a persistable AccountRecord.
-    const snapshot = serialize([existing])[0];
-    const removed = pool.removeAccount(id);
-    if (!removed) {
-      res.status(404).json({ error: `Account "${id}" not found` });
+    try {
+      deleteAnthropicAccountTransaction({
+        id,
+        pool,
+        sessionRouter,
+        persist: saveAccounts,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError("accounts", 0, `Failed to persist accounts.json: ${message}`);
+      res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
       return;
     }
-
-    const result = tryPersist(() => {
-      pool.addAccount(snapshot);
-    });
-    if (!result.ok) {
-      res.status(500).json({ error: `Failed to persist accounts.json: ${result.message}` });
-      return;
-    }
-    sessionRouter.invalidateAccount(id);
     res.json({ ok: true, id });
   });
 
@@ -866,61 +872,32 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // ─── /v1/* — select account, refresh if needed, then proxy ───────────────
   // CRITICAL: Do NOT use express.json() here — it consumes the body stream
   // and breaks SSE streaming passthrough.
-  app.use("/v1", async (req, res, next) => {
-    let selected: { route: RoutedAccountLease; release: () => void; details: string };
-    try {
-      selected = acquireRequestRoute(
-        req.headers["x-claude-code-session-id"],
-        res,
-        sessionRouter,
-      );
-    } catch (err) {
-      if (err instanceof EmptyPoolError) {
-        stats.totalErrors++;
-        logError("proxy", 503, err.message);
-        res.status(503).json({
-          type: "error",
-          error: { type: "no_accounts", message: err.message },
-        });
-        return;
-      }
-      next(err);
-      return;
-    }
-
-    const { route } = selected;
-    req._ccRoute = route;
-    req._ccReleaseLease = selected.release;
+  app.use("/v1", createAnthropicRoutingMiddleware({
+    sessionRouter,
+    onEmptyPool: (err, _req, res) => {
+      stats.totalErrors++;
+      logError("proxy", 503, err.message);
+      res.status(503).json({
+        type: "error",
+        error: { type: "no_accounts", message: err.message },
+      });
+    },
+  }), createAnthropicRefreshMiddleware({
+    needsRefresh,
+    refresh: async (account) => {
+      const ok = await refreshAccountToken(account);
+      if (ok) saveAccounts(pool.getAll());
+      return ok;
+    },
+    onRefreshFailure: (account) => {
+      stats.totalErrors++;
+      logError(account.id, 401, "Token refresh failed");
+    },
+  }), (req, _res, next) => {
+    const route = req._ccRoute!;
     const account = route.account;
-    req._ccAccount = account;
-
-    try {
-      // Synchronous refresh if token expires within the buffer window
-      if (needsRefresh(account)) {
-        const ok = await refreshAccountToken(account);
-        if (ok) saveAccounts(pool.getAll());
-        if (!ok) {
-          req._ccReleaseLease();
-          stats.totalErrors++;
-          logError(account.id, 401, "Token refresh failed");
-          res.status(401).json({
-            type: "error",
-            error: {
-              type: "authentication_error",
-              message: "Anthropic subscription token refresh failed",
-            },
-          });
-          return;
-        }
-      }
-    } catch (err) {
-      req._ccReleaseLease();
-      next(err);
-      return;
-    }
-
     req._startTime = Date.now();
-    const source = req.headers["x-claude-code-session-id"]
+    const source = route.sessionId !== undefined
       ? "cli" as const
       : req.headers["x-api-key"]
       ? "desktop" as const
@@ -934,7 +911,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       method: req.method,
       path: req.path,
       source,
-      details: selected.details,
+      details: route.reason,
     };
     stats.totalRequests++;
 

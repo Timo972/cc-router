@@ -6,6 +6,33 @@ import {
   attachLeaseLifecycle,
   routeReasonDetails,
 } from "../proxy/lease-lifecycle.js";
+import { SessionRouter } from "../proxy/session-router.js";
+import { TokenPool } from "../proxy/token-pool.js";
+import type { Account } from "../proxy/types.js";
+import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
+
+function makeAccount(id: string): Account {
+  return {
+    id,
+    tokens: {
+      accessToken: `access-${id}`,
+      refreshToken: `refresh-${id}`,
+      expiresAt: Date.now() + 60_000,
+      scopes: ["user:inference"],
+    },
+    healthy: true,
+    busy: false,
+    requestCount: 0,
+    errorCount: 0,
+    lastUsed: 0,
+    lastRefresh: 0,
+    consecutiveErrors: 0,
+    rateLimits: { ...DEFAULT_RATE_LIMITS },
+    enabled: true,
+    sessionLimitPercent: 100,
+    weeklyLimitPercent: 100,
+  };
+}
 
 describe("attachLeaseLifecycle", () => {
   it.each(["finish", "close"] as const)("releases once on downstream %s", (event) => {
@@ -88,28 +115,29 @@ describe("routeReasonDetails", () => {
 
 describe("applyUpstreamFailureRouting", () => {
   const route = {
-    account: { id: "account-a" },
+    account: makeAccount("account-a"),
     sessionId: "session-a",
+    bindingGeneration: 7,
   };
 
   it("invalidates the matching binding on 401 without applying a cooldown", () => {
     const invalidate = vi.fn();
-    const setCooldown = vi.fn();
+    const setCooldownForAccount = vi.fn();
 
-    expect(applyUpstreamFailureRouting(401, undefined, route, { invalidate }, { setCooldown }))
+    expect(applyUpstreamFailureRouting(401, undefined, route, { invalidate }, { setCooldownForAccount }))
       .toBeUndefined();
-    expect(invalidate).toHaveBeenCalledWith("session-a", "account-a");
-    expect(setCooldown).not.toHaveBeenCalled();
+    expect(invalidate).toHaveBeenCalledWith("session-a", "account-a", 7);
+    expect(setCooldownForAccount).not.toHaveBeenCalled();
   });
 
   it("invalidates and applies a numeric Retry-After cooldown on 429", () => {
     const invalidate = vi.fn();
-    const setCooldown = vi.fn();
+    const setCooldownForAccount = vi.fn();
 
-    expect(applyUpstreamFailureRouting(429, "12.5", route, { invalidate }, { setCooldown }))
+    expect(applyUpstreamFailureRouting(429, "12.5", route, { invalidate }, { setCooldownForAccount }))
       .toBe(12.5);
-    expect(invalidate).toHaveBeenCalledWith("session-a", "account-a");
-    expect(setCooldown).toHaveBeenCalledWith("account-a", 12_500);
+    expect(invalidate).toHaveBeenCalledWith("session-a", "account-a", 7);
+    expect(setCooldownForAccount).toHaveBeenCalledWith(route.account, 12_500);
   });
 
   it.each([
@@ -126,40 +154,77 @@ describe("applyUpstreamFailureRouting", () => {
     "uses the 60-second 429 fallback for an unsafe Retry-After value %j",
     (retryAfter) => {
       const invalidate = vi.fn();
-      const setCooldown = vi.fn();
+      const setCooldownForAccount = vi.fn();
 
-      expect(applyUpstreamFailureRouting(429, retryAfter, route, { invalidate }, { setCooldown }))
+      expect(applyUpstreamFailureRouting(429, retryAfter, route, { invalidate }, { setCooldownForAccount }))
         .toBe(60);
-      expect(setCooldown).toHaveBeenCalledWith("account-a", 60_000);
+      expect(setCooldownForAccount).toHaveBeenCalledWith(route.account, 60_000);
     },
   );
 
   it("accepts a finite zero-second Retry-After value", () => {
     const invalidate = vi.fn();
-    const setCooldown = vi.fn();
+    const setCooldownForAccount = vi.fn();
 
-    expect(applyUpstreamFailureRouting(429, "0", route, { invalidate }, { setCooldown }))
+    expect(applyUpstreamFailureRouting(429, "0", route, { invalidate }, { setCooldownForAccount }))
       .toBe(0);
-    expect(setCooldown).toHaveBeenCalledWith("account-a", 0);
+    expect(setCooldownForAccount).toHaveBeenCalledWith(route.account, 0);
   });
 
   it("invalidates and applies the fixed 30-second cooldown on 529", () => {
     const invalidate = vi.fn();
-    const setCooldown = vi.fn();
+    const setCooldownForAccount = vi.fn();
 
-    expect(applyUpstreamFailureRouting(529, "900", route, { invalidate }, { setCooldown }))
+    expect(applyUpstreamFailureRouting(529, "900", route, { invalidate }, { setCooldownForAccount }))
       .toBe(30);
-    expect(invalidate).toHaveBeenCalledWith("session-a", "account-a");
-    expect(setCooldown).toHaveBeenCalledWith("account-a", 30_000);
+    expect(invalidate).toHaveBeenCalledWith("session-a", "account-a", 7);
+    expect(setCooldownForAccount).toHaveBeenCalledWith(route.account, 30_000);
   });
 
   it("does not mutate routing for successful responses", () => {
     const invalidate = vi.fn();
-    const setCooldown = vi.fn();
+    const setCooldownForAccount = vi.fn();
 
-    expect(applyUpstreamFailureRouting(200, undefined, route, { invalidate }, { setCooldown }))
+    expect(applyUpstreamFailureRouting(200, undefined, route, { invalidate }, { setCooldownForAccount }))
       .toBeUndefined();
     expect(invalidate).not.toHaveBeenCalled();
-    expect(setCooldown).not.toHaveBeenCalled();
+    expect(setCooldownForAccount).not.toHaveBeenCalled();
+  });
+
+  it("ignores an old same-account failure after the session was rebound", () => {
+    const pool = new TokenPool([makeAccount("a")]);
+    const router = new SessionRouter(pool);
+    const oldRoute = router.acquire("session-a");
+    oldRoute.release();
+    router.invalidate(oldRoute.sessionId, oldRoute.account.id, oldRoute.bindingGeneration);
+    const rebound = router.acquire("session-a");
+    rebound.release();
+
+    applyUpstreamFailureRouting(401, undefined, oldRoute, router, pool);
+
+    const sticky = router.acquire("session-a");
+    expect(sticky.reason).toBe("sticky");
+    expect(sticky.bindingGeneration).toBe(rebound.bindingGeneration);
+    sticky.release();
+  });
+
+  it("does not cool down a replacement account from an old incarnation's failure", () => {
+    const oldAccount = makeAccount("a");
+    const pool = new TokenPool([oldAccount]);
+    const router = new SessionRouter(pool);
+    const oldRoute = router.acquire("session-a");
+    oldRoute.release();
+    pool.removeAccount("a");
+    pool.addAccount({
+      id: "a",
+      accessToken: "replacement-access",
+      refreshToken: "replacement-refresh",
+      expiresAt: Date.now() + 60_000,
+      scopes: ["user:inference"],
+    });
+
+    applyUpstreamFailureRouting(429, "60", oldRoute, router, pool);
+
+    expect(pool.isCoolingDown("a")).toBe(false);
   });
 });

@@ -9,19 +9,25 @@ export interface Releasable {
 export interface RouteSummary {
   readonly reason: "sticky" | "new-session" | "unscoped" | "failover";
   readonly sessionId?: string;
+  readonly bindingGeneration?: number;
 }
 
-export interface FailureRoute {
-  readonly account: { readonly id: string };
+export interface FailureRoute<TAccount extends { readonly id: string } = { readonly id: string }> {
+  readonly account: TAccount;
   readonly sessionId?: string;
+  readonly bindingGeneration?: number;
 }
 
 export interface BindingInvalidator {
-  invalidate(sessionHeader: unknown, expectedAccountId?: string): boolean;
+  invalidate(
+    sessionHeader: unknown,
+    expectedAccountId?: string,
+    expectedGeneration?: number,
+  ): boolean;
 }
 
-export interface CooldownSetter {
-  setCooldown(accountId: string, durationMs: number): void;
+export interface CooldownSetter<TAccount extends { readonly id: string }> {
+  setCooldownForAccount(account: TAccount, durationMs: number): void;
 }
 
 export interface RoutedRequestLease extends Releasable, RouteSummary, FailureRoute {}
@@ -87,23 +93,23 @@ function retryAfterSeconds(value: unknown): number {
  * current response remains owned by the proxy's native byte stream; callers
  * use the returned seconds solely for status logging.
  */
-export function applyUpstreamFailureRouting(
+export function applyUpstreamFailureRouting<TAccount extends { readonly id: string }>(
   status: number,
   retryAfterHeader: unknown,
-  route: FailureRoute,
+  route: FailureRoute<TAccount>,
   router: BindingInvalidator,
-  pool: CooldownSetter,
+  pool: CooldownSetter<TAccount>,
 ): number | undefined {
   if (status !== 401 && status !== 429 && status !== 529) return undefined;
 
-  router.invalidate(route.sessionId, route.account.id);
+  router.invalidate(route.sessionId, route.account.id, route.bindingGeneration);
   if (status === 429) {
     const seconds = retryAfterSeconds(retryAfterHeader);
-    pool.setCooldown(route.account.id, seconds * 1_000);
+    pool.setCooldownForAccount(route.account, seconds * 1_000);
     return seconds;
   }
   if (status === 529) {
-    pool.setCooldown(route.account.id, 30_000);
+    pool.setCooldownForAccount(route.account, 30_000);
     return 30;
   }
   return undefined;

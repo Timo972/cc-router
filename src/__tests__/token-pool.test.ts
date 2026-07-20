@@ -227,6 +227,24 @@ describe("TokenPool — timestamp cooldown", () => {
     now = 61_000;
     expect(pool.isCoolingDown("a")).toBe(false);
   });
+
+  it("does not let an old account incarnation cool down a replacement with the same ID", () => {
+    const oldAccount = makeAccount("a");
+    const pool = new TokenPool([oldAccount]);
+    pool.removeAccount("a");
+    const replacement = pool.addAccount({
+      id: "a",
+      accessToken: "sk-ant-oat01-replacement",
+      refreshToken: "sk-ant-ort01-replacement",
+      expiresAt: Date.now() + 3_600_000,
+      scopes: ["user:inference"],
+    });
+
+    pool.setCooldownForAccount(oldAccount, 60_000);
+
+    expect(pool.findById("a")).toBe(replacement);
+    expect(pool.isCoolingDown("a")).toBe(false);
+  });
 });
 
 describe("TokenPool — unhealthy accounts", () => {

@@ -149,6 +149,34 @@ describe("SessionRouter", () => {
     expect(router.getBindingCount()).toBe(0);
   });
 
+  it("does not let an old same-account response invalidate a rebound generation", () => {
+    const pool = new TokenPool([makeAccount("a")]);
+    const router = new SessionRouter(pool);
+    const oldRoute = router.acquire("session-a");
+    oldRoute.release();
+
+    expect(router.invalidate(
+      oldRoute.sessionId,
+      oldRoute.account.id,
+      oldRoute.bindingGeneration,
+    )).toBe(true);
+    const rebound = router.acquire("session-a");
+    rebound.release();
+
+    expect(rebound.account).toBe(oldRoute.account);
+    expect(rebound.bindingGeneration).not.toBe(oldRoute.bindingGeneration);
+    expect(router.invalidate(
+      oldRoute.sessionId,
+      oldRoute.account.id,
+      oldRoute.bindingGeneration,
+    )).toBe(false);
+
+    const sticky = router.acquire("session-a");
+    expect(sticky.reason).toBe("sticky");
+    expect(sticky.bindingGeneration).toBe(rebound.bindingGeneration);
+    sticky.release();
+  });
+
   it("invalidates every binding for one account and repairs counts", () => {
     const pool = new TokenPool([makeAccount("a"), makeAccount("b")]);
     const router = new SessionRouter(pool);
@@ -210,6 +238,29 @@ describe("SessionRouter", () => {
     expect(router.getActiveSessionCount("a")).toBe(0);
   });
 
+  it("returns one aggregate account snapshot after a single expiry sweep", () => {
+    let now = 0;
+    let clockReads = 0;
+    const clock = () => {
+      clockReads++;
+      return now;
+    };
+    const pool = new TokenPool([makeAccount("a"), makeAccount("b")], { now: clock });
+    const router = new SessionRouter(pool, { now: clock, ttlMs: 10 });
+    router.acquire("expired-session").release();
+    now = 5;
+    router.acquire("live-session").release();
+    now = 10;
+    clockReads = 0;
+
+    const snapshot = router.getActiveSessionCountsSnapshot();
+
+    expect(clockReads).toBe(1);
+    expect([...snapshot]).toEqual([["b", 1]]);
+    expect([...snapshot.keys()]).not.toContain("expired-session");
+    expect([...snapshot.keys()]).not.toContain("live-session");
+  });
+
   it("sweeps expired bindings before applying the capacity limit", () => {
     let now = 0;
     const pool = new TokenPool([makeAccount("a"), makeAccount("b")], { now: () => now });
@@ -268,7 +319,7 @@ describe("SessionRouter", () => {
 
     expect(lease.sessionId).toBe("private-session-id");
     expect(Object.keys(lease).sort()).toEqual(
-      ["account", "fallback", "reason", "release", "sessionId"].sort(),
+      ["account", "bindingGeneration", "fallback", "reason", "release", "sessionId"].sort(),
     );
     expect(log).not.toHaveBeenCalled();
     expect(warn).not.toHaveBeenCalled();

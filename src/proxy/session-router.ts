@@ -10,6 +10,7 @@ export type RouteReason = "sticky" | "new-session" | "unscoped" | "failover";
 export interface RoutedAccountLease extends AccountLease {
   readonly reason: RouteReason;
   readonly sessionId?: string;
+  readonly bindingGeneration?: number;
 }
 
 export interface SessionRouterOptions {
@@ -21,6 +22,7 @@ export interface SessionRouterOptions {
 interface SessionBinding {
   accountId: string;
   lastSeen: number;
+  generation: number;
 }
 
 /**
@@ -47,6 +49,7 @@ export class SessionRouter {
   private readonly now: () => number;
   private readonly ttlMs: number;
   private readonly maxEntries: number;
+  private nextBindingGeneration = 1;
 
   constructor(
     private readonly pool: TokenPool,
@@ -78,26 +81,38 @@ export class SessionRouter {
       const stickyLease = this.pool.tryAcquire(existing.accountId);
       if (stickyLease) {
         existing.lastSeen = now;
-        return this.wrap(stickyLease, "sticky", sessionId);
+        return this.wrap(stickyLease, "sticky", sessionId, existing.generation);
       }
       this.removeBinding(sessionId);
     }
 
     const lease = this.pool.acquireBest(this.activeSessionCounts);
-    this.insertBinding(sessionId, lease.account.id, now);
-    return this.wrap(lease, existing ? "failover" : "new-session", sessionId);
+    const binding = this.insertBinding(sessionId, lease.account.id, now);
+    return this.wrap(
+      lease,
+      existing ? "failover" : "new-session",
+      sessionId,
+      binding.generation,
+    );
   }
 
   /**
    * Remove a binding only if it still belongs to the expected account. This
    * protects a new failover binding from a late response on the old account.
    */
-  invalidate(sessionHeader: unknown, expectedAccountId?: string): boolean {
+  invalidate(
+    sessionHeader: unknown,
+    expectedAccountId?: string,
+    expectedGeneration?: number,
+  ): boolean {
     const sessionId = normalizeSessionId(sessionHeader);
     if (!sessionId) return false;
     const binding = this.bindings.get(sessionId);
     if (!binding) return false;
     if (expectedAccountId !== undefined && binding.accountId !== expectedAccountId) {
+      return false;
+    }
+    if (expectedGeneration !== undefined && binding.generation !== expectedGeneration) {
       return false;
     }
     return this.removeBinding(sessionId);
@@ -122,10 +137,17 @@ export class SessionRouter {
     return this.bindings.size;
   }
 
+  /** Sweep once and expose only aggregate account IDs/counts. */
+  getActiveSessionCountsSnapshot(): ReadonlyMap<string, number> {
+    this.sweepExpiredBindings(this.now());
+    return new Map(this.activeSessionCounts);
+  }
+
   private wrap(
     lease: AccountLease,
     reason: RouteReason,
     sessionId?: string,
+    bindingGeneration?: number,
   ): RoutedAccountLease {
     return {
       account: lease.account,
@@ -133,13 +155,24 @@ export class SessionRouter {
       release: lease.release,
       reason,
       ...(sessionId === undefined ? {} : { sessionId }),
+      ...(bindingGeneration === undefined ? {} : { bindingGeneration }),
     };
   }
 
-  private insertBinding(sessionId: string, accountId: string, lastSeen: number): void {
+  private insertBinding(
+    sessionId: string,
+    accountId: string,
+    lastSeen: number,
+  ): SessionBinding {
     if (this.bindings.size >= this.maxEntries) this.evictLeastRecentlyUsed();
-    this.bindings.set(sessionId, { accountId, lastSeen });
+    const binding = {
+      accountId,
+      lastSeen,
+      generation: this.nextBindingGeneration++,
+    };
+    this.bindings.set(sessionId, binding);
     this.activeSessionCounts.set(accountId, this.getRawActiveSessionCount(accountId) + 1);
+    return binding;
   }
 
   private removeBinding(sessionId: string): boolean {

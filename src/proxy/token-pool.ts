@@ -208,11 +208,18 @@ export class TokenPool {
   }
 
   setCooldown(accountId: string, durationMs: number): void {
-    if (!this.findById(accountId)) return;
+    const account = this.findById(accountId);
+    if (!account) return;
+    this.setCooldownForAccount(account, durationMs);
+  }
+
+  /** Apply cooldown only to the exact account incarnation that was routed. */
+  setCooldownForAccount(account: Account, durationMs: number): void {
+    if (this.findById(account.id) !== account) return;
     if (!Number.isFinite(durationMs) || durationMs <= 0) return;
     const proposedExpiry = this.now() + durationMs;
-    const existingExpiry = this.cooldownUntil.get(accountId) ?? 0;
-    this.cooldownUntil.set(accountId, Math.max(existingExpiry, proposedExpiry));
+    const existingExpiry = this.cooldownUntil.get(account.id) ?? 0;
+    this.cooldownUntil.set(account.id, Math.max(existingExpiry, proposedExpiry));
   }
 
   isCoolingDown(accountId: string): boolean {
