@@ -188,6 +188,28 @@ describe("SessionRouter", () => {
     expired.release();
   });
 
+  it("sweeps expired bindings when reading the total binding count", () => {
+    let now = 0;
+    const pool = new TokenPool([makeAccount("a")], { now: () => now });
+    const router = new SessionRouter(pool, { now: () => now, ttlMs: 10 });
+    router.acquire("session-a").release();
+
+    now = 10;
+
+    expect(router.getBindingCount()).toBe(0);
+  });
+
+  it("sweeps expired bindings when reading an account's active session count", () => {
+    let now = 0;
+    const pool = new TokenPool([makeAccount("a")], { now: () => now });
+    const router = new SessionRouter(pool, { now: () => now, ttlMs: 10 });
+    router.acquire("session-a").release();
+
+    now = 10;
+
+    expect(router.getActiveSessionCount("a")).toBe(0);
+  });
+
   it("sweeps expired bindings before applying the capacity limit", () => {
     let now = 0;
     const pool = new TokenPool([makeAccount("a"), makeAccount("b")], { now: () => now });

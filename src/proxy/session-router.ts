@@ -113,10 +113,12 @@ export class SessionRouter {
   }
 
   getActiveSessionCount(accountId: string): number {
-    return this.activeSessionCounts.get(accountId) ?? 0;
+    this.sweepExpiredBindings(this.now());
+    return this.getRawActiveSessionCount(accountId);
   }
 
   getBindingCount(): number {
+    this.sweepExpiredBindings(this.now());
     return this.bindings.size;
   }
 
@@ -137,7 +139,7 @@ export class SessionRouter {
   private insertBinding(sessionId: string, accountId: string, lastSeen: number): void {
     if (this.bindings.size >= this.maxEntries) this.evictLeastRecentlyUsed();
     this.bindings.set(sessionId, { accountId, lastSeen });
-    this.activeSessionCounts.set(accountId, this.getActiveSessionCount(accountId) + 1);
+    this.activeSessionCounts.set(accountId, this.getRawActiveSessionCount(accountId) + 1);
   }
 
   private removeBinding(sessionId: string): boolean {
@@ -145,10 +147,14 @@ export class SessionRouter {
     if (!binding) return false;
     this.bindings.delete(sessionId);
 
-    const remaining = this.getActiveSessionCount(binding.accountId) - 1;
+    const remaining = this.getRawActiveSessionCount(binding.accountId) - 1;
     if (remaining <= 0) this.activeSessionCounts.delete(binding.accountId);
     else this.activeSessionCounts.set(binding.accountId, remaining);
     return true;
+  }
+
+  private getRawActiveSessionCount(accountId: string): number {
+    return this.activeSessionCounts.get(accountId) ?? 0;
   }
 
   private sweepExpiredBindings(now: number): void {
