@@ -15,12 +15,22 @@ export interface AnthropicProxyOptions {
  * buffer, transform, or synthesize any response bytes.
  */
 export function createAnthropicProxy(options: AnthropicProxyOptions): RequestHandler {
+  const configuredProxyRequest = options.on.proxyReq;
   return createProxyMiddleware<Request, ServerResponse>({
     target: options.target,
     changeOrigin: true,
     pathRewrite: path => `/v1${path}`,
     proxyTimeout: options.timeoutMs,
     timeout: options.timeoutMs,
-    on: options.on,
+    on: {
+      ...options.on,
+      proxyReq: (proxyRequest, request, response, proxyOptions) => {
+        proxyRequest.once("response", () => {
+          proxyRequest.setTimeout(0);
+          request.socket.setTimeout(0);
+        });
+        configuredProxyRequest?.(proxyRequest, request, response, proxyOptions);
+      },
+    },
   });
 }

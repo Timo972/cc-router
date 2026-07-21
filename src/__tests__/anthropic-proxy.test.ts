@@ -228,6 +228,42 @@ describe("createAnthropicProxy", () => {
     }
   });
 
+  it("does not abort a started SSE response after the pre-response timeout", async () => {
+    const gate = deferred();
+    const prefix = Buffer.from("event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n");
+    const suffix = Buffer.from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    const upstream = createServer(async (_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(prefix);
+      await gate.promise;
+      if (!res.destroyed) res.end(suffix);
+    });
+    const upstreamPort = await listen(upstream);
+    const app = express();
+    app.use("/v1", createAnthropicProxy({
+      target: `http://127.0.0.1:${upstreamPort}`,
+      timeoutMs: 50,
+      on: {},
+    }));
+    const downstream = createServer(app);
+    const downstreamPort = await listen(downstream);
+    const response = startCollecting(new URL(`http://127.0.0.1:${downstreamPort}/v1/messages`));
+    void response.completed.catch(() => undefined);
+    try {
+      await response.firstChunk;
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(response.hasCompleted()).toBe(false);
+      gate.resolve();
+      await expect(response.completed).resolves.toEqual(Buffer.concat([prefix, suffix]));
+    } finally {
+      gate.resolve();
+      response.request.destroy();
+      await Promise.allSettled([response.completed]);
+      await close(downstream);
+      await close(upstream);
+    }
+  });
+
   it("routes concurrent production-stack SSE streams with sticky leases and abort cleanup", async () => {
     const gates = new Map([
       ["/v1/one", deferred()],
