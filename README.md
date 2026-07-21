@@ -68,7 +68,7 @@ CC-Router keeps requests from one Claude Code session on the same healthy Anthro
 
 If an upstream account returns 401, 429, or 529, CC-Router passes that response through unchanged and invalidates the session's affinity. The client's next retry can then select another usable account; the router never retries after response bytes have started. Affinity mappings exist only in process memory, expire after one hour of inactivity, and are capped in size. Session IDs are never persisted or logged.
 
-Streaming remains byte-transparent. In particular, CC-Router never appends a synthetic `message_stop` event. `proxyRequestTimeoutMs` is only a transport safety limit for an upstream request that stops making progress; increasing it may allow a genuinely long request to finish, but does not fix an upstream or forwarding path that failed to deliver its terminal event.
+Streaming remains byte-transparent. In particular, CC-Router never appends a synthetic `message_stop` event. `proxyRequestTimeoutMs` protects only the phase before Anthropic response headers arrive; once a response starts, its body continues through the native byte-exact proxy pipe. Automatic `cc-router configure` setup manages Claude Code's event-level and byte-level stream idle watchdogs at 30 minutes. Restart any existing Claude Code process after configuration so it inherits those values.
 
 **Claude Desktop support** is opt-in and requires a small interceptor (mitmproxy) because Claude Desktop doesn't expose a custom API endpoint setting. See [Claude Desktop support](#claude-desktop-support).
 
@@ -172,13 +172,13 @@ server {
     location / {
         proxy_pass http://127.0.0.1:3456;
         proxy_buffering off;          # required for SSE streaming
-        proxy_read_timeout 300s;      # required for long thinking requests
+        proxy_read_timeout 1800s;     # outer-proxy body idle timeout
         proxy_set_header X-Forwarded-For $remote_addr;
     }
 }
 ```
 
-For longer requests, set `proxyRequestTimeoutMs` in `~/.cc-router/config.json` (milliseconds) and keep `proxy_read_timeout` at least as high. This timeout is a transport safety limit, not a repair for a missing upstream terminal event; CC-Router does not synthesize `message_stop` when it expires.
+These settings protect different phases. CC-Router's `proxyRequestTimeoutMs` in `~/.cc-router/config.json` applies only while waiting for Anthropic response headers. An outer proxy's `proxy_read_timeout` applies while reading the response body, so configure that outer timeout separately with enough headroom for long thinking pauses. Neither timeout repairs a missing upstream terminal event, and CC-Router never synthesizes `message_stop`.
 
 Each developer then points to:
 ```json

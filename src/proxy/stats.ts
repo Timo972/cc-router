@@ -1,3 +1,5 @@
+import type { StreamLifecycleState } from "./stream-lifecycle.js";
+
 export interface LogEntry {
   ts: number;
   accountId: string;
@@ -14,6 +16,7 @@ export interface LogEntry {
   cacheCreationTokens?: number;
   inputTokens?: number;
   outputTokens?: number;
+  streamLifecycle?: StreamLifecycleState;
 }
 
 const MAX_LOG_ENTRIES = 100;

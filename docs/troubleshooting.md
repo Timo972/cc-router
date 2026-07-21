@@ -79,6 +79,19 @@ cc-router itself does not buffer SSE — `selfHandleResponse` is always `false`.
 
 ---
 
+## Response stalled mid-stream
+
+CC-Router keeps passive lifecycle details on recent route entries returned by `cc-router status --json` and the `/cc-router/health` endpoint. Inspect the entry's `streamLifecycle` object:
+
+- `sawMessageStop: true`, `upstreamEnd: true`, and `downstreamFinish: true` indicate a normally completed SSE response.
+- `upstreamAborted: true` identifies termination by the upstream response.
+- `downstreamClose: true` with `downstreamFinish: false` identifies downstream cancellation, such as a client disconnect.
+- A missing `message_stop` is diagnostic evidence only. CC-Router never synthesizes a terminal event or changes the response body based on this flag.
+
+Streaming remains byte-transparent, and these diagnostics never retain response payload content or session IDs. If you changed Claude Code's stream idle watchdog configuration, restart existing Claude Code processes so they inherit the new values. When an outer reverse proxy is present, also check its response-body idle timeout separately from CC-Router's pre-header `proxyRequestTimeoutMs`.
+
+---
+
 ## Claude Code ignores the proxy after system restart
 
 The proxy is not set to auto-start. Either:

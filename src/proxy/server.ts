@@ -42,6 +42,7 @@ import {
   createAnthropicRefreshMiddleware,
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
+import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
@@ -720,7 +721,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         }
       },
 
-      proxyRes: (proxyRes, req) => {
+      proxyRes: (proxyRes, req, response) => {
         const account = (req as Request)._ccAccount;
         const route = (req as Request)._ccRoute;
         if (!account) return;
@@ -801,6 +802,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const contentType = String(proxyRes.headers["content-type"] ?? "");
         const encoding = String(proxyRes.headers["content-encoding"] ?? "");
         const isCompressed = /gzip|br|deflate/.test(encoding);
+        const streamTracker = createStreamLifecycleTracker(
+          (req as Request)._startTime ?? Date.now(),
+          !isCompressed && contentType.includes("text/event-stream"),
+        );
+        entry.streamLifecycle = streamTracker.state;
+        streamTracker.attach(proxyRes, response);
+        proxyRes.on("data", (chunk: Buffer) => streamTracker.observeChunk(chunk));
 
         if (!isCompressed && (contentType.includes("text/event-stream") || contentType.includes("application/json"))) {
           const isSSE = contentType.includes("text/event-stream");
