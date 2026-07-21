@@ -191,6 +191,107 @@ describe("removeClaudeSettings", () => {
     expect(written.env.CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS).toBe("1500000");
   });
 
+  it("restores one managed watchdog while preserving a user edit to the other", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({
+      env: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: "600000",
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: "900000",
+      },
+    }));
+    writeClaudeSettings(3456);
+    const settings = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
+    settings.env.CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS = "1500000";
+    fs.writeFileSync(settingsPath(), JSON.stringify(settings));
+
+    removeClaudeSettings();
+
+    const written = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
+    expect(written.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS).toBe("600000");
+    expect(written.env.CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS).toBe("1500000");
+    const config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
+    expect(config.claudeEnvBackup).toBeUndefined();
+  });
+
+  it("clears a stale backup when the settings file is missing before the next cycle", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({
+      env: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: "600000",
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: "900000",
+      },
+    }));
+    writeClaudeSettings(3456);
+    fs.unlinkSync(settingsPath());
+
+    removeClaudeSettings();
+
+    let config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
+    expect(config.claudeEnvBackup).toBeUndefined();
+
+    fs.writeFileSync(settingsPath(), JSON.stringify({
+      env: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: "1200000",
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: "1500000",
+      },
+    }));
+    writeClaudeSettings(4567);
+    config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
+    expect(config.claudeEnvBackup).toEqual({
+      CLAUDE_STREAM_IDLE_TIMEOUT_MS: { existed: true, value: "1200000" },
+      CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: { existed: true, value: "1500000" },
+    });
+  });
+
+  it("keeps the backup and propagates a settings write failure", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({
+      env: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: "600000",
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: "900000",
+      },
+    }));
+    writeClaudeSettings(3456);
+    fs.chmodSync(settingsPath(), 0o444);
+
+    try {
+      expect(() => removeClaudeSettings()).toThrow();
+      const config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
+      expect(config.claudeEnvBackup).toBeDefined();
+      const settings = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
+      expect(settings.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS).toBe("1800000");
+    } finally {
+      fs.chmodSync(settingsPath(), 0o644);
+    }
+  });
+
+  it("keeps the backup and propagates a settings read failure", () => {
+    writeClaudeSettings(3456);
+    fs.chmodSync(settingsPath(), 0o000);
+
+    try {
+      expect(() => removeClaudeSettings()).toThrow();
+      const config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
+      expect(config.claudeEnvBackup).toBeDefined();
+    } finally {
+      fs.chmodSync(settingsPath(), 0o644);
+    }
+  });
+
+  it("keeps the backup and propagates config cleanup failure after settings removal", () => {
+    writeClaudeSettings(3456);
+    fs.mkdirSync(`${MOCK_DIR}/config.json.tmp`);
+
+    expect(() => removeClaudeSettings()).toThrow();
+
+    let config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
+    expect(config.claudeEnvBackup).toBeDefined();
+    const settings = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
+    expect(settings.env).toBeUndefined();
+
+    fs.rmdirSync(`${MOCK_DIR}/config.json.tmp`);
+    removeClaudeSettings();
+    config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
+    expect(config.claudeEnvBackup).toBeUndefined();
+  });
+
   it("leaves malformed settings and the watchdog backup untouched", () => {
     fs.writeFileSync(settingsPath(), JSON.stringify({
       env: {
@@ -217,13 +318,13 @@ describe("removeClaudeSettings", () => {
     expect(written.env.KEEP_ME).toBe("yes");
   });
 
-  it("removes the env block entirely if it becomes empty", () => {
-    fs.writeFileSync(settingsPath(), JSON.stringify({
-      env: { ANTHROPIC_BASE_URL: "http://localhost:3456", ANTHROPIC_AUTH_TOKEN: "proxy-managed" },
-    }));
+  it("removes the env block entirely after removing managed settings", () => {
+    writeClaudeSettings(3456);
     removeClaudeSettings();
     const written = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
     expect(written.env).toBeUndefined();
+    const config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
+    expect(config.claudeEnvBackup).toBeUndefined();
   });
 
   it("preserves other top-level keys after removal", () => {

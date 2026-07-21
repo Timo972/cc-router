@@ -21,6 +21,13 @@ function captureClaudeEnvBackup(env: Record<string, unknown>): ManagedClaudeEnvB
   };
 }
 
+function clearClaudeEnvBackup(): void {
+  const config = readConfig();
+  if (!config.claudeEnvBackup) return;
+  const { claudeEnvBackup: _removed, ...rest } = config;
+  writeConfig(rest);
+}
+
 /**
  * Write ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN into ~/.claude/settings.json.
  *
@@ -81,33 +88,43 @@ export function writeClaudeSettings(port: number, baseUrl?: string, authToken?: 
  * Called when uninstalling cc-router so Claude Code goes back to its default auth.
  */
 export function removeClaudeSettings(): void {
-  if (!existsSync(CLAUDE_SETTINGS_PATH)) return;
+  const config = readConfig();
+  const backup = config.claudeEnvBackup;
+  if (!existsSync(CLAUDE_SETTINGS_PATH)) {
+    clearClaudeEnvBackup();
+    return;
+  }
+
+  const rawSettings = readFileSync(CLAUDE_SETTINGS_PATH, "utf-8");
+  let existing: Record<string, unknown>;
   try {
-    const config = readConfig();
-    const backup = config.claudeEnvBackup;
-    const existing = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, "utf-8")) as Record<string, unknown>;
-    const env = existing["env"] as Record<string, unknown> | undefined;
-    if (env) {
-      delete env["ANTHROPIC_BASE_URL"];
-      delete env["ANTHROPIC_AUTH_TOKEN"];
-      if (backup) {
-        for (const key of MANAGED_STREAM_ENV_KEYS) {
-          if (env[key] !== MANAGED_STREAM_IDLE_TIMEOUT_MS) continue;
-          const previous = backup[key];
-          if (previous.existed && previous.value !== undefined) env[key] = previous.value;
-          else delete env[key];
+    existing = JSON.parse(rawSettings) as Record<string, unknown>;
+  } catch {
+    // Malformed settings are user-owned. Leave both the file and backup intact.
+    return;
+  }
+
+  const env = existing["env"] as Record<string, unknown> | undefined;
+  if (env) {
+    delete env["ANTHROPIC_BASE_URL"];
+    delete env["ANTHROPIC_AUTH_TOKEN"];
+    if (backup) {
+      for (const key of MANAGED_STREAM_ENV_KEYS) {
+        if (env[key] !== MANAGED_STREAM_IDLE_TIMEOUT_MS) continue;
+        const previous = backup[key];
+        if (previous.existed && previous.value !== undefined) {
+          env[key] = previous.value;
+        } else {
+          delete env[key];
         }
       }
-      if (Object.keys(env).length === 0) delete existing["env"];
     }
-    writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(existing, null, 2), "utf-8");
-    if (backup) {
-      const { claudeEnvBackup: _removed, ...rest } = config;
-      writeConfig(rest);
-    }
-  } catch {
-    // If we can't parse it, leave it alone
+    if (Object.keys(env).length === 0) delete existing["env"];
   }
+
+  // Persist settings first. If this fails, keep the backup for a retry.
+  writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(existing, null, 2), "utf-8");
+  clearClaudeEnvBackup();
 }
 
 /** Read current Claude Code proxy settings (for display) */

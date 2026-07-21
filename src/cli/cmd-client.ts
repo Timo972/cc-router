@@ -153,11 +153,9 @@ export function registerClient(program: Command): void {
       console.log(chalk.green(`✓ Connected — ${test.data?.accounts?.length ?? "?"} accounts on server\n`));
 
       // 4. Save client config
-      const cfg = readConfig();
       const clientCfg: ClientConfig = { remoteUrl: url };
       if (secret) clientCfg.remoteSecret = secret;
-      cfg.client = clientCfg;
-      writeConfig(cfg);
+      writeConfig({ ...readConfig(), client: clientCfg });
 
       // 5. Configure Claude Code
       writeClaudeSettings(0, url, secret ?? "proxy-managed", opts?.model);
@@ -166,7 +164,7 @@ export function registerClient(program: Command): void {
       if (opts?.model) console.log(chalk.gray(`  model              → ${opts.model}`));
 
       if (opts?.codex) {
-        const result = writeCodexRouterConfigFromClient(cfg, {
+        const result = writeCodexRouterConfigFromClient(readConfig(), {
           defaultModel: opts.codexModel,
         });
         console.log(chalk.green("✓ Codex CLI configured to route through CC-Router"));
@@ -186,8 +184,11 @@ export function registerClient(program: Command): void {
 
       if (wantsDesktop) {
         await setupDesktopInterception(url, secret);
-        cfg.client!.desktopEnabled = true;
-        writeConfig(cfg);
+        const current = readConfig();
+        if (current.client) {
+          current.client = { ...current.client, desktopEnabled: true };
+          writeConfig(current);
+        }
       }
 
       console.log(chalk.bold.green("\n✓ Client mode active\n"));
@@ -258,8 +259,9 @@ export function registerClient(program: Command): void {
 
       removeClaudeSettings();
 
-      delete cfg.client;
-      writeConfig(cfg);
+      const current = readConfig();
+      delete current.client;
+      writeConfig(current);
 
       console.log(chalk.green("\n✓ Disconnected from CC-Router"));
       console.log(chalk.gray("  Claude Code will use direct Anthropic connection on next restart.\n"));
