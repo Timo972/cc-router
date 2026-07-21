@@ -12,6 +12,7 @@ const TEST_STATE = vi.hoisted(() => {
     dir: `${tmp}/cc-router-cfg-${id}`,
     failReadPath: undefined as string | undefined,
     failWritePath: undefined as string | undefined,
+    hideExistsPath: undefined as string | undefined,
   };
 });
 
@@ -26,6 +27,10 @@ vi.mock("fs", async () => {
   };
   return {
     ...actual,
+    existsSync: (candidate: import("fs").PathLike) => {
+      if (String(candidate) === TEST_STATE.hideExistsPath) return false;
+      return actual.existsSync(candidate);
+    },
     readFileSync: (...args: unknown[]) => {
       if (String(args[0]) === TEST_STATE.failReadPath) fail("permission denied", args[0]);
       return (actual.readFileSync as (...values: unknown[]) => unknown)(...args);
@@ -59,6 +64,7 @@ beforeEach(() => {
   fs.mkdirSync(MOCK_DIR, { recursive: true });
   TEST_STATE.failReadPath = undefined;
   TEST_STATE.failWritePath = undefined;
+  TEST_STATE.hideExistsPath = undefined;
 });
 
 afterEach(() => {
@@ -191,6 +197,68 @@ describe("writeClaudeSettings", () => {
 
     expect(() => writeClaudeSettings(3456)).toThrow(/EACCES/);
     TEST_STATE.failReadPath = undefined;
+
+    expect(fs.readFileSync(settingsPath(), "utf-8")).toBe(settingsBefore);
+    expect(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8")).toBe(configBefore);
+  });
+
+  it("propagates a settings EACCES even when existsSync reports the file absent", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({ env: { KEEP_ME: "yes" } }, null, 4));
+    fs.writeFileSync(`${MOCK_DIR}/config.json`, JSON.stringify({ proxySecret: "keep-secret" }, null, 4));
+    const settingsBefore = fs.readFileSync(settingsPath(), "utf-8");
+    const configBefore = fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8");
+    TEST_STATE.hideExistsPath = settingsPath();
+    TEST_STATE.failReadPath = settingsPath();
+
+    expect(() => writeClaudeSettings(3456)).toThrow(/EACCES/);
+    TEST_STATE.hideExistsPath = undefined;
+    TEST_STATE.failReadPath = undefined;
+
+    expect(fs.readFileSync(settingsPath(), "utf-8")).toBe(settingsBefore);
+    expect(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8")).toBe(configBefore);
+  });
+
+  it("propagates a config EACCES even when existsSync reports the file absent", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({ env: { KEEP_ME: "yes" } }, null, 4));
+    fs.writeFileSync(`${MOCK_DIR}/config.json`, JSON.stringify({ proxySecret: "keep-secret" }, null, 4));
+    const settingsBefore = fs.readFileSync(settingsPath(), "utf-8");
+    const configBefore = fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8");
+    TEST_STATE.hideExistsPath = `${MOCK_DIR}/config.json`;
+    TEST_STATE.failReadPath = `${MOCK_DIR}/config.json`;
+
+    expect(() => writeClaudeSettings(3456)).toThrow(/EACCES/);
+    TEST_STATE.hideExistsPath = undefined;
+    TEST_STATE.failReadPath = undefined;
+
+    expect(fs.readFileSync(settingsPath(), "utf-8")).toBe(settingsBefore);
+    expect(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8")).toBe(configBefore);
+  });
+
+  it("leaves semantic-invalid env settings and config byte-identical", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({ env: ["user-value"] }, null, 4));
+    fs.writeFileSync(`${MOCK_DIR}/config.json`, JSON.stringify({ proxySecret: "keep-secret" }, null, 4));
+    const settingsBefore = fs.readFileSync(settingsPath(), "utf-8");
+    const configBefore = fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8");
+
+    expect(() => writeClaudeSettings(3456)).toThrow(TypeError);
+
+    expect(fs.readFileSync(settingsPath(), "utf-8")).toBe(settingsBefore);
+    expect(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8")).toBe(configBefore);
+  });
+
+  it("leaves settings and config byte-identical when the watchdog backup is invalid", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({ env: { KEEP_ME: "yes" } }, null, 4));
+    fs.writeFileSync(`${MOCK_DIR}/config.json`, JSON.stringify({
+      proxySecret: "keep-secret",
+      claudeEnvBackup: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: { existed: true, value: 600000 },
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: { existed: false },
+      },
+    }, null, 4));
+    const settingsBefore = fs.readFileSync(settingsPath(), "utf-8");
+    const configBefore = fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8");
+
+    expect(() => writeClaudeSettings(3456)).toThrow(TypeError);
 
     expect(fs.readFileSync(settingsPath(), "utf-8")).toBe(settingsBefore);
     expect(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8")).toBe(configBefore);
@@ -350,6 +418,62 @@ describe("removeClaudeSettings", () => {
     TEST_STATE.failReadPath = undefined;
     const config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
     expect(config.claudeEnvBackup).toBeDefined();
+  });
+
+  it("propagates a removal settings EACCES even when existsSync reports the file absent", () => {
+    writeClaudeSettings(3456);
+    const settingsBefore = fs.readFileSync(settingsPath(), "utf-8");
+    const configBefore = fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8");
+    TEST_STATE.hideExistsPath = settingsPath();
+    TEST_STATE.failReadPath = settingsPath();
+
+    expect(() => removeClaudeSettings()).toThrow(/EACCES/);
+    TEST_STATE.hideExistsPath = undefined;
+    TEST_STATE.failReadPath = undefined;
+
+    expect(fs.readFileSync(settingsPath(), "utf-8")).toBe(settingsBefore);
+    expect(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8")).toBe(configBefore);
+  });
+
+  it("leaves semantic-invalid env settings and the backup byte-identical while removing", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({ env: ["user-value"] }, null, 4));
+    fs.writeFileSync(`${MOCK_DIR}/config.json`, JSON.stringify({
+      proxySecret: "keep-secret",
+      claudeEnvBackup: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: { existed: false },
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: { existed: false },
+      },
+    }, null, 4));
+    const settingsBefore = fs.readFileSync(settingsPath(), "utf-8");
+    const configBefore = fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8");
+
+    removeClaudeSettings();
+
+    expect(fs.readFileSync(settingsPath(), "utf-8")).toBe(settingsBefore);
+    expect(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8")).toBe(configBefore);
+  });
+
+  it("does not restore an invalid non-string watchdog backup value", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({
+      env: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: "1800000",
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: "1800000",
+      },
+    }, null, 4));
+    fs.writeFileSync(`${MOCK_DIR}/config.json`, JSON.stringify({
+      proxySecret: "keep-secret",
+      claudeEnvBackup: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: { existed: true, value: 600000 },
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: { existed: false },
+      },
+    }, null, 4));
+    const settingsBefore = fs.readFileSync(settingsPath(), "utf-8");
+    const configBefore = fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8");
+
+    expect(() => removeClaudeSettings()).toThrow(TypeError);
+
+    expect(fs.readFileSync(settingsPath(), "utf-8")).toBe(settingsBefore);
+    expect(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8")).toBe(configBefore);
   });
 
   it("leaves settings and malformed config byte-identical while removing", () => {

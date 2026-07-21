@@ -21,9 +21,36 @@ function captureClaudeEnvBackup(env: Record<string, unknown>): ManagedClaudeEnvB
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateClaudeEnvBackup(config: object): ManagedClaudeEnvBackup | undefined {
+  const raw = (config as Record<string, unknown>)["claudeEnvBackup"];
+  if (raw === undefined) return undefined;
+  if (!isRecord(raw)) {
+    throw new TypeError("claudeEnvBackup must contain an object");
+  }
+
+  for (const key of MANAGED_STREAM_ENV_KEYS) {
+    const entry = raw[key];
+    if (!isRecord(entry) || typeof entry["existed"] !== "boolean") {
+      throw new TypeError(`claudeEnvBackup.${key} must contain a boolean existed field`);
+    }
+    if (entry["existed"] === true && typeof entry["value"] !== "string") {
+      throw new TypeError(`claudeEnvBackup.${key}.value must be a string when it existed`);
+    }
+    if (entry["existed"] === false && Object.hasOwn(entry, "value")) {
+      throw new TypeError(`claudeEnvBackup.${key}.value must be absent when it did not exist`);
+    }
+  }
+
+  return raw as unknown as ManagedClaudeEnvBackup;
+}
+
 function clearClaudeEnvBackup(): void {
   const config = readConfigStrict();
-  if (!config.claudeEnvBackup) return;
+  if (!validateClaudeEnvBackup(config)) return;
   const { claudeEnvBackup: _removed, ...rest } = config;
   writeConfig(rest);
 }
@@ -33,7 +60,21 @@ function parseClaudeSettings(raw: string): Record<string, unknown> {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new TypeError(`${CLAUDE_SETTINGS_PATH} must contain a JSON object`);
   }
-  return parsed as Record<string, unknown>;
+  const settings = parsed as Record<string, unknown>;
+  const env = settings["env"];
+  if (env !== undefined && !isRecord(env)) {
+    throw new TypeError(`${CLAUDE_SETTINGS_PATH} env must contain a JSON object`);
+  }
+  return settings;
+}
+
+function readClaudeSettingsIfPresent(): Record<string, unknown> | undefined {
+  try {
+    return parseClaudeSettings(readFileSync(CLAUDE_SETTINGS_PATH, "utf-8"));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
 }
 
 /**
@@ -52,16 +93,16 @@ function parseClaudeSettings(raw: string): Record<string, unknown> {
  * @param defaultModel - optional Claude Code model, e.g. "openai/default"
  */
 export function writeClaudeSettings(port: number, baseUrl?: string, authToken?: string, defaultModel?: string): void {
-  const dir = dirname(CLAUDE_SETTINGS_PATH);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-
-  const existing = existsSync(CLAUDE_SETTINGS_PATH)
-    ? parseClaudeSettings(readFileSync(CLAUDE_SETTINGS_PATH, "utf-8"))
-    : {};
+  const existing = readClaudeSettingsIfPresent() ?? {};
 
   const existingEnv = (existing["env"] as Record<string, unknown>) ?? {};
   const config = readConfigStrict();
-  if (!config.claudeEnvBackup) {
+  const backup = validateClaudeEnvBackup(config);
+
+  // Do not create directories or write either user file until all existing
+  // settings and backup state have been read and validated successfully.
+  mkdirSync(dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
+  if (!backup) {
     config.claudeEnvBackup = captureClaudeEnvBackup(existingEnv);
     writeConfig(config);
   }
@@ -92,13 +133,17 @@ export function writeClaudeSettings(port: number, baseUrl?: string, authToken?: 
  */
 export function removeClaudeSettings(): void {
   const config = readConfigStrict();
-  const backup = config.claudeEnvBackup;
-  if (!existsSync(CLAUDE_SETTINGS_PATH)) {
+  const backup = validateClaudeEnvBackup(config);
+
+  let rawSettings: string;
+  try {
+    rawSettings = readFileSync(CLAUDE_SETTINGS_PATH, "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     clearClaudeEnvBackup();
     return;
   }
 
-  const rawSettings = readFileSync(CLAUDE_SETTINGS_PATH, "utf-8");
   let existing: Record<string, unknown>;
   try {
     existing = parseClaudeSettings(rawSettings);

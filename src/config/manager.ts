@@ -223,8 +223,12 @@ function parseProxyConfig(raw: string): ProxyConfig {
  * callers cannot replace an unreadable or malformed user config with defaults.
  */
 export function readConfigStrict(): ProxyConfig {
-  if (!existsSync(CONFIG_PATH)) return {};
-  return parseProxyConfig(readFileSync(CONFIG_PATH, "utf-8"));
+  try {
+    return parseProxyConfig(readFileSync(CONFIG_PATH, "utf-8"));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw err;
+  }
 }
 
 export function readConfig(): ProxyConfig {
