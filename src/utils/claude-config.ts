@@ -1,7 +1,25 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { dirname } from "path";
 import { CLAUDE_SETTINGS_PATH } from "../config/paths.js";
-import { readConfig } from "../config/manager.js";
+import { readConfig, writeConfig } from "../config/manager.js";
+import type { ManagedClaudeEnvBackup } from "../config/manager.js";
+
+const MANAGED_STREAM_IDLE_TIMEOUT_MS = "1800000";
+const MANAGED_STREAM_ENV_KEYS = [
+  "CLAUDE_STREAM_IDLE_TIMEOUT_MS",
+  "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS",
+] as const;
+
+function captureClaudeEnvBackup(env: Record<string, unknown>): ManagedClaudeEnvBackup {
+  const capture = (key: typeof MANAGED_STREAM_ENV_KEYS[number]) => {
+    const value = env[key];
+    return typeof value === "string" ? { existed: true, value } : { existed: false };
+  };
+  return {
+    CLAUDE_STREAM_IDLE_TIMEOUT_MS: capture("CLAUDE_STREAM_IDLE_TIMEOUT_MS"),
+    CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: capture("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"),
+  };
+}
 
 /**
  * Write ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN into ~/.claude/settings.json.
@@ -32,6 +50,11 @@ export function writeClaudeSettings(port: number, baseUrl?: string, authToken?: 
   }
 
   const existingEnv = (existing["env"] as Record<string, unknown>) ?? {};
+  const config = readConfig();
+  if (!config.claudeEnvBackup) {
+    config.claudeEnvBackup = captureClaudeEnvBackup(existingEnv);
+    writeConfig(config);
+  }
   // ANTHROPIC_BASE_URL: no trailing /v1 — Claude Code appends it automatically
   const resolvedUrl = baseUrl ?? `http://localhost:${port}`;
 
@@ -45,6 +68,8 @@ export function writeClaudeSettings(port: number, baseUrl?: string, authToken?: 
       // Explicit authToken wins (client mode points at a remote secret); otherwise
       // uses the local proxy secret, or the open placeholder if neither is set.
       ANTHROPIC_AUTH_TOKEN: authToken ?? readConfig().proxySecret ?? "proxy-managed",
+      CLAUDE_STREAM_IDLE_TIMEOUT_MS: MANAGED_STREAM_IDLE_TIMEOUT_MS,
+      CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: MANAGED_STREAM_IDLE_TIMEOUT_MS,
     },
   };
 
@@ -58,14 +83,28 @@ export function writeClaudeSettings(port: number, baseUrl?: string, authToken?: 
 export function removeClaudeSettings(): void {
   if (!existsSync(CLAUDE_SETTINGS_PATH)) return;
   try {
+    const config = readConfig();
+    const backup = config.claudeEnvBackup;
     const existing = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, "utf-8")) as Record<string, unknown>;
     const env = existing["env"] as Record<string, unknown> | undefined;
     if (env) {
       delete env["ANTHROPIC_BASE_URL"];
       delete env["ANTHROPIC_AUTH_TOKEN"];
+      if (backup) {
+        for (const key of MANAGED_STREAM_ENV_KEYS) {
+          if (env[key] !== MANAGED_STREAM_IDLE_TIMEOUT_MS) continue;
+          const previous = backup[key];
+          if (previous.existed && previous.value !== undefined) env[key] = previous.value;
+          else delete env[key];
+        }
+      }
       if (Object.keys(env).length === 0) delete existing["env"];
     }
     writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(existing, null, 2), "utf-8");
+    if (backup) {
+      const { claudeEnvBackup: _removed, ...rest } = config;
+      writeConfig(rest);
+    }
   } catch {
     // If we can't parse it, leave it alone
   }

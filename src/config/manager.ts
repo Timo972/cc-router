@@ -180,6 +180,16 @@ export interface RunPreferences {
   configureClaudeCode?: boolean;
 }
 
+export interface ManagedClaudeEnvValueBackup {
+  existed: boolean;
+  value?: string;
+}
+
+export interface ManagedClaudeEnvBackup {
+  CLAUDE_STREAM_IDLE_TIMEOUT_MS: ManagedClaudeEnvValueBackup;
+  CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: ManagedClaudeEnvValueBackup;
+}
+
 export interface ProxyConfig {
   proxySecret?: string;
   /** Upstream proxy request timeout in milliseconds. Default: 300000 (5 minutes). */
@@ -194,6 +204,8 @@ export interface ProxyConfig {
   client?: ClientConfig;
   /** Run preferences — asked once on first start, reused on subsequent starts */
   runPreferences?: RunPreferences;
+  /** Original Claude watchdog values saved while CC-Router manages them. */
+  claudeEnvBackup?: ManagedClaudeEnvBackup;
 }
 
 export function readConfig(): ProxyConfig {

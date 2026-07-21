@@ -58,6 +58,29 @@ describe("writeClaudeSettings", () => {
     expect(written.env.ANTHROPIC_AUTH_TOKEN).toBe("proxy-managed");
   });
 
+  it("writes 30-minute event and byte stream idle watchdogs", () => {
+    writeClaudeSettings(3456);
+    const written = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
+    expect(written.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS).toBe("1800000");
+    expect(written.env.CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS).toBe("1800000");
+  });
+
+  it("backs up pre-existing watchdog values only once", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({
+      env: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: "600000",
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: "900000",
+      },
+    }));
+    writeClaudeSettings(3456);
+    writeClaudeSettings(4567);
+    const config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
+    expect(config.claudeEnvBackup).toEqual({
+      CLAUDE_STREAM_IDLE_TIMEOUT_MS: { existed: true, value: "600000" },
+      CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: { existed: true, value: "900000" },
+    });
+  });
+
   it("merges with existing settings — preserves other top-level keys", () => {
     fs.writeFileSync(settingsPath(), JSON.stringify({
       model: "claude-opus-4-6",
@@ -130,6 +153,59 @@ describe("removeClaudeSettings", () => {
     const written = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
     expect(written.env?.ANTHROPIC_BASE_URL).toBeUndefined();
     expect(written.env?.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+  });
+
+  it("restores watchdog values that existed before configuration", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({
+      env: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: "600000",
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: "900000",
+      },
+    }));
+    writeClaudeSettings(3456);
+    removeClaudeSettings();
+    const written = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
+    expect(written.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS).toBe("600000");
+    expect(written.env.CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS).toBe("900000");
+    const config = JSON.parse(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8"));
+    expect(config.claudeEnvBackup).toBeUndefined();
+  });
+
+  it("removes watchdog values that did not exist before configuration", () => {
+    writeClaudeSettings(3456);
+    removeClaudeSettings();
+    const written = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
+    expect(written.env?.CLAUDE_STREAM_IDLE_TIMEOUT_MS).toBeUndefined();
+    expect(written.env?.CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS).toBeUndefined();
+  });
+
+  it("preserves watchdog values changed by the user after configuration", () => {
+    writeClaudeSettings(3456);
+    const settings = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
+    settings.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS = "1200000";
+    settings.env.CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS = "1500000";
+    fs.writeFileSync(settingsPath(), JSON.stringify(settings));
+    removeClaudeSettings();
+    const written = JSON.parse(fs.readFileSync(settingsPath(), "utf-8"));
+    expect(written.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS).toBe("1200000");
+    expect(written.env.CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS).toBe("1500000");
+  });
+
+  it("leaves malformed settings and the watchdog backup untouched", () => {
+    fs.writeFileSync(settingsPath(), JSON.stringify({
+      env: {
+        CLAUDE_STREAM_IDLE_TIMEOUT_MS: "600000",
+        CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: "900000",
+      },
+    }));
+    writeClaudeSettings(3456);
+    const configBefore = fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8");
+    fs.writeFileSync(settingsPath(), "{ malformed", "utf-8");
+
+    removeClaudeSettings();
+
+    expect(fs.readFileSync(settingsPath(), "utf-8")).toBe("{ malformed");
+    expect(fs.readFileSync(`${MOCK_DIR}/config.json`, "utf-8")).toBe(configBefore);
   });
 
   it("preserves other env vars after removal", () => {
