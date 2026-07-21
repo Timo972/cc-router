@@ -1,6 +1,9 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
-import { createStreamLifecycleTracker } from "../proxy/stream-lifecycle.js";
+import {
+  MAX_RETAINED_SSE_LINE_BYTES,
+  createStreamLifecycleTracker,
+} from "../proxy/stream-lifecycle.js";
 
 describe("createStreamLifecycleTracker", () => {
   it("observes a split message_stop without retaining payload content", () => {
@@ -12,6 +15,33 @@ describe("createStreamLifecycleTracker", () => {
     expect(tracker.state.sawMessageStop).toBe(true);
     expect(tracker.state.lastByteAt).toBe(1_200);
     expect(JSON.stringify(tracker.state)).not.toContain("not-retained");
+  });
+
+  it("discards an oversized incomplete line and detects the next message_stop", () => {
+    const tracker = createStreamLifecycleTracker(1_000, true, () => 1_100);
+    const oversizedTerminalLine = `data: {"type":"message_stop"}${" ".repeat(MAX_RETAINED_SSE_LINE_BYTES)}`;
+
+    tracker.observeChunk(Buffer.from(oversizedTerminalLine));
+    expect(tracker.state.sawMessageStop).toBe(false);
+
+    tracker.observeChunk(Buffer.from("\n"));
+    expect(tracker.state.sawMessageStop).toBe(false);
+
+    tracker.observeChunk(Buffer.from('data: {"type":"message_stop"}\n'));
+    expect(tracker.state.sawMessageStop).toBe(true);
+  });
+
+  it("clears an incomplete line on a terminal lifecycle event", () => {
+    const tracker = createStreamLifecycleTracker(1_000, true, () => 1_100);
+    const upstream = new EventEmitter();
+    const downstream = new EventEmitter();
+    tracker.attach(upstream, downstream);
+
+    tracker.observeChunk(Buffer.from('data: {"type":"message_'));
+    upstream.emit("end");
+    tracker.observeChunk(Buffer.from('stop"}\n'));
+
+    expect(tracker.state.sawMessageStop).toBe(false);
   });
 
   it("records upstream abort and downstream close", () => {
