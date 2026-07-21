@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { dirname } from "path";
 import { CLAUDE_SETTINGS_PATH } from "../config/paths.js";
-import { readConfig, writeConfig } from "../config/manager.js";
+import { readConfigStrict, writeConfig } from "../config/manager.js";
 import type { ManagedClaudeEnvBackup } from "../config/manager.js";
 
 const MANAGED_STREAM_IDLE_TIMEOUT_MS = "1800000";
@@ -22,10 +22,18 @@ function captureClaudeEnvBackup(env: Record<string, unknown>): ManagedClaudeEnvB
 }
 
 function clearClaudeEnvBackup(): void {
-  const config = readConfig();
+  const config = readConfigStrict();
   if (!config.claudeEnvBackup) return;
   const { claudeEnvBackup: _removed, ...rest } = config;
   writeConfig(rest);
+}
+
+function parseClaudeSettings(raw: string): Record<string, unknown> {
+  const parsed = JSON.parse(raw) as unknown;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new TypeError(`${CLAUDE_SETTINGS_PATH} must contain a JSON object`);
+  }
+  return parsed as Record<string, unknown>;
 }
 
 /**
@@ -47,17 +55,12 @@ export function writeClaudeSettings(port: number, baseUrl?: string, authToken?: 
   const dir = dirname(CLAUDE_SETTINGS_PATH);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
-  let existing: Record<string, unknown> = {};
-  if (existsSync(CLAUDE_SETTINGS_PATH)) {
-    try {
-      existing = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, "utf-8"));
-    } catch {
-      existing = {};
-    }
-  }
+  const existing = existsSync(CLAUDE_SETTINGS_PATH)
+    ? parseClaudeSettings(readFileSync(CLAUDE_SETTINGS_PATH, "utf-8"))
+    : {};
 
   const existingEnv = (existing["env"] as Record<string, unknown>) ?? {};
-  const config = readConfig();
+  const config = readConfigStrict();
   if (!config.claudeEnvBackup) {
     config.claudeEnvBackup = captureClaudeEnvBackup(existingEnv);
     writeConfig(config);
@@ -74,7 +77,7 @@ export function writeClaudeSettings(port: number, baseUrl?: string, authToken?: 
       // ANTHROPIC_AUTH_TOKEN has higher precedence than ANTHROPIC_API_KEY in Claude Code.
       // Explicit authToken wins (client mode points at a remote secret); otherwise
       // uses the local proxy secret, or the open placeholder if neither is set.
-      ANTHROPIC_AUTH_TOKEN: authToken ?? readConfig().proxySecret ?? "proxy-managed",
+      ANTHROPIC_AUTH_TOKEN: authToken ?? config.proxySecret ?? "proxy-managed",
       CLAUDE_STREAM_IDLE_TIMEOUT_MS: MANAGED_STREAM_IDLE_TIMEOUT_MS,
       CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: MANAGED_STREAM_IDLE_TIMEOUT_MS,
     },
@@ -88,7 +91,7 @@ export function writeClaudeSettings(port: number, baseUrl?: string, authToken?: 
  * Called when uninstalling cc-router so Claude Code goes back to its default auth.
  */
 export function removeClaudeSettings(): void {
-  const config = readConfig();
+  const config = readConfigStrict();
   const backup = config.claudeEnvBackup;
   if (!existsSync(CLAUDE_SETTINGS_PATH)) {
     clearClaudeEnvBackup();
@@ -98,7 +101,7 @@ export function removeClaudeSettings(): void {
   const rawSettings = readFileSync(CLAUDE_SETTINGS_PATH, "utf-8");
   let existing: Record<string, unknown>;
   try {
-    existing = JSON.parse(rawSettings) as Record<string, unknown>;
+    existing = parseClaudeSettings(rawSettings);
   } catch {
     // Malformed settings are user-owned. Leave both the file and backup intact.
     return;

@@ -208,10 +208,29 @@ export interface ProxyConfig {
   claudeEnvBackup?: ManagedClaudeEnvBackup;
 }
 
+function parseProxyConfig(raw: string): ProxyConfig {
+  const parsed = JSON.parse(raw) as unknown;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new TypeError(`${CONFIG_PATH} must contain a JSON object`);
+  }
+  return parsed as ProxyConfig;
+}
+
+/**
+ * Read config for a read-modify-write operation.
+ *
+ * Unlike readConfig(), this deliberately propagates read and parse failures so
+ * callers cannot replace an unreadable or malformed user config with defaults.
+ */
+export function readConfigStrict(): ProxyConfig {
+  if (!existsSync(CONFIG_PATH)) return {};
+  return parseProxyConfig(readFileSync(CONFIG_PATH, "utf-8"));
+}
+
 export function readConfig(): ProxyConfig {
   if (!existsSync(CONFIG_PATH)) return {};
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as ProxyConfig;
+    return readConfigStrict();
   } catch (err) {
     console.warn(`Warning: ${CONFIG_PATH} contains invalid JSON: ${(err as Error).message}`);
     try {

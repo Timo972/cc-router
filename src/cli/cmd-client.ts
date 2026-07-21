@@ -108,6 +108,14 @@ function formatUrl(raw: string): string {
   return url;
 }
 
+function mergeStoredClient(patch: Partial<ClientConfig>): ClientConfig | undefined {
+  const config = readConfig();
+  if (!config.client) return undefined;
+  const client = { ...config.client, ...patch };
+  writeConfig({ ...config, client });
+  return client;
+}
+
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 export function registerClient(program: Command): void {
@@ -407,8 +415,7 @@ export function registerClient(program: Command): void {
 
       if (!cfg.client.desktopEnabled) {
         await setupDesktopInterception(cfg.client.remoteUrl, cfg.client.remoteSecret);
-        cfg.client.desktopEnabled = true;
-        writeConfig(cfg);
+        mergeStoredClient({ desktopEnabled: true });
       }
 
       // Pre-flight check: verify Network Extension is ready on macOS.
@@ -452,7 +459,8 @@ export function registerClient(program: Command): void {
       console.log(chalk.green("\n✓ Claude Desktop interceptor running"));
 
       // ── Auto-start on boot ─────────────────────────────────────────────
-      if (!cfg.client.desktopAutoStart && !isInterceptorServiceInstalled()) {
+      const currentClient = readConfig().client;
+      if (!currentClient?.desktopAutoStart && !isInterceptorServiceInstalled()) {
         const autoStart = await confirm({
           message: "Start interceptor automatically when your computer boots? (recommended)",
           default: true,
@@ -460,14 +468,13 @@ export function registerClient(program: Command): void {
         if (autoStart) {
           const ok = await installInterceptorService(target, secret);
           if (ok) {
-            cfg.client.desktopAutoStart = true;
-            writeConfig(cfg);
+            mergeStoredClient({ desktopAutoStart: true });
             console.log(chalk.green("✓ Auto-start on boot configured"));
           } else {
             console.log(chalk.yellow("⚠ Could not configure auto-start. You can retry later."));
           }
         }
-      } else if (cfg.client.desktopAutoStart) {
+      } else if (currentClient?.desktopAutoStart) {
         console.log(chalk.gray("  Auto-start on boot: enabled"));
       }
 

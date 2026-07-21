@@ -8,6 +8,8 @@ const TEST_STATE = vi.hoisted(() => {
     inputs: [] as string[],
     selects: [] as string[],
     confirms: [] as boolean[],
+    onCheckMitmproxyInstalled: undefined as (() => void) | undefined,
+    onInstallInterceptorService: undefined as (() => void) | undefined,
   };
 });
 
@@ -54,7 +56,10 @@ vi.mock("../utils/platform.js", () => ({
 }));
 
 vi.mock("../interceptor/mitmproxy-manager.js", () => ({
-  checkMitmproxyInstalled: vi.fn(async () => true),
+  checkMitmproxyInstalled: vi.fn(async () => {
+    TEST_STATE.onCheckMitmproxyInstalled?.();
+    return true;
+  }),
   isCaCertInstalled: vi.fn(() => true),
   generateCaCert: vi.fn(async () => undefined),
   installCaCert: vi.fn(async () => true),
@@ -65,7 +70,10 @@ vi.mock("../interceptor/mitmproxy-manager.js", () => ({
   getProcessName: vi.fn(() => "Claude"),
   getNetworkExtensionStatus: vi.fn(async () => "enabled"),
   openNetworkExtensionSettings: vi.fn(async () => undefined),
-  installInterceptorService: vi.fn(async () => true),
+  installInterceptorService: vi.fn(async () => {
+    TEST_STATE.onInstallInterceptorService?.();
+    return true;
+  }),
   uninstallInterceptorService: vi.fn(async () => undefined),
   isInterceptorServiceInstalled: vi.fn(() => false),
 }));
@@ -76,6 +84,7 @@ import * as fs from "node:fs";
 import { Command } from "commander";
 import { registerClient } from "../cli/cmd-client.js";
 import { runSetupWizard } from "../cli/cmd-setup.js";
+import { writeClaudeSettings } from "../utils/claude-config.js";
 
 const settingsPath = path.join(TEST_STATE.dir, "settings.json");
 const configPath = path.join(TEST_STATE.dir, "config.json");
@@ -111,6 +120,8 @@ beforeEach(() => {
   TEST_STATE.inputs.length = 0;
   TEST_STATE.selects.length = 0;
   TEST_STATE.confirms.length = 0;
+  TEST_STATE.onCheckMitmproxyInstalled = undefined;
+  TEST_STATE.onInstallInterceptorService = undefined;
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
     status: "ok",
     accounts: [{ id: "one" }],
@@ -199,6 +210,49 @@ describe("client config lifecycle", () => {
       proxySecret: "local-secret",
       autoUpdate: false,
       futureSetting: { keep: true },
+    });
+  });
+
+  it("merges standalone Desktop state with config changes made during awaited setup", async () => {
+    seedClaudeSettings();
+    const initial = readJson(configPath);
+    initial.client = {
+      remoteUrl: "https://router.example",
+      remoteSecret: "secret",
+    };
+    fs.writeFileSync(configPath, JSON.stringify(initial));
+    TEST_STATE.confirms.push(true, false, true);
+
+    TEST_STATE.onCheckMitmproxyInstalled = () => {
+      TEST_STATE.onCheckMitmproxyInstalled = undefined;
+      writeClaudeSettings(0, "https://router.example", "secret");
+      const concurrent = readJson(configPath);
+      concurrent.concurrentBeforeDesktop = { keep: true };
+      fs.writeFileSync(configPath, JSON.stringify(concurrent));
+    };
+    TEST_STATE.onInstallInterceptorService = () => {
+      TEST_STATE.onInstallInterceptorService = undefined;
+      const concurrent = readJson(configPath);
+      concurrent.concurrentDuringService = { keep: true };
+      concurrent.client.futureClientSetting = "keep";
+      fs.writeFileSync(configPath, JSON.stringify(concurrent));
+    };
+
+    await runClient("start-desktop");
+
+    const config = readJson(configPath);
+    expect(config.claudeEnvBackup).toEqual({
+      CLAUDE_STREAM_IDLE_TIMEOUT_MS: { existed: true, value: "600000" },
+      CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: { existed: true, value: "900000" },
+    });
+    expect(config.concurrentBeforeDesktop).toEqual({ keep: true });
+    expect(config.concurrentDuringService).toEqual({ keep: true });
+    expect(config.client).toMatchObject({
+      remoteUrl: "https://router.example",
+      remoteSecret: "secret",
+      desktopEnabled: true,
+      desktopAutoStart: true,
+      futureClientSetting: "keep",
     });
   });
 });
