@@ -14,6 +14,15 @@ const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 // ─── Version helpers ─────────────────────────────────────────────────────────
 
+// Strict semver. The registry response is untrusted input: it is interpolated
+// into the `npm install ai-cc-router@<version>` argument, so any value that is
+// not a clean semver string must be rejected before it reaches a child process.
+const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+export function isValidVersion(value: unknown): value is string {
+  return typeof value === "string" && SEMVER_RE.test(value);
+}
+
 export function getCurrentVersion(): string {
   const require = createRequire(import.meta.url);
   const pkg = require("../../package.json") as { version: string };
@@ -81,6 +90,11 @@ export async function checkForUpdate(force = false): Promise<UpdateCheckResult> 
     });
     if (!res.ok) return { current, latest: current, diff: null, updateAvailable: false };
     const data = (await res.json()) as { version: string };
+    // Reject anything that is not a clean semver string — a malicious or
+    // compromised registry response must never flow into the install command.
+    if (!isValidVersion(data.version)) {
+      return { current, latest: current, diff: null, updateAvailable: false };
+    }
     writeCache(data.version);
     const diff = semverDiff(current, data.version);
     return { current, latest: data.version, diff, updateAvailable: diff !== null };
@@ -118,16 +132,27 @@ function detectInstallPrefix(): string {
 // ─── Perform update ──────────────────────────────────────────────────────────
 
 export async function performUpdate(targetVersion: string): Promise<boolean> {
+  // Defense in depth: never build an install command from an unvalidated
+  // version, even if a caller bypassed checkForUpdate.
+  if (!isValidVersion(targetVersion)) {
+    console.error(chalk.red(`✗ Refusing to update: "${targetVersion}" is not a valid version`));
+    return false;
+  }
+
   const prefix = detectInstallPrefix();
 
   console.log(chalk.cyan(`\nUpdating ${PKG_NAME} to v${targetVersion}...`));
   console.log(chalk.gray(`  prefix: ${prefix}`));
 
   return new Promise((resolve) => {
+    // No shell: pass argv directly. On Windows npm is a .cmd shim, so invoke it
+    // by name without shell:true (which would re-parse the joined string through
+    // cmd.exe and turn the version arg into a command-injection sink).
+    const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
     const child = spawn(
-      "npm",
+      npmBin,
       ["install", "-g", `${PKG_NAME}@${targetVersion}`, `--prefix=${prefix}`],
-      { stdio: "inherit", shell: process.platform === "win32" },
+      { stdio: "inherit" },
     );
 
     child.on("error", (err) => {

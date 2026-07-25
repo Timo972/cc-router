@@ -171,25 +171,20 @@ async function askRunPreferences(): Promise<RunPreferences> {
 }
 
 async function maybeSetupPassword(cfg: ReturnType<typeof readConfig>): Promise<void> {
-  console.log(chalk.yellow("\n  Server mode is enabled — a password is recommended to protect the proxy.\n"));
+  console.log(chalk.yellow(
+    "\n  Server mode binds the proxy to the network. A password is REQUIRED —" +
+    "\n  without it, anyone who can reach the port could use your accounts.\n",
+  ));
 
   const pwChoice = await select({
     message: "Set a proxy password?",
     choices: [
       { name: "Generate automatically  (recommended)", value: "generate" },
       { name: "Enter my own password", value: "manual" },
-      { name: "Skip — no password protection", value: "skip" },
     ],
   });
 
-  if (pwChoice === "generate") {
-    const secret = generateProxySecret();
-    cfg.proxySecret = secret;
-    writeConfig(cfg);
-    console.log(chalk.yellow("\n  *** Save this password — you cannot recover it later ***"));
-    console.log("      " + chalk.bold(secret));
-    console.log(chalk.gray("  Clients will need this to connect.\n"));
-  } else if (pwChoice === "manual") {
+  if (pwChoice === "manual") {
     const raw = await passwordPrompt({
       message: "Enter proxy password:",
       validate: (v) => v.trim().length >= 8 || "Minimum 8 characters",
@@ -197,7 +192,15 @@ async function maybeSetupPassword(cfg: ReturnType<typeof readConfig>): Promise<v
     cfg.proxySecret = raw.trim();
     writeConfig(cfg);
     console.log(chalk.green("  ✓ Password saved.\n"));
+    return;
   }
+
+  const secret = generateProxySecret();
+  cfg.proxySecret = secret;
+  writeConfig(cfg);
+  console.log(chalk.yellow("\n  *** Save this password — you cannot recover it later ***"));
+  console.log("      " + chalk.bold(secret));
+  console.log(chalk.gray("  Clients will need this to connect.\n"));
 }
 
 async function ensureClaudeCodeConfigured(
@@ -294,6 +297,17 @@ function printServerModeInstructions(port: number, secret?: string): void {
   console.log(chalk.cyan(`  │    ${chalk.gray(`}`)}                                                    │`));
   console.log(chalk.cyan(`  │  ${chalk.gray(`}`)}                                                      │`));
   console.log(chalk.bold.cyan(`  └${"─".repeat(56)}┘\n`));
+
+  // Plaintext-HTTP warning: the proxy speaks HTTP only. Over a non-loopback
+  // link the proxy secret and every prompt/response travel in the clear.
+  console.log(chalk.yellow.bold("  ⚠ This link is plain HTTP — not encrypted."));
+  console.log(chalk.yellow(
+    `    The password above and all prompts/responses are sent in cleartext and\n` +
+    `    can be read by anyone on the network path. For anything beyond a trusted\n` +
+    `    LAN, put CC-Router behind a TLS-terminating reverse proxy (Caddy, nginx,\n` +
+    `    Cloudflare Tunnel) and hand clients the https:// URL.\n` +
+    `    See: docs/security.md → "Transport security (TLS)".\n`,
+  ));
 }
 
 // ─── Foreground start (direct server import) ────────────────────────────────
