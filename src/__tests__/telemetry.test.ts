@@ -43,7 +43,8 @@ afterEach(() => {
 describe("loadTelemetryState", () => {
   it("creates fresh state with UUID and persists on first call", () => {
     const state = loadTelemetryState();
-    expect(state.enabled).toBe(true);
+    // Telemetry is opt-in: a fresh state is disabled until the user turns it on.
+    expect(state.enabled).toBe(false);
     expect(state.installId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
     );
@@ -65,7 +66,7 @@ describe("loadTelemetryState", () => {
   it("recovers from corrupted JSON", () => {
     fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, "NOT_JSON{}", "utf-8");
     const state = loadTelemetryState();
-    expect(state.enabled).toBe(true);
+    expect(state.enabled).toBe(false);
     expect(state.installId).toBeDefined();
   });
 });
@@ -91,8 +92,8 @@ describe("writeTelemetryState", () => {
 // ─── isTelemetryEnabled ──────────────────────────────────────────────────────
 
 describe("isTelemetryEnabled", () => {
-  it("returns true by default", () => {
-    expect(isTelemetryEnabled()).toBe(true);
+  it("returns false by default (opt-in)", () => {
+    expect(isTelemetryEnabled()).toBe(false);
   });
 
   it("returns false when DO_NOT_TRACK=1", () => {
@@ -142,10 +143,15 @@ describe("trackEvent", () => {
     // Dynamic import so the module picks up our mocked paths
     const mod = await import("../utils/telemetry.js");
     trackEvent = mod.trackEvent;
+    // Telemetry is opt-in: explicitly enable it so these tests exercise the
+    // fetch path.
+    const st = loadTelemetryState();
+    st.enabled = true;
+    writeTelemetryState(st);
   });
 
   it("sends event to Aptabase EU endpoint", async () => {
-    // Ensure telemetry state exists (enabled by default)
+    // Telemetry was enabled in beforeEach.
     loadTelemetryState();
 
     await trackEvent("test_event", { key: "value" });
