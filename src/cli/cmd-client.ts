@@ -21,6 +21,7 @@ import {
   installInterceptorService,
   uninstallInterceptorService,
   isInterceptorServiceInstalled,
+  removeCaCert,
 } from "../interceptor/mitmproxy-manager.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -263,6 +264,23 @@ export function registerClient(program: Command): void {
         }
         console.log(chalk.yellow("Stopping Claude Desktop interceptor..."));
         await stopInterceptor();
+
+        // Full teardown is the right moment to offer removing the system-wide
+        // root CA. It's left in place by default because reconnecting reuses it
+        // and reinstalling needs sudo again — but a permanently trusted CA whose
+        // private key lives in ~/.mitmproxy is a real leftover if you're done.
+        const removeCa = await confirm({
+          message: "Also remove the mitmproxy root CA from your system trust store? (needs sudo/admin — recommended if you won't reconnect)",
+          default: false,
+        });
+        if (removeCa) {
+          const ok = await removeCaCert();
+          console.log(ok
+            ? chalk.green("✓ mitmproxy root CA removed from the trust store")
+            : chalk.yellow("⚠ Could not remove the CA automatically — remove 'mitmproxy' from your OS trust store manually"));
+        } else {
+          console.log(chalk.gray("  Left the mitmproxy CA in your trust store (reused on reconnect)."));
+        }
       }
 
       removeClaudeSettings();

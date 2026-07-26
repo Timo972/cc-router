@@ -8,7 +8,7 @@ import type { Request } from "express";
 import { TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccounts, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
-import { checkForUpdate, performUpdate, restartSelf } from "../utils/self-update.js";
+import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
 import { logRoute, logError, logStartup } from "./logger.js";
@@ -351,21 +351,27 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // The /cc-router/health endpoint is always exempt so monitoring and PM2
   // healthchecks keep working.
   const { proxySecret } = initialConfig;
-  if (proxySecret) {
-    const secretBuf = Buffer.from(proxySecret, "utf-8");
+  const secretBuf = proxySecret ? Buffer.from(proxySecret, "utf-8") : null;
+
+  // Pull the presented secret from either accepted header.
+  const presentedSecret = (req: Request): string => {
+    const auth = (req.headers["authorization"] as string | undefined) ?? "";
+    const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const apiKey = (req.headers["x-api-key"] as string | undefined) ?? "";
+    return bearerToken || apiKey;
+  };
+  // Constant-time comparison with the configured secret (length pre-check is
+  // required — timingSafeEqual throws on length mismatch).
+  const secretMatches = (presented: string): boolean => {
+    if (!secretBuf) return false;
+    const presentedBuf = Buffer.from(presented, "utf-8");
+    return presentedBuf.length === secretBuf.length && timingSafeEqual(presentedBuf, secretBuf);
+  };
+
+  if (secretBuf) {
     app.use((req, res, next) => {
       if (req.path === "/cc-router/health") return next();
-
-      const auth = (req.headers["authorization"] as string | undefined) ?? "";
-      const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-      const apiKey = (req.headers["x-api-key"] as string | undefined) ?? "";
-      const presented = bearerToken || apiKey;
-      const presentedBuf = Buffer.from(presented, "utf-8");
-
-      if (
-        presentedBuf.length !== secretBuf.length ||
-        !timingSafeEqual(presentedBuf, secretBuf)
-      ) {
+      if (!secretMatches(presentedSecret(req))) {
         res.status(401).json({
           type: "error",
           error: { type: "authentication_error", message: "Invalid or missing proxy authentication token" },
@@ -377,7 +383,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   }
 
   // ─── Health endpoint (cc-router internal, NOT proxied) ────────────────────
-  app.get("/cc-router/health", (_req, res) => {
+  // Always reachable without auth so PM2/monitoring liveness checks keep
+  // working — but the DETAILED payload (account IDs, plan tier, usage, recent
+  // request paths) is disclosure-sensitive. Return it only to an authenticated
+  // caller. When no secret is configured the server is loopback-only (enforced
+  // before app.listen), so returning full detail to localhost is acceptable.
+  app.get("/cc-router/health", (req, res) => {
     // Sweep expired cooldowns on each poll so the dashboard reflects recovery
     // even during idle periods when no /v1 request would trigger getNext().
     pool.sweepExpiredCooldowns();
@@ -387,8 +398,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       openAIAccounts,
       resolveRoutingMetrics,
     );
+    const status = accountViews.some(a => a.healthy) ? "ok" : "degraded";
+
+    if (secretBuf && !secretMatches(presentedSecret(req))) {
+      res.json({ status });
+      return;
+    }
+
     res.json({
-      status: accountViews.some(a => a.healthy) ? "ok" : "degraded",
+      status,
       mode,
       target,
       operational: createOperationalStatus({
@@ -962,10 +980,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
 
-  // ─── Auto-update (opt-in via config or CC_ROUTER_AUTO_UPDATE=1) ───────────
-  // Auto-update enabled by default — users can disable via config or env var
+  // ─── Update handling ──────────────────────────────────────────────────────
+  // Auto-update is OFF by default: installing code unattended from the npm
+  // registry (no signature/provenance check) turns any publish-channel
+  // compromise into RCE across every running proxy. Default behaviour is
+  // notify-only, like pip/npm. Opt in explicitly with `autoUpdate: true` in
+  // config or CC_ROUTER_AUTO_UPDATE=1.
   const cfg = readConfig();
-  const autoUpdate = cfg.autoUpdate !== false && process.env["CC_ROUTER_NO_AUTO_UPDATE"] !== "1";
+  const autoUpdate =
+    (cfg.autoUpdate === true || process.env["CC_ROUTER_AUTO_UPDATE"] === "1") &&
+    process.env["CC_ROUTER_NO_AUTO_UPDATE"] !== "1";
   if (autoUpdate) {
     const AUTO_UPDATE_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
     const runAutoUpdate = async () => {
@@ -986,12 +1010,38 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // First check 60s after startup, then every 6h
     setTimeout(runAutoUpdate, 60_000).unref();
     setInterval(runAutoUpdate, AUTO_UPDATE_INTERVAL).unref();
+  } else {
+    // Notify-only: a single background check shortly after startup. Never
+    // installs — just prints the banner telling the user how to update.
+    setTimeout(() => {
+      void checkForUpdate()
+        .then(printUpdateBanner)
+        .catch(() => { /* network check is non-critical */ });
+    }, 60_000).unref();
   }
 
   // ─── Start ────────────────────────────────────────────────────────────────
   // HOST env var lets teams bind to 0.0.0.0 for LAN/VPS shared access.
   // Defaults to 127.0.0.1 (localhost-only) for single-user safety.
   const host = process.env["HOST"] ?? "127.0.0.1";
+
+  // Hard safety net: never expose the proxy on a non-loopback interface without
+  // a secret. Every start path funnels through app.listen(host), so this guards
+  // the daemon / service / HOST=0.0.0.0 cases the interactive wizard can't.
+  const isLoopbackHost = (h: string): boolean =>
+    h === "127.0.0.1" || h === "::1" || h === "localhost" || h === "::ffff:127.0.0.1";
+  if (!isLoopbackHost(host) && !proxySecret) {
+    console.error(chalk.red(
+      `\n✗ Refusing to bind ${host}:${port} without a proxy secret.\n` +
+      `  Exposing the proxy to the network without authentication would let\n` +
+      `  anyone who can reach it use your Claude/OpenAI accounts.\n` +
+      `  Fix: run 'cc-router start' and set a password when asked, or add a\n` +
+      `  "proxySecret" to ~/.cc-router/config.json. To bind localhost only,\n` +
+      `  unset HOST (or set HOST=127.0.0.1).\n`,
+    ));
+    process.exit(1);
+  }
+
   app.listen(port, host, () => {
     // Write PID for daemon/service process management
     if (process.env["CC_ROUTER_DAEMON"] === "1") {
@@ -1003,7 +1053,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       anthropic: accounts.length,
       openai: openAIAccounts.length,
     });
-    if (autoUpdate) console.log(chalk.gray("  Auto-update: enabled (patch/minor)"));
+    console.log(autoUpdate
+      ? chalk.gray("  Auto-update: enabled (patch/minor)")
+      : chalk.gray("  Auto-update: off (notify-only) — run 'cc-router update' to install"));
 
     // Anonymous telemetry — fire-and-forget, never blocks proxy startup.
     try {

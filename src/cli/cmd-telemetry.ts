@@ -1,7 +1,6 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { loadTelemetryState, writeTelemetryState, isTelemetryEnabled } from "../config/telemetry.js";
-import { trackEvent } from "../utils/telemetry.js";
 
 export function registerTelemetry(program: Command): void {
   program
@@ -25,8 +24,7 @@ export function registerTelemetry(program: Command): void {
       }
 
       if (resolved === "off") {
-        // Send one last event so we know about opt-out rates
-        await trackEvent("telemetry_disabled");
+        // Do not beacon on opt-out: an explicit "turn it off" must not send data.
         const state = loadTelemetryState();
         state.enabled = false;
         writeTelemetryState(state);

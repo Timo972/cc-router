@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, chmodSync } from "fs";
 import { randomBytes } from "crypto";
 import { CONFIG_DIR, ACCOUNTS_PATH, CONFIG_PATH } from "./paths.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
@@ -8,10 +8,32 @@ import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 
 export const DEFAULT_PROXY_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
+/** Owner-only permissions for files/dirs that hold OAuth tokens or the proxy secret. */
+const SECRET_FILE_MODE = 0o600;
+const SECRET_DIR_MODE = 0o700;
+
 export function ensureConfigDir(): void {
   if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
+    mkdirSync(CONFIG_DIR, { recursive: true, mode: SECRET_DIR_MODE });
+    return;
   }
+  // Tighten an existing dir that may predate this hardening. No-op on Windows.
+  try { chmodSync(CONFIG_DIR, SECRET_DIR_MODE); } catch { /* best effort */ }
+}
+
+/**
+ * Atomic + private write for credential files: write tmp as 0600 (umask can
+ * clear bits, so chmod defensively), then rename. rename preserves the source
+ * inode's mode, so the destination ends up 0600 even if it previously existed
+ * world-readable. On Windows `mode` is largely ignored; the file lives under
+ * the user profile and is protected by the profile ACL.
+ */
+function writeFileSecureSync(path: string, data: string): void {
+  const tmp = path + ".tmp";
+  writeFileSync(tmp, data, { encoding: "utf-8", mode: SECRET_FILE_MODE });
+  try { chmodSync(tmp, SECRET_FILE_MODE); } catch { /* best effort */ }
+  renameSync(tmp, path);
+  try { chmodSync(path, SECRET_FILE_MODE); } catch { /* best effort */ }
 }
 
 export function accountsFileExists(path?: string): boolean {
@@ -43,9 +65,8 @@ export function writeAccountsAtomic(data: unknown[]): void {
 }
 
 function writeAccountsAtomicToPath(path: string, data: unknown[]): void {
-  const tmp = path + ".tmp";
-  writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
-  renameSync(tmp, path);
+  // accounts.json holds plaintext OAuth access + refresh tokens — owner-only.
+  writeFileSecureSync(path, JSON.stringify(data, null, 2));
 }
 
 export function writeAnthropicAccountsPreservingOtherProviders(data: AccountRecord[]): void {
@@ -196,7 +217,8 @@ export interface ProxyConfig {
   proxyRequestTimeoutMs?: number;
   /** Deprecated typo-compatible alias for proxyRequestTimeoutMs. */
   proxyRequesTime?: number;
-  /** Auto-update on patch/minor releases. Default: true (enabled). Set to false to disable. */
+  /** Auto-update on patch/minor releases. Default: false (notify-only). Set to true to
+   *  opt in to unattended installs from the npm registry. */
   autoUpdate?: boolean;
   /** Default and alias model routing for Claude and OpenAI subscription providers. */
   modelRouting?: ModelRoutingConfig;
@@ -267,9 +289,8 @@ function normalizeProxyConfig(cfg: ProxyConfig): ProxyConfig {
 
 export function writeConfig(cfg: ProxyConfig): void {
   ensureConfigDir();
-  const tmp = CONFIG_PATH + ".tmp";
-  writeFileSync(tmp, JSON.stringify(normalizeProxyConfig(cfg), null, 2), "utf-8");
-  renameSync(tmp, CONFIG_PATH);
+  // config.json holds proxySecret and client.remoteSecret — owner-only.
+  writeFileSecureSync(CONFIG_PATH, JSON.stringify(normalizeProxyConfig(cfg), null, 2));
 }
 
 export function generateProxySecret(): string {
