@@ -10,7 +10,7 @@ import {
   type RunPreferences,
 } from "../config/manager.js";
 import { writeClaudeSettings } from "../utils/claude-config.js";
-import { checkForUpdate, performUpdate } from "../utils/self-update.js";
+import { checkForUpdate, performUpdate, PKG_NAME } from "../utils/self-update.js";
 import { launchDaemon } from "../daemon/launcher.js";
 import { isProxyRunning } from "../daemon/pid.js";
 import { installService } from "../daemon/service.js";
@@ -237,7 +237,7 @@ async function maybeUpdate(): Promise<void> {
   // From here, errors should be visible
   if (check.diff === "major") {
     console.log(chalk.yellow(`\n  New major version available: v${check.current} → v${check.latest}`));
-    console.log(chalk.gray(`  Update manually: npm i -g ai-cc-router@${check.latest}\n`));
+    console.log(chalk.gray(`  Update manually: npm i -g ${PKG_NAME}@${check.latest}\n`));
     return;
   }
 

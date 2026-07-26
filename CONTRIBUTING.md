@@ -12,7 +12,7 @@ Open an issue using the [feature request template](.github/ISSUE_TEMPLATE/featur
 ## Development setup
 
 ```bash
-git clone https://github.com/VictorMinemu/cc-router.git
+git clone https://github.com/Timo972/cc-router.git
 cd cc-router
 npm install
 

@@ -1,6 +1,6 @@
 {
-  "name": "ai-cc-router",
-  "version": "0.6.2",
+  "name": "@timo972/cc-router",
+  "version": "0.7.0",
   "description": "Cache-aware session router for Claude Max OAuth tokens — use multiple Claude Max accounts with Claude Code",
   "type": "module",
   "bin": {
@@ -26,12 +26,15 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/VictorMinemu/CC-Router.git"
+    "url": "git+https://github.com/Timo972/cc-router.git"
   },
   "bugs": {
-    "url": "https://github.com/VictorMinemu/CC-Router/issues"
+    "url": "https://github.com/Timo972/cc-router/issues"
   },
-  "homepage": "https://github.com/VictorMinemu/CC-Router#readme",
+  "homepage": "https://github.com/Timo972/cc-router#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "dist/",
     "src/interceptor/addon.py",

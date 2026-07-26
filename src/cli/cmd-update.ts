@@ -1,6 +1,6 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { checkForUpdate, performUpdate, restartSelf, getCurrentVersion } from "../utils/self-update.js";
+import { checkForUpdate, performUpdate, restartSelf, getCurrentVersion, PKG_NAME } from "../utils/self-update.js";
 
 export function registerUpdate(program: Command): void {
   program
@@ -29,14 +29,14 @@ export function registerUpdate(program: Command): void {
 
       if (check.diff === "major") {
         console.log(chalk.yellow("\n⚠ Major version update — may contain breaking changes."));
-        console.log(chalk.yellow(`  Install manually: npm i -g ai-cc-router@${check.latest}`));
+        console.log(chalk.yellow(`  Install manually: npm i -g ${PKG_NAME}@${check.latest}`));
         return;
       }
 
       const ok = await performUpdate(check.latest);
       if (!ok) {
         console.log(chalk.red("\nUpdate failed. Try manually:"));
-        console.log(chalk.cyan(`  npm i -g ai-cc-router@${check.latest}`));
+        console.log(chalk.cyan(`  npm i -g ${PKG_NAME}@${check.latest}`));
         return;
       }
 

@@ -11,7 +11,7 @@ describe("isValidVersion", () => {
   });
 
   it("rejects command-injection payloads in the version string", () => {
-    // These are the values that must never reach `npm install ai-cc-router@<v>`
+    // These are the values that must never reach `npm install @timo972/cc-router@<v>`
     // — especially on Windows where spawn used to run through cmd.exe.
     expect(isValidVersion("1.0.0 & calc.exe")).toBe(false);
     expect(isValidVersion("1.0.0 && powershell -e ...")).toBe(false);

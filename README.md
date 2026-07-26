@@ -3,7 +3,7 @@
 **Local multi-account router for Claude Max and OpenAI ChatGPT/Codex subscriptions.**  
 Distribute Claude Code requests across Claude subscriptions, and expose an OpenAI Responses-compatible route for Codex CLI through the same proxy.
 
-[![npm](https://img.shields.io/npm/v/ai-cc-router)](https://www.npmjs.com/package/ai-cc-router)
+[![npm](https://img.shields.io/npm/v/@timo972/cc-router)](https://www.npmjs.com/package/@timo972/cc-router)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ![CC-Router Dashboard](assets/dashboard.png)
@@ -20,8 +20,8 @@ Distribute Claude Code requests across Claude subscriptions, and expose an OpenA
 - **Claude Desktop support** — route Cowork / Agent-mode traffic through CC-Router via mitmproxy interception (macOS, Windows, Linux)
 - **Guided setup wizard** — interactive `cc-router setup` extracts tokens from Keychain or credentials file, configures everything
 - **Live dashboard** — real-time terminal UI showing account health, request counts, token usage, recent activity
-- **Proxy authentication** — optional Bearer / x-api-key secret for internet-exposed deployments
-- **Auto-update** — patch/minor releases install automatically (opt-out available)
+- **Proxy authentication** — Bearer / x-api-key secret; required when binding a non-loopback interface
+- **Update notifications** — new releases are announced in the CLI; installing is opt-in (`autoUpdate: true`)
 - **Multiple deployment modes** — background daemon, native OS auto-start (launchd/systemd), foreground, Docker Compose
 - **Cross-platform** — macOS, Linux, Windows; Node.js 20+
 
@@ -125,7 +125,7 @@ Run cc-router on a machine everyone on the team can reach — a home server, a V
 #### On the server
 
 ```bash
-npm install -g ai-cc-router
+npm install -g @timo972/cc-router
 cc-router setup          # configure the 3 shared accounts
 cc-router start          # first run asks: background/boot/server mode — choose "server mode"
 ```
@@ -198,7 +198,7 @@ Each developer then points to:
 
 ```bash
 # 1. Install
-npm install -g ai-cc-router
+npm install -g @timo972/cc-router
 
 # 2. Wizard: extract tokens + configure Claude Code automatically
 cc-router setup
@@ -224,7 +224,7 @@ cc-router start --reconfigure
 **Requirements:** Node.js 20 or 22.
 
 ```bash
-npm install -g ai-cc-router
+npm install -g @timo972/cc-router
 ```
 
 Verify:
@@ -722,10 +722,15 @@ Check status anytime: `cc-router telemetry status`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Bug reports → [GitHub Issues](https://github.com/VictorMinemu/CC-Router/issues)
+Bug reports → [GitHub Issues](https://github.com/Timo972/cc-router/issues)
 
 ---
 
 ## License
 
 [MIT](LICENSE)
+
+This project began as a fork of [VictorMinemu/CC-Router](https://github.com/VictorMinemu/CC-Router)
+and is now maintained independently as [`@timo972/cc-router`](https://www.npmjs.com/package/@timo972/cc-router).
+It is not affiliated with the upstream project, and issues should be filed here rather than upstream.
+The original MIT copyright notice is retained in [LICENSE](LICENSE).

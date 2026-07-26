@@ -41,7 +41,7 @@ jobs:
       # Publish with provenance so consumers can verify the build's origin.
       #
       # RECOMMENDED (maintainer action, one-time): enable npm Trusted Publishing
-      # for this package at https://www.npmjs.com/package/ai-cc-router/access and
+      # for this package at https://www.npmjs.com/package/@timo972/cc-router/access and
       # then DELETE the NPM_TOKEN secret — OIDC (id-token: write) replaces the
       # long-lived, exfiltratable token entirely. Until then the token is used as
       # a fallback.

@@ -6,7 +6,9 @@ import chalk from "chalk";
 import { CONFIG_DIR } from "../config/paths.js";
 import { removePid } from "../daemon/pid.js";
 
-const PKG_NAME = "ai-cc-router";
+// Single source of truth for the published package name: CLI hints that tell a
+// user what to install must never drift from what self-update actually pulls.
+export const PKG_NAME = "@timo972/cc-router";
 const REGISTRY_URL = `https://registry.npmjs.org/${PKG_NAME}/latest`;
 const CHECK_CACHE_PATH = join(CONFIG_DIR, "update-check.json");
 const LAST_GOOD_PATH = join(CONFIG_DIR, "last-good-version.json");
@@ -15,7 +17,7 @@ const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 // ─── Version helpers ─────────────────────────────────────────────────────────
 
 // Strict semver. The registry response is untrusted input: it is interpolated
-// into the `npm install ai-cc-router@<version>` argument, so any value that is
+// into the `npm install @timo972/cc-router@<version>` argument, so any value that is
 // not a clean semver string must be rejected before it reaches a child process.
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
@@ -110,12 +112,13 @@ export async function checkForUpdate(force = false): Promise<UpdateCheckResult> 
 function detectInstallPrefix(): string {
   try {
     const scriptPath = realpathSync(process.argv[1]);
-    // scriptPath is like: /prefix/lib/node_modules/ai-cc-router/dist/cli/index.js
-    // We need to walk up to the prefix root.
+    // scriptPath is like: /prefix/lib/node_modules/@timo972/cc-router/dist/cli/index.js
+    // We need to walk up to the prefix root. join() normalizes the scope
+    // separator, so the marker matches on Windows backslash paths too.
     const marker = join("node_modules", PKG_NAME);
     const idx = scriptPath.indexOf(marker);
     if (idx !== -1) {
-      // Walk up from .../lib/node_modules/ai-cc-router → .../
+      // Walk up from .../lib/node_modules/@timo972/cc-router → .../
       const libDir = scriptPath.slice(0, idx); // .../lib/
       return resolve(libDir, "..");
     }
