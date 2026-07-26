@@ -43,6 +43,7 @@
     "Dockerfile",
     "accounts.example.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "dependencies": {
