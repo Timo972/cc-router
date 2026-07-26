@@ -60,6 +60,19 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
+/**
+ * Fail with `message` instead of hanging to the suite-level timeout. Timing
+ * premises that go unmet otherwise surface as an opaque 5s stall.
+ */
+function withDeadline<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(message)), ms).unref();
+    }),
+  ]);
+}
+
 function collect(
   url: URL,
   headers: Record<string, string> = {},
@@ -229,6 +242,13 @@ describe("createAnthropicProxy", () => {
   });
 
   it("does not abort a started SSE response after the pre-response timeout", async () => {
+    // The timeout must elapse during the post-start wait for the assertion to
+    // mean anything, but response arrival must not itself be a race: loopback
+    // needs single-digit ms, and CI runners (Windows especially) are far slower
+    // than a local run. 500ms gives ~100x headroom while still expiring well
+    // inside the wait below.
+    const preResponseTimeoutMs = 500;
+    const postStartWaitMs = preResponseTimeoutMs * 2 + 100;
     const gate = deferred();
     const prefix = Buffer.from("event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n");
     const suffix = Buffer.from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
@@ -242,7 +262,7 @@ describe("createAnthropicProxy", () => {
     const app = express();
     app.use("/v1", createAnthropicProxy({
       target: `http://127.0.0.1:${upstreamPort}`,
-      timeoutMs: 50,
+      timeoutMs: preResponseTimeoutMs,
       on: {},
     }));
     const downstream = createServer(app);
@@ -250,8 +270,12 @@ describe("createAnthropicProxy", () => {
     const response = startCollecting(new URL(`http://127.0.0.1:${downstreamPort}/v1/messages`));
     void response.completed.catch(() => undefined);
     try {
-      await response.firstChunk;
-      await new Promise(resolve => setTimeout(resolve, 150));
+      await withDeadline(
+        response.firstChunk,
+        preResponseTimeoutMs * 4,
+        "upstream response never reached the client, so the post-timeout assertion below would be vacuous",
+      );
+      await new Promise(resolve => setTimeout(resolve, postStartWaitMs));
       expect(response.hasCompleted()).toBe(false);
       gate.resolve();
       await expect(response.completed).resolves.toEqual(Buffer.concat([prefix, suffix]));
