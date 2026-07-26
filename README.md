@@ -72,6 +72,8 @@ Streaming remains byte-transparent. In particular, CC-Router never appends a syn
 
 **Claude Desktop support** is opt-in and requires a small interceptor (mitmproxy) because Claude Desktop doesn't expose a custom API endpoint setting. See [Claude Desktop support](#claude-desktop-support).
 
+📖 **Running this for a team?** [docs/session-routing.md](docs/session-routing.md) covers how accounts are picked, what per-account throttles do, how to monitor affinity, and how to read the failure modes.
+
 ---
 
 ## Use cases

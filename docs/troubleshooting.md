@@ -65,6 +65,9 @@ If it happens frequently with a single account, add more accounts:
 cc-router setup --add
 ```
 
+Before adding accounts, check that per-account caps aren't taking accounts out of
+rotation while budget remains — see [per-account throttles](session-routing.md#per-account-throttles).
+
 ---
 
 ## Streaming (SSE) is broken or incomplete
