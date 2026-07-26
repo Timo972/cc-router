@@ -91,35 +91,6 @@ With two accounts you double your effective rate limit. With three, you triple i
 
 ---
 
-### Team sharing accounts — fewer subscriptions, same throughput
-
-A team of five doesn't need five Max subscriptions. In practice, developers don't all peak at the same time. Three accounts can comfortably serve five people working normal hours.
-
-#### Example setup: 5 devs, 3 accounts
-
-```text
-cc-router (hosted on a shared machine or VPS)
-     │
-     ├── max-account-1   ← alice's subscription
-     ├── max-account-2   ← bob's subscription
-     └── max-account-3   ← carol's subscription
-           │
-           └── serves: alice, bob, carol, dave, eve
-```
-
-Each developer sets their `ANTHROPIC_BASE_URL` to the shared proxy. Done. The proxy handles routing and token refresh invisibly.
-
-#### Cost example
-
-| Setup | Monthly cost |
-|-------|-------------|
-| 5 individual Max subscriptions | 5 × $100 = **$500/mo** |
-| 3 shared via cc-router | 3 × $100 = **$300/mo** |
-
-You save $200/mo without any loss in capability for a typical team workload.
-
----
-
 ### Hosting cc-router on a shared machine
 
 Run cc-router on a machine everyone on the team can reach — a home server, a VPS, or a spare machine on the office network.
@@ -128,7 +99,7 @@ Run cc-router on a machine everyone on the team can reach — a home server, a V
 
 ```bash
 npm install -g @timo972/cc-router
-cc-router setup          # configure the 3 shared accounts
+cc-router setup          # configure the accounts
 cc-router start          # first run asks: background/boot/server mode — choose "server mode"
 ```
 
