@@ -6,6 +6,13 @@ Distribute Claude Code requests across Claude subscriptions, and expose an OpenA
 [![npm](https://img.shields.io/npm/v/@timo972/cc-router)](https://www.npmjs.com/package/@timo972/cc-router)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+> **An actively maintained fork of [VictorMinemu/CC-Router](https://github.com/VictorMinemu/CC-Router)**, published as
+> [`@timo972/cc-router`](https://www.npmjs.com/package/@timo972/cc-router) with bug fixes and added features — most
+> notably **cache-aware sticky session routing**, which pins each Claude Code session to one account so a conversation
+> keeps hitting the same prompt cache instead of scattering its shared prefix across accounts. Also includes
+> load-aware account leases, byte-transparent streaming fixes, and a round of security hardening.
+> See [CHANGELOG.md](CHANGELOG.md) for the full list.
+
 ![CC-Router Dashboard](assets/dashboard.png)
 
 ### Features
