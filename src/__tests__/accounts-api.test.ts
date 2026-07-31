@@ -28,4 +28,33 @@ describe("createAccountsApi", () => {
       }),
     );
   });
+
+  it("reads the authenticated account safe view without retaining arbitrary response fields", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      accounts: [{
+        id: "max-1",
+        provider: "anthropic_subscription",
+        rateLimits: { usage: { modelLimits: [] } },
+        accessToken: "must-not-be-retained",
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+
+    const api = createAccountsApi("http://router.local", "secret");
+    const accounts = await api.list();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://router.local/cc-router/accounts",
+      expect.objectContaining({
+        method: "GET",
+        headers: { authorization: "Bearer secret" },
+        signal: expect.any(AbortSignal),
+      }),
+    );
+    expect(accounts).toEqual([{
+      id: "max-1",
+      provider: "anthropic_subscription",
+      rateLimits: { usage: { modelLimits: [] } },
+    }]);
+    expect(JSON.stringify(accounts)).not.toContain("must-not-be-retained");
+  });
 });

@@ -77,10 +77,53 @@ export interface HealthAccountView {
   expiresInMs: number;
   lastUsedMs: number;
   lastRefreshMs: number;
-  rateLimits?: AccountRateLimits;
+  rateLimits?: PublicAccountRateLimits;
   sessionLimitPercent?: number;
   weeklyLimitPercent?: number;
   cooldownUntilMs?: number;
+  globalCooldownUntilMs?: number;
+  modelCooldowns?: PublicModelCooldown[];
+}
+
+export interface PublicRateLimitWindow {
+  utilization: number;
+  resetAt: number;
+}
+
+export interface PublicModelRateLimit {
+  modelFamily: string;
+  displayName: string;
+  utilization: number;
+  resetAt: number;
+  active: boolean;
+  severity: "" | "warning" | "critical" | "unknown";
+}
+
+export interface PublicUsageSnapshot {
+  fiveHour?: PublicRateLimitWindow;
+  sevenDay?: PublicRateLimitWindow;
+  modelLimits: PublicModelRateLimit[];
+  extraUsage?: { enabled: boolean; spendLimitReached: boolean };
+  fetchedAt: number;
+  fetchStatus: "fresh" | "stale" | "unavailable";
+}
+
+export interface PublicAccountRateLimits {
+  status: "allowed" | "rate_limited" | "unknown";
+  fiveHourUtil: number;
+  fiveHourReset: number;
+  sevenDayUtil: number;
+  sevenDayReset: number;
+  claim: string;
+  plan: string;
+  requestsLimit: number;
+  lastUpdated: number;
+  usage?: PublicUsageSnapshot;
+}
+
+export interface PublicModelCooldown {
+  modelFamily: string;
+  untilMs: number;
 }
 
 export interface AccountRoutingMetrics {
@@ -88,6 +131,8 @@ export interface AccountRoutingMetrics {
   activeSessions: number;
   coolingDown: boolean;
   cooldownUntilMs?: number;
+  globalCooldownUntilMs?: number;
+  modelCooldowns?: PublicModelCooldown[];
 }
 
 type RoutingMetricsResolver = (accountId: string) => AccountRoutingMetrics;
@@ -204,6 +249,8 @@ function publicAnthropicAccountView(
     healthy: a.enabled !== false && a.healthy,
     busy: a.busy || metrics.coolingDown,
     cooldownUntilMs: metrics.cooldownUntilMs ?? 0,
+    globalCooldownUntilMs: metrics.globalCooldownUntilMs ?? 0,
+    modelCooldowns: publicModelCooldowns(metrics.modelCooldowns),
     inFlightRequests: metrics.inFlightRequests,
     activeSessions: metrics.activeSessions,
     requestCount: a.requestCount,
@@ -211,11 +258,87 @@ function publicAnthropicAccountView(
     expiresInMs: a.tokens.expiresAt - Date.now(),
     lastUsedMs: a.lastUsed,
     lastRefreshMs: a.lastRefresh,
-    rateLimits: {
-      ...a.rateLimits,
-      claim: publicRepresentativeClaim(a.rateLimits.claim),
-    },
+    rateLimits: publicRateLimits(a.rateLimits),
   };
+}
+
+function publicRateLimits(rateLimits: AccountRateLimits): PublicAccountRateLimits {
+  return {
+    status: rateLimits.status,
+    fiveHourUtil: publicUtilization(rateLimits.fiveHourUtil),
+    fiveHourReset: publicTimestamp(rateLimits.fiveHourReset),
+    sevenDayUtil: publicUtilization(rateLimits.sevenDayUtil),
+    sevenDayReset: publicTimestamp(rateLimits.sevenDayReset),
+    claim: publicRepresentativeClaim(rateLimits.claim),
+    plan: publicPlan(rateLimits.plan),
+    requestsLimit: publicNonNegativeInteger(rateLimits.requestsLimit),
+    lastUpdated: publicTimestamp(rateLimits.lastUpdated),
+    ...(rateLimits.usage ? { usage: publicUsageSnapshot(rateLimits.usage) } : {}),
+  };
+}
+
+function publicUsageSnapshot(usage: NonNullable<AccountRateLimits["usage"]>): PublicUsageSnapshot {
+  return {
+    ...(usage.fiveHour ? { fiveHour: publicWindow(usage.fiveHour) } : {}),
+    ...(usage.sevenDay ? { sevenDay: publicWindow(usage.sevenDay) } : {}),
+    modelLimits: usage.modelLimits.slice(0, 12).map(limit => ({
+      modelFamily: publicModelFamily(limit.modelFamily),
+      displayName: publicDisplayName(limit.displayName),
+      utilization: publicUtilization(limit.utilization),
+      resetAt: publicTimestamp(limit.resetAt),
+      active: limit.active === true,
+      severity: publicSeverity(limit.severity),
+    })),
+    ...(usage.extraUsage ? {
+      extraUsage: {
+        enabled: usage.extraUsage.enabled === true,
+        spendLimitReached: usage.extraUsage.spendLimitReached === true,
+      },
+    } : {}),
+    fetchedAt: publicTimestamp(usage.fetchedAt),
+    fetchStatus: usage.fetchStatus,
+  };
+}
+
+function publicWindow(window: { utilization: number; resetAt: number }): PublicRateLimitWindow {
+  return { utilization: publicUtilization(window.utilization), resetAt: publicTimestamp(window.resetAt) };
+}
+
+function publicModelCooldowns(cooldowns: PublicModelCooldown[] | undefined): PublicModelCooldown[] {
+  return (cooldowns ?? []).slice(0, 12).map(cooldown => ({
+    modelFamily: publicModelFamily(cooldown.modelFamily),
+    untilMs: publicTimestamp(cooldown.untilMs),
+  })).filter(cooldown => cooldown.untilMs > 0);
+}
+
+function publicUtilization(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+}
+
+function publicTimestamp(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function publicNonNegativeInteger(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function publicModelFamily(value: unknown): string {
+  return typeof value === "string" && /^[a-z0-9-]{1,64}$/.test(value) ? value : "unknown";
+}
+
+function publicDisplayName(value: unknown): string {
+  if (typeof value !== "string") return "Unknown model";
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 80);
+  return normalized || "Unknown model";
+}
+
+function publicSeverity(value: unknown): PublicModelRateLimit["severity"] {
+  return value === "warning" || value === "critical" ? value : value ? "unknown" : "";
+}
+
+function publicPlan(value: unknown): string {
+  return value === "Pro" || value === "Max 5x" || value === "Max 20x" ? value : "";
 }
 
 function publicRepresentativeClaim(claim: unknown): string {
@@ -347,12 +470,17 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const sessionRouter = new SessionRouter(pool);
   const createRoutingMetricsResolver = (): RoutingMetricsResolver => {
     const activeSessionCounts = sessionRouter.getActiveSessionCountsSnapshot();
-    return accountId => ({
-      inFlightRequests: pool.getInFlight(accountId),
-      activeSessions: activeSessionCounts.get(accountId) ?? 0,
-      coolingDown: pool.isCoolingDown(accountId),
-      cooldownUntilMs: pool.getEarliestCooldownUntil(accountId),
-    });
+    return accountId => {
+      const cooldowns = pool.getCooldownSummary(accountId);
+      return {
+        inFlightRequests: pool.getInFlight(accountId),
+        activeSessions: activeSessionCounts.get(accountId) ?? 0,
+        coolingDown: pool.isCoolingDown(accountId),
+        cooldownUntilMs: pool.getEarliestCooldownUntil(accountId),
+        globalCooldownUntilMs: cooldowns.globalUntilMs,
+        modelCooldowns: cooldowns.modelCooldowns,
+      };
+    };
   };
   const pickOpenAIAccount = createOpenAIAccountPicker(openAIAccounts);
   const initialConfig = readConfig();
@@ -827,7 +955,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           const retryAfter = cooldownSeconds ?? 60;
           pendingLog.type = "error";
           pendingLog.details = route
-            ? routeFailureDetails(route, "rate-limited")
+            ? routeFailureDetails(route, "rate-limited", failureRouting?.limitingScope)
             : "rate-limited";
           logError(account.id, 429, `Rate limited — cooldown ${retryAfter}s`);
           // Refresh in the background to narrow only ambiguity-owned global

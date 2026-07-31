@@ -22,6 +22,25 @@ interface AccountRateLimitsView {
   plan: string;
   requestsLimit: number;
   lastUpdated: number;
+  usage?: AccountUsageView;
+}
+
+interface AccountUsageView {
+  fiveHour?: { utilization: number; resetAt: number };
+  sevenDay?: { utilization: number; resetAt: number };
+  modelLimits: AccountModelLimitView[];
+  extraUsage?: { enabled: boolean; spendLimitReached: boolean };
+  fetchedAt: number;
+  fetchStatus: "fresh" | "stale" | "unavailable";
+}
+
+interface AccountModelLimitView {
+  modelFamily: string;
+  displayName: string;
+  utilization: number;
+  resetAt: number;
+  active: boolean;
+  severity: "" | "warning" | "critical" | "unknown";
 }
 
 interface AccountStat {
@@ -40,6 +59,8 @@ interface AccountStat {
   enabled?: boolean;
   sessionLimitPercent?: number;
   weeklyLimitPercent?: number;
+  globalCooldownUntilMs?: number;
+  modelCooldowns?: Array<{ modelFamily: string; untilMs: number }>;
 }
 
 const EMPTY_RL: AccountRateLimitsView = {
@@ -47,6 +68,67 @@ const EMPTY_RL: AccountRateLimitsView = {
   sevenDayUtil: 0, sevenDayReset: 0, claim: "", plan: "",
   requestsLimit: 0, lastUpdated: 0,
 };
+
+export interface AccountCapacityRow {
+  label: string;
+  state: string;
+  color: "green" | "yellow" | "red" | "gray";
+  utilization?: number;
+  resetAt?: number;
+}
+
+/** Turn the safe account payload into compact dynamic model/cooldown rows. */
+export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" | "globalCooldownUntilMs" | "modelCooldowns">): AccountCapacityRow[] {
+  const usage = account.rateLimits?.usage;
+  const modelCooldowns = account.modelCooldowns ?? [];
+  const rows: AccountCapacityRow[] = [];
+  const matchedCooldowns = new Set<string>();
+  if (usage?.modelLimits.length) {
+    const paidExtraAvailable = usage.extraUsage?.enabled === true && usage.extraUsage.spendLimitReached === false;
+    for (const limit of usage.modelLimits) {
+      const requestedCooldown = modelCooldowns.find(cooldown => cooldown.modelFamily === limit.modelFamily);
+      if (requestedCooldown) matchedCooldowns.add(requestedCooldown.modelFamily);
+      const exhausted = limit.utilization >= 1;
+      const state = !limit.active
+        ? "inactive"
+        : requestedCooldown && exhausted && paidExtraAvailable
+          ? "paid extra active · requested-model cooldown"
+          : requestedCooldown
+            ? "requested-model cooldown"
+            : exhausted && paidExtraAvailable
+              ? "paid extra active"
+              : exhausted
+                ? "exhausted"
+                : "included available";
+      const color: AccountCapacityRow["color"] = !limit.active ? "gray"
+        : requestedCooldown ? "yellow"
+          : exhausted && paidExtraAvailable ? "yellow"
+            : exhausted || limit.severity === "critical" ? "red"
+              : limit.severity === "warning" || limit.utilization >= 0.7 ? "yellow"
+                : "green";
+      rows.push({
+        label: limit.displayName,
+        state,
+        color,
+        utilization: limit.utilization,
+        resetAt: limit.resetAt,
+      });
+    }
+  }
+  for (const cooldown of modelCooldowns) {
+    if (matchedCooldowns.has(cooldown.modelFamily) || cooldown.untilMs <= Date.now()) continue;
+    rows.push({
+      label: `cooldown ${cooldown.modelFamily}`,
+      state: "requested-model cooldown",
+      color: "yellow",
+      resetAt: Math.floor(cooldown.untilMs / 1_000),
+    });
+  }
+  if (account.globalCooldownUntilMs && account.globalCooldownUntilMs > Date.now()) {
+    rows.push({ label: "cooldown", state: "global", color: "red", resetAt: Math.floor(account.globalCooldownUntilMs / 1_000) });
+  }
+  return rows;
+}
 
 interface HealthData {
   status: "ok" | "degraded";
@@ -835,6 +917,8 @@ function ProviderBadge({
 
 function AccountRow({ account: a, selected }: { account: AccountStat; selected: boolean }) {
   const rl = a.rateLimits ?? EMPTY_RL;
+  const usage = rl.usage;
+  const capacityRows = getAccountCapacityRows(a);
   const isLimited = rl.status === "rate_limited";
   const isDisabled = a.enabled === false;
 
@@ -885,13 +969,36 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
         )}
         {capsHint && <Text color="yellow">{capsHint}</Text>}
       </Box>
-      {rl.lastUpdated > 0 && (
+      {(rl.lastUpdated > 0 || usage) && (
         <Box paddingLeft={4}>
-          <UtilBar label="5h" util={rl.fiveHourUtil} resetTs={rl.fiveHourReset} isActive={rl.claim === "five_hour"} cap={s5} />
+          <UtilBar
+            label="5h"
+            util={usage?.fiveHour?.utilization ?? rl.fiveHourUtil}
+            resetTs={usage?.fiveHour?.resetAt ?? rl.fiveHourReset}
+            isActive={rl.claim === "five_hour"}
+            cap={s5}
+          />
           <Text>   </Text>
-          <UtilBar label="7d" util={rl.sevenDayUtil} resetTs={rl.sevenDayReset} isActive={rl.claim === "seven_day"} cap={w7} />
+          <UtilBar
+            label="7d all-model"
+            util={usage?.sevenDay?.utilization ?? rl.sevenDayUtil}
+            resetTs={usage?.sevenDay?.resetAt ?? rl.sevenDayReset}
+            isActive={rl.claim === "seven_day"}
+            cap={w7}
+          />
+          {usage && <Text color={usage.fetchStatus === "fresh" ? "gray" : "yellow"}>
+            {`  usage ${usage.fetchStatus} ${usage.fetchedAt > 0 ? formatAgo(usage.fetchedAt) : ""}`}
+          </Text>}
         </Box>
       )}
+      {capacityRows.map((row, index) => (
+        <Box key={`${row.label}-${index}`} paddingLeft={4}>
+          <Text color={row.color}> {row.label}</Text>
+          <Text color="gray"> · {row.state}</Text>
+          {row.utilization !== undefined && <Text color={row.color}>{` ${Math.round(row.utilization * 100)}%`}</Text>}
+          {row.resetAt && <Text color="gray"> {`↻${formatResetIn(row.resetAt)}`}</Text>}
+        </Box>
+      ))}
     </Box>
   );
 }

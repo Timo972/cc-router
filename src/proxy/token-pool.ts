@@ -44,6 +44,12 @@ interface AccountCooldowns {
   pendingAmbiguous: Map<number, { until: number; modelFamily?: string }>;
 }
 
+/** Compact diagnostic state for authenticated account status views. */
+export interface AccountCooldownSummary {
+  globalUntilMs: number;
+  modelCooldowns: Array<{ modelFamily: string; untilMs: number }>;
+}
+
 /**
  * Returns the reset timestamp (seconds) that must pass before the account
  * stops being rate_limited. Prefers the `claim` window (the one Anthropic
@@ -339,6 +345,28 @@ export class TokenPool {
   getEarliestCooldownUntil(accountId: string): number {
     const account = this.findById(accountId);
     return account ? this.earliestCooldownUntil(account) : 0;
+  }
+
+  /**
+   * Return only aggregate, normalized cooldown scopes. Session bindings and
+   * ambiguity tokens deliberately remain internal to the router.
+   */
+  getCooldownSummary(accountId: string): AccountCooldownSummary {
+    const account = this.findById(accountId);
+    if (!account) return { globalUntilMs: 0, modelCooldowns: [] };
+    const state = this.cooldowns.get(account);
+    if (!state) return { globalUntilMs: 0, modelCooldowns: [] };
+    this.clearExpiredCooldownState(account, state);
+    const current = this.cooldowns.get(account);
+    if (!current) return { globalUntilMs: 0, modelCooldowns: [] };
+    return {
+      globalUntilMs: current.globalUntil,
+      modelCooldowns: [...current.modelUntil]
+        .filter(([, untilMs]) => untilMs > 0)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .slice(0, 12)
+        .map(([modelFamily, untilMs]) => ({ modelFamily, untilMs })),
+    };
   }
 
   private hardBlock(account: Account, context?: RouteContext): HardBlock | null {

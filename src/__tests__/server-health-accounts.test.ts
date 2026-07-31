@@ -127,6 +127,73 @@ describe("createHealthAccountViews", () => {
     expect(account.rateLimits.claim).toBe("private-future-claim-with-customer-data");
     expect(JSON.stringify(view)).not.toContain("customer-data");
   });
+
+  it("exposes bounded normalized usage and cooldown summaries without OAuth or raw claims", () => {
+    const account = makeAnthropicAccount();
+    account.rateLimits.claim = "seven_day_private-customer-claim";
+    account.rateLimits.usage = {
+      fiveHour: { utilization: 0.25, resetAt: 1_735_689_600 },
+      sevenDay: { utilization: 0.4, resetAt: 1_735_776_000 },
+      modelLimits: [{
+        kind: "weekly_scoped",
+        group: "weekly",
+        modelId: "claude-future-private-model",
+        modelFamily: "future-model",
+        displayName: "Claude Future",
+        utilization: 0.9,
+        resetAt: 1_735_862_400,
+        active: true,
+        severity: "warning",
+      }],
+      extraUsage: {
+        enabled: true,
+        spendLimitReached: false,
+        disabledReason: "internal-upstream-detail",
+        usedMinor: 42,
+        limitMinor: 100,
+        currency: "USD",
+      },
+      fetchedAt: 1_735_600_000_000,
+      fetchStatus: "fresh",
+    };
+
+    const [view] = createHealthAccountViews([account], [], () => ({
+      inFlightRequests: 0,
+      activeSessions: 0,
+      coolingDown: true,
+      cooldownUntilMs: 1_735_600_010_000,
+      globalCooldownUntilMs: 1_735_600_010_000,
+      modelCooldowns: [{ modelFamily: "future-model", untilMs: 1_735_600_020_000 }],
+    }));
+
+    expect(view.rateLimits).toMatchObject({
+      claim: "seven_day_model",
+      usage: {
+        fiveHour: { utilization: 0.25, resetAt: 1_735_689_600 },
+        sevenDay: { utilization: 0.4, resetAt: 1_735_776_000 },
+        modelLimits: [{
+          displayName: "Claude Future",
+          modelFamily: "future-model",
+          utilization: 0.9,
+          resetAt: 1_735_862_400,
+          active: true,
+          severity: "warning",
+        }],
+        extraUsage: { enabled: true, spendLimitReached: false },
+        fetchedAt: 1_735_600_000_000,
+        fetchStatus: "fresh",
+      },
+    });
+    expect(view).toMatchObject({
+      globalCooldownUntilMs: 1_735_600_010_000,
+      modelCooldowns: [{ modelFamily: "future-model", untilMs: 1_735_600_020_000 }],
+    });
+    const serialized = JSON.stringify(view);
+    for (const forbidden of [
+      "ant-access", "ant-refresh", "claude-future-private-model",
+      "internal-upstream-detail", "usedMinor", "currency",
+    ]) expect(serialized).not.toContain(forbidden);
+  });
 });
 
 describe("applyRateLimitHeaders", () => {

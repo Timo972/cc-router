@@ -89,8 +89,9 @@ export type RouteFailureReason =
 export function routeFailureDetails(
   route: RouteSummary,
   failure: RouteFailureReason,
+  limitingScope?: "global" | `model:${string}`,
 ): string {
-  return `${routeReasonDetails(route)}:${failure}`;
+  return `${routeReasonDetails(route)}:${failure}${limitingScope ? `:${limitingScope}` : ""}`;
 }
 
 /** Acquire and immediately bind a routed lease to its response lifecycle. */
@@ -299,6 +300,8 @@ export function reconcileAmbiguousRateLimitCooldown<TAccount extends FailureAcco
 export interface AppliedFailureRouting {
   readonly cooldownSeconds?: number;
   readonly ambiguousCooldownToken?: number;
+  /** Bounded scope suitable for a diagnostic log, never an upstream claim. */
+  readonly limitingScope?: "global" | `model:${string}`;
 }
 
 /**
@@ -345,6 +348,11 @@ export function applyUpstreamFailureRoutingDetailed<TAccount extends FailureAcco
     return {
       cooldownSeconds: durationMs / 1_000,
       ...(ambiguousCooldownToken === undefined ? {} : { ambiguousCooldownToken }),
+      ...(classification.ambiguous
+        ? {}
+        : { limitingScope: classification.kind === "model" && classification.modelFamily
+          ? `model:${classification.modelFamily}` as const
+          : "global" as const }),
     };
   }
   if (status === 529) {

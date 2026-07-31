@@ -187,6 +187,22 @@ describe("applyUpstreamFailureRouting", () => {
     expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 12_500);
   });
 
+  it("returns a normalized model limiting scope for safe 429 activity logs", () => {
+    const applied = applyUpstreamFailureRoutingDetailed(
+      429,
+      {
+        "retry-after": "60",
+        "anthropic-ratelimit-unified-representative-claim": "seven_day_fable",
+      },
+      { ...route, modelFamily: "fable" },
+      { invalidate: vi.fn() },
+      cooldowns(),
+      () => 1_000,
+    );
+
+    expect(applied.limitingScope).toBe("model:fable");
+  });
+
   it.each([
     undefined,
     "",
