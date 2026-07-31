@@ -6,6 +6,38 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Model-aware Anthropic allowance routing.** Requested Messages models now
+  participate in account eligibility and headroom ranking through dynamic
+  model-scoped weekly limits. Account-based session affinity is retained while
+  the bound account can serve the requested model.
+- Authenticated dashboard, health, and accounts views now show safe global and
+  model-scoped capacity, usage freshness, paid-extra state, and global or
+  requested-model cooldown summaries.
+
+### Changed
+
+- Anthropic cooldowns, upstream quota exhaustion, disabled or unhealthy state,
+  and invalid authentication are hard routing exclusions. The only fallback is
+  an explicit bypass of configured per-account percentage caps when every
+  otherwise eligible account is capped.
+- Usage snapshots refresh in memory from Anthropic's internal OAuth usage
+  endpoint with bounded concurrency, timeout, and backoff, while response
+  headers remain the graceful-degradation source when that endpoint is
+  unavailable.
+
+### Fixed
+
+- When all accounts are hard-blocked, the router now returns a local
+  Anthropic-shaped 429 with the earliest trustworthy `Retry-After` (or a 503
+  without a retry time) and makes no Anthropic Messages request. Fallback no
+  longer sends requests to cooling or upstream-rate-limited accounts.
+
+---
+
 ## [0.7.0] — 2026-07-26
 
 First release of `@timo972/cc-router`, an independently maintained fork of

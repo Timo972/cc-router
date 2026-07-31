@@ -22,7 +22,7 @@ Distribute Claude Code requests across Claude subscriptions, and expose an OpenA
 - **Transparent Claude proxy** — Claude Code works normally; streaming, thinking, tool use, prompt caching all pass through
 - **Codex CLI support** — configure Codex to use CC-Router as a Responses-compatible provider
 - **Automatic token refresh** — OAuth tokens are refreshed before they expire, saved atomically to disk
-- **Rate limit awareness** — detects 429/529 responses and coolsdown accounts; picks the least-loaded one
+- **Model-aware rate limits** — avoids accounts whose requested-model or global allowance is exhausted, and respects scoped cooldowns
 - **Client mode** — connect to a remote CC-Router from any machine with one command (`cc-router client connect <url>`)
 - **Claude Desktop support** — route Cowork / Agent-mode traffic through CC-Router via mitmproxy interception (macOS, Windows, Linux)
 - **Guided setup wizard** — interactive `cc-router setup` extracts tokens from Keychain or credentials file, configures everything
@@ -71,9 +71,11 @@ All standard Claude Code features work transparently on the Claude route: stream
 
 ### Cache-aware Claude account routing
 
-CC-Router keeps requests from one Claude Code session on the same healthy Anthropic subscription account. This session affinity preserves prompt-cache locality instead of scattering a conversation's shared prefix across account-specific caches. New sessions prefer the account with the fewest in-flight requests, then the fewest bound sessions, then the most rate-limit headroom; exact ties use a rotating round-robin order.
+CC-Router keeps requests from one Claude Code session on the same eligible Anthropic subscription account. This session affinity remains account-based and preserves prompt-cache locality instead of scattering a conversation's shared prefix across account-specific caches. The model requested by each Messages call affects whether the bound account is still eligible; changing models does not create a second binding, but it can make the existing binding fail over when that account cannot serve the new model. New sessions prefer the account with the fewest in-flight requests, then the fewest bound sessions, then included allowance over paid extra usage, then the most applicable global and requested-model headroom; exact ties use a rotating round-robin order.
 
-If an upstream account returns 401, 429, or 529, CC-Router passes that response through unchanged and invalidates the session's affinity. The client's next retry can then select another usable account; the router never retries after response bytes have started. Affinity mappings exist only in process memory, expire after one hour of inactivity, and are capped in size. Session IDs are never persisted or logged.
+Anthropic cooldowns, effective global or requested-model quota exhaustion, disabled accounts, invalid authentication, and unhealthy accounts are hard exclusions. The configured per-account percentage caps are softer policy controls: when at least one account is otherwise usable but every usable account is over a configured cap, CC-Router may explicitly fall back to the least-loaded capped account. It never uses that fallback to bypass an Anthropic cooldown or exhausted effective quota.
+
+If an upstream account returns 401, 429, or 529, CC-Router passes that response through unchanged and invalidates the session's affinity. The client's next retry can then select another usable account; the router never retries after response bytes have started. If no account is usable before forwarding begins, the router instead returns a local Anthropic-shaped 429 with `Retry-After` set to the earliest trustworthy reset or cooldown, or a local 503 when no retry time is known. That local response makes no Anthropic Messages request. Affinity mappings exist only in process memory, expire after one hour of inactivity, and are capped in size. Session IDs are never persisted or logged.
 
 Streaming remains byte-transparent. In particular, CC-Router never appends a synthetic `message_stop` event. `proxyRequestTimeoutMs` protects only the phase before Anthropic response headers arrive; once a response starts, its body continues through the native byte-exact proxy pipe. Automatic `cc-router configure` setup manages Claude Code's event-level and byte-level stream idle watchdogs at 30 minutes. Restart any existing Claude Code process after configuration so it inherits those values.
 
@@ -615,7 +617,7 @@ cc-router status
 
 Press `q` to quit. Run with `--json` for non-interactive output; the JSON includes an `operational` block with capabilities, endpoints, provider readiness, auth status, and model routing. Secrets and account tokens are never included.
 
-The dashboard is also a control surface. In local mode it controls the local proxy; in client mode it controls the remote CC-Router configured by `cc-router client connect`.
+The dashboard is also a control surface. In local mode it controls the local proxy; in client mode it controls the remote CC-Router configured by `cc-router client connect`. Authenticated account views include dynamic model-scoped allowance rows, their reset times, applicable global or requested-model cooldowns, paid-extra state, and whether the usage snapshot is fresh, stale, or unavailable. A stale row is shown as unknown rather than as authoritative available capacity.
 
 | Key | Action |
 |-----|--------|

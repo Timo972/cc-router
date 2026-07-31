@@ -58,15 +58,43 @@ cc-router setup --add
 
 ## 429 Rate limit errors
 
-The account is hitting Anthropic's rate limits. cc-router puts the account on cooldown for the `Retry-After` period automatically.
+Do not assume every 429 is a short requests-per-minute throttle. Anthropic can
+exhaust a model-scoped weekly allowance while the account's overall weekly
+utilisation is still below 100%. For example, an account can show 67% overall
+weekly use while the requested model family is already at 100%.
+
+Inspect the authenticated dashboard or `cc-router status --json`. Find the
+requested model's capacity row, its snapshot freshness, and the earliest reset
+or cooldown. The row distinguishes included allowance, paid-extra use, an
+applicable requested-model cooldown, and stale or unavailable usage data.
+
+When Anthropic returns a 429, cc-router passes it through unchanged, records a
+global or unambiguous requested-model cooldown, invalidates that session's
+binding, and lets the client's next retry choose another usable account. It
+does not retry a started request itself.
+
+When all configured accounts are already hard-blocked, cc-router does not call
+Anthropic. It returns a local Anthropic-shaped 429 and sets `Retry-After` to the
+earliest trustworthy reset or cooldown. Wait for that time or make another
+account with allowance available. If recent activity shows
+`no-eligible:rate-limited`, the 429 was generated locally; an original upstream
+429 remains byte-transparent.
+
+If usage is marked stale or unavailable, the internal Anthropic OAuth usage
+endpoint could not be refreshed. The router keeps conservative stale exhaustion
+evidence until reset and otherwise falls back to global response-header state;
+it does not treat stale paid-extra state as spend authorization. Repeated
+refresh failures back off automatically.
 
 If it happens frequently with a single account, add more accounts:
 ```bash
 cc-router setup --add
 ```
 
-Before adding accounts, check that per-account caps aren't taking accounts out of
-rotation while budget remains — see [per-account throttles](session-routing.md#per-account-throttles).
+Configured per-account caps are soft and may be bypassed only when every
+otherwise usable account is capped. They do not bypass upstream cooldowns or
+effective quota exhaustion. See [session routing](session-routing.md#upstream-allowance-and-cooldowns)
+for the complete distinction.
 
 ---
 
