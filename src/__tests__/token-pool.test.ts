@@ -385,6 +385,26 @@ describe("TokenPool — model-aware hard eligibility", () => {
     expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
   });
 
+  it("keeps fresh extra usage authoritative after newer response headers", () => {
+    const a = makeAccount("a");
+    a.rateLimits = {
+      ...DEFAULT_RATE_LIMITS,
+      fiveHourUtil: 1,
+      fiveHourReset: futureReset,
+      lastUpdated: 200,
+      usage: {
+        fiveHour: { utilization: 0.5, resetAt: futureReset },
+        modelLimits: [],
+        extraUsage: { enabled: true, spendLimitReached: false },
+        fetchedAt: 100,
+        fetchStatus: "fresh",
+      },
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
+  });
+
   it.each([
     ["reached", { enabled: true, spendLimitReached: true }],
     ["disabled", { enabled: false, spendLimitReached: false }],
@@ -656,6 +676,21 @@ describe("TokenPool — requested-model headroom ranking", () => {
     const pool = new TokenPool([a, b], { now: () => nowMs });
 
     expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account).toBe(b);
+  });
+
+  it("normalizes global headroom by each configured user cap", () => {
+    const lowerRawUtilization = makeAccount("lower-raw");
+    lowerRawUtilization.sessionLimitPercent = 50;
+    lowerRawUtilization.rateLimits.fiveHourUtil = 0.4;
+    const greaterEffectiveHeadroom = makeAccount("greater-headroom");
+    greaterEffectiveHeadroom.sessionLimitPercent = 100;
+    greaterEffectiveHeadroom.rateLimits.fiveHourUtil = 0.6;
+    const pool = new TokenPool(
+      [lowerRawUtilization, greaterEffectiveHeadroom],
+      { now: () => nowMs },
+    );
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account).toBe(greaterEffectiveHeadroom);
   });
 
   it("ranks paid extra usage behind equal-load accounts with included quota", () => {

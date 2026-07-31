@@ -345,9 +345,7 @@ export class TokenPool {
 
   private canUsePaidExtra(account: Account): boolean {
     const usage = account.rateLimits.usage;
-    return usage?.fetchStatus === "fresh" &&
-      usage.fetchedAt >= account.rateLimits.lastUpdated &&
-      canUseExtraUsage(usage.extraUsage);
+    return usage?.fetchStatus === "fresh" && canUseExtraUsage(usage.extraUsage);
   }
 
   private usesPaidExtra(account: Account, context?: RouteContext): boolean {
@@ -393,8 +391,19 @@ export class TokenPool {
   }
 
   private headroomScore(account: Account, context?: RouteContext): number {
-    const windows = [...this.globalWindows(account), ...this.matchingModelWindows(account, context)];
-    return Math.max(0, ...windows.map(window => window.utilization));
+    const [fiveHour, sevenDay] = this.globalWindows(account);
+    const modelUtilization = this.matchingModelWindows(account, context)
+      .map(window => window.utilization);
+    return Math.max(
+      this.capNormalizedUtilization(fiveHour.utilization, account.sessionLimitPercent),
+      this.capNormalizedUtilization(sevenDay.utilization, account.weeklyLimitPercent),
+      ...modelUtilization,
+    );
+  }
+
+  private capNormalizedUtilization(utilization: number, capPercent: number): number {
+    const cap = Number.isFinite(capPercent) ? Math.max(0, capPercent / 100) : 1;
+    return cap === 0 ? Number.POSITIVE_INFINITY : utilization / cap;
   }
 
   private circularDistance(account: Account): number {

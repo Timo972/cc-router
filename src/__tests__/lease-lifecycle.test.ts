@@ -114,9 +114,9 @@ describe("routeReasonDetails", () => {
     expect(route.release).toHaveBeenCalledTimes(1);
   });
 
-  it("marks emergency fallback in bounded route details without exposing the session", () => {
+  it("marks user-cap fallback in bounded route details without exposing the session", () => {
     const account = makeAccount("account-a");
-    account.enabled = false;
+    account.sessionLimitPercent = 0;
     const router = new SessionRouter(new TokenPool([account]));
     const route = router.acquire("private-fallback-session");
 
@@ -132,7 +132,7 @@ describe("routeReasonDetails", () => {
     "retains fallback routing details after a %s failure without exposing the session",
     (failure) => {
       const account = makeAccount("account-a");
-      account.healthy = false;
+      account.sessionLimitPercent = 0;
       const router = new SessionRouter(new TokenPool([account]));
       const route = router.acquire("private-fallback-session");
 
