@@ -889,4 +889,3 @@ git commit -m "docs: explain model-aware rate-limit routing"
 - Dashboard/API users can see the model-scoped limit that explains a 429.
 - The router continues to function from response-header state when the internal
   OAuth usage endpoint is unavailable.
-
