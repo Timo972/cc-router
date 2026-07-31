@@ -42,7 +42,7 @@ export interface AccountSafeView {
         active: boolean;
         severity: Severity;
       }>;
-      extraUsage?: { enabled: boolean; spendLimitReached: boolean };
+      extraUsage?: { enabled: boolean; spendLimitReached: boolean; usable: boolean };
       fetchedAt: number;
       fetchStatus: FetchStatus;
     };
@@ -140,7 +140,11 @@ function publicUsage(value: unknown): NonNullable<AccountSafeView["rateLimits"]>
   const fiveHour = publicWindow(value.fiveHour);
   const sevenDay = publicWindow(value.sevenDay);
   const extraUsage = isRecord(value.extraUsage)
-    ? { enabled: value.extraUsage.enabled === true, spendLimitReached: value.extraUsage.spendLimitReached === true }
+    ? {
+        enabled: value.extraUsage.enabled === true,
+        spendLimitReached: value.extraUsage.spendLimitReached === true,
+        usable: value.extraUsage.usable === true,
+      }
     : undefined;
   return {
     ...(fiveHour ? { fiveHour } : {}),

@@ -169,6 +169,36 @@ describe("production Anthropic routing middleware", () => {
     }
   });
 
+  it("omits Retry-After when an exhausted header reset is beyond the trust horizon", async () => {
+    const now = 1_000_000;
+    const account = makeAccount("far-future-reset");
+    account.rateLimits.fiveHourUtil = 1;
+    account.rateLimits.fiveHourReset = now / 1_000 + 8 * 24 * 60 * 60 + 2;
+    const pool = new TokenPool([account], { now: () => now });
+    const sessionRouter = new SessionRouter(pool, { now: () => now });
+    const forwarded = vi.fn();
+    const app = express();
+    app.use(createAnthropicRoutingMiddleware({ sessionRouter, now: () => now }));
+    app.use((_req, res) => {
+      forwarded();
+      res.end("forwarded");
+    });
+    const server = createServer(app);
+    const port = await listen(server);
+
+    try {
+      const response = await send({ host: "127.0.0.1", port, path: "/v1/messages" });
+
+      expect(response.status).toBe(429);
+      expect(response.headers["retry-after"]).toBeUndefined();
+      expect(JSON.parse(response.body).error.type).toBe("rate_limit_error");
+      expect(forwarded).not.toHaveBeenCalled();
+      expect(sessionRouter.getBindingCount()).toBe(0);
+    } finally {
+      await close(server);
+    }
+  });
+
   it("returns a local 503 when all accounts are unavailable without a retry time", async () => {
     const accounts = [makeAccount("disabled"), makeAccount("unhealthy")];
     accounts[0].enabled = false;

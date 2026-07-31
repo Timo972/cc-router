@@ -29,6 +29,7 @@ import { SessionRouter } from "./session-router.js";
 import type { RoutedAccountLease } from "./session-router.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
+import { canUseExtraUsage } from "../providers/anthropic/usage.js";
 import {
   applyUpstreamFailureRoutingDetailed,
   reconcileAmbiguousRateLimitCooldown,
@@ -103,7 +104,7 @@ export interface PublicUsageSnapshot {
   fiveHour?: PublicRateLimitWindow;
   sevenDay?: PublicRateLimitWindow;
   modelLimits: PublicModelRateLimit[];
-  extraUsage?: { enabled: boolean; spendLimitReached: boolean };
+  extraUsage?: { enabled: boolean; spendLimitReached: boolean; usable: boolean };
   fetchedAt: number;
   fetchStatus: "fresh" | "stale" | "unavailable";
 }
@@ -293,6 +294,7 @@ function publicUsageSnapshot(usage: NonNullable<AccountRateLimits["usage"]>): Pu
       extraUsage: {
         enabled: usage.extraUsage.enabled === true,
         spendLimitReached: usage.extraUsage.spendLimitReached === true,
+        usable: usage.fetchStatus === "fresh" && canUseExtraUsage(usage.extraUsage),
       },
     } : {}),
     fetchedAt: publicTimestamp(usage.fetchedAt),

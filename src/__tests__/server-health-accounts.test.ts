@@ -179,7 +179,7 @@ describe("createHealthAccountViews", () => {
           active: true,
           severity: "warning",
         }],
-        extraUsage: { enabled: true, spendLimitReached: false },
+        extraUsage: { enabled: true, spendLimitReached: false, usable: false },
         fetchedAt: 1_735_600_000_000,
         fetchStatus: "fresh",
       },

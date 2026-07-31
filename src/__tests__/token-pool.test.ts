@@ -733,6 +733,49 @@ describe("TokenPool — hard versus soft fallback", () => {
     expect(() => pool.acquireBest(new Map(), SONNET_CONTEXT)).toThrow(NoEligibleAccountError);
   });
 
+  it("does not trust a far-future OAuth usage reset for local retry timing", () => {
+    const a = makeAccount("snapshot-far-future");
+    a.rateLimits.usage = {
+      fiveHour: {
+        utilization: 1,
+        resetAt: nowMs / 1_000 + 8 * 24 * 60 * 60 + 2,
+      },
+      modelLimits: [],
+      fetchedAt: 1,
+      fetchStatus: "fresh",
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    let thrown: unknown;
+    try {
+      pool.acquireBest(new Map(), SONNET_CONTEXT);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(NoEligibleAccountError);
+    expect(thrown).toMatchObject({ reason: "rate_limited" });
+    expect((thrown as NoEligibleAccountError).retryAtMs).toBeUndefined();
+  });
+
+  it("does not trust a far-future legacy header reset for local retry timing", () => {
+    const a = makeAccount("header-far-future");
+    a.rateLimits.fiveHourUtil = 1;
+    a.rateLimits.fiveHourReset = nowMs / 1_000 + 8 * 24 * 60 * 60 + 2;
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    let thrown: unknown;
+    try {
+      pool.acquireBest(new Map(), SONNET_CONTEXT);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(NoEligibleAccountError);
+    expect(thrown).toMatchObject({ reason: "rate_limited" });
+    expect((thrown as NoEligibleAccountError).retryAtMs).toBeUndefined();
+  });
+
   it("returns the earliest applicable unblock time when all accounts are hard-blocked", () => {
     const quotaBlocked = makeAccount("quota-blocked");
     quotaBlocked.rateLimits.usage = {

@@ -34,7 +34,7 @@ describe("getAccountCapacityRows", () => {
             { displayName: "Claude Fable", modelFamily: "fable", utilization: 0.3, resetAt: 0, active: true, severity: "" },
             { displayName: "Claude Future", modelFamily: "future", utilization: 1, resetAt: 1_900_000_000, active: true, severity: "critical" },
           ],
-          extraUsage: { enabled: true, spendLimitReached: false },
+          extraUsage: { enabled: true, spendLimitReached: false, usable: true },
           fetchedAt: 1_700_000_000_000,
           fetchStatus: "fresh",
         },
@@ -78,7 +78,7 @@ describe("getAccountCapacityRows", () => {
             active: true,
             severity: "",
           }],
-          extraUsage: { enabled: true, spendLimitReached: false },
+          extraUsage: { enabled: true, spendLimitReached: false, usable: true },
           fetchedAt: 1_700_000_000_000,
           fetchStatus: "stale",
         },
@@ -93,4 +93,40 @@ describe("getAccountCapacityRows", () => {
     expect(rows[0].state).not.toContain("available");
     expect(rows[0].state).not.toContain("paid extra");
   });
+
+  it.each([
+    ["stale", true, "usage stale · requested-model cooldown"],
+    ["unavailable", true, "usage unavailable · requested-model cooldown"],
+    ["fresh", false, "inactive · requested-model cooldown"],
+  ] as const)(
+    "keeps a live requested-model cooldown visible for %s usage with active=%s",
+    (fetchStatus, active, expectedState) => {
+      const rows = getAccountCapacityRows({
+        rateLimits: {
+          status: "allowed", fiveHourUtil: 0.1, fiveHourReset: 0,
+          sevenDayUtil: 0.1, sevenDayReset: 0, claim: "", plan: "",
+          requestsLimit: 0, lastUpdated: 0,
+          usage: {
+            modelLimits: [{
+              displayName: "Claude Future",
+              modelFamily: "future",
+              utilization: 0.4,
+              resetAt: 1_900_000_000,
+              active,
+              severity: "",
+            }],
+            fetchedAt: 1_700_000_000_000,
+            fetchStatus,
+          },
+        },
+        modelCooldowns: [{ modelFamily: "future", untilMs: Date.now() + 60_000 }],
+      });
+
+      expect(rows).toEqual([expect.objectContaining({
+        label: "Claude Future",
+        state: expectedState,
+        color: "yellow",
+      })]);
+    },
+  );
 });

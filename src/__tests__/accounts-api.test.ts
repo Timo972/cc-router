@@ -1,5 +1,48 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHealthAccountViews } from "../proxy/server.js";
+import { DEFAULT_RATE_LIMITS, type Account, type ExtraUsageState } from "../proxy/types.js";
 import { createAccountsApi } from "../ui/accountsApi.js";
+import { getAccountCapacityRows } from "../ui/Dashboard.js";
+
+function makeExtraUsageAccount(id: string, extraUsage: ExtraUsageState): Account {
+  return {
+    id,
+    tokens: {
+      accessToken: `access-${id}`,
+      refreshToken: `refresh-${id}`,
+      expiresAt: Date.now() + 60_000,
+      scopes: ["user:inference"],
+    },
+    healthy: true,
+    busy: false,
+    requestCount: 0,
+    errorCount: 0,
+    lastUsed: 0,
+    lastRefresh: 0,
+    consecutiveErrors: 0,
+    rateLimits: {
+      ...DEFAULT_RATE_LIMITS,
+      usage: {
+        modelLimits: [{
+          kind: "weekly_scoped",
+          group: "weekly",
+          modelFamily: "future",
+          displayName: "Claude Future",
+          utilization: 1,
+          resetAt: 1_900_000_000,
+          active: true,
+          severity: "critical",
+        }],
+        extraUsage,
+        fetchedAt: Date.now(),
+        fetchStatus: "fresh",
+      },
+    },
+    enabled: true,
+    sessionLimitPercent: 100,
+    weeklyLimitPercent: 100,
+  };
+}
 
 describe("createAccountsApi", () => {
   afterEach(() => vi.restoreAllMocks());
@@ -101,7 +144,7 @@ describe("createAccountsApi", () => {
                 severity: "warning",
               })),
             ],
-            extraUsage: { enabled: true, spendLimitReached: false, currency: "USD", usedMinor: 999 },
+            extraUsage: { enabled: true, spendLimitReached: false, usable: "yes", currency: "USD", usedMinor: 999 },
             fetchedAt: -1,
             fetchStatus: "unexpected",
             rawClaim: "private-claim",
@@ -135,7 +178,7 @@ describe("createAccountsApi", () => {
           sevenDay: { utilization: 0.5, resetAt: 0 },
           fetchedAt: 0,
           fetchStatus: "unavailable",
-          extraUsage: { enabled: true, spendLimitReached: false },
+          extraUsage: { enabled: true, spendLimitReached: false, usable: false },
         }),
       }),
       globalCooldownUntilMs: 0,
@@ -152,5 +195,41 @@ describe("createAccountsApi", () => {
     });
     expect(account.modelCooldowns).toHaveLength(12);
     expect(JSON.stringify(accounts)).not.toMatch(/access-secret|refresh-secret|session-secret|private-model-id|private-claim|USD|999/);
+  });
+
+  it("uses only the server-computed effective extra-usage boolean end to end", async () => {
+    const disabledByReason = makeExtraUsageAccount("disabled-extra", {
+      enabled: true,
+      spendLimitReached: false,
+      disabledReason: "private-billing-reason",
+    });
+    const usable = makeExtraUsageAccount("usable-extra", {
+      enabled: true,
+      spendLimitReached: false,
+    });
+    const serverSafeViews = createHealthAccountViews([disabledByReason, usable], []);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      accounts: serverSafeViews,
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+
+    const accounts = await createAccountsApi("http://router.local", "secret").list();
+
+    expect(accounts[0].rateLimits?.usage?.extraUsage).toEqual({
+      enabled: true,
+      spendLimitReached: false,
+      usable: false,
+    });
+    expect(getAccountCapacityRows(accounts[0])).toEqual([
+      expect.objectContaining({ label: "Claude Future", state: "exhausted", color: "red" }),
+    ]);
+    expect(accounts[1].rateLimits?.usage?.extraUsage).toEqual({
+      enabled: true,
+      spendLimitReached: false,
+      usable: true,
+    });
+    expect(getAccountCapacityRows(accounts[1])).toEqual([
+      expect.objectContaining({ label: "Claude Future", state: "paid extra active", color: "yellow" }),
+    ]);
+    expect(JSON.stringify(accounts)).not.toContain("private-billing-reason");
   });
 });

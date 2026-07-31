@@ -44,6 +44,8 @@ interface AccountCooldowns {
   pendingAmbiguous: Map<number, { until: number; modelFamily?: string }>;
 }
 
+const MAX_TRUSTED_RATE_LIMIT_RESET_MS = 8 * 24 * 60 * 60 * 1_000;
+
 /** Compact diagnostic state for authenticated account status views. */
 export interface AccountCooldownSummary {
   globalUntilMs: number;
@@ -68,6 +70,16 @@ function modelScopedClaim(claim: string): boolean {
   return claim.startsWith("seven_day_") &&
     claim !== "seven_day_oauth_apps" &&
     claim !== "seven_day_overage_included";
+}
+
+/** Accept only reset timestamps within the same bounded horizon as cooldown evidence. */
+function trustworthyResetMs(resetAtSeconds: unknown, nowMs: number): number | undefined {
+  if (typeof resetAtSeconds !== "number" || !Number.isFinite(resetAtSeconds) || resetAtSeconds <= 0) {
+    return undefined;
+  }
+  const resetAtMs = Math.floor(resetAtSeconds) * 1_000;
+  if (!Number.isFinite(resetAtMs) || resetAtMs <= nowMs) return undefined;
+  return resetAtMs - nowMs <= MAX_TRUSTED_RATE_LIMIT_RESET_MS ? resetAtMs : undefined;
 }
 
 /**
@@ -385,8 +397,8 @@ export class TokenPool {
 
     if (account.rateLimits.status === "rate_limited" && !modelScopedClaim(account.rateLimits.claim)) {
       rateLimited = true;
-      const resetAt = limitingReset(account) * 1_000;
-      if (resetAt > nowMs) timedBlockers.push(resetAt);
+      const resetAt = trustworthyResetMs(limitingReset(account), nowMs);
+      if (resetAt !== undefined) timedBlockers.push(resetAt);
       else hasIndefiniteBlocker = true;
     }
 
@@ -397,8 +409,8 @@ export class TokenPool {
     if (exhausted.length > 0 && !this.canUsePaidExtra(account)) {
       rateLimited = true;
       for (const window of exhausted) {
-        const resetAt = window.resetAt * 1_000;
-        if (resetAt > nowMs) timedBlockers.push(resetAt);
+        const resetAt = trustworthyResetMs(window.resetAt, nowMs);
+        if (resetAt !== undefined) timedBlockers.push(resetAt);
         else hasIndefiniteBlocker = true;
       }
     }

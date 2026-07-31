@@ -29,7 +29,7 @@ interface AccountUsageView {
   fiveHour?: { utilization: number; resetAt: number };
   sevenDay?: { utilization: number; resetAt: number };
   modelLimits: AccountModelLimitView[];
-  extraUsage?: { enabled: boolean; spendLimitReached: boolean };
+  extraUsage?: { enabled: boolean; spendLimitReached: boolean; usable: boolean };
   fetchedAt: number;
   fetchStatus: "fresh" | "stale" | "unavailable";
 }
@@ -83,29 +83,31 @@ export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" |
   const modelCooldowns = account.modelCooldowns ?? [];
   const rows: AccountCapacityRow[] = [];
   const matchedCooldowns = new Set<string>();
+  const now = Date.now();
   if (usage?.modelLimits.length) {
     const usageState = usage.fetchStatus === "fresh" ? undefined : `usage ${usage.fetchStatus}`;
-    const paidExtraAvailable = usage.extraUsage?.enabled === true && usage.extraUsage.spendLimitReached === false;
+    const paidExtraAvailable = usage.extraUsage?.usable === true;
     for (const limit of usage.modelLimits) {
-      const requestedCooldown = modelCooldowns.find(cooldown => cooldown.modelFamily === limit.modelFamily);
-      if (requestedCooldown) matchedCooldowns.add(requestedCooldown.modelFamily);
+      const requestedCooldown = modelCooldowns.find(cooldown =>
+        cooldown.modelFamily === limit.modelFamily && cooldown.untilMs > now,
+      );
       const exhausted = limit.utilization >= 1;
-      const state = usageState
+      const capacityState = usageState
         ? usageState
         : !limit.active
         ? "inactive"
-        : requestedCooldown && exhausted && paidExtraAvailable
-          ? "paid extra active · requested-model cooldown"
-          : requestedCooldown
-            ? "requested-model cooldown"
-            : exhausted && paidExtraAvailable
-              ? "paid extra active"
-              : exhausted
-                ? "exhausted"
-                : "included available";
-      const color: AccountCapacityRow["color"] = usageState ? usage.fetchStatus === "stale" ? "yellow" : "gray"
+        : exhausted && paidExtraAvailable
+          ? "paid extra active"
+          : exhausted
+            ? "exhausted"
+            : "included available";
+      const state = requestedCooldown
+        ? `${capacityState} · requested-model cooldown`
+        : capacityState;
+      if (requestedCooldown) matchedCooldowns.add(requestedCooldown.modelFamily);
+      const color: AccountCapacityRow["color"] = requestedCooldown ? "yellow"
+        : usageState ? usage.fetchStatus === "stale" ? "yellow" : "gray"
         : !limit.active ? "gray"
-        : requestedCooldown ? "yellow"
           : exhausted && paidExtraAvailable ? "yellow"
             : exhausted || limit.severity === "critical" ? "red"
               : limit.severity === "warning" || limit.utilization >= 0.7 ? "yellow"
@@ -120,7 +122,7 @@ export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" |
     }
   }
   for (const cooldown of modelCooldowns) {
-    if (matchedCooldowns.has(cooldown.modelFamily) || cooldown.untilMs <= Date.now()) continue;
+    if (matchedCooldowns.has(cooldown.modelFamily) || cooldown.untilMs <= now) continue;
     rows.push({
       label: `cooldown ${cooldown.modelFamily}`,
       state: "requested-model cooldown",
@@ -128,7 +130,7 @@ export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" |
       resetAt: Math.floor(cooldown.untilMs / 1_000),
     });
   }
-  if (account.globalCooldownUntilMs && account.globalCooldownUntilMs > Date.now()) {
+  if (account.globalCooldownUntilMs && account.globalCooldownUntilMs > now) {
     rows.push({ label: "cooldown", state: "global", color: "red", resetAt: Math.floor(account.globalCooldownUntilMs / 1_000) });
   }
   return rows;
