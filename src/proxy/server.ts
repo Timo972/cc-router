@@ -28,6 +28,7 @@ import chalk from "chalk";
 import { SessionRouter } from "./session-router.js";
 import type { RoutedAccountLease } from "./session-router.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
+import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
 import {
   applyUpstreamFailureRouting,
   routeFailureDetails,
@@ -340,6 +341,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   startRefreshLoop(accounts);
   startOpenAIRefreshLoop(openAIAccounts, saveOpenAIAccounts);
+  const usageRefresher = new AnthropicUsageRefresher(pool);
+  usageRefresher.start();
 
   const app = express();
   const proxyRequestTimeoutMs = getProxyRequestTimeoutMs();
@@ -792,6 +795,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             ? routeFailureDetails(route, "rate-limited")
             : "rate-limited";
           logError(account.id, 429, `Rate limited — cooldown ${retryAfter}s`);
+          // The provider's 429 body is ambiguous about which usage window is
+          // exhausted. Refresh in the background only; the current response
+          // and its Retry-After cooldown remain entirely untouched.
+          queueMicrotask(() => { void usageRefresher.refreshNow(account); });
         } else if (status === 529) {
           // Anthropic service overloaded — short cooldown on this account.
           stats.totalErrors++;
@@ -971,6 +978,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // ─── Graceful shutdown ────────────────────────────────────────────────────
   const shutdown = () => {
     console.log(chalk.yellow("\nShutting down — saving tokens..."));
+    usageRefresher.stop();
     saveAccounts(pool.getAll());
     if (process.env["CC_ROUTER_DAEMON"] === "1") {
       removePid();

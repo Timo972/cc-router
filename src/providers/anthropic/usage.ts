@@ -1,9 +1,25 @@
 import type {
+  Account,
   AccountUsageSnapshot,
   ExtraUsageState,
   ModelRateLimit,
   RateLimitWindow,
 } from "../../proxy/types.js";
+
+const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
+const OAUTH_BETA_HEADER = "oauth-2025-04-20";
+const DEFAULT_USAGE_TIMEOUT_MS = 5_000;
+
+export type UsageFetchFailureReason =
+  | "http"
+  | "timeout"
+  | "network"
+  | "invalid_json"
+  | "invalid_schema";
+
+export type UsageFetchResult =
+  | { ok: true; snapshot: AccountUsageSnapshot }
+  | { ok: false; reason: UsageFetchFailureReason; status?: number };
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -167,4 +183,57 @@ export function canUseExtraUsage(state: ExtraUsageState | undefined): boolean {
   return state?.enabled === true
     && state.spendLimitReached === false
     && !state.disabledReason;
+}
+
+/**
+ * Fetch and normalize the OAuth usage snapshot for one account.
+ *
+ * All expected provider failures are deliberately represented as compact
+ * results. In particular, this function neither reads nor exposes an error
+ * response body, which prevents tokens or provider diagnostics from leaking
+ * through refresh logs.
+ */
+export async function fetchAnthropicUsage(
+  account: Account,
+  options: {
+    fetch?: typeof globalThis.fetch;
+    now?: () => number;
+    timeoutMs?: number;
+  } = {},
+): Promise<UsageFetchResult> {
+  const request = options.fetch ?? globalThis.fetch;
+  const now = options.now ?? Date.now;
+  const timeoutMs = Math.max(0, options.timeoutMs ?? DEFAULT_USAGE_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await request(ANTHROPIC_USAGE_ENDPOINT, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${account.tokens.accessToken}`,
+        "anthropic-beta": OAUTH_BETA_HEADER,
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) return { ok: false, reason: "http", status: response.status };
+
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      return { ok: false, reason: "invalid_json" };
+    }
+
+    const snapshot = parseAnthropicUsage(body, now());
+    return snapshot
+      ? { ok: true, snapshot }
+      : { ok: false, reason: "invalid_schema" };
+  } catch {
+    return controller.signal.aborted
+      ? { ok: false, reason: "timeout" }
+      : { ok: false, reason: "network" };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
