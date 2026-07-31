@@ -1,6 +1,6 @@
 import type { Account, AccountRecord, RouteContext } from "./types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "./types.js";
-import { canUseExtraUsage } from "../providers/anthropic/usage.js";
+import { canUseExtraUsage, normalizeModelFamily } from "../providers/anthropic/usage.js";
 
 export class EmptyPoolError extends Error {
   constructor(message: string) {
@@ -37,6 +37,13 @@ interface HardBlock {
   retryAtMs?: number;
 }
 
+interface AccountCooldowns {
+  globalUntil: number;
+  modelUntil: Map<string, number>;
+  definiteGlobalUntil: number;
+  ambiguousGlobalUntil: number;
+}
+
 /**
  * Returns the reset timestamp (seconds) that must pass before the account
  * stops being rate_limited. Prefers the `claim` window (the one Anthropic
@@ -49,6 +56,12 @@ function limitingReset(a: Account): number {
   if (r.claim === "five_hour" && r.fiveHourReset) return r.fiveHourReset;
   if (r.claim === "seven_day" && r.sevenDayReset) return r.sevenDayReset;
   return Math.max(r.fiveHourReset, r.sevenDayReset, 0);
+}
+
+function modelScopedClaim(claim: string): boolean {
+  return claim.startsWith("seven_day_") &&
+    claim !== "seven_day_oauth_apps" &&
+    claim !== "seven_day_overage_included";
 }
 
 /**
@@ -138,7 +151,7 @@ export interface TokenPoolOptions {
 
 export class TokenPool {
   private readonly inFlight = new Map<string, number>();
-  private readonly cooldownUntil = new Map<string, number>();
+  private readonly cooldowns = new Map<Account, AccountCooldowns>();
   private readonly now: () => number;
   private currentIndex = 0;
 
@@ -224,24 +237,93 @@ export class TokenPool {
   setCooldown(accountId: string, durationMs: number): void {
     const account = this.findById(accountId);
     if (!account) return;
-    this.setCooldownForAccount(account, durationMs);
+    this.setGlobalCooldownForAccount(account, durationMs);
   }
 
-  /** Apply cooldown only to the exact account incarnation that was routed. */
+  /** Compatibility alias retained for callers that have not adopted scopes. */
   setCooldownForAccount(account: Account, durationMs: number): void {
-    if (this.findById(account.id) !== account) return;
-    if (!Number.isFinite(durationMs) || durationMs <= 0) return;
-    const proposedExpiry = this.now() + durationMs;
-    const existingExpiry = this.cooldownUntil.get(account.id) ?? 0;
-    this.cooldownUntil.set(account.id, Math.max(existingExpiry, proposedExpiry));
+    this.setGlobalCooldownForAccount(account, durationMs);
   }
 
-  isCoolingDown(accountId: string): boolean {
-    const until = this.cooldownUntil.get(accountId);
-    if (until === undefined) return false;
-    if (this.now() < until) return true;
-    this.cooldownUntil.delete(accountId);
-    return false;
+  /** Apply an account-global cooldown to the exact account incarnation routed. */
+  setGlobalCooldownForAccount(account: Account, durationMs: number): void {
+    const expiry = this.proposedExpiry(account, durationMs);
+    if (expiry === undefined) return;
+    const state = this.cooldownsFor(account);
+    state.definiteGlobalUntil = Math.max(state.definiteGlobalUntil, expiry);
+    state.globalUntil = Math.max(state.definiteGlobalUntil, state.ambiguousGlobalUntil);
+  }
+
+  /** Apply a model-family cooldown to the exact account incarnation routed. */
+  setModelCooldownForAccount(
+    account: Account,
+    modelFamily: string,
+    durationMs: number,
+  ): void {
+    const expiry = this.proposedExpiry(account, durationMs);
+    const family = normalizeModelFamily(modelFamily);
+    if (expiry === undefined || family === undefined) return;
+    const state = this.cooldownsFor(account);
+    state.modelUntil.set(family, Math.max(state.modelUntil.get(family) ?? 0, expiry));
+  }
+
+  /** Mark a conservative global cooldown as eligible for later narrowing. */
+  setAmbiguousGlobalCooldownForAccount(account: Account, durationMs: number): void {
+    const expiry = this.proposedExpiry(account, durationMs);
+    if (expiry === undefined) return;
+    const state = this.cooldownsFor(account);
+    state.ambiguousGlobalUntil = Math.max(state.ambiguousGlobalUntil, expiry);
+    state.globalUntil = Math.max(state.definiteGlobalUntil, state.ambiguousGlobalUntil);
+  }
+
+  /** Narrow only ambiguity-owned global state after a successful usage refresh. */
+  reconcileAmbiguousGlobalCooldownForAccount(
+    account: Account,
+    modelFamily: string,
+    durationMs: number,
+  ): void {
+    if (this.findById(account.id) !== account) return;
+    const state = this.cooldowns.get(account);
+    if (!state || state.ambiguousGlobalUntil <= this.now()) return;
+    const family = normalizeModelFamily(modelFamily);
+    if (!family) return;
+    const proposed = this.proposedExpiry(account, durationMs) ?? 0;
+    const expiry = Math.max(state.ambiguousGlobalUntil, proposed);
+    state.modelUntil.set(family, Math.max(state.modelUntil.get(family) ?? 0, expiry));
+    state.ambiguousGlobalUntil = 0;
+    state.globalUntil = state.definiteGlobalUntil;
+    if (state.definiteGlobalUntil <= this.now()) {
+      account.rateLimits.status = "allowed";
+    }
+    this.deleteEmptyCooldowns(account, state);
+  }
+
+  getApplicableCooldownUntil(accountId: string, context?: RouteContext): number {
+    const account = this.findById(accountId);
+    if (!account) return 0;
+    const state = this.cooldowns.get(account);
+    if (!state) return 0;
+    this.clearExpiredCooldownState(account, state);
+    const current = this.cooldowns.get(account);
+    if (!current) return 0;
+    const family = normalizeModelFamily(context?.modelFamily ?? context?.requestedModel);
+    return Math.max(
+      current.globalUntil,
+      family ? current.modelUntil.get(family) ?? 0 : 0,
+    );
+  }
+
+  isCoolingDown(accountId: string, context?: RouteContext): boolean {
+    if (context !== undefined) return this.getApplicableCooldownUntil(accountId, context) > 0;
+    const account = this.findById(accountId);
+    if (!account) return false;
+    return this.earliestCooldownUntil(account) > 0;
+  }
+
+  /** Earliest active scope expiry for aggregate health reporting. */
+  getEarliestCooldownUntil(accountId: string): number {
+    const account = this.findById(accountId);
+    return account ? this.earliestCooldownUntil(account) : 0;
   }
 
   private hardBlock(account: Account, context?: RouteContext): HardBlock | null {
@@ -252,14 +334,13 @@ export class TokenPool {
     let hasIndefiniteBlocker = false;
     let rateLimited = false;
 
-    if (this.isCoolingDown(account.id)) {
+    const cooldownExpiry = this.getApplicableCooldownUntil(account.id, context);
+    if (cooldownExpiry > 0) {
       rateLimited = true;
-      const cooldownExpiry = this.cooldownUntil.get(account.id);
-      if (cooldownExpiry !== undefined) timedBlockers.push(cooldownExpiry);
-      else hasIndefiniteBlocker = true;
+      timedBlockers.push(cooldownExpiry);
     }
 
-    if (account.rateLimits.status === "rate_limited") {
+    if (account.rateLimits.status === "rate_limited" && !modelScopedClaim(account.rateLimits.claim)) {
       rateLimited = true;
       const resetAt = limitingReset(account) * 1_000;
       if (resetAt > nowMs) timedBlockers.push(resetAt);
@@ -364,6 +445,54 @@ export class TokenPool {
       : 0;
   }
 
+  private proposedExpiry(account: Account, durationMs: number): number | undefined {
+    if (this.findById(account.id) !== account) return undefined;
+    if (!Number.isFinite(durationMs) || durationMs <= 0) return undefined;
+    const expiry = this.now() + durationMs;
+    return Number.isFinite(expiry) ? expiry : undefined;
+  }
+
+  private cooldownsFor(account: Account): AccountCooldowns {
+    let state = this.cooldowns.get(account);
+    if (!state) {
+      state = {
+        globalUntil: 0,
+        modelUntil: new Map(),
+        definiteGlobalUntil: 0,
+        ambiguousGlobalUntil: 0,
+      };
+      this.cooldowns.set(account, state);
+    }
+    return state;
+  }
+
+  private clearExpiredCooldownState(account: Account, state: AccountCooldowns): void {
+    const now = this.now();
+    if (state.definiteGlobalUntil <= now) state.definiteGlobalUntil = 0;
+    if (state.ambiguousGlobalUntil <= now) state.ambiguousGlobalUntil = 0;
+    state.globalUntil = Math.max(state.definiteGlobalUntil, state.ambiguousGlobalUntil);
+    for (const [family, expiry] of state.modelUntil) {
+      if (expiry <= now) state.modelUntil.delete(family);
+    }
+    this.deleteEmptyCooldowns(account, state);
+  }
+
+  private deleteEmptyCooldowns(account: Account, state: AccountCooldowns): void {
+    if (state.globalUntil === 0 && state.modelUntil.size === 0) {
+      this.cooldowns.delete(account);
+    }
+  }
+
+  private earliestCooldownUntil(account: Account): number {
+    const state = this.cooldowns.get(account);
+    if (!state) return 0;
+    this.clearExpiredCooldownState(account, state);
+    const current = this.cooldowns.get(account);
+    if (!current) return 0;
+    const expiries = [current.globalUntil, ...current.modelUntil.values()].filter(value => value > 0);
+    return expiries.length > 0 ? Math.min(...expiries) : 0;
+  }
+
   private selectEligible(
     candidates: Account[],
     activeSessions: ReadonlyMap<string, number>,
@@ -462,7 +591,8 @@ export class TokenPool {
     const now = this.now();
     for (const a of this.accounts) {
       clearExpiredRateLimitWindows(a, now, this.onCooldownExpired);
-      this.isCoolingDown(a.id);
+      const state = this.cooldowns.get(a);
+      if (state) this.clearExpiredCooldownState(a, state);
     }
   }
 
@@ -481,6 +611,7 @@ export class TokenPool {
       busy: a.busy,
       inFlightRequests: this.getInFlight(a.id),
       coolingDown: this.isCoolingDown(a.id),
+      cooldownUntilMs: this.earliestCooldownUntil(a),
       requestCount: a.requestCount,
       errorCount: a.errorCount,
       expiresInMs: a.tokens.expiresAt - Date.now(),
@@ -566,9 +697,9 @@ export class TokenPool {
   removeAccount(id: string): boolean {
     const idx = this.accounts.findIndex(a => a.id === id);
     if (idx === -1) return false;
-    this.accounts.splice(idx, 1);
+    const [removed] = this.accounts.splice(idx, 1);
     this.inFlight.delete(id);
-    this.cooldownUntil.delete(id);
+    if (removed) this.cooldowns.delete(removed);
     if (this.accounts.length > 0) {
       this.currentIndex = this.currentIndex % this.accounts.length;
     } else {

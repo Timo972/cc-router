@@ -405,16 +405,20 @@ describe("createAnthropicProxy", () => {
       upstreamRequests++;
       res.writeHead(429, {
         "content-type": "application/json",
-        "retry-after": "invalid",
+        "retry-after": "60",
+        "anthropic-ratelimit-unified-representative-claim": "seven_day_sonnet",
+        "x-upstream-marker": "preserved-verbatim",
       });
       res.write(failureBody.subarray(0, 11));
       res.end(failureBody.subarray(11));
     });
     const upstreamPort = await listen(upstream);
     const invalidate = vi.fn();
-    const setCooldownForAccount = vi.fn();
+    const account = makeAccount("account-a");
+    const pool = new TokenPool([account]);
     const route = {
-      account: makeAccount("account-a"),
+      account,
+      modelFamily: "sonnet",
       sessionId: "session-a",
       bindingGeneration: 1,
     };
@@ -427,10 +431,10 @@ describe("createAnthropicProxy", () => {
         proxyRes: proxyResponse => {
           applyUpstreamFailureRouting(
             proxyResponse.statusCode ?? 0,
-            proxyResponse.headers["retry-after"],
+            proxyResponse.headers,
             route,
             { invalidate },
-            { setCooldownForAccount },
+            pool,
           );
         },
       },
@@ -442,10 +446,16 @@ describe("createAnthropicProxy", () => {
       const response = await collect(new URL(`http://127.0.0.1:${downstreamPort}/v1/messages`));
 
       expect(response.status).toBe(429);
+      expect(response.headers["content-type"]).toBe("application/json");
+      expect(response.headers["retry-after"]).toBe("60");
+      expect(response.headers["anthropic-ratelimit-unified-representative-claim"])
+        .toBe("seven_day_sonnet");
+      expect(response.headers["x-upstream-marker"]).toBe("preserved-verbatim");
       expect(response.body).toEqual(failureBody);
       expect(upstreamRequests).toBe(1);
       expect(invalidate).toHaveBeenCalledWith("session-a", "account-a", 1);
-      expect(setCooldownForAccount).toHaveBeenCalledWith(route.account, 60_000);
+      expect(pool.isEligible("account-a", { modelFamily: "sonnet" })).toBe(false);
+      expect(pool.isEligible("account-a", { modelFamily: "opus" })).toBe(true);
       expect(response.body.toString("utf8")).not.toContain("message_stop");
     } finally {
       await close(downstream);

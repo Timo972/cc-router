@@ -281,6 +281,106 @@ describe("TokenPool — timestamp cooldown", () => {
     expect(pool.findById("a")).toBe(replacement);
     expect(pool.isCoolingDown("a")).toBe(false);
   });
+
+  it("applies global cooldowns to every requested model", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+
+    pool.setGlobalCooldownForAccount(account, 60_000);
+
+    expect(pool.isEligible("a", SONNET_CONTEXT)).toBe(false);
+    expect(pool.isEligible("a", OPUS_CONTEXT)).toBe(false);
+  });
+
+  it("normalizes model cooldowns and applies them only to the matching family", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+
+    pool.setModelCooldownForAccount(account, "Claude Sonnet 4", 60_000);
+
+    expect(pool.isEligible("a", SONNET_CONTEXT)).toBe(false);
+    expect(pool.isEligible("a", OPUS_CONTEXT)).toBe(true);
+  });
+
+  it("does not turn a named model claim into an account-global status block", () => {
+    const account = makeAccount("a");
+    account.rateLimits.status = "rate_limited";
+    account.rateLimits.claim = "seven_day_sonnet";
+    const pool = new TokenPool([account], { now: () => 1_000 });
+    pool.setModelCooldownForAccount(account, "sonnet", 60_000);
+
+    expect(pool.isEligible("a", SONNET_CONTEXT)).toBe(false);
+    expect(pool.isEligible("a", OPUS_CONTEXT)).toBe(true);
+  });
+
+  it("extends but never shortens global and model cooldown expiries", () => {
+    let now = 1_000;
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setGlobalCooldownForAccount(account, 60_000);
+    pool.setGlobalCooldownForAccount(account, 30_000);
+    pool.setModelCooldownForAccount(account, "sonnet", 90_000);
+    pool.setModelCooldownForAccount(account, "sonnet", 10_000);
+
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(61_000);
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(91_000);
+    now = 61_000;
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(0);
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(91_000);
+  });
+
+  it("expires exactly the matching model cooldown", () => {
+    let now = 1_000;
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => now });
+    pool.setModelCooldownForAccount(account, "sonnet", 10_000);
+    pool.setModelCooldownForAccount(account, "opus", 20_000);
+
+    now = 11_000;
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(0);
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(21_000);
+  });
+
+  it("does not carry scoped cooldown state through removal and same-ID replacement", () => {
+    const oldAccount = makeAccount("a");
+    const pool = new TokenPool([oldAccount], { now: () => 1_000 });
+    pool.setGlobalCooldownForAccount(oldAccount, 60_000);
+    pool.setModelCooldownForAccount(oldAccount, "sonnet", 90_000);
+
+    pool.removeAccount("a");
+    const replacement = pool.addAccount({
+      id: "a",
+      accessToken: "sk-ant-oat01-replacement",
+      refreshToken: "sk-ant-ort01-replacement",
+      expiresAt: Date.now() + 3_600_000,
+      scopes: ["user:inference"],
+    });
+
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(0);
+    expect(pool.isEligible(replacement.id, SONNET_CONTEXT)).toBe(true);
+  });
+
+  it("moves only an ambiguity-created global cooldown to a proven model scope", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+    pool.setAmbiguousGlobalCooldownForAccount(account, 60_000);
+
+    pool.reconcileAmbiguousGlobalCooldownForAccount(account, "sonnet", 90_000);
+
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(0);
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(91_000);
+  });
+
+  it("does not narrow a definite global cooldown during reconciliation", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+    pool.setGlobalCooldownForAccount(account, 60_000);
+
+    pool.reconcileAmbiguousGlobalCooldownForAccount(account, "sonnet", 90_000);
+
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(61_000);
+  });
 });
 
 describe("TokenPool — unhealthy accounts", () => {
@@ -745,6 +845,18 @@ describe("TokenPool — stats", () => {
     expect(s.coolingDown).toBe(true);
 
     lease.release();
+  });
+
+  it("reports only the earliest active scoped cooldown timestamp", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+    pool.setModelCooldownForAccount(account, "opus", 20_000);
+    pool.setModelCooldownForAccount(account, "sonnet", 10_000);
+
+    const stats = pool.getStats()[0];
+    expect(stats.cooldownUntilMs).toBe(11_000);
+    expect(stats).not.toHaveProperty("modelUntil");
+    expect(stats).not.toHaveProperty("cooldowns");
   });
 });
 

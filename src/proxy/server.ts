@@ -31,6 +31,7 @@ import { createAnthropicProxy } from "./anthropic-proxy.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
 import {
   applyUpstreamFailureRouting,
+  reconcileAmbiguousRateLimitCooldown,
   routeFailureDetails,
   routeReasonDetails,
 } from "./lease-lifecycle.js";
@@ -79,12 +80,14 @@ export interface HealthAccountView {
   rateLimits?: AccountRateLimits;
   sessionLimitPercent?: number;
   weeklyLimitPercent?: number;
+  cooldownUntilMs?: number;
 }
 
 export interface AccountRoutingMetrics {
   inFlightRequests: number;
   activeSessions: number;
   coolingDown: boolean;
+  cooldownUntilMs?: number;
 }
 
 type RoutingMetricsResolver = (accountId: string) => AccountRoutingMetrics;
@@ -93,6 +96,7 @@ const zeroRoutingMetrics: RoutingMetricsResolver = () => ({
   inFlightRequests: 0,
   activeSessions: 0,
   coolingDown: false,
+  cooldownUntilMs: 0,
 });
 
 export interface OperationalStatus {
@@ -199,6 +203,7 @@ function publicAnthropicAccountView(
     weeklyLimitPercent: a.weeklyLimitPercent,
     healthy: a.enabled !== false && a.healthy,
     busy: a.busy || metrics.coolingDown,
+    cooldownUntilMs: metrics.cooldownUntilMs ?? 0,
     inFlightRequests: metrics.inFlightRequests,
     activeSessions: metrics.activeSessions,
     requestCount: a.requestCount,
@@ -329,6 +334,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       inFlightRequests: pool.getInFlight(accountId),
       activeSessions: activeSessionCounts.get(accountId) ?? 0,
       coolingDown: pool.isCoolingDown(accountId),
+      cooldownUntilMs: pool.getEarliestCooldownUntil(accountId),
     });
   };
   const pickOpenAIAccount = createOpenAIAccountPicker(openAIAccounts);
@@ -776,7 +782,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const cooldownSeconds = route
           ? applyUpstreamFailureRouting(
               status,
-              proxyRes.headers["retry-after"],
+              proxyRes.headers,
               route,
               sessionRouter,
               pool,
@@ -806,10 +812,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             ? routeFailureDetails(route, "rate-limited")
             : "rate-limited";
           logError(account.id, 429, `Rate limited — cooldown ${retryAfter}s`);
-          // The provider's 429 body is ambiguous about which usage window is
-          // exhausted. Refresh in the background only; the current response
-          // and its Retry-After cooldown remain entirely untouched.
-          queueMicrotask(() => { void usageRefresher.refreshNow(account); });
+          // Refresh in the background to narrow only ambiguity-owned global
+          // state when fresh usage proves a requested-model exhaustion. The
+          // current upstream response remains on the native proxy stream.
+          queueMicrotask(() => {
+            void usageRefresher.refreshNow(account).then(result => {
+              if (result.ok && route) {
+                reconcileAmbiguousRateLimitCooldown(route, pool);
+              }
+            });
+          });
         } else if (status === 529) {
           // Anthropic service overloaded — short cooldown on this account.
           stats.totalErrors++;

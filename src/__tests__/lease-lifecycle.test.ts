@@ -4,6 +4,7 @@ import {
   acquireRequestRoute,
   applyUpstreamFailureRouting,
   attachLeaseLifecycle,
+  reconcileAmbiguousRateLimitCooldown,
   routeFailureDetails,
   routeReasonDetails,
 } from "../proxy/lease-lifecycle.js";
@@ -35,6 +36,9 @@ function makeAccount(id: string): Account {
     weeklyLimitPercent: 100,
   };
 }
+
+const SONNET_CONTEXT = { modelFamily: "sonnet" } as const;
+const OPUS_CONTEXT = { modelFamily: "opus" } as const;
 
 describe("attachLeaseLifecycle", () => {
   it.each(["finish", "close"] as const)("releases once on downstream %s", (event) => {
@@ -150,7 +154,17 @@ describe("applyUpstreamFailureRouting", () => {
     account: makeAccount("account-a"),
     sessionId: "session-a",
     bindingGeneration: 7,
+    modelFamily: "sonnet",
   };
+
+  function cooldowns() {
+    return {
+      setCooldownForAccount: vi.fn(),
+      setGlobalCooldownForAccount: vi.fn(),
+      setModelCooldownForAccount: vi.fn(),
+      setAmbiguousGlobalCooldownForAccount: vi.fn(),
+    };
+  }
 
   it("invalidates the matching binding on 401 without applying a cooldown", () => {
     const invalidate = vi.fn();
@@ -164,12 +178,12 @@ describe("applyUpstreamFailureRouting", () => {
 
   it("invalidates and applies a numeric Retry-After cooldown on 429", () => {
     const invalidate = vi.fn();
-    const setCooldownForAccount = vi.fn();
+    const pool = cooldowns();
 
-    expect(applyUpstreamFailureRouting(429, "12.5", route, { invalidate }, { setCooldownForAccount }))
+    expect(applyUpstreamFailureRouting(429, { "retry-after": "12.5", "anthropic-ratelimit-unified-representative-claim": "five_hour" }, route, { invalidate }, pool, () => 1_000))
       .toBe(12.5);
     expect(invalidate).toHaveBeenCalledWith("session-a", "account-a", 7);
-    expect(setCooldownForAccount).toHaveBeenCalledWith(route.account, 12_500);
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 12_500);
   });
 
   it.each([
@@ -186,31 +200,243 @@ describe("applyUpstreamFailureRouting", () => {
     "uses the 60-second 429 fallback for an unsafe Retry-After value %j",
     (retryAfter) => {
       const invalidate = vi.fn();
-      const setCooldownForAccount = vi.fn();
+      const pool = cooldowns();
 
-      expect(applyUpstreamFailureRouting(429, retryAfter, route, { invalidate }, { setCooldownForAccount }))
+      expect(applyUpstreamFailureRouting(429, { "retry-after": retryAfter }, route, { invalidate }, pool, () => 1_000))
         .toBe(60);
-      expect(setCooldownForAccount).toHaveBeenCalledWith(route.account, 60_000);
+      expect(pool.setAmbiguousGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 60_000);
     },
   );
 
-  it("accepts a finite zero-second Retry-After value", () => {
+  it("rejects a zero-second Retry-After because it is not a future expiry", () => {
     const invalidate = vi.fn();
-    const setCooldownForAccount = vi.fn();
+    const pool = cooldowns();
 
-    expect(applyUpstreamFailureRouting(429, "0", route, { invalidate }, { setCooldownForAccount }))
-      .toBe(0);
-    expect(setCooldownForAccount).toHaveBeenCalledWith(route.account, 0);
+    expect(applyUpstreamFailureRouting(429, { "retry-after": "0" }, route, { invalidate }, pool, () => 1_000))
+      .toBe(60);
+    expect(pool.setAmbiguousGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 60_000);
+  });
+
+  it.each(["five_hour", "seven_day", "seven_day_oauth_apps"])(
+    "classifies the representative claim %s as account-global",
+    (claim) => {
+      const pool = cooldowns();
+      applyUpstreamFailureRouting(
+        429,
+        {
+          "retry-after": "10",
+          "anthropic-ratelimit-unified-representative-claim": claim,
+        },
+        route,
+        { invalidate: vi.fn() },
+        pool,
+        () => 1_000,
+      );
+
+      expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 10_000);
+      expect(pool.setModelCooldownForAccount).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["seven_day_sonnet", "sonnet"],
+    ["seven_day_opus", "opus"],
+    ["seven_day_custom_family", "custom-family"],
+  ])("classifies representative claim %s as model family %s", (claim, family) => {
+    const pool = cooldowns();
+    applyUpstreamFailureRouting(
+      429,
+      {
+        "retry-after": "10",
+        "anthropic-ratelimit-unified-representative-claim": claim,
+      },
+      route,
+      { invalidate: vi.fn() },
+      pool,
+      () => 1_000,
+    );
+
+    expect(pool.setModelCooldownForAccount).toHaveBeenCalledWith(route.account, family, 10_000);
+    expect(pool.setGlobalCooldownForAccount).not.toHaveBeenCalled();
+  });
+
+  it("scopes overage-included to the requested model only with matching exhausted evidence", () => {
+    const account = makeAccount("account-a");
+    account.rateLimits.usage = {
+      modelLimits: [{
+        kind: "weekly_scoped",
+        group: "weekly",
+        modelFamily: "sonnet",
+        displayName: "Sonnet",
+        utilization: 1,
+        resetAt: 120,
+        active: true,
+        severity: "",
+      }],
+      fetchedAt: 900,
+      fetchStatus: "fresh",
+    };
+    const pool = cooldowns();
+
+    applyUpstreamFailureRouting(
+      429,
+      {
+        "retry-after": "10",
+        "anthropic-ratelimit-unified-representative-claim": "seven_day_overage_included",
+      },
+      { ...route, account },
+      { invalidate: vi.fn() },
+      pool,
+      () => 1_000,
+    );
+
+    expect(pool.setModelCooldownForAccount).toHaveBeenCalledWith(account, "sonnet", 119_000);
+  });
+
+  it.each(["seven_day_overage_included", "", "future_unknown_claim"])(
+    "uses an ambiguity-marked global cooldown for claim %j without matching evidence",
+    (claim) => {
+      const pool = cooldowns();
+      applyUpstreamFailureRouting(
+        429,
+        {
+          "retry-after": "10",
+          "anthropic-ratelimit-unified-representative-claim": claim,
+        },
+        route,
+        { invalidate: vi.fn() },
+        pool,
+        () => 1_000,
+      );
+
+      expect(pool.setAmbiguousGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 10_000);
+      expect(pool.setModelCooldownForAccount).not.toHaveBeenCalled();
+    },
+  );
+
+  it("uses the greatest trustworthy future expiry from retry, unified, and usage reset evidence", () => {
+    const now = Date.parse("2026-07-31T12:00:00Z");
+    const account = makeAccount("account-a");
+    account.rateLimits.usage = {
+      modelLimits: [{
+        kind: "weekly_scoped",
+        group: "weekly",
+        modelFamily: "sonnet",
+        displayName: "Sonnet",
+        utilization: 1,
+        resetAt: (now + 40_000) / 1_000,
+        active: true,
+        severity: "",
+      }],
+      fetchedAt: now,
+      fetchStatus: "fresh",
+    };
+    const pool = cooldowns();
+
+    expect(applyUpstreamFailureRouting(
+      429,
+      {
+        "retry-after": new Date(now + 20_000).toUTCString(),
+        "anthropic-ratelimit-unified-reset": String((now + 30_000) / 1_000),
+        "anthropic-ratelimit-unified-representative-claim": "seven_day_sonnet",
+      },
+      { ...route, account },
+      { invalidate: vi.fn() },
+      pool,
+      () => now,
+    )).toBe(40);
+    expect(pool.setModelCooldownForAccount).toHaveBeenCalledWith(account, "sonnet", 40_000);
+  });
+
+  it("rejects unreasonably distant reset timestamps", () => {
+    const pool = cooldowns();
+    expect(applyUpstreamFailureRouting(
+      429,
+      {
+        "retry-after": "315360000",
+        "anthropic-ratelimit-unified-reset": "253402300799",
+      },
+      route,
+      { invalidate: vi.fn() },
+      pool,
+      () => 1_000,
+    )).toBe(60);
+  });
+
+  it("narrows an ambiguous global cooldown after a conclusive fresh usage refresh", () => {
+    const now = 1_000_000;
+    const account = makeAccount("account-a");
+    const pool = new TokenPool([account], { now: () => now });
+    const refreshedRoute = { ...route, account };
+    applyUpstreamFailureRouting(
+      429,
+      { "retry-after": "60" },
+      refreshedRoute,
+      { invalidate: vi.fn() },
+      pool,
+      () => now,
+    );
+    account.rateLimits.usage = {
+      fiveHour: { utilization: 0.5, resetAt: 1_100 },
+      sevenDay: { utilization: 0.5, resetAt: 1_200 },
+      modelLimits: [{
+        kind: "weekly_scoped",
+        group: "weekly",
+        modelFamily: "sonnet",
+        displayName: "Sonnet",
+        utilization: 1,
+        resetAt: 1_090,
+        active: true,
+        severity: "",
+      }],
+      extraUsage: { enabled: false, spendLimitReached: false },
+      fetchedAt: now,
+      fetchStatus: "fresh",
+    };
+    account.rateLimits.status = "rate_limited";
+    account.rateLimits.claim = "";
+
+    expect(reconcileAmbiguousRateLimitCooldown(refreshedRoute, pool, () => now)).toBe(true);
+    expect(account.rateLimits.status).toBe("allowed");
+    expect(pool.getApplicableCooldownUntil("account-a", OPUS_CONTEXT)).toBe(0);
+    expect(pool.getApplicableCooldownUntil("account-a", SONNET_CONTEXT)).toBe(1_090_000);
+  });
+
+  it("does not broaden a model cooldown from an unavailable refresh snapshot", () => {
+    const now = 1_000_000;
+    const account = makeAccount("account-a");
+    const pool = new TokenPool([account], { now: () => now });
+    const refreshedRoute = { ...route, account };
+    applyUpstreamFailureRouting(
+      429,
+      {
+        "retry-after": "60",
+        "anthropic-ratelimit-unified-representative-claim": "seven_day_sonnet",
+      },
+      refreshedRoute,
+      { invalidate: vi.fn() },
+      pool,
+      () => now,
+    );
+    account.rateLimits.usage = {
+      modelLimits: [],
+      fetchedAt: now,
+      fetchStatus: "unavailable",
+    };
+
+    expect(reconcileAmbiguousRateLimitCooldown(refreshedRoute, pool, () => now)).toBe(false);
+    expect(pool.getApplicableCooldownUntil("account-a", OPUS_CONTEXT)).toBe(0);
+    expect(pool.getApplicableCooldownUntil("account-a", SONNET_CONTEXT)).toBe(1_060_000);
   });
 
   it("invalidates and applies the fixed 30-second cooldown on 529", () => {
     const invalidate = vi.fn();
-    const setCooldownForAccount = vi.fn();
+    const pool = cooldowns();
 
-    expect(applyUpstreamFailureRouting(529, "900", route, { invalidate }, { setCooldownForAccount }))
+    expect(applyUpstreamFailureRouting(529, { "retry-after": "900" }, route, { invalidate }, pool))
       .toBe(30);
     expect(invalidate).toHaveBeenCalledWith("session-a", "account-a", 7);
-    expect(setCooldownForAccount).toHaveBeenCalledWith(route.account, 30_000);
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 30_000);
   });
 
   it("does not mutate routing for successful responses", () => {
