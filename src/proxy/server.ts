@@ -284,6 +284,17 @@ function extractRateLimits(headers: Record<string, string | string[] | undefined
   };
 }
 
+/** Apply upstream rate-limit headers without discarding the usage snapshot. */
+export function applyRateLimitHeaders(
+  account: Account,
+  headers: Record<string, string | string[] | undefined>,
+): boolean {
+  const rateLimits = extractRateLimits(headers);
+  if (!rateLimits) return false;
+  account.rateLimits = { ...account.rateLimits, ...rateLimits };
+  return true;
+}
+
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const port = opts.port ?? PROXY_PORT;
 
@@ -811,8 +822,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         }
 
         // ── Capture rate limit utilization from response headers ────────────
-        const rl = extractRateLimits(proxyRes.headers as Record<string, string | string[] | undefined>);
-        if (rl) account.rateLimits = rl;
+        applyRateLimitHeaders(account, proxyRes.headers as Record<string, string | string[] | undefined>);
 
         const entry = pendingLog as LogEntry;
         stats.addLog(entry);

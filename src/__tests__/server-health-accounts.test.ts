@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { createHealthAccountViews, createOperationalStatus } from "../proxy/server.js";
+import {
+  applyRateLimitHeaders,
+  createHealthAccountViews,
+  createOperationalStatus,
+} from "../proxy/server.js";
+import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
+import { applyUpstreamFailureRouting } from "../proxy/lease-lifecycle.js";
+import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 
@@ -108,6 +115,46 @@ describe("createHealthAccountViews", () => {
       enabled: false,
       healthy: false,
     });
+  });
+});
+
+describe("applyRateLimitHeaders", () => {
+  it("keeps a good usage snapshot through a 429 header update so a failed refresh can mark it stale", async () => {
+    const account = makeAnthropicAccount();
+    account.rateLimits.usage = {
+      fiveHour: { utilization: 0.25, resetAt: 1_700_000_000 },
+      modelLimits: [],
+      fetchedAt: 123,
+      fetchStatus: "fresh",
+    };
+    const pool = new TokenPool([account]);
+
+    applyUpstreamFailureRouting(429, "12", { account }, { invalidate: () => true }, pool);
+    expect(applyRateLimitHeaders(account, {
+      "anthropic-ratelimit-unified-status": "rate_limited",
+      "anthropic-ratelimit-unified-5h-utilization": "0.8",
+      "anthropic-ratelimit-unified-5h-reset": "1700001000",
+      "anthropic-ratelimit-unified-7d-utilization": "0.4",
+      "anthropic-ratelimit-unified-7d-reset": "1700100000",
+      "anthropic-ratelimit-unified-representative-claim": "five_hour",
+    })).toBe(true);
+
+    const refresher = new AnthropicUsageRefresher(pool, {
+      fetchUsage: async () => ({ ok: false, reason: "timeout" }),
+    });
+    await refresher.refreshNow(account);
+
+    expect(account.rateLimits).toMatchObject({
+      status: "rate_limited",
+      fiveHourUtil: 0.8,
+      claim: "five_hour",
+      usage: {
+        fiveHour: { utilization: 0.25, resetAt: 1_700_000_000 },
+        fetchedAt: 123,
+        fetchStatus: "stale",
+      },
+    });
+    expect(pool.isCoolingDown(account.id)).toBe(true);
   });
 });
 
