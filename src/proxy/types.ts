@@ -15,6 +15,8 @@ export interface AccountRateLimits {
   plan: string;              // "Pro" | "Max 5x" | "Max 20x" | ""
   requestsLimit: number;     // per-minute RPM from anthropic-ratelimit-requests-limit
   lastUpdated: number;       // Unix timestamp in ms
+  /** Detailed usage from the OAuth usage endpoint, when available. */
+  usage?: AccountUsageSnapshot;
 }
 
 export const DEFAULT_RATE_LIMITS: AccountRateLimits = {
@@ -28,6 +30,47 @@ export const DEFAULT_RATE_LIMITS: AccountRateLimits = {
   requestsLimit: 0,
   lastUpdated: 0,
 };
+
+export interface RateLimitWindow {
+  utilization: number;
+  resetAt: number;
+}
+
+export interface ModelRateLimit {
+  kind: string;
+  group: string;
+  modelId?: string;
+  modelFamily: string;
+  displayName: string;
+  utilization: number;
+  resetAt: number;
+  active: boolean;
+  severity: string;
+}
+
+export interface ExtraUsageState {
+  enabled: boolean;
+  spendLimitReached: boolean;
+  disabledReason?: string;
+  utilization?: number;
+  currency?: string;
+  usedMinor?: number;
+  limitMinor?: number;
+}
+
+export interface AccountUsageSnapshot {
+  fiveHour?: RateLimitWindow;
+  sevenDay?: RateLimitWindow;
+  modelLimits: ModelRateLimit[];
+  extraUsage?: ExtraUsageState;
+  fetchedAt: number;
+  fetchStatus: "fresh" | "stale" | "unavailable";
+}
+
+export interface RouteContext {
+  requestedModel?: string;
+  modelFamily?: string;
+}
 
 export interface Account {
   id: string;
