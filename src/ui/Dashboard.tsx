@@ -84,12 +84,15 @@ export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" |
   const rows: AccountCapacityRow[] = [];
   const matchedCooldowns = new Set<string>();
   if (usage?.modelLimits.length) {
+    const usageState = usage.fetchStatus === "fresh" ? undefined : `usage ${usage.fetchStatus}`;
     const paidExtraAvailable = usage.extraUsage?.enabled === true && usage.extraUsage.spendLimitReached === false;
     for (const limit of usage.modelLimits) {
       const requestedCooldown = modelCooldowns.find(cooldown => cooldown.modelFamily === limit.modelFamily);
       if (requestedCooldown) matchedCooldowns.add(requestedCooldown.modelFamily);
       const exhausted = limit.utilization >= 1;
-      const state = !limit.active
+      const state = usageState
+        ? usageState
+        : !limit.active
         ? "inactive"
         : requestedCooldown && exhausted && paidExtraAvailable
           ? "paid extra active · requested-model cooldown"
@@ -100,7 +103,8 @@ export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" |
               : exhausted
                 ? "exhausted"
                 : "included available";
-      const color: AccountCapacityRow["color"] = !limit.active ? "gray"
+      const color: AccountCapacityRow["color"] = usageState ? usage.fetchStatus === "stale" ? "yellow" : "gray"
+        : !limit.active ? "gray"
         : requestedCooldown ? "yellow"
           : exhausted && paidExtraAvailable ? "yellow"
             : exhausted || limit.severity === "critical" ? "red"

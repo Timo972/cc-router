@@ -62,4 +62,35 @@ describe("getAccountCapacityRows", () => {
 
     expect(getAccountCapacityRows({ rateLimits: undefined })).toEqual([]);
   });
+
+  it("does not present stale model entries as available or paid capacity", () => {
+    const rows = getAccountCapacityRows({
+      rateLimits: {
+        status: "allowed", fiveHourUtil: 0.1, fiveHourReset: 0,
+        sevenDayUtil: 0.1, sevenDayReset: 0, claim: "", plan: "",
+        requestsLimit: 0, lastUpdated: 0,
+        usage: {
+          modelLimits: [{
+            displayName: "Claude Future",
+            modelFamily: "future",
+            utilization: 1,
+            resetAt: 1_900_000_000,
+            active: true,
+            severity: "",
+          }],
+          extraUsage: { enabled: true, spendLimitReached: false },
+          fetchedAt: 1_700_000_000_000,
+          fetchStatus: "stale",
+        },
+      },
+    });
+
+    expect(rows).toEqual([expect.objectContaining({
+      label: "Claude Future",
+      state: "usage stale",
+      color: "yellow",
+    })]);
+    expect(rows[0].state).not.toContain("available");
+    expect(rows[0].state).not.toContain("paid extra");
+  });
 });
