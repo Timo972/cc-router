@@ -26,7 +26,7 @@ describe("parseAnthropicUsage", () => {
 
     expect(parseAnthropicUsage(raw, FETCHED_AT)).toEqual({
       fiveHour: { utilization: 0.25, resetAt: 1_735_689_600 },
-      sevenDay: { utilization: 0.5, resetAt: 1_735_776_000 },
+      sevenDay: { utilization: 0.005, resetAt: 1_735_776_000 },
       modelLimits: [{
         kind: "weekly_scoped",
         group: "weekly",

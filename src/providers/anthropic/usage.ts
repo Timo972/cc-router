@@ -31,7 +31,7 @@ function numberValue(value: unknown): number | undefined {
 function utilization(value: unknown): number {
   const number = numberValue(value);
   if (number === undefined) return 0;
-  return Math.max(0, Math.min(1, number > 1 ? number / 100 : number));
+  return Math.max(0, Math.min(1, number / 100));
 }
 
 function resetAt(value: unknown): number {
