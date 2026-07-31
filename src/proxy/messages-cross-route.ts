@@ -204,9 +204,10 @@ export function mountMessagesCrossProviderRoute(
         return;
       }
 
-      const route = selectRoute(req.body.model, opts.modelRouting);
+      const requestedModel = typeof req.body.model === "string" ? req.body.model : undefined;
+      const route = selectRoute(requestedModel, opts.modelRouting);
       if (route.provider !== "openai_subscription") {
-        req._ccRouteContext = extractAnthropicRouteContext(req.body.model, opts.modelRouting);
+        req._ccRouteContext = extractAnthropicRouteContext(requestedModel, opts.modelRouting);
         next();
         return;
       }

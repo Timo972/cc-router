@@ -408,4 +408,45 @@ describe("mountMessagesCrossProviderRoute", () => {
       });
     }
   });
+
+  it.each([42, { future: "model" }])(
+    "treats a non-string Messages model as the default Anthropic route: %j",
+    async (model) => {
+      const app = express();
+      mountMessagesCrossProviderRoute(app, {
+        getOpenAIAccount: () => null,
+        forwardOpenAI: async () => new Response("unused"),
+      });
+      app.use("/v1/messages", (req, res) => {
+        res.json({ routeContext: req._ccRouteContext });
+      });
+      const server = createServer(app);
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+
+      try {
+        const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        });
+
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({
+          routeContext: {
+            requestedModel: "claude-sonnet-4-5",
+            modelFamily: "sonnet",
+          },
+        });
+      } finally {
+        await new Promise<void>((resolve, reject) => {
+          server.close(err => err ? reject(err) : resolve());
+        });
+      }
+    },
+  );
 });
