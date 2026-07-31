@@ -6,6 +6,55 @@ import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.j
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
 
 describe("mountMessagesCrossProviderRoute", () => {
+  it("does not continue OpenAI-routed messages into Anthropic account selection", async () => {
+    const anthropicSelection = vi.fn();
+    const app = express();
+    mountMessagesCrossProviderRoute(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(JSON.stringify({
+        id: "resp_1",
+        model: "gpt-5.5",
+        output: [],
+        usage: {},
+      }), {
+        headers: { "content-type": "application/json" },
+      }),
+    });
+    app.use("/v1/messages", (_req, res) => {
+      anthropicSelection();
+      res.status(500).end();
+    });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(anthropicSelection).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
   it("translates Claude Code openai/* messages into Responses and returns Anthropic-shaped JSON", async () => {
     const forwardedBodies: OpenAIResponsesRequest[] = [];
     const app = express();
@@ -312,7 +361,7 @@ describe("mountMessagesCrossProviderRoute", () => {
     }
   });
 
-  it("passes non-openai models to later Anthropic proxy middleware with replayable raw body", async () => {
+  it("passes non-openai models to later Anthropic proxy middleware with route context and replayable raw body", async () => {
     const app = express();
     const nextSpy = vi.fn();
 
@@ -324,6 +373,7 @@ describe("mountMessagesCrossProviderRoute", () => {
       nextSpy();
       res.json({
         rawBody: req._ccRawBody?.toString("utf8"),
+        routeContext: req._ccRouteContext,
       });
     });
 
@@ -344,7 +394,13 @@ describe("mountMessagesCrossProviderRoute", () => {
       });
 
       expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ rawBody: JSON.stringify(body) });
+      expect(await res.json()).toEqual({
+        rawBody: JSON.stringify(body),
+        routeContext: {
+          requestedModel: "claude-sonnet-4-5",
+          modelFamily: "sonnet",
+        },
+      });
       expect(nextSpy).toHaveBeenCalledOnce();
     } finally {
       await new Promise<void>((resolve, reject) => {

@@ -1,3 +1,5 @@
+import type { RouteContext } from "./types.js";
+
 export interface ResponseLifecycle {
   once(event: "finish" | "close", listener: () => void): unknown;
 }
@@ -34,7 +36,7 @@ export interface CooldownSetter<TAccount extends { readonly id: string }> {
 export interface RoutedRequestLease extends Releasable, RouteSummary, FailureRoute {}
 
 export interface RouteAcquirer<T extends RoutedRequestLease> {
-  acquire(sessionHeader: unknown): T;
+  acquire(sessionHeader: unknown, context?: RouteContext): T;
 }
 
 /**
@@ -81,8 +83,9 @@ export function acquireRequestRoute<T extends RoutedRequestLease>(
   sessionHeader: unknown,
   response: ResponseLifecycle,
   router: RouteAcquirer<T>,
+  context?: RouteContext,
 ): { route: T; release: () => void; details: string } {
-  const route = router.acquire(sessionHeader);
+  const route = context === undefined ? router.acquire(sessionHeader) : router.acquire(sessionHeader, context);
   return {
     route,
     release: attachLeaseLifecycle(response, route),

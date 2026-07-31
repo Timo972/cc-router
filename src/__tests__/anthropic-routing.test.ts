@@ -98,6 +98,40 @@ function send(options: Parameters<typeof request>[0]): Promise<{
 }
 
 describe("production Anthropic routing middleware", () => {
+  it("passes the Messages model context into Anthropic session acquisition", async () => {
+    const pool = new TokenPool([makeAccount("a")]);
+    const sessionRouter = new SessionRouter(pool);
+    const acquire = vi.spyOn(sessionRouter, "acquire");
+    const context = {
+      requestedModel: "claude-opus-4-1",
+      modelFamily: "opus",
+    };
+    const app = express();
+    app.use((req, _res, next) => {
+      req._ccRouteContext = context;
+      next();
+    });
+    app.use(createAnthropicRoutingMiddleware({ sessionRouter }));
+    app.use((req, res) => res.json({ modelFamily: req._ccRoute?.modelFamily }));
+    const server = createServer(app);
+    const port = await listen(server);
+
+    try {
+      const response = await send({
+        host: "127.0.0.1",
+        port,
+        path: "/v1/messages",
+        headers: { "X-Claude-Code-Session-Id": "session-a" },
+      });
+
+      expect(response.status).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({ modelFamily: "opus" });
+      expect(acquire).toHaveBeenCalledWith("session-a", context);
+    } finally {
+      await close(server);
+    }
+  });
+
   it("rejects duplicate native HTTP session fields as unscoped", async () => {
     const pool = new TokenPool([makeAccount("a")]);
     const sessionRouter = new SessionRouter(pool);

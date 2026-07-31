@@ -1,5 +1,7 @@
 import type { AccountLease } from "./token-pool.js";
 import { TokenPool } from "./token-pool.js";
+import { normalizeModelFamily } from "../providers/anthropic/usage.js";
+import type { RouteContext } from "./types.js";
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_ENTRIES = 10_000;
@@ -10,12 +12,14 @@ export type ScopedRouteReason = Exclude<RouteReason, "unscoped">;
 
 export interface UnscopedRoutedAccountLease extends AccountLease {
   readonly reason: "unscoped";
+  readonly modelFamily?: string;
   readonly sessionId?: never;
   readonly bindingGeneration?: never;
 }
 
 export interface ScopedRoutedAccountLease extends AccountLease {
   readonly reason: ScopedRouteReason;
+  readonly modelFamily?: string;
   readonly sessionId: string;
   readonly bindingGeneration: number;
 }
@@ -76,32 +80,34 @@ export class SessionRouter {
     }
   }
 
-  acquire(sessionHeader: unknown): RoutedAccountLease {
+  acquire(sessionHeader: unknown, context?: RouteContext): RoutedAccountLease {
     const sessionId = normalizeSessionId(sessionHeader);
+    const modelFamily = normalizeModelFamily(context?.modelFamily);
     const now = this.now();
     this.sweepExpiredBindings(now);
 
     if (!sessionId) {
-      return this.wrapUnscoped(this.pool.acquireBest(this.activeSessionCounts));
+      return this.wrapUnscoped(this.pool.acquireBest(this.activeSessionCounts, context), modelFamily);
     }
 
     const existing = this.bindings.get(sessionId);
     if (existing) {
-      const stickyLease = this.pool.tryAcquire(existing.accountId);
+      const stickyLease = this.pool.tryAcquire(existing.accountId, context);
       if (stickyLease) {
         existing.lastSeen = now;
-        return this.wrapScoped(stickyLease, "sticky", sessionId, existing.generation);
+        return this.wrapScoped(stickyLease, "sticky", sessionId, existing.generation, modelFamily);
       }
       this.removeBinding(sessionId);
     }
 
-    const lease = this.pool.acquireBest(this.activeSessionCounts);
+    const lease = this.pool.acquireBest(this.activeSessionCounts, context);
     const binding = this.insertBinding(sessionId, lease.account.id, now);
     return this.wrapScoped(
       lease,
       existing ? "failover" : "new-session",
       sessionId,
       binding.generation,
+      modelFamily,
     );
   }
 
@@ -152,12 +158,13 @@ export class SessionRouter {
     return new Map(this.activeSessionCounts);
   }
 
-  private wrapUnscoped(lease: AccountLease): UnscopedRoutedAccountLease {
+  private wrapUnscoped(lease: AccountLease, modelFamily?: string): UnscopedRoutedAccountLease {
     return {
       account: lease.account,
       fallback: lease.fallback,
       release: lease.release,
       reason: "unscoped",
+      ...(modelFamily ? { modelFamily } : {}),
     };
   }
 
@@ -166,6 +173,7 @@ export class SessionRouter {
     reason: ScopedRouteReason,
     sessionId: string,
     bindingGeneration: number,
+    modelFamily?: string,
   ): ScopedRoutedAccountLease {
     return {
       account: lease.account,
@@ -174,6 +182,7 @@ export class SessionRouter {
       reason,
       sessionId,
       bindingGeneration,
+      ...(modelFamily ? { modelFamily } : {}),
     };
   }
 

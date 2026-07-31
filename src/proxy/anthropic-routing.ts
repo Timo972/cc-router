@@ -47,6 +47,7 @@ export function createAnthropicRoutingMiddleware(
         extractClaudeSessionId(request),
         response,
         options.sessionRouter,
+        request._ccRouteContext,
       );
       routedRequest._ccRoute = selected.route;
       routedRequest._ccReleaseLease = selected.release;

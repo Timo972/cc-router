@@ -3,7 +3,7 @@ import { SessionRouter, normalizeSessionId } from "../proxy/session-router.js";
 import type { RoutedAccountLease } from "../proxy/session-router.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
-import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
+import { DEFAULT_RATE_LIMITS, type RouteContext } from "../proxy/types.js";
 
 function makeAccount(id: string): Account {
   return {
@@ -363,5 +363,69 @@ describe("SessionRouter", () => {
     lease.release();
     log.mockRestore();
     warn.mockRestore();
+  });
+
+  it("keeps one binding when both requested model families are available", () => {
+    const pool = new TokenPool([makeAccount("a"), makeAccount("b")]);
+    const router = new SessionRouter(pool);
+
+    const first = router.acquire("session-a", { modelFamily: "sonnet" });
+    const second = router.acquire("session-a", { modelFamily: "opus" });
+
+    expect(first.account.id).toBe("a");
+    expect(second.account.id).toBe("a");
+    expect(second.reason).toBe("sticky");
+    expect(second.modelFamily).toBe("opus");
+    first.release();
+    second.release();
+  });
+
+  it("rebinds only when the bound account is hard-ineligible for the requested model", () => {
+    const pool = new TokenPool([makeAccount("a"), makeAccount("b")]);
+    const router = new SessionRouter(pool);
+    const sonnet: RouteContext = { modelFamily: "sonnet" };
+    const opus: RouteContext = { modelFamily: "opus" };
+    const originalTryAcquire = pool.tryAcquire.bind(pool);
+    const originalAcquireBest = pool.acquireBest.bind(pool);
+    vi.spyOn(pool, "tryAcquire").mockImplementation((accountId, context) => (
+      accountId === "a" && context?.modelFamily === "opus"
+        ? null
+        : originalTryAcquire(accountId, context)
+    ));
+    vi.spyOn(pool, "acquireBest").mockImplementation((activeSessions, context) => (
+      context?.modelFamily === "opus"
+        ? originalTryAcquire("b", context)!
+        : originalAcquireBest(activeSessions, context)
+    ));
+
+    const first = router.acquire("session-a", sonnet);
+    const rebound = router.acquire("session-a", opus);
+    const returned = router.acquire("session-a", sonnet);
+
+    expect(first.account.id).toBe("a");
+    expect(rebound.account.id).toBe("b");
+    expect(rebound.reason).toBe("failover");
+    expect(returned.account.id).toBe("b");
+    expect(returned.reason).toBe("sticky");
+    expect(pool.tryAcquire).toHaveBeenCalledWith("a", opus);
+    expect(pool.tryAcquire).toHaveBeenCalledWith("b", sonnet);
+    first.release();
+    rebound.release();
+    returned.release();
+  });
+
+  it("uses model-aware unscoped selection without creating affinity", () => {
+    const pool = new TokenPool([makeAccount("a"), makeAccount("b")]);
+    const router = new SessionRouter(pool);
+    const acquireBest = vi.spyOn(pool, "acquireBest");
+    const context: RouteContext = { modelFamily: "haiku" };
+
+    const route = router.acquire(undefined, context);
+
+    expect(acquireBest).toHaveBeenCalledWith(expect.any(Map), context);
+    expect(route.reason).toBe("unscoped");
+    expect(route.modelFamily).toBe("haiku");
+    expect(router.getBindingCount()).toBe(0);
+    route.release();
   });
 });

@@ -1,4 +1,4 @@
-import type { Account, AccountRecord } from "./types.js";
+import type { Account, AccountRecord, RouteContext } from "./types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "./types.js";
 
 export class EmptyPoolError extends Error {
@@ -160,7 +160,7 @@ export class TokenPool {
    * Acquire the best eligible account using load, session affinity pressure,
    * rate-limit headroom, and a rotating tie-break, in that order.
    */
-  acquireBest(activeSessions: ReadonlyMap<string, number>): AccountLease {
+  acquireBest(activeSessions: ReadonlyMap<string, number>, _context?: RouteContext): AccountLease {
     if (this.accounts.length === 0) {
       throw new EmptyPoolError("token pool is empty — add an account first");
     }
@@ -188,7 +188,7 @@ export class TokenPool {
   }
 
   /** Acquire a specific account for an existing sticky session. */
-  tryAcquire(accountId: string): AccountLease | null {
+  tryAcquire(accountId: string, _context?: RouteContext): AccountLease | null {
     const account = this.findById(accountId);
     if (!account) return null;
     clearExpiredRateLimitWindows(account, this.now(), this.onCooldownExpired);
