@@ -8,6 +8,7 @@ import {
 } from "../proxy/anthropic-routing.js";
 import { SessionRouter } from "../proxy/session-router.js";
 import { TokenPool } from "../proxy/token-pool.js";
+import { createLocalRoutingErrorLog } from "../proxy/stats.js";
 import {
   needsRefresh,
   refreshAccountIfCurrent,
@@ -80,6 +81,7 @@ function successfulRefreshResponse(): Response {
 
 function send(options: Parameters<typeof request>[0]): Promise<{
   status: number;
+  headers: Record<string, string | string[] | undefined>;
   body: string;
 }> {
   return new Promise((resolve, reject) => {
@@ -88,6 +90,7 @@ function send(options: Parameters<typeof request>[0]): Promise<{
       response.on("data", chunk => chunks.push(Buffer.from(chunk)));
       response.on("end", () => resolve({
         status: response.statusCode ?? 0,
+        headers: response.headers,
         body: Buffer.concat(chunks).toString("utf8"),
       }));
       response.on("error", reject);
@@ -98,6 +101,139 @@ function send(options: Parameters<typeof request>[0]): Promise<{
 }
 
 describe("production Anthropic routing middleware", () => {
+  it("returns a local 429 with the earliest retry and acquires no lease or binding", async () => {
+    let now = 1_000_000;
+    const accounts = [makeAccount("a"), makeAccount("b")];
+    const pool = new TokenPool(accounts, { now: () => now });
+    pool.setModelCooldownForAccount(accounts[0], "fable", 10_001);
+    pool.setModelCooldownForAccount(accounts[1], "fable", 2_001);
+    const sessionRouter = new SessionRouter(pool, { now: () => now });
+    const forwarded = vi.fn();
+    const localFailure = vi.fn();
+    const app = express();
+    app.use((req, _res, next) => {
+      req._ccRouteContext = { requestedModel: "claude-fable-5", modelFamily: "fable" };
+      next();
+    });
+    app.use(createAnthropicRoutingMiddleware({
+      sessionRouter,
+      now: () => now,
+      onNoEligibleAccount: localFailure,
+    }));
+    app.use((_req, res) => {
+      forwarded();
+      res.end("forwarded");
+    });
+    const server = createServer(app);
+    const port = await listen(server);
+
+    try {
+      const response = await send({
+        host: "127.0.0.1",
+        port,
+        path: "/v1/messages",
+        headers: { "X-Claude-Code-Session-Id": "private-session" },
+      });
+
+      expect(response.status).toBe(429);
+      expect(response.headers["retry-after"]).toBe("3");
+      expect(Object.keys(response.headers)).not.toContain(
+        "anthropic-ratelimit-unified-representative-claim",
+      );
+      expect(JSON.parse(response.body)).toEqual({
+        type: "error",
+        error: {
+          type: "rate_limit_error",
+          message: "All configured accounts are unavailable for the requested model",
+        },
+      });
+      expect(localFailure).toHaveBeenCalledTimes(1);
+      expect(forwarded).not.toHaveBeenCalled();
+      expect(pool.getInFlight("a")).toBe(0);
+      expect(pool.getInFlight("b")).toBe(0);
+      expect(sessionRouter.getBindingCount()).toBe(0);
+
+      now += 2_001;
+      const retry = await send({
+        host: "127.0.0.1",
+        port,
+        path: "/v1/messages",
+        headers: { "X-Claude-Code-Session-Id": "private-session" },
+      });
+      expect(retry.status).toBe(200);
+      expect(forwarded).toHaveBeenCalledTimes(1);
+      expect(sessionRouter.getBindingCount()).toBe(1);
+      expect(sessionRouter.getActiveSessionCount("b")).toBe(1);
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("returns a local 503 when all accounts are unavailable without a retry time", async () => {
+    const accounts = [makeAccount("disabled"), makeAccount("unhealthy")];
+    accounts[0].enabled = false;
+    accounts[1].healthy = false;
+    const pool = new TokenPool(accounts);
+    const sessionRouter = new SessionRouter(pool);
+    const app = express();
+    app.use(createAnthropicRoutingMiddleware({ sessionRouter }));
+    app.use((_req, res) => res.end("forwarded"));
+    const server = createServer(app);
+    const port = await listen(server);
+
+    try {
+      const response = await send({ host: "127.0.0.1", port, path: "/v1/messages" });
+      expect(response.status).toBe(503);
+      expect(response.headers["retry-after"]).toBeUndefined();
+      expect(JSON.parse(response.body)).toEqual({
+        type: "error",
+        error: {
+          type: "service_unavailable",
+          message: "All configured accounts are unavailable for the requested model",
+        },
+      });
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("retains the configured empty-pool response", async () => {
+    const sessionRouter = new SessionRouter(new TokenPool([]));
+    const app = express();
+    app.use(createAnthropicRoutingMiddleware({
+      sessionRouter,
+      onEmptyPool: (error, _request, response) => {
+        response.status(503).json({
+          type: "error",
+          error: { type: "no_accounts", message: error.message },
+        });
+      },
+    }));
+    const server = createServer(app);
+    const port = await listen(server);
+
+    try {
+      const response = await send({ host: "127.0.0.1", port, path: "/v1/messages" });
+      expect(response.status).toBe(503);
+      expect(JSON.parse(response.body).error.type).toBe("no_accounts");
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("builds bounded local-failure logs from model context without session identifiers", () => {
+    expect(createLocalRoutingErrorLog("rate_limited", "fable", 123)).toEqual({
+      ts: 123,
+      accountId: "proxy",
+      model: "fable",
+      type: "error",
+      details: "no-eligible:rate-limited",
+      statusCode: 429,
+    });
+    expect(JSON.stringify(createLocalRoutingErrorLog("unavailable", undefined, 123)))
+      .not.toContain("session");
+  });
+
   it("passes the Messages model context into Anthropic session acquisition", async () => {
     const pool = new TokenPool([makeAccount("a")]);
     const sessionRouter = new SessionRouter(pool);

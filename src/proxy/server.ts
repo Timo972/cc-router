@@ -12,7 +12,7 @@ import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner } from ".
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
 import { logRoute, logError, logStartup } from "./logger.js";
-import { stats } from "./stats.js";
+import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { PROXY_PORT, LITELLM_URL } from "../config/paths.js";
 import { writePid, removePid } from "../daemon/pid.js";
@@ -974,6 +974,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         type: "error",
         error: { type: "no_accounts", message: err.message },
       });
+    },
+    onNoEligibleAccount: (err, req) => {
+      stats.totalErrors++;
+      const entry = createLocalRoutingErrorLog(err.reason, req._ccRouteContext?.modelFamily);
+      stats.addLog(entry);
+      logError(entry.accountId, entry.statusCode ?? 0, entry.details ?? "no-eligible");
     },
   }), createAnthropicRefreshMiddleware({
     needsRefresh,
