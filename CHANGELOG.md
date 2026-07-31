@@ -32,9 +32,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - When all accounts are hard-blocked, the router now returns a local
-  Anthropic-shaped 429 with the earliest trustworthy `Retry-After` (or a 503
-  without a retry time) and makes no Anthropic Messages request. Fallback no
-  longer sends requests to cooling or upstream-rate-limited accounts.
+  Anthropic-shaped 429 when any blocker is rate-limit or quota related, adding
+  the earliest trustworthy `Retry-After` only when known. A 503 is used only
+  for entirely non-rate-limit unavailability. These local errors make no
+  Anthropic Messages request, and fallback no longer sends requests to cooling
+  or upstream-rate-limited accounts.
 
 ---
 

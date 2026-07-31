@@ -74,11 +74,14 @@ binding, and lets the client's next retry choose another usable account. It
 does not retry a started request itself.
 
 When all configured accounts are already hard-blocked, cc-router does not call
-Anthropic. It returns a local Anthropic-shaped 429 and sets `Retry-After` to the
-earliest trustworthy reset or cooldown. Wait for that time or make another
-account with allowance available. If recent activity shows
-`no-eligible:rate-limited`, the 429 was generated locally; an original upstream
-429 remains byte-transparent.
+Anthropic. It returns a local Anthropic-shaped 429 whenever any account has a
+rate-limit or quota blocker. The response includes `Retry-After` only when the
+router knows a trustworthy unblock time; without one, it remains a 429 without
+that header. A local 503 means the accounts were unavailable entirely for
+non-rate-limit reasons, such as all being disabled or unhealthy. Wait for the
+reported time when present or make another account with allowance available.
+If recent activity shows `no-eligible:rate-limited`, the 429 was generated
+locally; an original upstream 429 remains byte-transparent.
 
 If usage is marked stale or unavailable, the internal Anthropic OAuth usage
 endpoint could not be refreshed. The router keeps conservative stale exhaustion

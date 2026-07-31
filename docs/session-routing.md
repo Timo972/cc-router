@@ -77,10 +77,12 @@ restarted or stitched together from two accounts.
 
 When every account is hard-blocked before forwarding begins, cc-router makes no
 Anthropic Messages request. It returns an Anthropic-shaped local **429** when
-the block is rate-limit related, with `Retry-After` rounded up from the earliest
-trustworthy reset or cooldown. It returns a local **503** when no retry time is
-known. A local error is distinguishable from an upstream response in recent
-activity as `no-eligible:rate-limited` or `no-eligible:unavailable`.
+any block is rate-limit or quota related. The 429 includes `Retry-After`, rounded
+up from the earliest trustworthy unblock time, only when that time is known. It
+returns a local **503** only when the accounts are entirely unavailable for
+non-rate-limit reasons, such as all being disabled or unhealthy. A local error
+is distinguishable from an upstream response in recent activity as
+`no-eligible:rate-limited` or `no-eligible:unavailable`.
 
 ---
 
@@ -157,11 +159,13 @@ its configured limit.
 
 Use them when accounts shouldn't be drawn down equally — for example, when one is
 a teammate's personal subscription they still want capacity on. Setting an
-account to 60% reserves 40% of its budget for its owner.
+account to 60% creates an approximate 40% holdback during normal selection while
+an under-cap alternative remains. It is not a guaranteed reservation: the
+all-capped fallback may cross the configured cap.
 
 Both are editable per account from the dashboard.
 
-> Setting caps low reserves capacity during normal selection, but cannot make
+> Setting caps low holds back capacity during normal selection, but cannot make
 > every otherwise usable account unavailable: the all-capped fallback may
 > bypass them. Anthropic quota exhaustion and cooldowns remain hard regardless
 > of these settings.
