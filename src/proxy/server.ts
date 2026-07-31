@@ -30,7 +30,7 @@ import type { RoutedAccountLease } from "./session-router.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
 import {
-  applyUpstreamFailureRouting,
+  applyUpstreamFailureRoutingDetailed,
   reconcileAmbiguousRateLimitCooldown,
   routeFailureDetails,
   routeReasonDetails,
@@ -211,8 +211,25 @@ function publicAnthropicAccountView(
     expiresInMs: a.tokens.expiresAt - Date.now(),
     lastUsedMs: a.lastUsed,
     lastRefreshMs: a.lastRefresh,
-    rateLimits: a.rateLimits,
+    rateLimits: {
+      ...a.rateLimits,
+      claim: publicRepresentativeClaim(a.rateLimits.claim),
+    },
   };
+}
+
+function publicRepresentativeClaim(claim: unknown): string {
+  if (typeof claim !== "string") return "unknown";
+  const normalized = claim.trim().toLowerCase();
+  if (!normalized) return "";
+  if (normalized === "five_hour" ||
+    normalized === "seven_day" ||
+    normalized === "seven_day_oauth_apps" ||
+    normalized === "seven_day_overage_included") return normalized;
+  if (normalized.startsWith("seven_day_") && normalized.length > "seven_day_".length) {
+    return "seven_day_model";
+  }
+  return "unknown";
 }
 
 function publicOpenAIAccountView(a: OpenAISubscriptionAccount): HealthAccountView {
@@ -779,8 +796,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         pendingLog.statusCode = status;
         if (durationMs !== undefined) pendingLog.durationMs = durationMs;
 
-        const cooldownSeconds = route
-          ? applyUpstreamFailureRouting(
+        const failureRouting = route
+          ? applyUpstreamFailureRoutingDetailed(
               status,
               proxyRes.headers,
               route,
@@ -788,6 +805,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
               pool,
             )
           : undefined;
+        const cooldownSeconds = failureRouting?.cooldownSeconds;
 
         if (status === 401) {
           // Token invalid or expired mid-request.
@@ -816,9 +834,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           // state when fresh usage proves a requested-model exhaustion. The
           // current upstream response remains on the native proxy stream.
           queueMicrotask(() => {
-            void usageRefresher.refreshNow(account).then(result => {
+            void usageRefresher.refreshAfterCurrent(account).then(result => {
               if (result.ok && route) {
-                reconcileAmbiguousRateLimitCooldown(route, pool);
+                reconcileAmbiguousRateLimitCooldown(
+                  route,
+                  pool,
+                  failureRouting?.ambiguousCooldownToken,
+                );
               }
             });
           });

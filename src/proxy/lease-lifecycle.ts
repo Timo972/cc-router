@@ -35,12 +35,17 @@ export interface CooldownSetter<TAccount extends { readonly id: string }> {
   setCooldownForAccount(account: TAccount, durationMs: number): void;
   setGlobalCooldownForAccount?(account: TAccount, durationMs: number): void;
   setModelCooldownForAccount?(account: TAccount, modelFamily: string, durationMs: number): void;
-  setAmbiguousGlobalCooldownForAccount?(account: TAccount, durationMs: number): void;
+  setAmbiguousGlobalCooldownForAccount?(
+    account: TAccount,
+    durationMs: number,
+    modelFamily?: string,
+  ): number | undefined;
   reconcileAmbiguousGlobalCooldownForAccount?(
     account: TAccount,
+    token: number,
     modelFamily: string,
     durationMs: number,
-  ): void;
+  ): boolean;
 }
 
 export interface RoutedRequestLease extends Releasable, RouteSummary, FailureRoute {}
@@ -196,7 +201,7 @@ function classifyCooldown(
 
   if (claim === "seven_day_overage_included") {
     const matching = matchingModelLimit(route.account, requestedFamily);
-    if (requestedFamily && matching && matching.utilization >= 1) {
+    if (requestedFamily && matching?.active === true && matching.utilization >= 1) {
       return {
         kind: "model",
         ambiguous: false,
@@ -245,25 +250,28 @@ function setGlobalCooldown<TAccount extends { readonly id: string }>(
   account: TAccount,
   durationMs: number,
   ambiguous: boolean,
-): void {
+  modelFamily?: string,
+): number | undefined {
   if (ambiguous && pool.setAmbiguousGlobalCooldownForAccount) {
-    pool.setAmbiguousGlobalCooldownForAccount(account, durationMs);
+    return pool.setAmbiguousGlobalCooldownForAccount(account, durationMs, modelFamily);
   } else if (pool.setGlobalCooldownForAccount) {
     pool.setGlobalCooldownForAccount(account, durationMs);
   } else {
     pool.setCooldownForAccount(account, durationMs);
   }
+  return undefined;
 }
 
 /** Narrow an ambiguity-created 429 cooldown only from a fresh, conclusive snapshot. */
 export function reconcileAmbiguousRateLimitCooldown<TAccount extends FailureAccount>(
   route: FailureRoute<TAccount>,
   pool: CooldownSetter<TAccount>,
+  token: number | undefined,
   now: () => number = Date.now,
 ): boolean {
   const family = normalizeModelFamily(route.modelFamily);
   const usage = route.account.rateLimits?.usage;
-  if (!family || !usage || usage.fetchStatus !== "fresh") return false;
+  if (token === undefined || !family || !usage || usage.fetchStatus !== "fresh") return false;
   if (!usage.fiveHour || !usage.sevenDay) return false;
   if (!Number.isFinite(usage.fiveHour.utilization) ||
     !Number.isFinite(usage.sevenDay.utilization) ||
@@ -273,16 +281,24 @@ export function reconcileAmbiguousRateLimitCooldown<TAccount extends FailureAcco
     usage.sevenDay.utilization >= 1) return false;
   if (canUseExtraUsage(usage.extraUsage)) return false;
   const matching = matchingModelLimit(route.account, family);
-  if (!matching || !Number.isFinite(matching.utilization) || matching.utilization < 1) return false;
+  if (!matching || !matching.active || !Number.isFinite(matching.utilization) || matching.utilization < 1) {
+    return false;
+  }
   if (!pool.reconcileAmbiguousGlobalCooldownForAccount) return false;
 
-  const resetDurationMs = matching.resetAt * 1_000 - now();
-  pool.reconcileAmbiguousGlobalCooldownForAccount(
+  const nowMs = now();
+  const resetExpiry = futureExpiry(matching.resetAt * 1_000, nowMs);
+  return pool.reconcileAmbiguousGlobalCooldownForAccount(
     route.account,
+    token,
     family,
-    Math.max(0, resetDurationMs),
+    resetExpiry === undefined ? 0 : resetExpiry - nowMs,
   );
-  return true;
+}
+
+export interface AppliedFailureRouting {
+  readonly cooldownSeconds?: number;
+  readonly ambiguousCooldownToken?: number;
 }
 
 /**
@@ -290,15 +306,15 @@ export function reconcileAmbiguousRateLimitCooldown<TAccount extends FailureAcco
  * current response remains owned by the proxy's native byte stream; callers
  * use the returned seconds solely for status logging.
  */
-export function applyUpstreamFailureRouting<TAccount extends FailureAccount>(
+export function applyUpstreamFailureRoutingDetailed<TAccount extends FailureAccount>(
   status: number,
   failureHeaders: unknown,
   route: FailureRoute<TAccount>,
   router: BindingInvalidator,
   pool: CooldownSetter<TAccount>,
   now: () => number = Date.now,
-): number | undefined {
-  if (status !== 401 && status !== 429 && status !== 529) return undefined;
+): AppliedFailureRouting {
+  if (status !== 401 && status !== 429 && status !== 529) return {};
 
   if (route.sessionId !== undefined && route.bindingGeneration !== undefined) {
     router.invalidate(route.sessionId, route.account.id, route.bindingGeneration);
@@ -310,6 +326,7 @@ export function applyUpstreamFailureRouting<TAccount extends FailureAccount>(
       route,
     );
     const durationMs = cooldownDurationMs(headers, classification, now());
+    let ambiguousCooldownToken: number | undefined;
     if (classification.kind === "model" && classification.modelFamily) {
       if (pool.setModelCooldownForAccount) {
         pool.setModelCooldownForAccount(route.account, classification.modelFamily, durationMs);
@@ -317,13 +334,40 @@ export function applyUpstreamFailureRouting<TAccount extends FailureAccount>(
         pool.setCooldownForAccount(route.account, durationMs);
       }
     } else {
-      setGlobalCooldown(pool, route.account, durationMs, classification.ambiguous);
+      ambiguousCooldownToken = setGlobalCooldown(
+        pool,
+        route.account,
+        durationMs,
+        classification.ambiguous,
+        route.modelFamily,
+      );
     }
-    return durationMs / 1_000;
+    return {
+      cooldownSeconds: durationMs / 1_000,
+      ...(ambiguousCooldownToken === undefined ? {} : { ambiguousCooldownToken }),
+    };
   }
   if (status === 529) {
     setGlobalCooldown(pool, route.account, OVERLOAD_COOLDOWN_MS, false);
-    return OVERLOAD_COOLDOWN_MS / 1_000;
+    return { cooldownSeconds: OVERLOAD_COOLDOWN_MS / 1_000 };
   }
-  return undefined;
+  return {};
+}
+
+export function applyUpstreamFailureRouting<TAccount extends FailureAccount>(
+  status: number,
+  failureHeaders: unknown,
+  route: FailureRoute<TAccount>,
+  router: BindingInvalidator,
+  pool: CooldownSetter<TAccount>,
+  now: () => number = Date.now,
+): number | undefined {
+  return applyUpstreamFailureRoutingDetailed(
+    status,
+    failureHeaders,
+    route,
+    router,
+    pool,
+    now,
+  ).cooldownSeconds;
 }

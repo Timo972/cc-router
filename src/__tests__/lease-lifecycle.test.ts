@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   acquireRequestRoute,
   applyUpstreamFailureRouting,
+  applyUpstreamFailureRoutingDetailed,
   attachLeaseLifecycle,
   reconcileAmbiguousRateLimitCooldown,
   routeFailureDetails,
@@ -162,7 +163,7 @@ describe("applyUpstreamFailureRouting", () => {
       setCooldownForAccount: vi.fn(),
       setGlobalCooldownForAccount: vi.fn(),
       setModelCooldownForAccount: vi.fn(),
-      setAmbiguousGlobalCooldownForAccount: vi.fn(),
+      setAmbiguousGlobalCooldownForAccount: vi.fn().mockReturnValue(123),
     };
   }
 
@@ -204,7 +205,8 @@ describe("applyUpstreamFailureRouting", () => {
 
       expect(applyUpstreamFailureRouting(429, { "retry-after": retryAfter }, route, { invalidate }, pool, () => 1_000))
         .toBe(60);
-      expect(pool.setAmbiguousGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 60_000);
+      expect(pool.setAmbiguousGlobalCooldownForAccount)
+        .toHaveBeenCalledWith(route.account, 60_000, "sonnet");
     },
   );
 
@@ -214,7 +216,8 @@ describe("applyUpstreamFailureRouting", () => {
 
     expect(applyUpstreamFailureRouting(429, { "retry-after": "0" }, route, { invalidate }, pool, () => 1_000))
       .toBe(60);
-    expect(pool.setAmbiguousGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 60_000);
+    expect(pool.setAmbiguousGlobalCooldownForAccount)
+      .toHaveBeenCalledWith(route.account, 60_000, "sonnet");
   });
 
   it.each(["five_hour", "seven_day", "seven_day_oauth_apps"])(
@@ -293,6 +296,41 @@ describe("applyUpstreamFailureRouting", () => {
     expect(pool.setModelCooldownForAccount).toHaveBeenCalledWith(account, "sonnet", 119_000);
   });
 
+  it("does not use an inactive exhausted model limit to narrow an overage claim", () => {
+    const account = makeAccount("account-a");
+    account.rateLimits.usage = {
+      modelLimits: [{
+        kind: "weekly_scoped",
+        group: "weekly",
+        modelFamily: "sonnet",
+        displayName: "Sonnet",
+        utilization: 1,
+        resetAt: 120,
+        active: false,
+        severity: "",
+      }],
+      fetchedAt: 900,
+      fetchStatus: "fresh",
+    };
+    const pool = cooldowns();
+
+    applyUpstreamFailureRouting(
+      429,
+      {
+        "retry-after": "10",
+        "anthropic-ratelimit-unified-representative-claim": "seven_day_overage_included",
+      },
+      { ...route, account },
+      { invalidate: vi.fn() },
+      pool,
+      () => 1_000,
+    );
+
+    expect(pool.setModelCooldownForAccount).not.toHaveBeenCalled();
+    expect(pool.setAmbiguousGlobalCooldownForAccount)
+      .toHaveBeenCalledWith(account, 10_000, "sonnet");
+  });
+
   it.each(["seven_day_overage_included", "", "future_unknown_claim"])(
     "uses an ambiguity-marked global cooldown for claim %j without matching evidence",
     (claim) => {
@@ -309,7 +347,8 @@ describe("applyUpstreamFailureRouting", () => {
         () => 1_000,
       );
 
-      expect(pool.setAmbiguousGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 10_000);
+      expect(pool.setAmbiguousGlobalCooldownForAccount)
+        .toHaveBeenCalledWith(route.account, 10_000, "sonnet");
       expect(pool.setModelCooldownForAccount).not.toHaveBeenCalled();
     },
   );
@@ -368,7 +407,7 @@ describe("applyUpstreamFailureRouting", () => {
     const account = makeAccount("account-a");
     const pool = new TokenPool([account], { now: () => now });
     const refreshedRoute = { ...route, account };
-    applyUpstreamFailureRouting(
+    const applied = applyUpstreamFailureRoutingDetailed(
       429,
       { "retry-after": "60" },
       refreshedRoute,
@@ -396,7 +435,12 @@ describe("applyUpstreamFailureRouting", () => {
     account.rateLimits.status = "rate_limited";
     account.rateLimits.claim = "";
 
-    expect(reconcileAmbiguousRateLimitCooldown(refreshedRoute, pool, () => now)).toBe(true);
+    expect(reconcileAmbiguousRateLimitCooldown(
+      refreshedRoute,
+      pool,
+      applied.ambiguousCooldownToken,
+      () => now,
+    )).toBe(true);
     expect(account.rateLimits.status).toBe("allowed");
     expect(pool.getApplicableCooldownUntil("account-a", OPUS_CONTEXT)).toBe(0);
     expect(pool.getApplicableCooldownUntil("account-a", SONNET_CONTEXT)).toBe(1_090_000);
@@ -424,9 +468,150 @@ describe("applyUpstreamFailureRouting", () => {
       fetchStatus: "unavailable",
     };
 
-    expect(reconcileAmbiguousRateLimitCooldown(refreshedRoute, pool, () => now)).toBe(false);
+    expect(reconcileAmbiguousRateLimitCooldown(refreshedRoute, pool, undefined, () => now)).toBe(false);
     expect(pool.getApplicableCooldownUntil("account-a", OPUS_CONTEXT)).toBe(0);
     expect(pool.getApplicableCooldownUntil("account-a", SONNET_CONTEXT)).toBe(1_060_000);
+  });
+
+  it("bounds a malformed distant model reset during ambiguity reconciliation", () => {
+    const now = 1_000_000;
+    const account = makeAccount("account-a");
+    const pool = new TokenPool([account], { now: () => now });
+    const refreshedRoute = { ...route, account };
+    const applied = applyUpstreamFailureRoutingDetailed(
+      429,
+      { "retry-after": "60" },
+      refreshedRoute,
+      { invalidate: vi.fn() },
+      pool,
+      () => now,
+    );
+    account.rateLimits.usage = {
+      fiveHour: { utilization: 0.5, resetAt: 1_100 },
+      sevenDay: { utilization: 0.5, resetAt: 1_200 },
+      modelLimits: [{
+        kind: "weekly_scoped",
+        group: "weekly",
+        modelFamily: "sonnet",
+        displayName: "Sonnet",
+        utilization: 1,
+        resetAt: 253_402_300_799,
+        active: true,
+        severity: "",
+      }],
+      extraUsage: { enabled: false, spendLimitReached: false },
+      fetchedAt: now,
+      fetchStatus: "fresh",
+    };
+
+    expect(reconcileAmbiguousRateLimitCooldown(
+      refreshedRoute,
+      pool,
+      applied.ambiguousCooldownToken,
+      () => now,
+    )).toBe(true);
+    expect(pool.getApplicableCooldownUntil("account-a", SONNET_CONTEXT)).toBe(1_060_000);
+    expect(pool.getEarliestCooldownUntil("account-a")).toBe(1_060_000);
+  });
+
+  it("keeps an ambiguous global cooldown when refreshed model evidence is inactive", () => {
+    const now = 1_000_000;
+    const account = makeAccount("account-a");
+    const pool = new TokenPool([account], { now: () => now });
+    const refreshedRoute = { ...route, account };
+    const applied = applyUpstreamFailureRoutingDetailed(
+      429,
+      { "retry-after": "60" },
+      refreshedRoute,
+      { invalidate: vi.fn() },
+      pool,
+      () => now,
+    );
+    account.rateLimits.usage = {
+      fiveHour: { utilization: 0.5, resetAt: 1_100 },
+      sevenDay: { utilization: 0.5, resetAt: 1_200 },
+      modelLimits: [{
+        kind: "weekly_scoped",
+        group: "weekly",
+        modelFamily: "sonnet",
+        displayName: "Sonnet",
+        utilization: 1,
+        resetAt: 1_060,
+        active: false,
+        severity: "",
+      }],
+      extraUsage: { enabled: false, spendLimitReached: false },
+      fetchedAt: now,
+      fetchStatus: "fresh",
+    };
+
+    expect(reconcileAmbiguousRateLimitCooldown(
+      refreshedRoute,
+      pool,
+      applied.ambiguousCooldownToken,
+      () => now,
+    )).toBe(false);
+    expect(pool.getApplicableCooldownUntil("account-a", OPUS_CONTEXT)).toBe(1_060_000);
+  });
+
+  it("keeps simultaneous ambiguous model failures independently reconcilable", () => {
+    const now = 1_000_000;
+    const account = makeAccount("account-a");
+    const pool = new TokenPool([account], { now: () => now });
+    const sonnetRoute = { ...route, account, modelFamily: "sonnet" };
+    const opusRoute = { ...route, account, modelFamily: "opus" };
+    const sonnetFailure = applyUpstreamFailureRoutingDetailed(
+      429,
+      { "retry-after": "60" },
+      sonnetRoute,
+      { invalidate: vi.fn() },
+      pool,
+      () => now,
+    );
+    const opusFailure = applyUpstreamFailureRoutingDetailed(
+      429,
+      { "retry-after": "90" },
+      opusRoute,
+      { invalidate: vi.fn() },
+      pool,
+      () => now,
+    );
+    expect(sonnetFailure.ambiguousCooldownToken)
+      .not.toBe(opusFailure.ambiguousCooldownToken);
+    account.rateLimits.usage = {
+      fiveHour: { utilization: 0.5, resetAt: 1_100 },
+      sevenDay: { utilization: 0.5, resetAt: 1_200 },
+      modelLimits: [
+        {
+          kind: "weekly_scoped", group: "weekly", modelFamily: "sonnet",
+          displayName: "Sonnet", utilization: 1, resetAt: 1_060, active: true, severity: "",
+        },
+        {
+          kind: "weekly_scoped", group: "weekly", modelFamily: "opus",
+          displayName: "Opus", utilization: 1, resetAt: 1_090, active: true, severity: "",
+        },
+      ],
+      extraUsage: { enabled: false, spendLimitReached: false },
+      fetchedAt: now,
+      fetchStatus: "fresh",
+    };
+
+    expect(reconcileAmbiguousRateLimitCooldown(
+      sonnetRoute,
+      pool,
+      sonnetFailure.ambiguousCooldownToken,
+      () => now,
+    )).toBe(true);
+    expect(pool.getApplicableCooldownUntil("account-a", OPUS_CONTEXT)).toBe(1_090_000);
+
+    expect(reconcileAmbiguousRateLimitCooldown(
+      opusRoute,
+      pool,
+      opusFailure.ambiguousCooldownToken,
+      () => now,
+    )).toBe(true);
+    expect(pool.getApplicableCooldownUntil("account-a", SONNET_CONTEXT)).toBe(1_060_000);
+    expect(pool.getApplicableCooldownUntil("account-a", OPUS_CONTEXT)).toBe(1_090_000);
   });
 
   it("invalidates and applies the fixed 30-second cooldown on 529", () => {

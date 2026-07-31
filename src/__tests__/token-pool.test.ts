@@ -364,9 +364,9 @@ describe("TokenPool — timestamp cooldown", () => {
   it("moves only an ambiguity-created global cooldown to a proven model scope", () => {
     const account = makeAccount("a");
     const pool = new TokenPool([account], { now: () => 1_000 });
-    pool.setAmbiguousGlobalCooldownForAccount(account, 60_000);
+    const token = pool.setAmbiguousGlobalCooldownForAccount(account, 60_000, "sonnet");
 
-    pool.reconcileAmbiguousGlobalCooldownForAccount(account, "sonnet", 90_000);
+    pool.reconcileAmbiguousGlobalCooldownForAccount(account, token!, "sonnet", 90_000);
 
     expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(0);
     expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(91_000);
@@ -377,9 +377,24 @@ describe("TokenPool — timestamp cooldown", () => {
     const pool = new TokenPool([account], { now: () => 1_000 });
     pool.setGlobalCooldownForAccount(account, 60_000);
 
-    pool.reconcileAmbiguousGlobalCooldownForAccount(account, "sonnet", 90_000);
+    pool.reconcileAmbiguousGlobalCooldownForAccount(account, 999, "sonnet", 90_000);
 
     expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(61_000);
+  });
+
+  it("reconciles only the exact ambiguous failure when two model 429s overlap", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+    const sonnetFailure = pool.setAmbiguousGlobalCooldownForAccount(account, 60_000, "sonnet");
+    const opusFailure = pool.setAmbiguousGlobalCooldownForAccount(account, 90_000, "opus");
+
+    pool.reconcileAmbiguousGlobalCooldownForAccount(account, sonnetFailure!, "sonnet", 60_000);
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(91_000);
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(91_000);
+
+    pool.reconcileAmbiguousGlobalCooldownForAccount(account, opusFailure!, "opus", 90_000);
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(61_000);
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(91_000);
   });
 });
 

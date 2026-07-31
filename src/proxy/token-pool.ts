@@ -41,7 +41,7 @@ interface AccountCooldowns {
   globalUntil: number;
   modelUntil: Map<string, number>;
   definiteGlobalUntil: number;
-  ambiguousGlobalUntil: number;
+  pendingAmbiguous: Map<number, { until: number; modelFamily?: string }>;
 }
 
 /**
@@ -154,6 +154,7 @@ export class TokenPool {
   private readonly cooldowns = new Map<Account, AccountCooldowns>();
   private readonly now: () => number;
   private currentIndex = 0;
+  private nextAmbiguousCooldownToken = 1;
 
   constructor(private readonly accounts: Account[], options: TokenPoolOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -251,7 +252,7 @@ export class TokenPool {
     if (expiry === undefined) return;
     const state = this.cooldownsFor(account);
     state.definiteGlobalUntil = Math.max(state.definiteGlobalUntil, expiry);
-    state.globalUntil = Math.max(state.definiteGlobalUntil, state.ambiguousGlobalUntil);
+    this.recomputeGlobalUntil(state);
   }
 
   /** Apply a model-family cooldown to the exact account incarnation routed. */
@@ -268,34 +269,48 @@ export class TokenPool {
   }
 
   /** Mark a conservative global cooldown as eligible for later narrowing. */
-  setAmbiguousGlobalCooldownForAccount(account: Account, durationMs: number): void {
+  setAmbiguousGlobalCooldownForAccount(
+    account: Account,
+    durationMs: number,
+    modelFamily?: string,
+  ): number | undefined {
     const expiry = this.proposedExpiry(account, durationMs);
-    if (expiry === undefined) return;
+    if (expiry === undefined) return undefined;
     const state = this.cooldownsFor(account);
-    state.ambiguousGlobalUntil = Math.max(state.ambiguousGlobalUntil, expiry);
-    state.globalUntil = Math.max(state.definiteGlobalUntil, state.ambiguousGlobalUntil);
+    const token = this.nextAmbiguousCooldownToken++;
+    const family = normalizeModelFamily(modelFamily);
+    state.pendingAmbiguous.set(token, {
+      until: expiry,
+      ...(family ? { modelFamily: family } : {}),
+    });
+    this.recomputeGlobalUntil(state);
+    return token;
   }
 
   /** Narrow only ambiguity-owned global state after a successful usage refresh. */
   reconcileAmbiguousGlobalCooldownForAccount(
     account: Account,
+    token: number,
     modelFamily: string,
     durationMs: number,
-  ): void {
-    if (this.findById(account.id) !== account) return;
+  ): boolean {
+    if (this.findById(account.id) !== account) return false;
     const state = this.cooldowns.get(account);
-    if (!state || state.ambiguousGlobalUntil <= this.now()) return;
+    if (!state) return false;
+    const pending = state.pendingAmbiguous.get(token);
+    if (!pending || pending.until <= this.now()) return false;
     const family = normalizeModelFamily(modelFamily);
-    if (!family) return;
+    if (!family || pending.modelFamily !== family) return false;
     const proposed = this.proposedExpiry(account, durationMs) ?? 0;
-    const expiry = Math.max(state.ambiguousGlobalUntil, proposed);
+    const expiry = Math.max(pending.until, proposed);
     state.modelUntil.set(family, Math.max(state.modelUntil.get(family) ?? 0, expiry));
-    state.ambiguousGlobalUntil = 0;
-    state.globalUntil = state.definiteGlobalUntil;
-    if (state.definiteGlobalUntil <= this.now()) {
+    state.pendingAmbiguous.delete(token);
+    this.recomputeGlobalUntil(state);
+    if (state.globalUntil <= this.now()) {
       account.rateLimits.status = "allowed";
     }
     this.deleteEmptyCooldowns(account, state);
+    return true;
   }
 
   getApplicableCooldownUntil(accountId: string, context?: RouteContext): number {
@@ -459,7 +474,7 @@ export class TokenPool {
         globalUntil: 0,
         modelUntil: new Map(),
         definiteGlobalUntil: 0,
-        ambiguousGlobalUntil: 0,
+        pendingAmbiguous: new Map(),
       };
       this.cooldowns.set(account, state);
     }
@@ -469,8 +484,10 @@ export class TokenPool {
   private clearExpiredCooldownState(account: Account, state: AccountCooldowns): void {
     const now = this.now();
     if (state.definiteGlobalUntil <= now) state.definiteGlobalUntil = 0;
-    if (state.ambiguousGlobalUntil <= now) state.ambiguousGlobalUntil = 0;
-    state.globalUntil = Math.max(state.definiteGlobalUntil, state.ambiguousGlobalUntil);
+    for (const [token, pending] of state.pendingAmbiguous) {
+      if (pending.until <= now) state.pendingAmbiguous.delete(token);
+    }
+    this.recomputeGlobalUntil(state);
     for (const [family, expiry] of state.modelUntil) {
       if (expiry <= now) state.modelUntil.delete(family);
     }
@@ -481,6 +498,14 @@ export class TokenPool {
     if (state.globalUntil === 0 && state.modelUntil.size === 0) {
       this.cooldowns.delete(account);
     }
+  }
+
+  private recomputeGlobalUntil(state: AccountCooldowns): void {
+    let globalUntil = state.definiteGlobalUntil;
+    for (const pending of state.pendingAmbiguous.values()) {
+      globalUntil = Math.max(globalUntil, pending.until);
+    }
+    state.globalUntil = globalUntil;
   }
 
   private earliestCooldownUntil(account: Account): number {

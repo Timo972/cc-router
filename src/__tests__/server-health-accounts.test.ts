@@ -116,6 +116,17 @@ describe("createHealthAccountViews", () => {
       healthy: false,
     });
   });
+
+  it("redacts arbitrary representative claims to bounded public categories", () => {
+    const account = makeAnthropicAccount();
+    account.rateLimits.claim = "private-future-claim-with-customer-data";
+
+    const [view] = createHealthAccountViews([account], []);
+
+    expect(view.rateLimits?.claim).toBe("unknown");
+    expect(account.rateLimits.claim).toBe("private-future-claim-with-customer-data");
+    expect(JSON.stringify(view)).not.toContain("customer-data");
+  });
 });
 
 describe("applyRateLimitHeaders", () => {

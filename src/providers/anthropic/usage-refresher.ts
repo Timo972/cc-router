@@ -96,6 +96,14 @@ export class AnthropicUsageRefresher {
     return pending;
   }
 
+  /** Start a refresh after any request that was already in flight at call time. */
+  refreshAfterCurrent(account: Account): Promise<UsageFetchResult> {
+    const existing = this.inFlight.get(account);
+    return existing
+      ? existing.then(() => this.refreshNow(account))
+      : this.refreshNow(account);
+  }
+
   private reconcile(startup = false): void {
     if (!this.started) return;
     const accounts = this.pool.getAll();
@@ -169,14 +177,13 @@ export class AnthropicUsageRefresher {
         this.apply(account, result);
         if (this.started) this.schedule(account, this.nextDelay(account, result));
       }
-      resolve(result);
-    })().finally(() => {
       if (this.inFlight.get(account) === operation) this.inFlight.delete(account);
       this.resolvers.delete(account);
       this.active--;
+      resolve(result);
       this.reconcile();
       this.runQueued();
-    });
+    })();
   }
 
   private apply(account: Account, result: UsageFetchResult): void {

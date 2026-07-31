@@ -181,6 +181,29 @@ describe("AnthropicUsageRefresher", () => {
     expect(accounts[0].rateLimits.usage).toBeUndefined();
   });
 
+  it("starts a new refresh after a pre-existing in-flight refresh settles", async () => {
+    const a = account("a");
+    const pool = new TokenPool([a]);
+    const first = deferred<UsageFetchResult>();
+    const second = deferred<UsageFetchResult>();
+    const fetchUsage = vi.fn()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const refresher = new AnthropicUsageRefresher(pool, { fetchUsage });
+
+    const preExisting = refresher.refreshNow(a);
+    const postFailure = refresher.refreshAfterCurrent(a);
+    expect(fetchUsage).toHaveBeenCalledTimes(1);
+
+    first.resolve(usageResult(10));
+    await preExisting;
+    await vi.waitFor(() => expect(fetchUsage).toHaveBeenCalledTimes(2));
+    second.resolve(usageResult(20));
+
+    await expect(postFailure).resolves.toEqual(usageResult(20));
+    expect(a.rateLimits.usage).toMatchObject({ fetchedAt: 20, fetchStatus: "fresh" });
+  });
+
   it("reconciles additions and removals, and stop prevents future work", async () => {
     vi.useFakeTimers();
     const accounts = [account("a")];
