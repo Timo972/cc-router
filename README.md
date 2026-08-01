@@ -23,7 +23,7 @@ Distribute Claude Code requests across Claude subscriptions, and expose an OpenA
 - **Codex CLI support** — configure Codex to use CC-Router as a Responses-compatible provider
 - **Automatic token refresh** — OAuth tokens are refreshed before they expire, saved atomically to disk
 - **Model-aware rate limits** — avoids accounts whose requested-model or global allowance is exhausted, and respects scoped cooldowns
-- **Client mode** — connect to a remote CC-Router from any machine with one command (`cc-router client connect <url>`)
+- **Client mode** — connect another device you own to your private CC-Router (`cc-router client connect <url>`)
 - **Claude Desktop support** — route Cowork / Agent-mode traffic through CC-Router via mitmproxy interception (macOS, Windows, Linux)
 - **Guided setup wizard** — interactive `cc-router setup` extracts tokens from Keychain or credentials file, configures everything
 - **Live dashboard** — real-time terminal UI showing account health, request counts, token usage, recent activity
@@ -81,8 +81,6 @@ Streaming remains byte-transparent. In particular, CC-Router never appends a syn
 
 **Claude Desktop support** is opt-in and requires a small interceptor (mitmproxy) because Claude Desktop doesn't expose a custom API endpoint setting. See [Claude Desktop support](#claude-desktop-support).
 
-📖 **Running this for a team?** [docs/session-routing.md](docs/session-routing.md) covers how accounts are picked, what per-account throttles do, how to monitor affinity, and how to read the failure modes.
-
 ---
 
 ## Use cases
@@ -97,82 +95,6 @@ With two accounts you double your effective rate limit. With three, you triple i
 1 account  →  hit limit, wait 60s, continue
 3 accounts →  new sessions spread across all three; each session stays cache-local
 ```
-
----
-
-### Hosting cc-router on a shared machine
-
-Run cc-router on a machine everyone on the team can reach — a home server, a VPS, or a spare machine on the office network.
-
-#### On the server
-
-```bash
-npm install -g @timo972/cc-router
-cc-router setup          # configure the accounts
-cc-router start          # first run asks: background/boot/server mode — choose "server mode"
-```
-
-When you enable server mode during `cc-router start`, the proxy automatically binds to all interfaces (`0.0.0.0`) and prints instructions for connecting clients.
-
-#### On each developer's machine
-
-No installation needed. Just set two environment variables in `~/.claude/settings.json`:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://192.168.1.50:3456",
-    "ANTHROPIC_AUTH_TOKEN": "proxy-managed"
-  }
-}
-```
-
-Replace `192.168.1.50` with the server's IP or hostname. Then run `claude` normally.
-
-Or use the CLI to write the settings automatically:
-
-```bash
-cc-router configure --port 3456
-# Then manually update ANTHROPIC_BASE_URL to the remote IP
-```
-
----
-
-### Hosting on a VPS (internet-accessible)
-
-If your team is distributed or works remotely, run cc-router on a VPS and expose it over HTTPS via a reverse proxy.
-
-#### Recommended nginx config
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name cc-router.yourcompany.com;
-
-    # ... SSL cert config (e.g. Let's Encrypt) ...
-
-    location / {
-        proxy_pass http://127.0.0.1:3456;
-        proxy_buffering off;          # required for SSE streaming
-        proxy_read_timeout 1800s;     # outer-proxy body idle timeout
-        proxy_set_header X-Forwarded-For $remote_addr;
-    }
-}
-```
-
-These settings protect different phases. CC-Router's `proxyRequestTimeoutMs` in `~/.cc-router/config.json` applies only while waiting for Anthropic response headers. An outer proxy's `proxy_read_timeout` applies while reading the response body, so configure that outer timeout separately with enough headroom for long thinking pauses. Neither timeout repairs a missing upstream terminal event, and CC-Router never synthesizes `message_stop`.
-
-Each developer then points to:
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "https://cc-router.yourcompany.com",
-    "ANTHROPIC_AUTH_TOKEN": "proxy-managed"
-  }
-}
-```
-
-**Security note:** if the proxy is internet-accessible, add authentication at the nginx level (basic auth, mTLS, or IP allowlist) so only your team can use it. cc-router does not implement user authentication itself.
 
 ---
 
@@ -445,9 +367,9 @@ This prompts for the OpenAI access token, refresh token, expiry timestamp, and s
 
 ---
 
-## Client mode — connecting to an existing CC-Router
+## Client mode — connecting your own devices
 
-If someone on your team already hosts a CC-Router instance (on a VPS, home server, or another machine on the LAN), you don't need to install accounts locally. You just point your Claude Code at the remote proxy.
+Client mode lets you connect another device you own to your private CC-Router over a trusted private network. It is not intended for sharing subscription accounts or proxy access with other people, or for exposing CC-Router to the public internet.
 
 The setup wizard asks about this at the very first step:
 
@@ -455,13 +377,13 @@ The setup wizard asks about this at the very first step:
 cc-router setup
 # → What do you want to do?
 #   • Host CC-Router on this machine
-#   • Connect to an existing CC-Router server  ← pick this
+#   • Connect to your existing CC-Router server  ← pick this
 ```
 
 Or use the dedicated command directly:
 
 ```bash
-# Quick connect — just point Claude Code at the remote proxy
+# Connect another device you own over your private network
 cc-router client connect http://192.168.1.50:3456 --secret cc-rtr-abc123...
 
 # Check status
@@ -695,6 +617,7 @@ Check status anytime: `cc-router telemetry status`.
 >
 > **Read Anthropic's Terms of Service before using this tool.**  
 > Using multiple Max subscriptions to increase throughput may violate the ToS. Anthropic has been known to ban accounts for unusual OAuth usage patterns.
+> Do not share subscription accounts, OAuth credentials, or CC-Router proxy access with other people.
 >
 > The authors are not responsible for any account bans, loss of access, or other consequences resulting from the use of this software. Use at your own risk.
 
