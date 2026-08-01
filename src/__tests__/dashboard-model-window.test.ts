@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { getAccountCapacityRows, getVisibleModelWindow } from "../ui/Dashboard.js";
+import {
+  getAccountCapacityRows,
+  getGlobalCapacityView,
+  getVisibleModelWindow,
+} from "../ui/Dashboard.js";
 
 describe("getVisibleModelWindow", () => {
   it("scrolls the visible model window to keep the selected model in view", () => {
@@ -24,6 +28,7 @@ describe("getVisibleModelWindow", () => {
 
 describe("getAccountCapacityRows", () => {
   it("renders dynamic model rows and compact state labels without fixed model names", () => {
+    const now = Date.now();
     const rows = getAccountCapacityRows({
       rateLimits: {
         status: "allowed", fiveHourUtil: 0, fiveHourReset: 0,
@@ -39,8 +44,8 @@ describe("getAccountCapacityRows", () => {
           fetchStatus: "fresh",
         },
       },
-      globalCooldownUntilMs: 1_800_000_000_000,
-      modelCooldowns: [{ modelFamily: "future", untilMs: 1_800_000_100_000 }],
+      globalCooldownUntilMs: now + 60_000,
+      modelCooldowns: [{ modelFamily: "future", untilMs: now + 120_000 }],
     });
 
     expect(rows).toEqual([
@@ -129,4 +134,60 @@ describe("getAccountCapacityRows", () => {
       })]);
     },
   );
+});
+
+describe("getGlobalCapacityView", () => {
+  it("prefers newer response-header windows and marks the older snapshot stale", () => {
+    const view = getGlobalCapacityView({
+      status: "allowed",
+      fiveHourUtil: 0.8,
+      fiveHourReset: 800,
+      sevenDayUtil: 0.7,
+      sevenDayReset: 700,
+      claim: "",
+      plan: "",
+      requestsLimit: 0,
+      lastUpdated: 200,
+      usage: {
+        fiveHour: { utilization: 0.1, resetAt: 100 },
+        sevenDay: { utilization: 0.2, resetAt: 200 },
+        modelLimits: [],
+        fetchedAt: 100,
+        fetchStatus: "fresh",
+      },
+    });
+
+    expect(view).toEqual({
+      fiveHour: { utilization: 0.8, resetAt: 800 },
+      sevenDay: { utilization: 0.7, resetAt: 700 },
+      usageFetchStatus: "stale",
+    });
+  });
+
+  it("uses snapshot windows when they are at least as new as the headers", () => {
+    const view = getGlobalCapacityView({
+      status: "allowed",
+      fiveHourUtil: 0.8,
+      fiveHourReset: 800,
+      sevenDayUtil: 0.7,
+      sevenDayReset: 700,
+      claim: "",
+      plan: "",
+      requestsLimit: 0,
+      lastUpdated: 200,
+      usage: {
+        fiveHour: { utilization: 0.1, resetAt: 100 },
+        sevenDay: { utilization: 0.2, resetAt: 200 },
+        modelLimits: [],
+        fetchedAt: 200,
+        fetchStatus: "fresh",
+      },
+    });
+
+    expect(view).toEqual({
+      fiveHour: { utilization: 0.1, resetAt: 100 },
+      sevenDay: { utilization: 0.2, resetAt: 200 },
+      usageFetchStatus: "fresh",
+    });
+  });
 });

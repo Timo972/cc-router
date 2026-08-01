@@ -222,4 +222,25 @@ describe("AnthropicUsageRefresher", () => {
     await vi.advanceTimersByTimeAsync(20 * 60_000);
     expect(fetchUsage).toHaveBeenCalledTimes(calls);
   });
+
+  it("prunes failure history when an account is removed", async () => {
+    vi.useFakeTimers();
+    const removed = account("removed");
+    const accounts = [removed];
+    const pool = new TokenPool(accounts);
+    const refresher = new AnthropicUsageRefresher(pool, {
+      fetchUsage: async () => ({ ok: false, reason: "network" }),
+      startupStaggerMs: 0,
+    });
+
+    refresher.start();
+    await vi.advanceTimersByTimeAsync(0);
+    const failures = (refresher as unknown as { failures: Map<Account, number> }).failures;
+    expect(failures.get(removed)).toBe(1);
+
+    accounts.splice(0, 1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(failures.has(removed)).toBe(false);
+    refresher.stop();
+  });
 });

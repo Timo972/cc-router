@@ -123,6 +123,9 @@ export class AnthropicUsageRefresher {
         this.inFlight.delete(account);
       }
     }
+    for (const account of this.failures.keys()) {
+      if (!current.has(account)) this.failures.delete(account);
+    }
 
     accounts.forEach((account, index) => {
       if (!this.timers.has(account) && !this.inFlight.has(account) && !this.queued.has(account)) {

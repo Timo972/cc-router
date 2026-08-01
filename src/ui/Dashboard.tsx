@@ -69,6 +69,33 @@ const EMPTY_RL: AccountRateLimitsView = {
   requestsLimit: 0, lastUpdated: 0,
 };
 
+interface GlobalCapacityView {
+  fiveHour: { utilization: number; resetAt: number };
+  sevenDay: { utilization: number; resetAt: number };
+  usageFetchStatus?: AccountUsageView["fetchStatus"];
+}
+
+/** Match TokenPool's source precedence for the dashboard's global windows. */
+export function getGlobalCapacityView(rateLimits: AccountRateLimitsView): GlobalCapacityView {
+  const usage = rateLimits.usage;
+  const snapshotIsCurrent = usage !== undefined &&
+    usage.fetchStatus !== "unavailable" &&
+    usage.fetchedAt >= rateLimits.lastUpdated;
+  const usageFetchStatus = usage?.fetchStatus === "fresh" && !snapshotIsCurrent
+    ? "stale"
+    : usage?.fetchStatus;
+
+  return {
+    fiveHour: snapshotIsCurrent && usage.fiveHour
+      ? usage.fiveHour
+      : { utilization: rateLimits.fiveHourUtil, resetAt: rateLimits.fiveHourReset },
+    sevenDay: snapshotIsCurrent && usage.sevenDay
+      ? usage.sevenDay
+      : { utilization: rateLimits.sevenDayUtil, resetAt: rateLimits.sevenDayReset },
+    usageFetchStatus,
+  };
+}
+
 export interface AccountCapacityRow {
   label: string;
   state: string;
@@ -85,7 +112,11 @@ export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" |
   const matchedCooldowns = new Set<string>();
   const now = Date.now();
   if (usage?.modelLimits.length) {
-    const usageState = usage.fetchStatus === "fresh" ? undefined : `usage ${usage.fetchStatus}`;
+    const usageFetchStatus = usage.fetchStatus === "fresh" &&
+      usage.fetchedAt < (account.rateLimits?.lastUpdated ?? 0)
+      ? "stale"
+      : usage.fetchStatus;
+    const usageState = usageFetchStatus === "fresh" ? undefined : `usage ${usageFetchStatus}`;
     const paidExtraAvailable = usage.extraUsage?.usable === true;
     for (const limit of usage.modelLimits) {
       const requestedCooldown = modelCooldowns.find(cooldown =>
@@ -106,7 +137,7 @@ export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" |
         : capacityState;
       if (requestedCooldown) matchedCooldowns.add(requestedCooldown.modelFamily);
       const color: AccountCapacityRow["color"] = requestedCooldown ? "yellow"
-        : usageState ? usage.fetchStatus === "stale" ? "yellow" : "gray"
+        : usageState ? usageFetchStatus === "stale" ? "yellow" : "gray"
         : !limit.active ? "gray"
           : exhausted && paidExtraAvailable ? "yellow"
             : exhausted || limit.severity === "critical" ? "red"
@@ -924,6 +955,7 @@ function ProviderBadge({
 function AccountRow({ account: a, selected }: { account: AccountStat; selected: boolean }) {
   const rl = a.rateLimits ?? EMPTY_RL;
   const usage = rl.usage;
+  const globalCapacity = getGlobalCapacityView(rl);
   const capacityRows = getAccountCapacityRows(a);
   const isLimited = rl.status === "rate_limited";
   const isDisabled = a.enabled === false;
@@ -979,21 +1011,21 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
         <Box paddingLeft={4}>
           <UtilBar
             label="5h"
-            util={usage?.fiveHour?.utilization ?? rl.fiveHourUtil}
-            resetTs={usage?.fiveHour?.resetAt ?? rl.fiveHourReset}
+            util={globalCapacity.fiveHour.utilization}
+            resetTs={globalCapacity.fiveHour.resetAt}
             isActive={rl.claim === "five_hour"}
             cap={s5}
           />
           <Text>   </Text>
           <UtilBar
             label="7d all-model"
-            util={usage?.sevenDay?.utilization ?? rl.sevenDayUtil}
-            resetTs={usage?.sevenDay?.resetAt ?? rl.sevenDayReset}
+            util={globalCapacity.sevenDay.utilization}
+            resetTs={globalCapacity.sevenDay.resetAt}
             isActive={rl.claim === "seven_day"}
             cap={w7}
           />
-          {usage && <Text color={usage.fetchStatus === "fresh" ? "gray" : "yellow"}>
-            {`  usage ${usage.fetchStatus} ${usage.fetchedAt > 0 ? formatAgo(usage.fetchedAt) : ""}`}
+          {usage && <Text color={globalCapacity.usageFetchStatus === "fresh" ? "gray" : "yellow"}>
+            {`  usage ${globalCapacity.usageFetchStatus} ${usage.fetchedAt > 0 ? formatAgo(usage.fetchedAt) : ""}`}
           </Text>}
         </Box>
       )}
