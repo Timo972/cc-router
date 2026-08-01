@@ -19,6 +19,24 @@ export interface LogEntry {
   streamLifecycle?: StreamLifecycleState;
 }
 
+export type LocalRoutingErrorReason = "rate_limited" | "unavailable";
+
+/** Build a bounded diagnostic for a request rejected before account selection. */
+export function createLocalRoutingErrorLog(
+  reason: LocalRoutingErrorReason,
+  modelFamily?: string,
+  now = Date.now(),
+): LogEntry {
+  return {
+    ts: now,
+    accountId: "proxy",
+    model: modelFamily ?? "-",
+    type: "error",
+    details: `no-eligible:${reason.replace("_", "-")}`,
+    statusCode: reason === "rate_limited" ? 429 : 503,
+  };
+}
+
 const MAX_LOG_ENTRIES = 100;
 
 class ProxyStats {

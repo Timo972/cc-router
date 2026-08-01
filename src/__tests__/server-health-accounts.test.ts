@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { createHealthAccountViews, createOperationalStatus } from "../proxy/server.js";
+import {
+  applyRateLimitHeaders,
+  createHealthAccountViews,
+  createOperationalStatus,
+} from "../proxy/server.js";
+import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
+import { applyUpstreamFailureRouting } from "../proxy/lease-lifecycle.js";
+import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 
@@ -108,6 +115,124 @@ describe("createHealthAccountViews", () => {
       enabled: false,
       healthy: false,
     });
+  });
+
+  it("redacts arbitrary representative claims to bounded public categories", () => {
+    const account = makeAnthropicAccount();
+    account.rateLimits.claim = "private-future-claim-with-customer-data";
+
+    const [view] = createHealthAccountViews([account], []);
+
+    expect(view.rateLimits?.claim).toBe("unknown");
+    expect(account.rateLimits.claim).toBe("private-future-claim-with-customer-data");
+    expect(JSON.stringify(view)).not.toContain("customer-data");
+  });
+
+  it("exposes bounded normalized usage and cooldown summaries without OAuth or raw claims", () => {
+    const account = makeAnthropicAccount();
+    account.rateLimits.claim = "seven_day_private-customer-claim";
+    account.rateLimits.usage = {
+      fiveHour: { utilization: 0.25, resetAt: 1_735_689_600 },
+      sevenDay: { utilization: 0.4, resetAt: 1_735_776_000 },
+      modelLimits: [{
+        kind: "weekly_scoped",
+        group: "weekly",
+        modelId: "claude-future-private-model",
+        modelFamily: "future-model",
+        displayName: "Claude Future",
+        utilization: 0.9,
+        resetAt: 1_735_862_400,
+        active: true,
+        severity: "warning",
+      }],
+      extraUsage: {
+        enabled: true,
+        spendLimitReached: false,
+        disabledReason: "internal-upstream-detail",
+        usedMinor: 42,
+        limitMinor: 100,
+        currency: "USD",
+      },
+      fetchedAt: 1_735_600_000_000,
+      fetchStatus: "fresh",
+    };
+
+    const [view] = createHealthAccountViews([account], [], () => ({
+      inFlightRequests: 0,
+      activeSessions: 0,
+      coolingDown: true,
+      cooldownUntilMs: 1_735_600_010_000,
+      globalCooldownUntilMs: 1_735_600_010_000,
+      modelCooldowns: [{ modelFamily: "future-model", untilMs: 1_735_600_020_000 }],
+    }));
+
+    expect(view.rateLimits).toMatchObject({
+      claim: "seven_day_model",
+      usage: {
+        fiveHour: { utilization: 0.25, resetAt: 1_735_689_600 },
+        sevenDay: { utilization: 0.4, resetAt: 1_735_776_000 },
+        modelLimits: [{
+          displayName: "Claude Future",
+          modelFamily: "future-model",
+          utilization: 0.9,
+          resetAt: 1_735_862_400,
+          active: true,
+          severity: "warning",
+        }],
+        extraUsage: { enabled: true, spendLimitReached: false, usable: false },
+        fetchedAt: 1_735_600_000_000,
+        fetchStatus: "fresh",
+      },
+    });
+    expect(view).toMatchObject({
+      globalCooldownUntilMs: 1_735_600_010_000,
+      modelCooldowns: [{ modelFamily: "future-model", untilMs: 1_735_600_020_000 }],
+    });
+    const serialized = JSON.stringify(view);
+    for (const forbidden of [
+      "ant-access", "ant-refresh", "claude-future-private-model",
+      "internal-upstream-detail", "usedMinor", "currency",
+    ]) expect(serialized).not.toContain(forbidden);
+  });
+});
+
+describe("applyRateLimitHeaders", () => {
+  it("keeps a good usage snapshot through a 429 header update so a failed refresh can mark it stale", async () => {
+    const account = makeAnthropicAccount();
+    account.rateLimits.usage = {
+      fiveHour: { utilization: 0.25, resetAt: 1_700_000_000 },
+      modelLimits: [],
+      fetchedAt: 123,
+      fetchStatus: "fresh",
+    };
+    const pool = new TokenPool([account]);
+
+    applyUpstreamFailureRouting(429, "12", { account }, { invalidate: () => true }, pool);
+    expect(applyRateLimitHeaders(account, {
+      "anthropic-ratelimit-unified-status": "rate_limited",
+      "anthropic-ratelimit-unified-5h-utilization": "0.8",
+      "anthropic-ratelimit-unified-5h-reset": "1700001000",
+      "anthropic-ratelimit-unified-7d-utilization": "0.4",
+      "anthropic-ratelimit-unified-7d-reset": "1700100000",
+      "anthropic-ratelimit-unified-representative-claim": "five_hour",
+    })).toBe(true);
+
+    const refresher = new AnthropicUsageRefresher(pool, {
+      fetchUsage: async () => ({ ok: false, reason: "timeout" }),
+    });
+    await refresher.refreshNow(account);
+
+    expect(account.rateLimits).toMatchObject({
+      status: "rate_limited",
+      fiveHourUtil: 0.8,
+      claim: "five_hour",
+      usage: {
+        fiveHour: { utilization: 0.25, resetAt: 1_700_000_000 },
+        fetchedAt: 123,
+        fetchStatus: "stale",
+      },
+    });
+    expect(pool.isCoolingDown(account.id)).toBe(true);
   });
 });
 

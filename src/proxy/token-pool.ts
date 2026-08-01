@@ -1,5 +1,6 @@
-import type { Account, AccountRecord } from "./types.js";
+import type { Account, AccountRecord, RouteContext } from "./types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "./types.js";
+import { canUseExtraUsage, normalizeModelFamily } from "../providers/anthropic/usage.js";
 
 export class EmptyPoolError extends Error {
   constructor(message: string) {
@@ -8,25 +9,77 @@ export class EmptyPoolError extends Error {
   }
 }
 
-/** Returns the earliest non-zero reset timestamp (seconds) for an account. */
-function earliestReset(a: Account): number {
-  const r = a.rateLimits;
-  if (r.fiveHourReset && r.sevenDayReset) return Math.min(r.fiveHourReset, r.sevenDayReset);
-  return r.fiveHourReset || r.sevenDayReset || Infinity;
+export class NoEligibleAccountError extends Error {
+  readonly reason: "rate_limited" | "unavailable";
+  readonly retryAtMs?: number;
+  readonly blockedAccounts: number;
+
+  constructor(
+    reason: "rate_limited" | "unavailable",
+    blockedAccounts: number,
+    retryAtMs?: number,
+  ) {
+    super("no account is currently eligible for routing");
+    this.name = "NoEligibleAccountError";
+    this.reason = reason;
+    this.blockedAccounts = blockedAccounts;
+    if (retryAtMs !== undefined) this.retryAtMs = retryAtMs;
+  }
+}
+
+interface CapacityWindow {
+  utilization: number;
+  resetAt: number;
+}
+
+interface HardBlock {
+  reason: "rate_limited" | "unavailable";
+  retryAtMs?: number;
+}
+
+interface AccountCooldowns {
+  globalUntil: number;
+  modelUntil: Map<string, number>;
+  definiteGlobalUntil: number;
+  pendingAmbiguous: Map<number, { until: number; modelFamily?: string }>;
+}
+
+const MAX_TRUSTED_RATE_LIMIT_RESET_MS = 8 * 24 * 60 * 60 * 1_000;
+
+/** Compact diagnostic state for authenticated account status views. */
+export interface AccountCooldownSummary {
+  globalUntilMs: number;
+  modelCooldowns: Array<{ modelFamily: string; untilMs: number }>;
 }
 
 /**
  * Returns the reset timestamp (seconds) that must pass before the account
  * stops being rate_limited. Prefers the `claim` window (the one Anthropic
- * said was actually limiting); falls back to the earliest non-zero reset.
+ * said was actually limiting); when the claim is absent, all known windows
+ * must reset, so the latest non-zero reset is the complete unblock time.
  * Returns 0 when no reset is known.
  */
 function limitingReset(a: Account): number {
   const r = a.rateLimits;
   if (r.claim === "five_hour" && r.fiveHourReset) return r.fiveHourReset;
   if (r.claim === "seven_day" && r.sevenDayReset) return r.sevenDayReset;
-  const earliest = earliestReset(a);
-  return Number.isFinite(earliest) ? earliest : 0;
+  return Math.max(r.fiveHourReset, r.sevenDayReset, 0);
+}
+
+function modelScopedClaim(claim: string): boolean {
+  return claim.startsWith("seven_day_") &&
+    claim !== "seven_day_oauth_apps" &&
+    claim !== "seven_day_overage_included";
+}
+
+/** Accept only reset timestamps within the same bounded horizon as cooldown evidence. */
+function trustworthyResetMs(resetAtSeconds: unknown, nowMs: number): number | undefined {
+  if (typeof resetAtSeconds !== "number" || !Number.isFinite(resetAtSeconds) || resetAtSeconds <= 0) {
+    return undefined;
+  }
+  const resetAtMs = Math.floor(resetAtSeconds) * 1_000;
+  if (!Number.isFinite(resetAtMs) || resetAtMs <= nowMs) return undefined;
+  return resetAtMs - nowMs <= MAX_TRUSTED_RATE_LIMIT_RESET_MS ? resetAtMs : undefined;
 }
 
 /**
@@ -54,18 +107,31 @@ function clearExpiredRateLimitWindows(
 ): void {
   const nowSec = Math.floor(nowMs / 1000);
   const r = a.rateLimits;
-  let changed = false;
   let recovered = false;
 
   if (r.fiveHourReset > 0 && nowSec >= r.fiveHourReset) {
     r.fiveHourUtil = 0;
     r.fiveHourReset = 0;
-    changed = true;
   }
   if (r.sevenDayReset > 0 && nowSec >= r.sevenDayReset) {
     r.sevenDayUtil = 0;
     r.sevenDayReset = 0;
-    changed = true;
+  }
+
+  const usage = r.usage;
+  if (usage) {
+    for (const window of [usage.fiveHour, usage.sevenDay]) {
+      if (window && window.resetAt > 0 && nowSec >= window.resetAt) {
+        window.utilization = 0;
+        window.resetAt = 0;
+      }
+    }
+    for (const limit of usage.modelLimits) {
+      if (limit.resetAt > 0 && nowSec >= limit.resetAt) {
+        limit.utilization = 0;
+        limit.resetAt = 0;
+      }
+    }
   }
 
   // If the account was rate_limited and its claimed window just reset,
@@ -79,25 +145,10 @@ function clearExpiredRateLimitWindows(
     if (!stillBlocked) {
       r.status = "allowed";
       recovered = true;
-      changed = true;
     }
   }
 
-  if (changed) r.lastUpdated = nowMs;
   if (recovered && onExpired) onExpired(a);
-}
-
-/** True when the account's user-defined caps have been reached. */
-function overUserCap(a: Account): boolean {
-  return (
-    a.rateLimits.fiveHourUtil * 100 >= a.sessionLimitPercent ||
-    a.rateLimits.sevenDayUtil * 100 >= a.weeklyLimitPercent
-  );
-}
-
-/** Filter out accounts the user has taken out of the rotation. */
-function isUsable(a: Account): boolean {
-  return a.enabled && !overUserCap(a);
 }
 
 export interface AccountPatch {
@@ -118,9 +169,10 @@ export interface TokenPoolOptions {
 
 export class TokenPool {
   private readonly inFlight = new Map<string, number>();
-  private readonly cooldownUntil = new Map<string, number>();
+  private readonly cooldowns = new Map<Account, AccountCooldowns>();
   private readonly now: () => number;
   private currentIndex = 0;
+  private nextAmbiguousCooldownToken = 1;
 
   constructor(private readonly accounts: Account[], options: TokenPoolOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -128,27 +180,9 @@ export class TokenPool {
 
   /**
    * Compatibility wrapper for request sites that do not yet retain leases.
-   * Selection considers accounts that are:
-   *   • healthy
-   *   • not busy
-   *   • not rate-limited by Anthropic
-   *   • enabled (user toggle)
-   *   • under the user-configured 5h/7d caps
-   *
-   * Fallback chain when nothing is available:
-   *   1. Any healthy+usable (enabled & under caps) account — pick earliest reset.
-   *   2. Any healthy account — pick earliest reset. This intentionally ignores
-   *      user caps when every option is capped; limits are advisory, not a hard
-   *      ban that would leave Claude Code with no working account. The fallback
-   *      is logged via the optional onCapBypass callback so the dashboard can
-   *      surface it instead of silently exceeding the cap.
-   *   3. Any account as a last resort (only if every account is unhealthy).
-   *
-   * Fallback sets prefer the lowest in-flight load, then the earliest reset.
-   *
-   * Throws `EmptyPoolError` when there are no accounts at all — callers in
-   * the request path should map this to a 503. The DELETE endpoint guards
-   * against this state by refusing to remove the last account.
+   * User caps are advisory and may be bypassed when every hard-eligible
+   * account is capped. Upstream exhaustion, cooldown, disabled state, and
+   * unhealthy state are hard blocks and are never bypassed.
    */
   getNext(): Account {
     const lease = this.acquireBest(new Map());
@@ -160,47 +194,59 @@ export class TokenPool {
    * Acquire the best eligible account using load, session affinity pressure,
    * rate-limit headroom, and a rotating tie-break, in that order.
    */
-  acquireBest(activeSessions: ReadonlyMap<string, number>): AccountLease {
+  acquireBest(activeSessions: ReadonlyMap<string, number>, context?: RouteContext): AccountLease {
     if (this.accounts.length === 0) {
       throw new EmptyPoolError("token pool is empty — add an account first");
     }
 
     this.sweepExpiredCooldowns();
-    const eligible = this.accounts.filter(account => this.isEligibleWithoutSweep(account));
+    const hardBlocks = new Map<Account, HardBlock>();
+    const hardEligible = this.accounts.filter(account => {
+      const block = this.hardBlock(account, context);
+      if (block) hardBlocks.set(account, block);
+      return block === null;
+    });
+    const withinUserCaps = hardEligible.filter(account => !this.overUserCap(account));
 
-    if (eligible.length > 0) {
-      const account = this.selectEligible(eligible, activeSessions);
+    if (withinUserCaps.length > 0) {
+      const account = this.selectEligible(withinUserCaps, activeSessions, context);
       this.advanceCursor(account);
       return this.createLease(account, false);
     }
 
-    const healthyUsable = this.accounts.filter(account => account.healthy && isUsable(account));
-    const healthy = this.accounts.filter(account => account.healthy);
-    const fallbackCandidates = healthyUsable.length > 0
-      ? healthyUsable
-      : healthy.length > 0
-        ? healthy
-        : this.accounts;
-    const account = this.selectFallback(fallbackCandidates);
-    this.advanceCursor(account);
-    if (overUserCap(account)) this.onCapBypass?.(account);
-    return this.createLease(account, true);
+    if (hardEligible.length > 0) {
+      const account = this.selectEligible(hardEligible, activeSessions, context);
+      this.advanceCursor(account);
+      this.onCapBypass?.(account);
+      return this.createLease(account, true);
+    }
+
+    const rateLimited = [...hardBlocks.values()].filter(block => block.reason === "rate_limited");
+    const retryTimes = rateLimited
+      .map(block => block.retryAtMs)
+      .filter((retryAtMs): retryAtMs is number => retryAtMs !== undefined);
+    const retryAtMs = retryTimes.length > 0 ? Math.min(...retryTimes) : undefined;
+    throw new NoEligibleAccountError(
+      rateLimited.length > 0 ? "rate_limited" : "unavailable",
+      this.accounts.length,
+      retryAtMs,
+    );
   }
 
   /** Acquire a specific account for an existing sticky session. */
-  tryAcquire(accountId: string): AccountLease | null {
+  tryAcquire(accountId: string, context?: RouteContext): AccountLease | null {
     const account = this.findById(accountId);
     if (!account) return null;
     clearExpiredRateLimitWindows(account, this.now(), this.onCooldownExpired);
-    if (!this.isEligibleWithoutSweep(account)) return null;
+    if (this.hardBlock(account, context) || this.overUserCap(account)) return null;
     return this.createLease(account, false);
   }
 
-  isEligible(accountId: string): boolean {
+  isEligible(accountId: string, context?: RouteContext): boolean {
     const account = this.findById(accountId);
     if (!account) return false;
     clearExpiredRateLimitWindows(account, this.now(), this.onCooldownExpired);
-    return this.isEligibleWithoutSweep(account);
+    return this.hardBlock(account, context) === null && !this.overUserCap(account);
   }
 
   getInFlight(accountId: string): number {
@@ -210,50 +256,329 @@ export class TokenPool {
   setCooldown(accountId: string, durationMs: number): void {
     const account = this.findById(accountId);
     if (!account) return;
-    this.setCooldownForAccount(account, durationMs);
+    this.setGlobalCooldownForAccount(account, durationMs);
   }
 
-  /** Apply cooldown only to the exact account incarnation that was routed. */
+  /** Compatibility alias retained for callers that have not adopted scopes. */
   setCooldownForAccount(account: Account, durationMs: number): void {
-    if (this.findById(account.id) !== account) return;
-    if (!Number.isFinite(durationMs) || durationMs <= 0) return;
-    const proposedExpiry = this.now() + durationMs;
-    const existingExpiry = this.cooldownUntil.get(account.id) ?? 0;
-    this.cooldownUntil.set(account.id, Math.max(existingExpiry, proposedExpiry));
+    this.setGlobalCooldownForAccount(account, durationMs);
   }
 
-  isCoolingDown(accountId: string): boolean {
-    const until = this.cooldownUntil.get(accountId);
-    if (until === undefined) return false;
-    if (this.now() < until) return true;
-    this.cooldownUntil.delete(accountId);
-    return false;
+  /** Apply an account-global cooldown to the exact account incarnation routed. */
+  setGlobalCooldownForAccount(account: Account, durationMs: number): void {
+    const expiry = this.proposedExpiry(account, durationMs);
+    if (expiry === undefined) return;
+    const state = this.cooldownsFor(account);
+    state.definiteGlobalUntil = Math.max(state.definiteGlobalUntil, expiry);
+    this.recomputeGlobalUntil(state);
   }
 
-  private isEligibleWithoutSweep(account: Account): boolean {
-    return account.healthy &&
-      !account.busy &&
-      !this.isCoolingDown(account.id) &&
-      account.rateLimits.status !== "rate_limited" &&
-      isUsable(account);
+  /** Apply a model-family cooldown to the exact account incarnation routed. */
+  setModelCooldownForAccount(
+    account: Account,
+    modelFamily: string,
+    durationMs: number,
+  ): void {
+    const expiry = this.proposedExpiry(account, durationMs);
+    const family = normalizeModelFamily(modelFamily);
+    if (expiry === undefined || family === undefined) return;
+    const state = this.cooldownsFor(account);
+    state.modelUntil.set(family, Math.max(state.modelUntil.get(family) ?? 0, expiry));
+  }
+
+  /** Mark a conservative global cooldown as eligible for later narrowing. */
+  setAmbiguousGlobalCooldownForAccount(
+    account: Account,
+    durationMs: number,
+    modelFamily?: string,
+  ): number | undefined {
+    const expiry = this.proposedExpiry(account, durationMs);
+    if (expiry === undefined) return undefined;
+    const state = this.cooldownsFor(account);
+    const token = this.nextAmbiguousCooldownToken++;
+    const family = normalizeModelFamily(modelFamily);
+    state.pendingAmbiguous.set(token, {
+      until: expiry,
+      ...(family ? { modelFamily: family } : {}),
+    });
+    this.recomputeGlobalUntil(state);
+    return token;
+  }
+
+  /** Narrow only ambiguity-owned global state after a successful usage refresh. */
+  reconcileAmbiguousGlobalCooldownForAccount(
+    account: Account,
+    token: number,
+    modelFamily: string,
+    durationMs: number,
+  ): boolean {
+    if (this.findById(account.id) !== account) return false;
+    const state = this.cooldowns.get(account);
+    if (!state) return false;
+    const pending = state.pendingAmbiguous.get(token);
+    if (!pending || pending.until <= this.now()) return false;
+    const family = normalizeModelFamily(modelFamily);
+    if (!family || pending.modelFamily !== family) return false;
+    const proposed = this.proposedExpiry(account, durationMs) ?? 0;
+    const expiry = Math.max(pending.until, proposed);
+    state.modelUntil.set(family, Math.max(state.modelUntil.get(family) ?? 0, expiry));
+    state.pendingAmbiguous.delete(token);
+    this.recomputeGlobalUntil(state);
+    if (state.globalUntil <= this.now()) {
+      account.rateLimits.status = "allowed";
+    }
+    this.deleteEmptyCooldowns(account, state);
+    return true;
+  }
+
+  getApplicableCooldownUntil(accountId: string, context?: RouteContext): number {
+    const account = this.findById(accountId);
+    if (!account) return 0;
+    const state = this.cooldowns.get(account);
+    if (!state) return 0;
+    this.clearExpiredCooldownState(account, state);
+    const current = this.cooldowns.get(account);
+    if (!current) return 0;
+    const family = normalizeModelFamily(context?.modelFamily ?? context?.requestedModel);
+    return Math.max(
+      current.globalUntil,
+      family ? current.modelUntil.get(family) ?? 0 : 0,
+    );
+  }
+
+  isCoolingDown(accountId: string, context?: RouteContext): boolean {
+    if (context !== undefined) return this.getApplicableCooldownUntil(accountId, context) > 0;
+    const account = this.findById(accountId);
+    if (!account) return false;
+    return this.earliestCooldownUntil(account) > 0;
+  }
+
+  /** Earliest active scope expiry for aggregate health reporting. */
+  getEarliestCooldownUntil(accountId: string): number {
+    const account = this.findById(accountId);
+    return account ? this.earliestCooldownUntil(account) : 0;
+  }
+
+  /**
+   * Return only aggregate, normalized cooldown scopes. Session bindings and
+   * ambiguity tokens deliberately remain internal to the router.
+   */
+  getCooldownSummary(accountId: string): AccountCooldownSummary {
+    const account = this.findById(accountId);
+    if (!account) return { globalUntilMs: 0, modelCooldowns: [] };
+    const state = this.cooldowns.get(account);
+    if (!state) return { globalUntilMs: 0, modelCooldowns: [] };
+    this.clearExpiredCooldownState(account, state);
+    const current = this.cooldowns.get(account);
+    if (!current) return { globalUntilMs: 0, modelCooldowns: [] };
+    return {
+      globalUntilMs: current.globalUntil,
+      modelCooldowns: [...current.modelUntil]
+        .filter(([, untilMs]) => untilMs > 0)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .slice(0, 12)
+        .map(([modelFamily, untilMs]) => ({ modelFamily, untilMs })),
+    };
+  }
+
+  private hardBlock(account: Account, context?: RouteContext): HardBlock | null {
+    if (!account.enabled || !account.healthy) return { reason: "unavailable" };
+
+    const nowMs = this.now();
+    const timedBlockers: number[] = [];
+    let hasIndefiniteBlocker = false;
+    let rateLimited = false;
+
+    const cooldownExpiry = this.getApplicableCooldownUntil(account.id, context);
+    if (cooldownExpiry > 0) {
+      rateLimited = true;
+      timedBlockers.push(cooldownExpiry);
+    }
+
+    if (account.rateLimits.status === "rate_limited" && !modelScopedClaim(account.rateLimits.claim)) {
+      rateLimited = true;
+      const resetAt = trustworthyResetMs(limitingReset(account), nowMs);
+      if (resetAt !== undefined) timedBlockers.push(resetAt);
+      else hasIndefiniteBlocker = true;
+    }
+
+    const exhausted = [
+      ...this.globalWindows(account),
+      ...this.matchingModelWindows(account, context),
+    ].filter(window => window.utilization >= 1);
+    if (exhausted.length > 0 && !this.canUsePaidExtra(account)) {
+      rateLimited = true;
+      for (const window of exhausted) {
+        const resetAt = trustworthyResetMs(window.resetAt, nowMs);
+        if (resetAt !== undefined) timedBlockers.push(resetAt);
+        else hasIndefiniteBlocker = true;
+      }
+    }
+
+    if (!rateLimited) return null;
+    const retryAtMs = !hasIndefiniteBlocker && timedBlockers.length > 0
+      ? Math.max(...timedBlockers)
+      : undefined;
+    return retryAtMs === undefined
+      ? { reason: "rate_limited" }
+      : { reason: "rate_limited", retryAtMs };
+  }
+
+  private overUserCap(account: Account): boolean {
+    const [fiveHour, sevenDay] = this.globalWindows(account);
+    return (account.sessionLimitPercent < 100 &&
+        fiveHour.utilization * 100 >= account.sessionLimitPercent) ||
+      (account.weeklyLimitPercent < 100 &&
+        sevenDay.utilization * 100 >= account.weeklyLimitPercent);
+  }
+
+  private globalWindows(account: Account): [CapacityWindow, CapacityWindow] {
+    const headers: [CapacityWindow, CapacityWindow] = [
+      {
+        utilization: this.safeUtilization(account.rateLimits.fiveHourUtil),
+        resetAt: this.safeResetAt(account.rateLimits.fiveHourReset),
+      },
+      {
+        utilization: this.safeUtilization(account.rateLimits.sevenDayUtil),
+        resetAt: this.safeResetAt(account.rateLimits.sevenDayReset),
+      },
+    ];
+    const usage = account.rateLimits.usage;
+    if (!usage || usage.fetchStatus === "unavailable" || usage.fetchedAt < account.rateLimits.lastUpdated) {
+      return headers;
+    }
+    return [
+      usage.fiveHour
+        ? {
+            utilization: this.safeUtilization(usage.fiveHour.utilization),
+            resetAt: this.safeResetAt(usage.fiveHour.resetAt),
+          }
+        : headers[0],
+      usage.sevenDay
+        ? {
+            utilization: this.safeUtilization(usage.sevenDay.utilization),
+            resetAt: this.safeResetAt(usage.sevenDay.resetAt),
+          }
+        : headers[1],
+    ];
+  }
+
+  private matchingModelWindows(account: Account, context?: RouteContext): CapacityWindow[] {
+    const usage = account.rateLimits.usage;
+    if (!usage || usage.fetchStatus === "unavailable") return [];
+    const requestedModel = context?.requestedModel;
+    const modelFamily = context?.modelFamily;
+    if (!requestedModel && !modelFamily) return [];
+
+    return usage.modelLimits
+      .filter(limit =>
+        (modelFamily !== undefined && limit.modelFamily === modelFamily) ||
+        (requestedModel !== undefined && limit.modelId === requestedModel),
+      )
+      .map(limit => ({
+        utilization: this.safeUtilization(limit.utilization),
+        resetAt: this.safeResetAt(limit.resetAt),
+      }));
+  }
+
+  private canUsePaidExtra(account: Account): boolean {
+    const usage = account.rateLimits.usage;
+    return usage?.fetchStatus === "fresh" && canUseExtraUsage(usage.extraUsage);
+  }
+
+  private usesPaidExtra(account: Account, context?: RouteContext): boolean {
+    if (!this.canUsePaidExtra(account)) return false;
+    return [...this.globalWindows(account), ...this.matchingModelWindows(account, context)]
+      .some(window => window.utilization >= 1);
+  }
+
+  private safeUtilization(value: unknown): number {
+    return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+  }
+
+  private safeResetAt(value: unknown): number {
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+      ? Math.floor(value)
+      : 0;
+  }
+
+  private proposedExpiry(account: Account, durationMs: number): number | undefined {
+    if (this.findById(account.id) !== account) return undefined;
+    if (!Number.isFinite(durationMs) || durationMs <= 0) return undefined;
+    const expiry = this.now() + durationMs;
+    return Number.isFinite(expiry) ? expiry : undefined;
+  }
+
+  private cooldownsFor(account: Account): AccountCooldowns {
+    let state = this.cooldowns.get(account);
+    if (!state) {
+      state = {
+        globalUntil: 0,
+        modelUntil: new Map(),
+        definiteGlobalUntil: 0,
+        pendingAmbiguous: new Map(),
+      };
+      this.cooldowns.set(account, state);
+    }
+    return state;
+  }
+
+  private clearExpiredCooldownState(account: Account, state: AccountCooldowns): void {
+    const now = this.now();
+    if (state.definiteGlobalUntil <= now) state.definiteGlobalUntil = 0;
+    for (const [token, pending] of state.pendingAmbiguous) {
+      if (pending.until <= now) state.pendingAmbiguous.delete(token);
+    }
+    this.recomputeGlobalUntil(state);
+    for (const [family, expiry] of state.modelUntil) {
+      if (expiry <= now) state.modelUntil.delete(family);
+    }
+    this.deleteEmptyCooldowns(account, state);
+  }
+
+  private deleteEmptyCooldowns(account: Account, state: AccountCooldowns): void {
+    if (state.globalUntil === 0 && state.modelUntil.size === 0) {
+      this.cooldowns.delete(account);
+    }
+  }
+
+  private recomputeGlobalUntil(state: AccountCooldowns): void {
+    let globalUntil = state.definiteGlobalUntil;
+    for (const pending of state.pendingAmbiguous.values()) {
+      globalUntil = Math.max(globalUntil, pending.until);
+    }
+    state.globalUntil = globalUntil;
+  }
+
+  private earliestCooldownUntil(account: Account): number {
+    const state = this.cooldowns.get(account);
+    if (!state) return 0;
+    this.clearExpiredCooldownState(account, state);
+    const current = this.cooldowns.get(account);
+    if (!current) return 0;
+    const expiries = [current.globalUntil, ...current.modelUntil.values()].filter(value => value > 0);
+    return expiries.length > 0 ? Math.min(...expiries) : 0;
   }
 
   private selectEligible(
     candidates: Account[],
     activeSessions: ReadonlyMap<string, number>,
+    context?: RouteContext,
   ): Account {
     return candidates.reduce((best, account) => {
       const comparison = this.compareTuple(
         [
           this.getInFlight(account.id),
           activeSessions.get(account.id) ?? 0,
-          this.headroomScore(account),
+          this.usesPaidExtra(account, context) ? 1 : 0,
+          this.headroomScore(account, context),
           this.circularDistance(account),
         ],
         [
           this.getInFlight(best.id),
           activeSessions.get(best.id) ?? 0,
-          this.headroomScore(best),
+          this.usesPaidExtra(best, context) ? 1 : 0,
+          this.headroomScore(best, context),
           this.circularDistance(best),
         ],
       );
@@ -261,26 +586,20 @@ export class TokenPool {
     });
   }
 
-  private selectFallback(candidates: Account[]): Account {
-    return candidates.reduce((best, account) => {
-      const comparison = this.compareTuple(
-        [this.getInFlight(account.id), earliestReset(account), this.circularDistance(account)],
-        [this.getInFlight(best.id), earliestReset(best), this.circularDistance(best)],
-      );
-      return comparison < 0 ? account : best;
-    });
+  private headroomScore(account: Account, context?: RouteContext): number {
+    const [fiveHour, sevenDay] = this.globalWindows(account);
+    const modelUtilization = this.matchingModelWindows(account, context)
+      .map(window => window.utilization);
+    return Math.max(
+      this.capNormalizedUtilization(fiveHour.utilization, account.sessionLimitPercent),
+      this.capNormalizedUtilization(sevenDay.utilization, account.weeklyLimitPercent),
+      ...modelUtilization,
+    );
   }
 
-  private headroomScore(account: Account): number {
-    const fiveHourCap = account.sessionLimitPercent / 100;
-    const sevenDayCap = account.weeklyLimitPercent / 100;
-    const fiveHourUtil = Number.isFinite(account.rateLimits.fiveHourUtil)
-      ? Math.max(0, account.rateLimits.fiveHourUtil)
-      : 0;
-    const sevenDayUtil = Number.isFinite(account.rateLimits.sevenDayUtil)
-      ? Math.max(0, account.rateLimits.sevenDayUtil)
-      : 0;
-    return Math.max(fiveHourUtil / fiveHourCap, sevenDayUtil / sevenDayCap);
+  private capNormalizedUtilization(utilization: number, capPercent: number): number {
+    const cap = Number.isFinite(capPercent) ? Math.max(0, capPercent / 100) : 1;
+    return cap === 0 ? Number.POSITIVE_INFINITY : utilization / cap;
   }
 
   private circularDistance(account: Account): number {
@@ -339,7 +658,8 @@ export class TokenPool {
     const now = this.now();
     for (const a of this.accounts) {
       clearExpiredRateLimitWindows(a, now, this.onCooldownExpired);
-      this.isCoolingDown(a.id);
+      const state = this.cooldowns.get(a);
+      if (state) this.clearExpiredCooldownState(a, state);
     }
   }
 
@@ -358,6 +678,7 @@ export class TokenPool {
       busy: a.busy,
       inFlightRequests: this.getInFlight(a.id),
       coolingDown: this.isCoolingDown(a.id),
+      cooldownUntilMs: this.earliestCooldownUntil(a),
       requestCount: a.requestCount,
       errorCount: a.errorCount,
       expiresInMs: a.tokens.expiresAt - Date.now(),
@@ -443,9 +764,9 @@ export class TokenPool {
   removeAccount(id: string): boolean {
     const idx = this.accounts.findIndex(a => a.id === id);
     if (idx === -1) return false;
-    this.accounts.splice(idx, 1);
+    const [removed] = this.accounts.splice(idx, 1);
     this.inFlight.delete(id);
-    this.cooldownUntil.delete(id);
+    if (removed) this.cooldowns.delete(removed);
     if (this.accounts.length > 0) {
       this.currentIndex = this.currentIndex % this.accounts.length;
     } else {

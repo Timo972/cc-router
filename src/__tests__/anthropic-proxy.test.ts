@@ -132,6 +132,168 @@ function startCollecting(
 }
 
 describe("createAnthropicProxy", () => {
+  it("enforces scoped and global cooldowns before opening an upstream request", async () => {
+    let now = 1_000_000;
+    let upstreamRequests = 0;
+    const authorization: string[] = [];
+    const upstream = createServer((req, res) => {
+      upstreamRequests++;
+      authorization.push(String(req.headers.authorization ?? ""));
+      res.end("upstream");
+    });
+    const upstreamPort = await listen(upstream);
+    const accounts = [makeAccount("a"), makeAccount("b")];
+    const pool = new TokenPool(accounts, { now: () => now });
+    const sessionRouter = new SessionRouter(pool, { now: () => now });
+    pool.setModelCooldownForAccount(accounts[0], "fable", 30_000);
+
+    const app = express();
+    app.use("/v1", (req, _res, next) => {
+      const modelFamily = req.path.includes("sonnet") ? "sonnet" : "fable";
+      req._ccRouteContext = { requestedModel: `claude-${modelFamily}-5`, modelFamily };
+      next();
+    });
+    app.use("/v1", createAnthropicRoutingMiddleware({
+      sessionRouter,
+      now: () => now,
+    }));
+    app.use("/v1", createAnthropicRefreshMiddleware({
+      needsRefresh: () => false,
+      refresh: async () => true,
+      onRefreshFailure: vi.fn(),
+    }));
+    app.use("/v1", createAnthropicProxy({
+      target: `http://127.0.0.1:${upstreamPort}`,
+      timeoutMs: 2_000,
+      on: {
+        proxyReq: (proxyRequest, req) => {
+          const account = (req as express.Request)._ccAccount!;
+          proxyRequest.setHeader("authorization", `Bearer ${account.tokens.accessToken}`);
+        },
+      },
+    }));
+    const downstream = createServer(app);
+    const downstreamPort = await listen(downstream);
+    const base = `http://127.0.0.1:${downstreamPort}`;
+
+    try {
+      const selectedAvailable = await collect(new URL(`${base}/v1/fable-one`));
+      expect(selectedAvailable.status).toBe(200);
+      expect(authorization).toEqual(["Bearer access-b"]);
+
+      pool.setModelCooldownForAccount(accounts[1], "fable", 15_001);
+      const beforeLocalFailure = upstreamRequests;
+      const allFableBlocked = await collect(new URL(`${base}/v1/fable-two`));
+      expect(allFableBlocked.status).toBe(429);
+      expect(allFableBlocked.headers["retry-after"]).toBe("16");
+      expect(upstreamRequests).toBe(beforeLocalFailure);
+
+      accounts[1].enabled = false;
+      const sonnet = await collect(new URL(`${base}/v1/sonnet`));
+      expect(sonnet.status).toBe(200);
+      expect(authorization.at(-1)).toBe("Bearer access-a");
+
+      accounts[1].enabled = true;
+      pool.setGlobalCooldownForAccount(accounts[0], 5_000);
+      pool.setGlobalCooldownForAccount(accounts[1], 5_000);
+      const beforeGlobalFailure = upstreamRequests;
+      const globallyBlocked = await collect(new URL(`${base}/v1/sonnet-global`));
+      expect(globallyBlocked.status).toBe(429);
+      expect(upstreamRequests).toBe(beforeGlobalFailure);
+    } finally {
+      await close(downstream);
+      await close(upstream);
+    }
+  });
+
+  it("still forwards cap-only fallback routes and marks them as fallback", async () => {
+    const upstream = createServer((_req, res) => res.end("fallback-forwarded"));
+    const upstreamPort = await listen(upstream);
+    const account = makeAccount("capped");
+    account.sessionLimitPercent = 50;
+    account.rateLimits.fiveHourUtil = 0.75;
+    const pool = new TokenPool([account]);
+    const sessionRouter = new SessionRouter(pool);
+    let observedFallback: boolean | undefined;
+    const app = express();
+    app.use("/v1", createAnthropicRoutingMiddleware({ sessionRouter }));
+    app.use("/v1", createAnthropicRefreshMiddleware({
+      needsRefresh: () => false,
+      refresh: async () => true,
+      onRefreshFailure: vi.fn(),
+    }));
+    app.use("/v1", createAnthropicProxy({
+      target: `http://127.0.0.1:${upstreamPort}`,
+      timeoutMs: 2_000,
+      on: {
+        proxyReq: (_proxyRequest, req) => {
+          observedFallback = (req as express.Request)._ccRoute?.fallback;
+        },
+      },
+    }));
+    const downstream = createServer(app);
+    const downstreamPort = await listen(downstream);
+
+    try {
+      const response = await collect(
+        new URL(`http://127.0.0.1:${downstreamPort}/v1/messages`),
+      );
+      expect(response.status).toBe(200);
+      expect(response.body.toString("utf8")).toBe("fallback-forwarded");
+      expect(observedFallback).toBe(true);
+    } finally {
+      await close(downstream);
+      await close(upstream);
+    }
+  });
+
+  it("keeps successful and failed SSE byte-transparent through the routing stack", async () => {
+    const successBody = Buffer.from(
+      "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
+      "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    const failureBody = Buffer.from(
+      "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}\n\n",
+    );
+    const upstream = createServer((req, res) => {
+      const failed = req.url?.includes("failure") === true;
+      const body = failed ? failureBody : successBody;
+      res.writeHead(failed ? 429 : 200, { "content-type": "text/event-stream" });
+      res.write(body.subarray(0, 17));
+      res.end(body.subarray(17));
+    });
+    const upstreamPort = await listen(upstream);
+    const pool = new TokenPool([makeAccount("a")]);
+    const sessionRouter = new SessionRouter(pool);
+    const app = express();
+    app.use("/v1", createAnthropicRoutingMiddleware({ sessionRouter }));
+    app.use("/v1", createAnthropicRefreshMiddleware({
+      needsRefresh: () => false,
+      refresh: async () => true,
+      onRefreshFailure: vi.fn(),
+    }));
+    app.use("/v1", createAnthropicProxy({
+      target: `http://127.0.0.1:${upstreamPort}`,
+      timeoutMs: 2_000,
+      on: {},
+    }));
+    const downstream = createServer(app);
+    const downstreamPort = await listen(downstream);
+    const base = `http://127.0.0.1:${downstreamPort}`;
+
+    try {
+      const success = await collect(new URL(`${base}/v1/success`));
+      const failure = await collect(new URL(`${base}/v1/failure`));
+      expect(success.status).toBe(200);
+      expect(success.body).toEqual(successBody);
+      expect(failure.status).toBe(429);
+      expect(failure.body).toEqual(failureBody);
+    } finally {
+      await close(downstream);
+      await close(upstream);
+    }
+  });
+
   it("forwards deliberately split SSE bytes without inserting or removing events", async () => {
     const chunks = [
       Buffer.from("event: message_start\nda"),
@@ -405,16 +567,20 @@ describe("createAnthropicProxy", () => {
       upstreamRequests++;
       res.writeHead(429, {
         "content-type": "application/json",
-        "retry-after": "invalid",
+        "retry-after": "60",
+        "anthropic-ratelimit-unified-representative-claim": "seven_day_sonnet",
+        "x-upstream-marker": "preserved-verbatim",
       });
       res.write(failureBody.subarray(0, 11));
       res.end(failureBody.subarray(11));
     });
     const upstreamPort = await listen(upstream);
     const invalidate = vi.fn();
-    const setCooldownForAccount = vi.fn();
+    const account = makeAccount("account-a");
+    const pool = new TokenPool([account]);
     const route = {
-      account: makeAccount("account-a"),
+      account,
+      modelFamily: "sonnet",
       sessionId: "session-a",
       bindingGeneration: 1,
     };
@@ -427,10 +593,10 @@ describe("createAnthropicProxy", () => {
         proxyRes: proxyResponse => {
           applyUpstreamFailureRouting(
             proxyResponse.statusCode ?? 0,
-            proxyResponse.headers["retry-after"],
+            proxyResponse.headers,
             route,
             { invalidate },
-            { setCooldownForAccount },
+            pool,
           );
         },
       },
@@ -442,10 +608,16 @@ describe("createAnthropicProxy", () => {
       const response = await collect(new URL(`http://127.0.0.1:${downstreamPort}/v1/messages`));
 
       expect(response.status).toBe(429);
+      expect(response.headers["content-type"]).toBe("application/json");
+      expect(response.headers["retry-after"]).toBe("60");
+      expect(response.headers["anthropic-ratelimit-unified-representative-claim"])
+        .toBe("seven_day_sonnet");
+      expect(response.headers["x-upstream-marker"]).toBe("preserved-verbatim");
       expect(response.body).toEqual(failureBody);
       expect(upstreamRequests).toBe(1);
       expect(invalidate).toHaveBeenCalledWith("session-a", "account-a", 1);
-      expect(setCooldownForAccount).toHaveBeenCalledWith(route.account, 60_000);
+      expect(pool.isEligible("account-a", { modelFamily: "sonnet" })).toBe(false);
+      expect(pool.isEligible("account-a", { modelFamily: "opus" })).toBe(true);
       expect(response.body.toString("utf8")).not.toContain("message_stop");
     } finally {
       await close(downstream);

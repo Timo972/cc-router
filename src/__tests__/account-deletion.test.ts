@@ -3,6 +3,7 @@ import {
   AccountDeletionConflictError,
   accountDeletionStatusCode,
   deleteAnthropicAccountTransaction,
+  deleteOpenAIAccountTransaction,
   LastAccountDeletionError,
 } from "../proxy/account-deletion.js";
 import { SessionRouter } from "../proxy/session-router.js";
@@ -13,6 +14,7 @@ import {
 } from "../proxy/token-refresher.js";
 import type { Account } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
+import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 
 function makeAccount(id: string): Account {
   return {
@@ -282,5 +284,45 @@ describe("deleteAnthropicAccountTransaction", () => {
     expect(persistedRotatedToken).toBe("rotated-refresh");
     expect(events).toEqual(["p1-persist", "delete-persist"]);
     expect(pool.findById("a")).toBeNull();
+  });
+});
+
+describe("deleteOpenAIAccountTransaction", () => {
+  const openAIAccount = (id: string): OpenAISubscriptionAccount => ({
+    id,
+    provider: "openai_subscription",
+    accessToken: `access-${id}`,
+    refreshToken: `refresh-${id}`,
+    expiresAt: Date.now() + 60_000,
+    enabled: true,
+  });
+
+  it("persists prospective state before removing the live account", () => {
+    const first = openAIAccount("openai-a");
+    const second = openAIAccount("openai-b");
+    const accounts = [first, second];
+    const persist = vi.fn((prospective: OpenAISubscriptionAccount[]) => {
+      expect(prospective).toEqual([second]);
+      expect(accounts).toEqual([first, second]);
+    });
+
+    expect(deleteOpenAIAccountTransaction({
+      id: first.id,
+      accounts,
+      otherAccountCount: 0,
+      persist,
+    })).toBe(first);
+    expect(accounts).toEqual([second]);
+  });
+
+  it("does not remove the final configured account", () => {
+    const accounts = [openAIAccount("only")];
+    expect(() => deleteOpenAIAccountTransaction({
+      id: "only",
+      accounts,
+      otherAccountCount: 0,
+      persist: vi.fn(),
+    })).toThrow(LastAccountDeletionError);
+    expect(accounts).toHaveLength(1);
   });
 });

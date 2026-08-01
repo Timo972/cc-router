@@ -32,17 +32,25 @@ whether that header is present and valid.
 
 | Reason | When | Behaviour |
 |---|---|---|
-| `sticky` | Session already bound to a healthy account | Reuses that account — the cache-hit path |
+| `sticky` | Session already bound to an account eligible for the requested model | Reuses that account — the cache-hit path |
 | `new-session` | Valid session, no binding yet | Picks the best account, then binds it |
 | `failover` | Bound account returned 401/429/529 | Binding invalidated; next request rebinds |
 | `unscoped` | No valid session header | Load-balanced per request, **no** affinity |
 
-For `new-session`, accounts are ranked in this order:
+The session binding is account-based, not model-based. Every request still
+carries its requested model into eligibility checks. A model change keeps the
+same binding when that account can serve the new model; otherwise the binding
+is removed and the session selects one replacement account.
+
+For `new-session`, `failover`, and `unscoped` selection, cc-router first removes
+hard-unavailable accounts and applies the configured caps described below. The
+remaining accounts are ranked in this order:
 
 1. Fewest in-flight requests
 2. Fewest bound sessions
-3. Most rate-limit headroom
-4. Rotating round-robin (tie-break only)
+3. Included allowance before actively used paid extra allowance
+4. Most headroom across the applicable global and requested-model windows
+5. Rotating round-robin (tie-break only)
 
 A session header is only honoured if it is a single non-empty string of at most
 256 bytes. Multiple values are **rejected rather than picked between** — a
@@ -67,8 +75,14 @@ cc-router deliberately does **not** retry on your behalf, and **never** retries
 after response bytes have started. A half-streamed answer is never silently
 restarted or stitched together from two accounts.
 
-If your team sees a burst of 429s, that means every eligible account was rate
-limited — adding accounts is the fix, not tuning the router.
+When every account is hard-blocked before forwarding begins, cc-router makes no
+Anthropic Messages request. It returns an Anthropic-shaped local **429** when
+any block is rate-limit or quota related. The 429 includes `Retry-After`, rounded
+up from the earliest trustworthy unblock time, only when that time is known. It
+returns a local **503** only when the accounts are entirely unavailable for
+non-rate-limit reasons, such as all being disabled or unhealthy. A local error
+is distinguishable from an upstream response in recent activity as
+`no-eligible:rate-limited` or `no-eligible:unavailable`.
 
 ---
 
@@ -96,6 +110,35 @@ generous headroom for extended thinking.
 
 ## Operating it for a team
 
+### Upstream allowance and cooldowns
+
+Anthropic exposes unified five-hour and all-model weekly windows plus a dynamic
+set of model-scoped weekly windows. The requested Messages model is normalized
+to a model family and matched against those scopes; cc-router does not maintain
+a fixed list of model names. An exhausted matching scope blocks that model but
+does not block unrelated models when global capacity remains. An exhausted
+five-hour or all-model weekly window blocks every model. Usable paid extra
+allowance can keep an otherwise exhausted account eligible, but it ranks behind
+included allowance.
+
+These are **hard exclusions**, as are disabled or unhealthy accounts, invalid
+authentication, global cooldowns, and cooldowns for the requested model. They
+are never bypassed by fallback routing. A model-specific 429 narrows the
+cooldown only when the response and current model-scoped evidence make that
+classification unambiguous; unknown rate-limit failures and service overloads
+remain account-global.
+
+The router refreshes allowance snapshots in memory from Anthropic's fixed
+internal `GET https://api.anthropic.com/api/oauth/usage` OAuth endpoint. That
+endpoint is not a documented public API and may change. Refreshes use bounded
+timeouts, staggered concurrency, and per-account backoff. When refresh fails,
+the last good snapshot becomes stale and continues to provide conservative
+exhaustion evidence until its reset, but stale paid-extra state cannot authorize
+spend. If no usable snapshot exists, model-scoped status is unavailable and the
+router degrades to the global rate-limit state observed in Anthropic response
+headers. The dashboard labels snapshot freshness; stale model rows are not
+presented as authoritative available capacity.
+
 ### Per-account throttles
 
 Each account carries two caps (0–100), each governing a different Anthropic
@@ -106,21 +149,26 @@ rate-limit window:
 | `sessionLimitPercent` | 5-hour utilisation |
 | `weeklyLimitPercent` | 7-day utilisation |
 
-These are **hard caps, not just preferences**. Once an account reaches either
-one, it is removed from rotation entirely until that window recovers — it will
-not serve new sessions even if every other account is busy. Below the cap,
-utilisation measured *relative to the cap* also feeds the headroom ranking, so a
-throttled account is picked less often as it approaches its limit.
+These configured caps are **soft policy controls**, distinct from Anthropic's
+hard quota and cooldown exclusions. Accounts below their caps are preferred.
+If all hard-eligible accounts exceed only these configured caps, cc-router may
+select the least-loaded capped account through an explicit cap-bypass fallback.
+Below the cap, utilisation measured *relative to the cap* also feeds the
+headroom ranking, so a throttled account is picked less often as it approaches
+its configured limit.
 
 Use them when accounts shouldn't be drawn down equally — for example, when one is
 a teammate's personal subscription they still want capacity on. Setting an
-account to 60% reserves 40% of its budget for its owner.
+account to 60% creates an approximate 40% holdback during normal selection while
+an under-cap alternative remains. It is not a guaranteed reservation: the
+all-capped fallback may cross the configured cap.
 
 Both are editable per account from the dashboard.
 
-> Setting caps too low across the board takes accounts out of rotation earlier
-> and can produce 429s while budget technically remains. If you see failover
-> churn, check the caps before adding accounts.
+> Setting caps low holds back capacity during normal selection, but cannot make
+> every otherwise usable account unavailable: the all-capped fallback may
+> bypass them. Anthropic quota exhaustion and cooldowns remain hard regardless
+> of these settings.
 
 ### Monitoring
 
@@ -138,7 +186,8 @@ Per account, the useful routing fields are:
 - `inFlightRequests` — requests currently in flight
 - `activeSessions` — sessions currently bound
 - `healthy` / `enabled` — eligibility for new sessions
-- `rateLimits` — remaining headroom
+- `rateLimits` — global windows, dynamic model-scoped windows, snapshot
+  freshness, paid-extra state, and bounded cooldown summaries
 
 A healthy multi-account router under load shows `activeSessions` spread across
 accounts. If they pile onto one account while others sit idle, the others are
@@ -173,8 +222,10 @@ account shows all the in-flight requests, that account simply has the busiest
 conversation.
 
 **A session jumped to another account mid-conversation.**
-Its previous account returned 401/429/529, or the binding aged out after an hour
-idle. Both are by design. The next turn pays one cache miss and then stays put.
+Its previous account returned 401/429/529, became ineligible for the requested
+model, or the binding aged out after an hour idle. These are by design. The next
+turn pays one cache miss and then stays put while the replacement remains
+eligible.
 
 **Sessions rebind constantly after a restart.**
 Affinity is in-memory; a router restart clears it. If the router is restarting

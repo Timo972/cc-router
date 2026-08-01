@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { TokenPool, EmptyPoolError } from "../proxy/token-pool.js";
+import {
+  TokenPool,
+  EmptyPoolError,
+  NoEligibleAccountError,
+} from "../proxy/token-pool.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
 
@@ -23,6 +27,38 @@ function makeAccount(id: string, healthy = true, busy = false): Account {
     enabled: true,
     sessionLimitPercent: 100,
     weeklyLimitPercent: 100,
+  };
+}
+
+const SONNET_CONTEXT = {
+  requestedModel: "claude-sonnet-4-20250514",
+  modelFamily: "sonnet",
+} as const;
+
+const OPUS_CONTEXT = {
+  requestedModel: "claude-opus-4-20250514",
+  modelFamily: "opus",
+} as const;
+
+function addModelLimit(
+  account: Account,
+  modelFamily: string,
+  utilization: number,
+  resetAt: number,
+): void {
+  account.rateLimits.usage = {
+    modelLimits: [{
+      kind: "weekly_scoped",
+      group: "weekly",
+      modelFamily,
+      displayName: modelFamily,
+      utilization,
+      resetAt,
+      active: true,
+      severity: "",
+    }],
+    fetchedAt: 1,
+    fetchStatus: "fresh",
   };
 }
 
@@ -149,13 +185,13 @@ describe("TokenPool — request leases", () => {
     second!.release();
   });
 
-  it("chooses the lowest in-flight account for all-unavailable fallback", () => {
+  it("chooses the lowest in-flight account for a user-cap bypass", () => {
     const a = makeAccount("a");
     const b = makeAccount("b");
     const pool = new TokenPool([a, b]);
     const first = pool.tryAcquire("a");
-    a.enabled = false;
-    b.enabled = false;
+    a.sessionLimitPercent = 0;
+    b.sessionLimitPercent = 0;
 
     const fallback = pool.acquireBest(new Map());
     expect(fallback.account.id).toBe("b");
@@ -245,6 +281,121 @@ describe("TokenPool — timestamp cooldown", () => {
     expect(pool.findById("a")).toBe(replacement);
     expect(pool.isCoolingDown("a")).toBe(false);
   });
+
+  it("applies global cooldowns to every requested model", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+
+    pool.setGlobalCooldownForAccount(account, 60_000);
+
+    expect(pool.isEligible("a", SONNET_CONTEXT)).toBe(false);
+    expect(pool.isEligible("a", OPUS_CONTEXT)).toBe(false);
+  });
+
+  it("normalizes model cooldowns and applies them only to the matching family", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+
+    pool.setModelCooldownForAccount(account, "Claude Sonnet 4", 60_000);
+
+    expect(pool.isEligible("a", SONNET_CONTEXT)).toBe(false);
+    expect(pool.isEligible("a", OPUS_CONTEXT)).toBe(true);
+  });
+
+  it("does not turn a named model claim into an account-global status block", () => {
+    const account = makeAccount("a");
+    account.rateLimits.status = "rate_limited";
+    account.rateLimits.claim = "seven_day_sonnet";
+    const pool = new TokenPool([account], { now: () => 1_000 });
+    pool.setModelCooldownForAccount(account, "sonnet", 60_000);
+
+    expect(pool.isEligible("a", SONNET_CONTEXT)).toBe(false);
+    expect(pool.isEligible("a", OPUS_CONTEXT)).toBe(true);
+  });
+
+  it("extends but never shortens global and model cooldown expiries", () => {
+    let now = 1_000;
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setGlobalCooldownForAccount(account, 60_000);
+    pool.setGlobalCooldownForAccount(account, 30_000);
+    pool.setModelCooldownForAccount(account, "sonnet", 90_000);
+    pool.setModelCooldownForAccount(account, "sonnet", 10_000);
+
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(61_000);
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(91_000);
+    now = 61_000;
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(0);
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(91_000);
+  });
+
+  it("expires exactly the matching model cooldown", () => {
+    let now = 1_000;
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => now });
+    pool.setModelCooldownForAccount(account, "sonnet", 10_000);
+    pool.setModelCooldownForAccount(account, "opus", 20_000);
+
+    now = 11_000;
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(0);
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(21_000);
+  });
+
+  it("does not carry scoped cooldown state through removal and same-ID replacement", () => {
+    const oldAccount = makeAccount("a");
+    const pool = new TokenPool([oldAccount], { now: () => 1_000 });
+    pool.setGlobalCooldownForAccount(oldAccount, 60_000);
+    pool.setModelCooldownForAccount(oldAccount, "sonnet", 90_000);
+
+    pool.removeAccount("a");
+    const replacement = pool.addAccount({
+      id: "a",
+      accessToken: "sk-ant-oat01-replacement",
+      refreshToken: "sk-ant-ort01-replacement",
+      expiresAt: Date.now() + 3_600_000,
+      scopes: ["user:inference"],
+    });
+
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(0);
+    expect(pool.isEligible(replacement.id, SONNET_CONTEXT)).toBe(true);
+  });
+
+  it("moves only an ambiguity-created global cooldown to a proven model scope", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+    const token = pool.setAmbiguousGlobalCooldownForAccount(account, 60_000, "sonnet");
+
+    pool.reconcileAmbiguousGlobalCooldownForAccount(account, token!, "sonnet", 90_000);
+
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(0);
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(91_000);
+  });
+
+  it("does not narrow a definite global cooldown during reconciliation", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+    pool.setGlobalCooldownForAccount(account, 60_000);
+
+    pool.reconcileAmbiguousGlobalCooldownForAccount(account, 999, "sonnet", 90_000);
+
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(61_000);
+  });
+
+  it("reconciles only the exact ambiguous failure when two model 429s overlap", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+    const sonnetFailure = pool.setAmbiguousGlobalCooldownForAccount(account, 60_000, "sonnet");
+    const opusFailure = pool.setAmbiguousGlobalCooldownForAccount(account, 90_000, "opus");
+
+    pool.reconcileAmbiguousGlobalCooldownForAccount(account, sonnetFailure!, "sonnet", 60_000);
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(91_000);
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(91_000);
+
+    pool.reconcileAmbiguousGlobalCooldownForAccount(account, opusFailure!, "opus", 90_000);
+    expect(pool.getApplicableCooldownUntil("a", SONNET_CONTEXT)).toBe(61_000);
+    expect(pool.getApplicableCooldownUntil("a", OPUS_CONTEXT)).toBe(91_000);
+  });
 });
 
 describe("TokenPool — unhealthy accounts", () => {
@@ -258,9 +409,9 @@ describe("TokenPool — unhealthy accounts", () => {
     expect(ids).toEqual(["b", "c", "b"]);
   });
 
-  it("returns first account when ALL are unhealthy (emergency fallback)", () => {
+  it("throws when all accounts are unhealthy", () => {
     const pool = new TokenPool([makeAccount("a", false), makeAccount("b", false)]);
-    expect(pool.getNext().id).toBe("a");
+    expect(() => pool.getNext()).toThrow(NoEligibleAccountError);
   });
 
   it("getHealthy() excludes unhealthy accounts", () => {
@@ -270,30 +421,450 @@ describe("TokenPool — unhealthy accounts", () => {
 });
 
 describe("TokenPool — busy accounts", () => {
-  it("skips busy accounts in round-robin", () => {
+  it("does not use legacy busy state as an eligibility signal", () => {
     const pool = new TokenPool([makeAccount("a", true, true), makeAccount("b")]);
-    expect(pool.getNext().id).toBe("b");
+    expect(pool.getNext().id).toBe("a");
     expect(pool.getNext().id).toBe("b");
   });
 
-  it("returns account with earliest reset when ALL healthy accounts are busy", () => {
+  it("rotates normally when all healthy accounts have legacy busy state", () => {
     const a = makeAccount("a", true, true);
     const b = makeAccount("b", true, true);
-    // Use future timestamps — past resets get swept to 0 before selection,
-    // which would defeat the "earliest reset" comparison.
-    const nowSec = Math.floor(Date.now() / 1000);
-    a.rateLimits = { ...DEFAULT_RATE_LIMITS, fiveHourReset: nowSec + 7200 };
-    b.rateLimits = { ...DEFAULT_RATE_LIMITS, fiveHourReset: nowSec + 60 };
     const pool = new TokenPool([a, b]);
+    expect(pool.getNext().id).toBe("a");
     expect(pool.getNext().id).toBe("b");
   });
 
-  it("falls back to least-loaded of all when all are both busy AND unhealthy", () => {
+  it("does not fall back when all busy accounts are unhealthy", () => {
     const a = makeAccount("a", false, true);
     const b = makeAccount("b", false, true);
-    // All unhealthy → emergency path returns first account
     const pool = new TokenPool([a, b]);
-    expect(pool.getNext().id).toBe("a");
+    expect(() => pool.getNext()).toThrow(NoEligibleAccountError);
+  });
+});
+
+describe("TokenPool — model-aware hard eligibility", () => {
+  const nowMs = 1_000_000;
+  const futureReset = 1_100;
+
+  it("excludes an account with an exhausted matching model scope", () => {
+    const a = makeAccount("a");
+    addModelLimit(a, "sonnet", 1, futureReset);
+    const pool = new TokenPool([a, makeAccount("b")], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("b");
+  });
+
+  it("does not exclude an account for an exhausted unrelated model scope", () => {
+    const a = makeAccount("a");
+    addModelLimit(a, "sonnet", 1, futureReset);
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), OPUS_CONTEXT).account.id).toBe("a");
+  });
+
+  it("uses global windows only for an unknown request model", () => {
+    const a = makeAccount("a");
+    addModelLimit(a, "sonnet", 1, futureReset);
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), { requestedModel: "future-model-v1" }).account.id).toBe("a");
+  });
+
+  it.each([
+    ["five-hour", "fiveHourUtil", "fiveHourReset"],
+    ["weekly", "sevenDayUtil", "sevenDayReset"],
+  ] as const)("excludes every model when global %s capacity is exhausted", (_name, utilKey, resetKey) => {
+    const a = makeAccount("a");
+    a.rateLimits = {
+      ...DEFAULT_RATE_LIMITS,
+      [utilKey]: 1,
+      [resetKey]: futureReset,
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(() => pool.acquireBest(new Map(), OPUS_CONTEXT)).toThrow(NoEligibleAccountError);
+  });
+
+  it("keeps an otherwise exhausted account eligible when extra usage is usable", () => {
+    const a = makeAccount("a");
+    a.rateLimits.usage = {
+      fiveHour: { utilization: 1, resetAt: futureReset },
+      modelLimits: [],
+      extraUsage: { enabled: true, spendLimitReached: false },
+      fetchedAt: 100,
+      fetchStatus: "fresh",
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
+  });
+
+  it("keeps fresh extra usage authoritative after newer response headers", () => {
+    const a = makeAccount("a");
+    a.rateLimits = {
+      ...DEFAULT_RATE_LIMITS,
+      fiveHourUtil: 1,
+      fiveHourReset: futureReset,
+      lastUpdated: 200,
+      usage: {
+        fiveHour: { utilization: 0.5, resetAt: futureReset },
+        modelLimits: [],
+        extraUsage: { enabled: true, spendLimitReached: false },
+        fetchedAt: 100,
+        fetchStatus: "fresh",
+      },
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
+  });
+
+  it.each([
+    ["reached", { enabled: true, spendLimitReached: true }],
+    ["disabled", { enabled: false, spendLimitReached: false }],
+    ["disabled with a reason", { enabled: true, spendLimitReached: false, disabledReason: "paused" }],
+  ] as const)("does not use %s extra usage for exhausted capacity", (_name, extraUsage) => {
+    const a = makeAccount("a");
+    a.rateLimits.usage = {
+      fiveHour: { utilization: 1, resetAt: futureReset },
+      modelLimits: [],
+      extraUsage,
+      fetchedAt: 100,
+      fetchStatus: "fresh",
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(() => pool.acquireBest(new Map(), SONNET_CONTEXT)).toThrow(NoEligibleAccountError);
+  });
+
+  it("uses newer fresh snapshot globals instead of older response headers", () => {
+    const a = makeAccount("a");
+    a.rateLimits = {
+      ...DEFAULT_RATE_LIMITS,
+      fiveHourUtil: 1,
+      fiveHourReset: futureReset,
+      lastUpdated: 100,
+      usage: {
+        fiveHour: { utilization: 0.2, resetAt: futureReset },
+        modelLimits: [],
+        fetchedAt: 200,
+        fetchStatus: "fresh",
+      },
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
+  });
+
+  it("blocks on exhausted newer snapshot globals despite older available headers", () => {
+    const a = makeAccount("a");
+    a.rateLimits = {
+      ...DEFAULT_RATE_LIMITS,
+      fiveHourUtil: 0.2,
+      fiveHourReset: futureReset,
+      lastUpdated: 100,
+      usage: {
+        fiveHour: { utilization: 1, resetAt: futureReset },
+        modelLimits: [],
+        fetchedAt: 200,
+        fetchStatus: "fresh",
+      },
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(() => pool.acquireBest(new Map(), SONNET_CONTEXT)).toThrow(NoEligibleAccountError);
+  });
+
+  it("uses newer response headers instead of an older usage snapshot", () => {
+    const a = makeAccount("a");
+    a.rateLimits = {
+      ...DEFAULT_RATE_LIMITS,
+      fiveHourUtil: 0.2,
+      fiveHourReset: futureReset,
+      lastUpdated: 200,
+      usage: {
+        fiveHour: { utilization: 1, resetAt: futureReset },
+        modelLimits: [],
+        fetchedAt: 100,
+        fetchStatus: "stale",
+      },
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
+  });
+
+  it("keeps stale snapshot values as conservative evidence until reset", () => {
+    const a = makeAccount("a");
+    a.rateLimits = {
+      ...DEFAULT_RATE_LIMITS,
+      fiveHourUtil: 0.2,
+      fiveHourReset: futureReset,
+      lastUpdated: 100,
+      usage: {
+        fiveHour: { utilization: 1, resetAt: futureReset },
+        modelLimits: [],
+        fetchedAt: 200,
+        fetchStatus: "stale",
+      },
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(() => pool.acquireBest(new Map(), SONNET_CONTEXT)).toThrow(NoEligibleAccountError);
+  });
+
+  it("falls back to current response headers when a snapshot is unavailable", () => {
+    const a = makeAccount("a");
+    a.rateLimits = {
+      ...DEFAULT_RATE_LIMITS,
+      fiveHourUtil: 0.2,
+      fiveHourReset: futureReset,
+      lastUpdated: 100,
+      usage: {
+        fiveHour: { utilization: 1, resetAt: futureReset },
+        modelLimits: [],
+        fetchedAt: 200,
+        fetchStatus: "unavailable",
+      },
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
+  });
+
+  it("rolls an exhausted matching model window over after its reset", () => {
+    const a = makeAccount("a");
+    addModelLimit(a, "sonnet", 1, 999);
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
+    expect(a.rateLimits.usage?.modelLimits[0]).toMatchObject({ utilization: 0, resetAt: 0 });
+  });
+
+  it("applies a matching model scope regardless of its display active flag", () => {
+    const a = makeAccount("a");
+    addModelLimit(a, "sonnet", 1, futureReset);
+    a.rateLimits.usage!.modelLimits[0].active = false;
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(() => pool.acquireBest(new Map(), SONNET_CONTEXT)).toThrow(NoEligibleAccountError);
+  });
+
+  it("never produces NaN ranking from non-finite or malformed utilization", () => {
+    const a = makeAccount("a");
+    const b = makeAccount("b");
+    a.rateLimits.fiveHourUtil = Number.NaN;
+    addModelLimit(a, "sonnet", Number.POSITIVE_INFINITY, futureReset);
+    a.rateLimits.usage!.sevenDay = { utilization: "malformed" as unknown as number, resetAt: futureReset };
+    b.rateLimits.fiveHourUtil = 0.8;
+    const pool = new TokenPool([a, b], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
+  });
+
+  it("does not authorize paid spillover from a stale extra-usage state", () => {
+    const a = makeAccount("a");
+    a.rateLimits.usage = {
+      fiveHour: { utilization: 1, resetAt: futureReset },
+      modelLimits: [],
+      extraUsage: { enabled: true, spendLimitReached: false },
+      fetchedAt: 100,
+      fetchStatus: "stale",
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(() => pool.acquireBest(new Map(), SONNET_CONTEXT)).toThrow(NoEligibleAccountError);
+  });
+});
+
+describe("TokenPool — hard versus soft fallback", () => {
+  const nowMs = 1_000_000;
+
+  it("may bypass only user caps when hard capacity remains", () => {
+    const capped = makeAccount("capped");
+    capped.sessionLimitPercent = 50;
+    capped.rateLimits.fiveHourUtil = 0.6;
+    const cooling = makeAccount("cooling");
+    const pool = new TokenPool([cooling, capped], { now: () => nowMs });
+    pool.setCooldown("cooling", 60_000);
+    let bypassed: Account | undefined;
+    pool.onCapBypass = account => { bypassed = account; };
+
+    const lease = pool.acquireBest(new Map(), SONNET_CONTEXT);
+    expect(lease.account).toBe(capped);
+    expect(lease.fallback).toBe(true);
+    expect(bypassed).toBe(capped);
+  });
+
+  it("never falls back to a globally cooling account", () => {
+    const pool = new TokenPool([makeAccount("cooling")], { now: () => nowMs });
+    pool.setCooldown("cooling", 60_000);
+
+    expect(() => pool.acquireBest(new Map(), SONNET_CONTEXT)).toThrow(NoEligibleAccountError);
+  });
+
+  it("never falls back to an account cooling for the requested model", () => {
+    const a = makeAccount("model-cooling");
+    addModelLimit(a, "sonnet", 1, 1_100);
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(() => pool.acquireBest(new Map(), SONNET_CONTEXT)).toThrow(NoEligibleAccountError);
+  });
+
+  it("can use a model-cooling account for a different model", () => {
+    const a = makeAccount("model-cooling");
+    addModelLimit(a, "sonnet", 1, 1_100);
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), OPUS_CONTEXT).account).toBe(a);
+  });
+
+  it("never falls back to an upstream rate-limited account", () => {
+    const a = makeAccount("upstream-limited");
+    a.rateLimits = {
+      ...DEFAULT_RATE_LIMITS,
+      status: "rate_limited",
+      claim: "five_hour",
+      fiveHourReset: 1_100,
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    expect(() => pool.acquireBest(new Map(), SONNET_CONTEXT)).toThrow(NoEligibleAccountError);
+  });
+
+  it("does not trust a far-future OAuth usage reset for local retry timing", () => {
+    const a = makeAccount("snapshot-far-future");
+    a.rateLimits.usage = {
+      fiveHour: {
+        utilization: 1,
+        resetAt: nowMs / 1_000 + 8 * 24 * 60 * 60 + 2,
+      },
+      modelLimits: [],
+      fetchedAt: 1,
+      fetchStatus: "fresh",
+    };
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    let thrown: unknown;
+    try {
+      pool.acquireBest(new Map(), SONNET_CONTEXT);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(NoEligibleAccountError);
+    expect(thrown).toMatchObject({ reason: "rate_limited" });
+    expect((thrown as NoEligibleAccountError).retryAtMs).toBeUndefined();
+  });
+
+  it("does not trust a far-future legacy header reset for local retry timing", () => {
+    const a = makeAccount("header-far-future");
+    a.rateLimits.fiveHourUtil = 1;
+    a.rateLimits.fiveHourReset = nowMs / 1_000 + 8 * 24 * 60 * 60 + 2;
+    const pool = new TokenPool([a], { now: () => nowMs });
+
+    let thrown: unknown;
+    try {
+      pool.acquireBest(new Map(), SONNET_CONTEXT);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(NoEligibleAccountError);
+    expect(thrown).toMatchObject({ reason: "rate_limited" });
+    expect((thrown as NoEligibleAccountError).retryAtMs).toBeUndefined();
+  });
+
+  it("returns the earliest applicable unblock time when all accounts are hard-blocked", () => {
+    const quotaBlocked = makeAccount("quota-blocked");
+    quotaBlocked.rateLimits.usage = {
+      fiveHour: { utilization: 1, resetAt: 1_200 },
+      sevenDay: { utilization: 1, resetAt: 1_100 },
+      modelLimits: [],
+      fetchedAt: 100,
+      fetchStatus: "fresh",
+    };
+    const cooling = makeAccount("cooling");
+    const disabled = makeAccount("disabled");
+    disabled.enabled = false;
+    const pool = new TokenPool([quotaBlocked, cooling, disabled], { now: () => nowMs });
+    pool.setCooldown("cooling", 150_000);
+
+    let thrown: unknown;
+    try {
+      pool.acquireBest(new Map(), SONNET_CONTEXT);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(NoEligibleAccountError);
+    expect(thrown).toMatchObject({
+      reason: "rate_limited",
+      retryAtMs: 1_150_000,
+      blockedAccounts: 3,
+    });
+  });
+
+  it("reports unavailable without exposing account identifiers", () => {
+    const account = makeAccount("private-account-id", false);
+    const pool = new TokenPool([account], { now: () => nowMs });
+
+    let thrown: unknown;
+    try {
+      pool.acquireBest(new Map(), SONNET_CONTEXT);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(NoEligibleAccountError);
+    expect(thrown).toMatchObject({ reason: "unavailable", blockedAccounts: 1 });
+    expect((thrown as Error).message).not.toContain(account.id);
+  });
+});
+
+describe("TokenPool — requested-model headroom ranking", () => {
+  const nowMs = 1_000_000;
+
+  it("ranks by the worst applicable requested-model or global utilization", () => {
+    const a = makeAccount("a");
+    const b = makeAccount("b");
+    a.rateLimits.fiveHourUtil = 0.2;
+    b.rateLimits.fiveHourUtil = 0.5;
+    addModelLimit(a, "sonnet", 0.9, 1_100);
+    addModelLimit(b, "sonnet", 0.1, 1_100);
+    const pool = new TokenPool([a, b], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account).toBe(b);
+  });
+
+  it("normalizes global headroom by each configured user cap", () => {
+    const lowerRawUtilization = makeAccount("lower-raw");
+    lowerRawUtilization.sessionLimitPercent = 50;
+    lowerRawUtilization.rateLimits.fiveHourUtil = 0.4;
+    const greaterEffectiveHeadroom = makeAccount("greater-headroom");
+    greaterEffectiveHeadroom.sessionLimitPercent = 100;
+    greaterEffectiveHeadroom.rateLimits.fiveHourUtil = 0.6;
+    const pool = new TokenPool(
+      [lowerRawUtilization, greaterEffectiveHeadroom],
+      { now: () => nowMs },
+    );
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account).toBe(greaterEffectiveHeadroom);
+  });
+
+  it("ranks paid extra usage behind equal-load accounts with included quota", () => {
+    const paid = makeAccount("paid");
+    paid.rateLimits.usage = {
+      fiveHour: { utilization: 1, resetAt: 1_100 },
+      modelLimits: [],
+      extraUsage: { enabled: true, spendLimitReached: false },
+      fetchedAt: 100,
+      fetchStatus: "fresh",
+    };
+    const included = makeAccount("included");
+    included.rateLimits.fiveHourUtil = 0.9;
+    const pool = new TokenPool([paid, included], { now: () => nowMs });
+
+    expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account).toBe(included);
   });
 });
 
@@ -331,6 +902,18 @@ describe("TokenPool — stats", () => {
     expect(s.coolingDown).toBe(true);
 
     lease.release();
+  });
+
+  it("reports only the earliest active scoped cooldown timestamp", () => {
+    const account = makeAccount("a");
+    const pool = new TokenPool([account], { now: () => 1_000 });
+    pool.setModelCooldownForAccount(account, "opus", 20_000);
+    pool.setModelCooldownForAccount(account, "sonnet", 10_000);
+
+    const stats = pool.getStats()[0];
+    expect(stats.cooldownUntilMs).toBe(11_000);
+    expect(stats).not.toHaveProperty("modelUntil");
+    expect(stats).not.toHaveProperty("cooldowns");
   });
 });
 

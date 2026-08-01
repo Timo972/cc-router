@@ -2,7 +2,7 @@ import type { IncomingMessage } from "node:http";
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { acquireRequestRoute } from "./lease-lifecycle.js";
 import { normalizeSessionId, type RoutedAccountLease, type SessionRouter } from "./session-router.js";
-import { EmptyPoolError } from "./token-pool.js";
+import { EmptyPoolError, NoEligibleAccountError } from "./token-pool.js";
 import type { Account } from "./types.js";
 
 const SESSION_HEADER = "x-claude-code-session-id";
@@ -34,6 +34,44 @@ export function extractClaudeSessionId(request: IncomingMessage): string | undef
 export interface AnthropicRoutingMiddlewareOptions {
   sessionRouter: SessionRouter;
   onEmptyPool?: (error: EmptyPoolError, request: Request, response: Response) => void;
+  onNoEligibleAccount?: (
+    error: NoEligibleAccountError,
+    request: Request,
+    response: Response,
+  ) => void;
+  now?: () => number;
+}
+
+const NO_ELIGIBLE_ACCOUNT_MESSAGE =
+  "All configured accounts are unavailable for the requested model";
+
+function sendNoEligibleAccountResponse(
+  error: NoEligibleAccountError,
+  response: Response,
+  now: number,
+): void {
+  if (error.reason === "rate_limited") {
+    if (error.retryAtMs !== undefined) {
+      const retryAfterSeconds = Math.max(0, Math.ceil((error.retryAtMs - now) / 1_000));
+      response.setHeader("Retry-After", String(retryAfterSeconds));
+    }
+    response.status(429).json({
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        message: NO_ELIGIBLE_ACCOUNT_MESSAGE,
+      },
+    });
+    return;
+  }
+
+  response.status(503).json({
+    type: "error",
+    error: {
+      type: "service_unavailable",
+      message: NO_ELIGIBLE_ACCOUNT_MESSAGE,
+    },
+  });
 }
 
 /** Acquire the production route and bind its lease to downstream termination. */
@@ -47,6 +85,7 @@ export function createAnthropicRoutingMiddleware(
         extractClaudeSessionId(request),
         response,
         options.sessionRouter,
+        request._ccRouteContext,
       );
       routedRequest._ccRoute = selected.route;
       routedRequest._ccReleaseLease = selected.release;
@@ -55,6 +94,11 @@ export function createAnthropicRoutingMiddleware(
     } catch (error) {
       if (error instanceof EmptyPoolError && options.onEmptyPool) {
         options.onEmptyPool(error, request, response);
+        return;
+      }
+      if (error instanceof NoEligibleAccountError) {
+        options.onNoEligibleAccount?.(error, request, response);
+        sendNoEligibleAccountResponse(error, response, (options.now ?? Date.now)());
         return;
       }
       next(error);

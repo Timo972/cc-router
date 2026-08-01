@@ -10,10 +10,13 @@ import type { AnthropicMessagesRequest } from "../protocol/anthropic-types.js";
 import type { OpenAIResponseCompleted } from "../protocol/openai-responses-types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
+import type { RouteContext } from "./types.js";
+import { extractAnthropicRouteContext } from "./request-model.js";
 
 declare module "express-serve-static-core" {
   interface Request {
     _ccRawBody?: Buffer;
+    _ccRouteContext?: RouteContext;
   }
 }
 
@@ -201,8 +204,10 @@ export function mountMessagesCrossProviderRoute(
         return;
       }
 
-      const route = selectRoute(req.body.model, opts.modelRouting);
+      const requestedModel = typeof req.body.model === "string" ? req.body.model : undefined;
+      const route = selectRoute(requestedModel, opts.modelRouting);
       if (route.provider !== "openai_subscription") {
+        req._ccRouteContext = extractAnthropicRouteContext(requestedModel, opts.modelRouting);
         next();
         return;
       }
