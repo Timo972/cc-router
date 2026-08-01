@@ -1,12 +1,12 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { loadAccounts, loadOpenAIAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById, readConfig } from "../config/manager.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
 import { formatExpiry, redactToken } from "../utils/token-extractor.js";
 import { PROXY_PORT } from "../config/paths.js";
 import { createOpenAIAccountRecord } from "../providers/openai/account-record.js";
 import { loginOpenAIWithDeviceCode } from "../providers/openai/device-oauth.js";
-import type { Account } from "../proxy/types.js";
+import type { Account, AccountRecord } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 
 export function registerAccounts(program: Command): void {
@@ -228,14 +228,17 @@ export function registerAccounts(program: Command): void {
       });
       if (!sure) { console.log(chalk.gray("Cancelled.")); return; }
 
-      const removed = removeAccountRecordById(id);
-      if (!removed) {
-        console.log(chalk.red(`✗ Account "${id}" disappeared before it could be removed.`));
+      const isOpenAI = openAIAccounts.some(account => account.id === id);
+      try {
+        await removeAccountRuntimeAware(id);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.log(chalk.red(`✗ Could not remove "${id}": ${message}`));
         process.exit(1);
       }
 
       const remaining = loadAccounts().length + loadOpenAIAccounts().length;
-      const providerLabel = removed.provider === "openai_subscription" ? "OpenAI account" : "Account";
+      const providerLabel = isOpenAI ? "OpenAI account" : "Account";
 
       console.log(chalk.green(`✓ Removed ${providerLabel} "${id}". ${remaining} account(s) remaining.`));
       if (remaining === 0) {
@@ -271,6 +274,59 @@ export function buildStoredAccountsJson(
       expiresAt: a.expiresAt,
     })),
   ];
+}
+
+export interface LiveAccountRemovalOptions {
+  baseUrl?: string;
+  authToken?: string;
+  fetch?: typeof globalThis.fetch;
+}
+
+/** Return false only when no running proxy can be reached; HTTP errors remain authoritative. */
+export async function tryRemoveAccountFromRunningProxy(
+  id: string,
+  options: LiveAccountRemovalOptions = {},
+): Promise<boolean> {
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  const baseUrl = (options.baseUrl ?? `http://localhost:${PROXY_PORT}`).replace(/\/+$/, "");
+  const authToken = options.authToken ?? readConfig().proxySecret;
+  let response: Response;
+  try {
+    response = await fetchImpl(`${baseUrl}/cc-router/accounts/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: authToken ? { authorization: `Bearer ${authToken}` } : {},
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch {
+    return false;
+  }
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const payload = await response.json() as { error?: unknown };
+      if (typeof payload.error === "string") detail = `: ${payload.error}`;
+    } catch { /* best effort */ }
+    throw new Error(`HTTP ${response.status}${detail}`);
+  }
+  return true;
+}
+
+export interface RuntimeAwareRemovalDependencies {
+  tryRemoveLive(id: string): Promise<boolean>;
+  removeStored(id: string): AccountRecord | null;
+}
+
+export async function removeAccountRuntimeAware(
+  id: string,
+  dependencies: RuntimeAwareRemovalDependencies = {
+    tryRemoveLive: tryRemoveAccountFromRunningProxy,
+    removeStored: removeAccountRecordById,
+  },
+): Promise<{ mode: "live" } | { mode: "stored"; removed: AccountRecord }> {
+  if (await dependencies.tryRemoveLive(id)) return { mode: "live" };
+  const removed = dependencies.removeStored(id);
+  if (!removed) throw new Error(`Account "${id}" disappeared before it could be removed`);
+  return { mode: "stored", removed };
 }
 
 async function fetchLiveStats(): Promise<null | Array<{

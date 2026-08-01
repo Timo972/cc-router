@@ -40,6 +40,7 @@ import { persistProviderEnabledState } from "./provider-routing.js";
 import {
   accountDeletionStatusCode,
   deleteAnthropicAccountTransaction,
+  deleteOpenAIAccountTransaction,
 } from "./account-deletion.js";
 import {
   createAnthropicRefreshMiddleware,
@@ -802,16 +803,40 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   accountsRouter.delete("/:id", async (req, res) => {
     const { id } = req.params;
-    // Refuse to remove the last account — downstream /v1/* would have no
-    // token to route with and the pool would throw EmptyPoolError on the
-    // next request. Users who want an empty pool should `cc-router stop`.
-    if (pool.getAll().length <= 1) {
-      res.status(409).json({ error: "Cannot remove the last account — at least one must remain" });
+    const existing = pool.findById(id);
+    const openAIExisting = openAIAccounts.find(account => account.id === id);
+    if (!existing && !openAIExisting) {
+      res.status(404).json({ error: `Account "${id}" not found` });
       return;
     }
-    const existing = pool.findById(id);
-    if (!existing) {
-      res.status(404).json({ error: `Account "${id}" not found` });
+
+    if (openAIExisting && !existing) {
+      try {
+        deleteOpenAIAccountTransaction({
+          id,
+          accounts: openAIAccounts,
+          otherAccountCount: pool.getAll().length,
+          persist: saveOpenAIAccounts,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const status = accountDeletionStatusCode(err);
+        if (status === 409) {
+          res.status(409).json({ error: message });
+          return;
+        }
+        logError("accounts", 0, `Failed to persist accounts.json: ${message}`);
+        res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
+        return;
+      }
+      res.json({ ok: true, id });
+      return;
+    }
+
+    // Preserve the existing Anthropic invariant: a running Anthropic pool
+    // always retains at least one account.
+    if (pool.getAll().length <= 1) {
+      res.status(409).json({ error: "Cannot remove the last account — at least one must remain" });
       return;
     }
     try {

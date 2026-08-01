@@ -2,6 +2,7 @@ import type { SessionRouter } from "./session-router.js";
 import type { TokenPool } from "./token-pool.js";
 import type { Account } from "./types.js";
 import { reserveAccountForDeletion } from "./token-refresher.js";
+import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 
 export class AccountDeletionConflictError extends Error {
   constructor(id: string) {
@@ -31,6 +32,13 @@ export interface DeleteAnthropicAccountOptions {
   persist(accounts: Account[]): void;
 }
 
+export interface DeleteOpenAIAccountOptions {
+  id: string;
+  accounts: OpenAISubscriptionAccount[];
+  otherAccountCount: number;
+  persist(accounts: OpenAISubscriptionAccount[]): void;
+}
+
 /** Persist prospective state before irreversibly removing runtime routing state. */
 export async function deleteAnthropicAccountTransaction(
   options: DeleteAnthropicAccountOptions,
@@ -58,4 +66,23 @@ export async function deleteAnthropicAccountTransaction(
   } finally {
     releaseReservation();
   }
+}
+
+/** Persist prospective OpenAI state before removing it from the live picker array. */
+export function deleteOpenAIAccountTransaction(
+  options: DeleteOpenAIAccountOptions,
+): OpenAISubscriptionAccount {
+  const account = options.accounts.find(candidate => candidate.id === options.id);
+  if (!account) throw new Error(`Account "${options.id}" not found`);
+  if (options.accounts.length + options.otherAccountCount <= 1) {
+    throw new LastAccountDeletionError();
+  }
+
+  const prospective = options.accounts.filter(candidate => candidate !== account);
+  options.persist(prospective);
+
+  const index = options.accounts.indexOf(account);
+  if (index < 0) throw new AccountDeletionConflictError(options.id);
+  options.accounts.splice(index, 1);
+  return account;
 }
