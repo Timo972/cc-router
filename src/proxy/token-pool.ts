@@ -426,8 +426,10 @@ export class TokenPool {
 
   private overUserCap(account: Account): boolean {
     const [fiveHour, sevenDay] = this.globalWindows(account);
-    return fiveHour.utilization * 100 >= account.sessionLimitPercent ||
-      sevenDay.utilization * 100 >= account.weeklyLimitPercent;
+    return (account.sessionLimitPercent < 100 &&
+        fiveHour.utilization * 100 >= account.sessionLimitPercent) ||
+      (account.weeklyLimitPercent < 100 &&
+        sevenDay.utilization * 100 >= account.weeklyLimitPercent);
   }
 
   private globalWindows(account: Account): [CapacityWindow, CapacityWindow] {

@@ -140,6 +140,37 @@ describe("SessionRouter", () => {
     sticky.release();
   });
 
+  it("keeps paid-extra sessions sticky when the default 100% setting is uncapped", () => {
+    const now = 1_000_000;
+    const a = makeAccount("a");
+    const b = makeAccount("b");
+    for (const account of [a, b]) {
+      account.rateLimits.usage = {
+        fiveHour: { utilization: 1, resetAt: 2_000 },
+        modelLimits: [],
+        extraUsage: { enabled: true, spendLimitReached: false },
+        fetchedAt: 100,
+        fetchStatus: "fresh",
+      };
+    }
+    const pool = new TokenPool([a, b], { now: () => now });
+    const capBypass = vi.fn();
+    pool.onCapBypass = capBypass;
+    const router = new SessionRouter(pool);
+
+    const first = router.acquire("paid-session");
+    first.release();
+    const second = router.acquire("paid-session");
+
+    expect(first.account).toBe(a);
+    expect(first.fallback).toBe(false);
+    expect(second.account).toBe(a);
+    expect(second.reason).toBe("sticky");
+    expect(second.fallback).toBe(false);
+    expect(capBypass).not.toHaveBeenCalled();
+    second.release();
+  });
+
   it.each([
     ["disabled", (account: Account, pool: TokenPool) => { account.enabled = false; }],
     ["unhealthy", (account: Account, pool: TokenPool) => { account.healthy = false; }],

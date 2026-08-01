@@ -861,7 +861,6 @@ describe("TokenPool — requested-model headroom ranking", () => {
       fetchStatus: "fresh",
     };
     const included = makeAccount("included");
-    included.sessionLimitPercent = 50;
     included.rateLimits.fiveHourUtil = 0.9;
     const pool = new TokenPool([paid, included], { now: () => nowMs });
 
