@@ -31,6 +31,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Anthropic model-scoped usage rows using the current nested `scope.model`
+  shape are parsed correctly, so exhausting Fable capacity no longer creates
+  an account-global cooldown that also blocks Opus routing.
 - When all accounts are hard-blocked, the router now returns a local
   Anthropic-shaped 429 when any blocker is rate-limit or quota related, adding
   the earliest trustworthy `Retry-After` only when known. A 503 is used only

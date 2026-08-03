@@ -93,11 +93,15 @@ export function normalizeModelFamily(modelIdOrName: string | undefined): string 
 
 function modelDetails(limit: UnknownRecord): { modelId?: string; displayName: string; modelFamily: string } | undefined {
   const model = isRecord(limit.model) ? limit.model : undefined;
+  const scope = isRecord(limit.scope) ? limit.scope : undefined;
+  const scopedModel = scope && isRecord(scope.model) ? scope.model : undefined;
   const modelId = stringValue(getFirst(limit, ["model_id", "modelId"]))
-    ?? (model ? stringValue(getFirst(model, ["id", "model_id"])) : undefined);
+    ?? (model ? stringValue(getFirst(model, ["id", "model_id"])) : undefined)
+    ?? (scopedModel ? stringValue(getFirst(scopedModel, ["id", "model_id"])) : undefined);
   const displayName = stringValue(getFirst(limit, ["model_name", "display_name", "displayName"]))
     ?? (typeof limit.model === "string" ? stringValue(limit.model) : undefined)
     ?? (model ? stringValue(getFirst(model, ["display_name", "displayName", "name"])) : undefined)
+    ?? (scopedModel ? stringValue(getFirst(scopedModel, ["display_name", "displayName", "name"])) : undefined)
     ?? modelId;
   const modelFamily = normalizeModelFamily(modelId ?? displayName);
   if (!displayName || !modelFamily) return undefined;
@@ -108,13 +112,14 @@ function parseModelLimit(value: unknown): ModelRateLimit | undefined {
   if (!isRecord(value) || stringValue(value.kind) !== "weekly_scoped") return undefined;
   const model = modelDetails(value);
   if (!model) return undefined;
+  const active = getFirst(value, ["active", "is_active"]);
   return {
     kind: "weekly_scoped",
     group: stringValue(value.group) ?? "weekly",
     ...model,
     utilization: utilization(getFirst(value, ["utilization", "percentage", "percent"])),
     resetAt: resetAt(getFirst(value, ["resets_at", "reset_at", "resetAt"])),
-    active: typeof value.active === "boolean" ? value.active : true,
+    active: typeof active === "boolean" ? active : true,
     severity: stringValue(value.severity) ?? "",
   };
 }
