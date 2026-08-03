@@ -65,6 +65,34 @@ describe("parseAnthropicUsage", () => {
     ]);
   });
 
+  it("parses model identity and activity from the current scoped limit shape", () => {
+    const parsed = parseAnthropicUsage({
+      limits: [{
+        kind: "weekly_scoped",
+        group: "weekly",
+        scope: {
+          model: { id: null, display_name: "Fable" },
+          surface: null,
+        },
+        percent: 100,
+        resets_at: "2026-08-02T12:00:00.152578+00:00",
+        is_active: false,
+        severity: "critical",
+      }],
+    }, FETCHED_AT);
+
+    expect(parsed?.modelLimits).toEqual([{
+      kind: "weekly_scoped",
+      group: "weekly",
+      modelFamily: "fable",
+      displayName: "Fable",
+      utilization: 1,
+      resetAt: 1_785_672_000,
+      active: false,
+      severity: "critical",
+    }]);
+  });
+
   it("tolerates malformed optional fields while rejecting non-object or fieldless responses", () => {
     expect(parseAnthropicUsage(null, FETCHED_AT)).toBeNull();
     expect(parseAnthropicUsage([], FETCHED_AT)).toBeNull();

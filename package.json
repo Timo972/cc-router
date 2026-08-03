@@ -1,6 +1,6 @@
 {
   "name": "@timo972/cc-router",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Cache-aware session router for Claude Max OAuth tokens — use multiple Claude Max accounts with Claude Code",
   "type": "module",
   "bin": {
