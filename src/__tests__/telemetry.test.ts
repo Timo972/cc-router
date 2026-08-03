@@ -21,6 +21,7 @@ vi.mock("../config/paths.js", () => ({
 import {
   loadTelemetryState,
   writeTelemetryState,
+  getTelemetrySnapshot,
   isTelemetryEnabled,
   type TelemetryState,
 } from "../config/telemetry.js";
@@ -43,8 +44,7 @@ afterEach(() => {
 describe("loadTelemetryState", () => {
   it("creates fresh state with UUID and persists on first call", () => {
     const state = loadTelemetryState();
-    // Telemetry is opt-in: a fresh state is disabled until the user turns it on.
-    expect(state.enabled).toBe(false);
+    expect(state.enabled).toBe(true);
     expect(state.installId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
     );
@@ -66,8 +66,50 @@ describe("loadTelemetryState", () => {
   it("recovers from corrupted JSON", () => {
     fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, "NOT_JSON{}", "utf-8");
     const state = loadTelemetryState();
-    expect(state.enabled).toBe(false);
+    expect(state.enabled).toBe(true);
     expect(state.installId).toBeDefined();
+  });
+
+  it("migrates a state missing enabled to enabled without replacing its install identity", () => {
+    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, JSON.stringify({
+      installId: "existing-install-id",
+      firstRunAt: "2026-01-01T00:00:00.000Z",
+    }), "utf-8");
+
+    expect(loadTelemetryState()).toEqual({
+      enabled: true,
+      installId: "existing-install-id",
+      firstRunAt: "2026-01-01T00:00:00.000Z",
+    });
+    expect(JSON.parse(fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"))).toEqual({
+      enabled: true,
+      installId: "existing-install-id",
+      firstRunAt: "2026-01-01T00:00:00.000Z",
+    });
+  });
+
+  it.each([true, false])("preserves a persisted enabled value of %s", (enabled) => {
+    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, JSON.stringify({
+      enabled,
+      installId: "existing-install-id",
+      firstRunAt: "2026-01-01T00:00:00.000Z",
+    }), "utf-8");
+
+    expect(loadTelemetryState().enabled).toBe(enabled);
+  });
+
+  it("atomically rewrites every missing state field", () => {
+    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, "{}", "utf-8");
+
+    const state = loadTelemetryState();
+
+    expect(state.enabled).toBe(true);
+    expect(state.installId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+    expect(new Date(state.firstRunAt).getTime()).toBeGreaterThan(0);
+    expect(JSON.parse(fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"))).toEqual(state);
+    expect(fs.existsSync(`${MOCK_DIR}/telemetry.json.tmp`)).toBe(false);
   });
 });
 
@@ -77,7 +119,6 @@ describe("writeTelemetryState", () => {
       enabled: false,
       installId: "test-uuid",
       firstRunAt: "2026-01-01T00:00:00.000Z",
-      disclosureShown: true,
     };
     writeTelemetryState(state);
     const raw = JSON.parse(
@@ -89,36 +130,63 @@ describe("writeTelemetryState", () => {
   });
 });
 
-// ─── isTelemetryEnabled ──────────────────────────────────────────────────────
+// ─── Effective telemetry enablement ──────────────────────────────────────────
 
 describe("isTelemetryEnabled", () => {
-  it("returns false by default (opt-in)", () => {
-    expect(isTelemetryEnabled()).toBe(false);
+  it("returns true for fresh persisted state", () => {
+    expect(isTelemetryEnabled()).toBe(true);
   });
 
-  it("returns false when DO_NOT_TRACK=1", () => {
+  it("lets DO_NOT_TRACK=1 disable a persisted opt-in", () => {
+    writeTelemetryState({
+      enabled: true,
+      installId: "existing-install-id",
+      firstRunAt: "2026-01-01T00:00:00.000Z",
+    });
     process.env["DO_NOT_TRACK"] = "1";
     expect(isTelemetryEnabled()).toBe(false);
   });
 
-  it("returns false when CC_ROUTER_TELEMETRY=0", () => {
+  it("lets CC_ROUTER_TELEMETRY=0 disable a persisted opt-in", () => {
+    writeTelemetryState({
+      enabled: true,
+      installId: "existing-install-id",
+      firstRunAt: "2026-01-01T00:00:00.000Z",
+    });
     process.env["CC_ROUTER_TELEMETRY"] = "0";
     expect(isTelemetryEnabled()).toBe(false);
   });
 
-  it("returns false when state.enabled is false", () => {
-    const state = loadTelemetryState();
-    state.enabled = false;
-    writeTelemetryState(state);
+  it("does not let non-kill-switch environment values override a persisted opt-out", () => {
+    writeTelemetryState({
+      enabled: false,
+      installId: "existing-install-id",
+      firstRunAt: "2026-01-01T00:00:00.000Z",
+    });
+    process.env["DO_NOT_TRACK"] = "0";
+    process.env["CC_ROUTER_TELEMETRY"] = "1";
+
     expect(isTelemetryEnabled()).toBe(false);
   });
+});
 
-  it("env var takes precedence even when state.enabled is true", () => {
-    const state = loadTelemetryState();
-    state.enabled = true;
-    writeTelemetryState(state);
+describe("getTelemetrySnapshot", () => {
+  it("returns the persisted state with the authoritative effective value", () => {
+    writeTelemetryState({
+      enabled: true,
+      installId: "existing-install-id",
+      firstRunAt: "2026-01-01T00:00:00.000Z",
+    });
     process.env["DO_NOT_TRACK"] = "1";
-    expect(isTelemetryEnabled()).toBe(false);
+
+    expect(getTelemetrySnapshot()).toEqual({
+      state: {
+        enabled: true,
+        installId: "existing-install-id",
+        firstRunAt: "2026-01-01T00:00:00.000Z",
+      },
+      enabled: false,
+    });
   });
 });
 
@@ -143,15 +211,10 @@ describe("trackEvent", () => {
     // Dynamic import so the module picks up our mocked paths
     const mod = await import("../utils/telemetry.js");
     trackEvent = mod.trackEvent;
-    // Telemetry is opt-in: explicitly enable it so these tests exercise the
-    // fetch path.
-    const st = loadTelemetryState();
-    st.enabled = true;
-    writeTelemetryState(st);
+    loadTelemetryState();
   });
 
   it("sends event to Aptabase EU endpoint", async () => {
-    // Telemetry was enabled in beforeEach.
     loadTelemetryState();
 
     await trackEvent("test_event", { key: "value" });

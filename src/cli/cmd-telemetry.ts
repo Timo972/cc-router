@@ -1,6 +1,6 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { loadTelemetryState, writeTelemetryState, isTelemetryEnabled } from "../config/telemetry.js";
+import { getTelemetrySnapshot, loadTelemetryState, writeTelemetryState } from "../config/telemetry.js";
 
 export function registerTelemetry(program: Command): void {
   program
@@ -18,7 +18,8 @@ export function registerTelemetry(program: Command): void {
         const state = loadTelemetryState();
         state.enabled = true;
         writeTelemetryState(state);
-        console.log(chalk.green("Telemetry enabled."));
+        console.log(chalk.green("Telemetry enabled for future daemon starts."));
+        console.log(chalk.dim("Restart a daemon that started with telemetry disabled to begin sending telemetry."));
         console.log(chalk.dim(`Install ID: ${state.installId}`));
         return;
       }
@@ -28,7 +29,7 @@ export function registerTelemetry(program: Command): void {
         const state = loadTelemetryState();
         state.enabled = false;
         writeTelemetryState(state);
-        console.log(chalk.yellow("Telemetry disabled. No data will be sent."));
+        console.log(chalk.yellow("Telemetry disabled. New outbound telemetry stops immediately."));
         console.log(chalk.dim("Re-enable anytime with: cc-router telemetry on"));
         return;
       }
@@ -39,7 +40,7 @@ export function registerTelemetry(program: Command): void {
 }
 
 function showStatus(): void {
-  const state = loadTelemetryState();
+  const { state, enabled } = getTelemetrySnapshot();
   const envDisabled =
     process.env["DO_NOT_TRACK"] === "1" || process.env["CC_ROUTER_TELEMETRY"] === "0";
 
@@ -49,18 +50,19 @@ function showStatus(): void {
   if (envDisabled) {
     console.log(`  Status:     ${chalk.yellow("disabled")} (by environment variable)`);
   } else if (state.enabled) {
-    console.log(`  Status:     ${chalk.green("enabled")}`);
+    console.log(`  Status:     ${chalk.green("enabled")} (persisted)`);
   } else {
-    console.log(`  Status:     ${chalk.yellow("disabled")}`);
+    console.log(`  Status:     ${chalk.yellow("disabled")} (persisted)`);
   }
 
-  console.log(`  Active:     ${isTelemetryEnabled() ? chalk.green("yes") : chalk.yellow("no")}`);
+  console.log(`  Active:     ${enabled ? chalk.green("yes") : chalk.yellow("no")}`);
   console.log(`  Install ID: ${chalk.dim(state.installId)}`);
   console.log(`  Since:      ${chalk.dim(state.firstRunAt)}`);
   console.log();
   console.log(chalk.dim("  What we send:  version, OS, locale, lifecycle events (start, heartbeat)"));
   console.log(chalk.dim("  What we DON'T: IPs, tokens, prompts, request content, account names"));
   console.log(chalk.dim("  Source code:   src/utils/telemetry.ts"));
+  console.log(chalk.dim("  Default:       on for new installs"));
   console.log();
   console.log(chalk.dim("  Disable:  cc-router telemetry off"));
   console.log(chalk.dim("  Or set:   DO_NOT_TRACK=1  |  CC_ROUTER_TELEMETRY=0"));

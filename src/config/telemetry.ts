@@ -12,11 +12,14 @@ export interface TelemetryState {
   firstRunAt: string;
 }
 
+export interface TelemetrySnapshot {
+  state: TelemetryState;
+  enabled: boolean;
+}
+
 function defaultState(): TelemetryState {
   return {
-    // Opt-in: telemetry stays off until the user explicitly enables it with
-    // `cc-router telemetry on`. Nothing is sent on first run.
-    enabled: false,
+    enabled: true,
     installId: randomUUID(),
     firstRunAt: new Date().toISOString(),
   };
@@ -32,14 +35,21 @@ export function loadTelemetryState(): TelemetryState {
   }
   try {
     const raw = JSON.parse(readFileSync(TELEMETRY_PATH, "utf-8")) as Partial<TelemetryState>;
-    // Fill any missing fields to keep the file forward-compatible. Missing
-    // `enabled` defaults to OFF (opt-in).
+    // Fill any missing fields to keep the file forward-compatible. Existing
+    // boolean choices are always preserved; an older state without `enabled`
+    // migrates to the default-on policy.
     const state: TelemetryState = {
-      enabled: raw.enabled ?? false,
-      installId: raw.installId ?? randomUUID(),
-      firstRunAt: raw.firstRunAt ?? new Date().toISOString(),
+      enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,
+      installId: typeof raw.installId === "string" && raw.installId ? raw.installId : randomUUID(),
+      firstRunAt: typeof raw.firstRunAt === "string" && raw.firstRunAt
+        ? raw.firstRunAt
+        : new Date().toISOString(),
     };
-    if (!raw.installId) {
+    if (
+      raw.enabled !== state.enabled ||
+      raw.installId !== state.installId ||
+      raw.firstRunAt !== state.firstRunAt
+    ) {
       writeTelemetryState(state);
     }
     return state;
@@ -58,15 +68,25 @@ export function writeTelemetryState(state: TelemetryState): void {
   renameSync(tmp, TELEMETRY_PATH);
 }
 
+// Returns persisted state with the one authoritative effective value. Environment
+// values only act as kill switches; they cannot turn a persisted opt-out back on.
+export function getTelemetrySnapshot(): TelemetrySnapshot {
+  const state = loadTelemetryState();
+  const enabled =
+    process.env["DO_NOT_TRACK"] !== "1" &&
+    process.env["CC_ROUTER_TELEMETRY"] !== "0" &&
+    state.enabled;
+
+  return { state, enabled };
+}
+
 // Returns true only if the user has not opted out through any mechanism:
 //   - DO_NOT_TRACK=1     (de-facto standard)
 //   - CC_ROUTER_TELEMETRY=0  (project-specific override)
 //   - `cc-router telemetry off` (persisted enabled: false)
 export function isTelemetryEnabled(): boolean {
-  if (process.env["DO_NOT_TRACK"] === "1") return false;
-  if (process.env["CC_ROUTER_TELEMETRY"] === "0") return false;
   try {
-    return loadTelemetryState().enabled;
+    return getTelemetrySnapshot().enabled;
   } catch {
     return false;
   }
