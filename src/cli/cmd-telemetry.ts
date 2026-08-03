@@ -40,14 +40,12 @@ export function registerTelemetry(program: Command): void {
 }
 
 function showStatus(): void {
-  const { state, enabled } = getTelemetrySnapshot();
-  const envDisabled =
-    process.env["DO_NOT_TRACK"] === "1" || process.env["CC_ROUTER_TELEMETRY"] === "0";
+  const { state, environmentDisabled, enabled } = getTelemetrySnapshot();
 
   console.log(chalk.bold("Telemetry"));
   console.log();
 
-  if (envDisabled) {
+  if (environmentDisabled) {
     console.log(`  Status:     ${chalk.yellow("disabled")} (by environment variable)`);
   } else if (state.enabled) {
     console.log(`  Status:     ${chalk.green("enabled")} (persisted)`);

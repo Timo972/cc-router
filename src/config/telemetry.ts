@@ -14,6 +14,7 @@ export interface TelemetryState {
 
 export interface TelemetrySnapshot {
   state: TelemetryState;
+  environmentDisabled: boolean;
   enabled: boolean;
 }
 
@@ -72,12 +73,11 @@ export function writeTelemetryState(state: TelemetryState): void {
 // values only act as kill switches; they cannot turn a persisted opt-out back on.
 export function getTelemetrySnapshot(): TelemetrySnapshot {
   const state = loadTelemetryState();
-  const enabled =
-    process.env["DO_NOT_TRACK"] !== "1" &&
-    process.env["CC_ROUTER_TELEMETRY"] !== "0" &&
-    state.enabled;
+  const environmentDisabled =
+    process.env["DO_NOT_TRACK"] === "1" || process.env["CC_ROUTER_TELEMETRY"] === "0";
+  const enabled = !environmentDisabled && state.enabled;
 
-  return { state, enabled };
+  return { state, environmentDisabled, enabled };
 }
 
 // Returns true only if the user has not opted out through any mechanism:
