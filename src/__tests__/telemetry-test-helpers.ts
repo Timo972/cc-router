@@ -1,5 +1,5 @@
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { isIP, type AddressInfo } from "node:net";
 
 export interface CapturedTransportRequest {
   method: string;
@@ -36,13 +36,19 @@ function isLoopbackAddress(address: string | undefined): boolean {
   return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 }
 
+function isLoopbackHostname(hostname: string): boolean {
+  const address = hostname.replace(/^\[|\]$/g, "");
+  if (isIP(address) === 4) return address.startsWith("127.");
+  return address === "::1";
+}
+
 export function assertLoopbackUrl(value: string | URL): URL {
   const url = new URL(value);
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error(`transport capture URL must use HTTP(S): ${url.protocol}`);
   }
 
-  if (!["127.0.0.1", "::1", "localhost"].includes(url.hostname)) {
+  if (!isLoopbackHostname(url.hostname)) {
     throw new Error(`telemetry test transport must remain on loopback: ${url.hostname}`);
   }
 
