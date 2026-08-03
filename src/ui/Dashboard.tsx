@@ -1034,7 +1034,9 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
           <Text color={row.color}> {row.label}</Text>
           <Text color="gray"> · {row.state}</Text>
           {row.utilization !== undefined && <Text color={row.color}>{` ${Math.round(row.utilization * 100)}%`}</Text>}
-          {row.resetAt && <Text color="gray"> {`↻${formatResetIn(row.resetAt)}`}</Text>}
+          {row.resetAt !== undefined && row.resetAt > 0 && (
+            <Text color="gray"> {`↻${formatResetIn(row.resetAt)}`}</Text>
+          )}
         </Box>
       ))}
     </Box>

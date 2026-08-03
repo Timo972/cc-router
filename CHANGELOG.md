@@ -31,6 +31,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The interactive status dashboard no longer crashes when model-scoped usage
+  reports an unknown reset timestamp as zero.
 - Anthropic model-scoped usage rows using the current nested `scope.model`
   shape are parsed correctly, so exhausting Fable capacity no longer creates
   an account-global cooldown that also blocks Opus routing.
