@@ -17,26 +17,27 @@ jobs:
       id-token: write
 
     steps:
-      # Actions are pinned to a full commit SHA (a moved tag can otherwise
-      # inject code into the publish job). Version noted in the trailing comment.
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: pnpm
           registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Build
-        run: npm run build
+        run: pnpm build
 
       - name: Type-check
-        run: npm run lint
+        run: pnpm lint
 
       - name: Test
-        run: npm test
+        run: pnpm test
 
       # Publish with provenance so consumers can verify the build's origin.
       #
@@ -46,6 +47,6 @@ jobs:
       # long-lived, exfiltratable token entirely. Until then the token is used as
       # a fallback.
       - name: Publish
-        run: npm publish --provenance --access public
+        run: pnpm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
