@@ -1,3 +1,4 @@
+import { join } from "path";
 import { describe, expect, it, vi } from "vitest";
 import {
   codexBaseUrlFromRouterUrl,
@@ -22,7 +23,7 @@ describe("writeCodexRouterConfig", () => {
       },
     });
 
-    expect(output.path).toBe("/tmp/home/.codex/config.toml");
+    expect(output.path).toBe(join("/tmp/home", ".codex", "config.toml"));
     expect(writeFileSync.mock.calls[0][1]).toContain("[model_providers.cc-router]");
     expect(writeFileSync.mock.calls[0][1]).toContain("base_url = \"http://localhost:3456/v1\"");
     expect(writeFileSync.mock.calls[0][1]).toContain("wire_api = \"responses\"");
