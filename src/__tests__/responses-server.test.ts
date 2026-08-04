@@ -5,6 +5,23 @@ import { forwardOpenAICodexResponse, toCodexBackendRequest } from "../providers/
 import { mountResponsesRoutes } from "../proxy/responses-server.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
 
+async function withServer(
+  app: ReturnType<typeof express>,
+  fn: (baseUrl: string) => Promise<void>,
+): Promise<void> {
+  const server = createServer(app);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+  try {
+    await fn(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close(err => err ? reject(err) : resolve());
+    });
+  }
+}
+
 describe("forwardOpenAICodexResponse", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -81,6 +98,46 @@ describe("toCodexBackendRequest", () => {
 
 describe("mountResponsesRoutes", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it("rejects an explicit store:true with 400 and records exactly one warn entry", async () => {
+    const record = vi.fn();
+    const forward = vi.fn();
+    const app = express();
+
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60_000,
+        enabled: true,
+      }),
+      forwardOpenAI: forward,
+      recordActivity: record,
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], store: true }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: {
+          type: "invalid_request_error",
+          message: expect.stringContaining("store:true"),
+        },
+      });
+      expect(forward).not.toHaveBeenCalled();
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "warn", statusCode: 400, accountId: "-" }),
+      );
+    });
+  });
 
   it("accepts Codex Responses requests and strips the openai model prefix before forwarding", async () => {
     const forwardedBodies: OpenAIResponsesRequest[] = [];

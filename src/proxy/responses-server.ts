@@ -5,6 +5,9 @@ import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
+import { stats } from "./stats.js";
+import type { LogEntry } from "./stats.js";
+import { logWarn } from "./logger.js";
 
 type ForwardOpenAI = typeof forwardOpenAICodexResponse;
 
@@ -13,6 +16,7 @@ export interface ResponsesRoutesOptions {
   prepareOpenAIAccount?: (account: OpenAISubscriptionAccount) => Promise<boolean>;
   forwardOpenAI?: ForwardOpenAI;
   modelRouting?: ModelRoutingConfig;
+  recordActivity?: (entry: LogEntry) => void;
 }
 
 function isResponsesRequest(value: unknown): value is OpenAIResponsesRequest {
@@ -54,6 +58,7 @@ async function sendUpstreamResponse(upstream: globalThis.Response, res: Response
 export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions): void {
   const forwardOpenAI = opts.forwardOpenAI ?? forwardOpenAICodexResponse;
   const prepareOpenAIAccount = opts.prepareOpenAIAccount ?? (async () => true);
+  const recordActivity = opts.recordActivity ?? ((entry: LogEntry) => stats.addLog(entry));
 
   app.post("/v1/responses", express.json({ limit: "10mb" }), async (req: Request, res: Response) => {
     if (!isResponsesRequest(req.body)) {
@@ -61,6 +66,25 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         error: {
           type: "invalid_request_error",
           message: "Expected Responses request with string model and input array",
+        },
+      });
+      return;
+    }
+
+    if (req.body.store === true) {
+      recordActivity({
+        ts: Date.now(),
+        accountId: "-",
+        model: req.body.model,
+        type: "warn",
+        statusCode: 400,
+        details: "store:true rejected — Codex backend is stateless (store:false only)",
+      });
+      logWarn("responses", "store:true is not supported by the Codex backend; rejecting request");
+      res.status(400).json({
+        error: {
+          type: "invalid_request_error",
+          message: "store:true is not supported: the Codex subscription backend operates only in stateless (store:false) mode.",
         },
       });
       return;
