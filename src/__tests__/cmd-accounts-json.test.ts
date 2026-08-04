@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  addAccountRuntimeAware,
   buildStoredAccountsJson,
   removeAccountRuntimeAware,
+  tryAddAccountToRunningProxy,
   tryRemoveAccountFromRunningProxy,
 } from "../cli/cmd-accounts.js";
 import type { AccountRecord } from "../proxy/types.js";
@@ -107,5 +109,83 @@ describe("runtime-aware account removal", () => {
         signal: expect.any(AbortSignal),
       }),
     );
+  });
+});
+
+describe("runtime-aware account add", () => {
+  const record: AccountRecord = {
+    id: "openai-1",
+    provider: "openai_subscription",
+    accessToken: "access",
+    refreshToken: "refresh",
+    expiresAt: 1999999999000,
+    scopes: ["openid"],
+    enabled: true,
+  };
+
+  it("adds through the running proxy without writing storage a second time", async () => {
+    const tryAddLive = vi.fn(async () => true);
+    const addStored = vi.fn();
+
+    await expect(addAccountRuntimeAware(record, { tryAddLive, addStored }))
+      .resolves.toEqual({ mode: "live" });
+    expect(tryAddLive).toHaveBeenCalledWith(record);
+    expect(addStored).not.toHaveBeenCalled();
+  });
+
+  it("falls back to stored configuration only when no proxy is reachable", async () => {
+    const addStored = vi.fn();
+
+    await expect(addAccountRuntimeAware(record, {
+      tryAddLive: async () => false,
+      addStored,
+    })).resolves.toEqual({ mode: "stored" });
+    expect(addStored).toHaveBeenCalledWith(record);
+  });
+
+  it("does not write stored configuration when the running proxy rejects the add", async () => {
+    const addStored = vi.fn();
+
+    await expect(addAccountRuntimeAware(record, {
+      tryAddLive: async () => { throw new Error("HTTP 409: Account \"openai-1\" already exists"); },
+      addStored,
+    })).rejects.toThrow("already exists");
+    expect(addStored).not.toHaveBeenCalled();
+  });
+
+  it("sends an authenticated JSON POST of the record to the live account API", async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ account: { id: "openai-1" } }), { status: 201 }));
+
+    await expect(tryAddAccountToRunningProxy(record, {
+      baseUrl: "http://router.local/",
+      authToken: "secret",
+      fetch,
+    })).resolves.toBe(true);
+
+    expect(fetch).toHaveBeenCalledWith(
+      "http://router.local/cc-router/accounts",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          authorization: "Bearer secret",
+          "content-type": "application/json",
+        }),
+        body: JSON.stringify(record),
+        signal: expect.any(AbortSignal),
+      }),
+    );
+  });
+
+  it("reports no reachable proxy when the POST connection fails", async () => {
+    const fetch = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
+
+    await expect(tryAddAccountToRunningProxy(record, { fetch })).resolves.toBe(false);
+  });
+
+  it("surfaces HTTP errors from the live account API instead of falling back", async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ error: "Account \"openai-1\" already exists" }), { status: 409 }));
+
+    await expect(tryAddAccountToRunningProxy(record, { fetch }))
+      .rejects.toThrow("HTTP 409: Account \"openai-1\" already exists");
   });
 });
