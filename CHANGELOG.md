@@ -42,6 +42,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for entirely non-rate-limit unavailability. These local errors make no
   Anthropic Messages request, and fallback no longer sends requests to cooling
   or upstream-rate-limited accounts.
+- Accounts added while the proxy is running (`accounts add`, `add-openai`,
+  `login-openai`) are now loaded into the live pool immediately — routable and
+  visible in `accounts list` without a restart. Previously only removals were
+  applied at runtime; adds required restarting the proxy. When no proxy is
+  running the add still falls back to a plain disk write.
 
 ---
 

@@ -42,6 +42,7 @@ import {
   deleteAnthropicAccountTransaction,
   deleteOpenAIAccountTransaction,
 } from "./account-deletion.js";
+import { addOpenAIAccountTransaction } from "./account-add.js";
 import {
   createAnthropicRefreshMiddleware,
   createAnthropicRoutingMiddleware,
@@ -765,8 +766,34 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       res.status(400).json({ error: "Invalid field types on account record" });
       return;
     }
-    if (pool.findById(body.id)) {
+    // IDs are unique across providers, so a new account may not collide with an
+    // existing account in either the Claude pool or the OpenAI picker.
+    if (pool.findById(body.id) || openAIAccounts.some(a => a.id === body.id)) {
       res.status(409).json({ error: `Account "${body.id}" already exists` });
+      return;
+    }
+
+    if (body.provider === "openai_subscription") {
+      let addedOpenAI;
+      try {
+        addedOpenAI = addOpenAIAccountTransaction({
+          record: {
+            id: body.id,
+            accessToken: body.accessToken,
+            refreshToken: body.refreshToken,
+            expiresAt: body.expiresAt,
+            enabled: body.enabled,
+          },
+          accounts: openAIAccounts,
+          persist: saveOpenAIAccounts,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logError("accounts", 0, `Failed to persist accounts.json: ${message}`);
+        res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
+        return;
+      }
+      res.status(201).json({ account: publicOpenAIAccountView(addedOpenAI) });
       return;
     }
 
