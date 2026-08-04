@@ -3,6 +3,7 @@ import type { Express, Request, Response } from "express";
 import { selectRoute } from "../providers/route-selector.js";
 import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
+import { collectCodexResponseStream } from "../protocol/openai-responses-collect.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 import { stats } from "./stats.js";
@@ -143,6 +144,17 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       body,
       stream: body.stream === true,
     });
-    await sendUpstreamResponse(upstream, res);
+
+    if (body.stream === true) {
+      await sendUpstreamResponse(upstream, res);
+      return;
+    }
+
+    const collected = await collectCodexResponseStream(upstream);
+    if (collected.kind === "json") {
+      res.status(collected.status).json(collected.body);
+    } else {
+      res.status(collected.status).type("text/plain").send(collected.body);
+    }
   });
 }

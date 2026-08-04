@@ -389,4 +389,73 @@ describe("mountResponsesRoutes", () => {
       );
     });
   });
+
+  it("reconciles a non-streaming request into a single JSON body", async () => {
+    const app = express();
+
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            controller.enqueue(encoder.encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'));
+            controller.enqueue(encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5","output":[]}}\n\n'));
+            controller.close();
+          },
+        }) as BodyInit,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({ id: "resp_1", model: "gpt-5.5", output: [] });
+    });
+  });
+
+  it("passes a non-2xx upstream through as text on the non-streaming path", async () => {
+    const app = express();
+
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response("upstream boom", {
+        status: 429,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get("content-type")).toContain("text/plain");
+      expect(await res.text()).toBe("upstream boom");
+    });
+  });
 });
