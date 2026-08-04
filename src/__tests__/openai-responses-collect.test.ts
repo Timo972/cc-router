@@ -50,14 +50,15 @@ describe("collectCodexResponseStream", () => {
   });
 
   it("passes a non-2xx upstream through as text with its status", async () => {
-    const upstream = new Response("rate limited", {
+    const body = JSON.stringify({ error: { message: "rate limited" } });
+    const upstream = new Response(body, {
       status: 429,
-      headers: { "content-type": "text/event-stream" },
+      headers: { "content-type": "application/json" },
     });
 
     const result = await collectCodexResponseStream(upstream);
 
-    expect(result).toEqual({ kind: "text", status: 429, body: "rate limited" });
+    expect(result).toEqual({ kind: "text", status: 429, contentType: "application/json", body });
   });
 
   it("maps a stream that never completes to a 502 upstream_error", async () => {

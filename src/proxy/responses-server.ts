@@ -154,7 +154,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
     if (collected.kind === "json") {
       res.status(collected.status).json(collected.body);
     } else {
-      res.status(collected.status).type("text/plain").send(collected.body);
+      res.status(collected.status).type(collected.contentType ?? "text/plain").send(collected.body);
     }
   });
 }

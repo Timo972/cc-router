@@ -11,9 +11,9 @@ async function withServer(
 ): Promise<void> {
   const server = createServer(app);
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
   try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
     await fn(`http://127.0.0.1:${address.port}`);
   } finally {
     await new Promise<void>((resolve, reject) => {
@@ -430,6 +430,7 @@ describe("mountResponsesRoutes", () => {
 
   it("passes a non-2xx upstream through as text on the non-streaming path", async () => {
     const app = express();
+    const errorBody = JSON.stringify({ error: { message: "upstream boom" } });
 
     mountResponsesRoutes(app, {
       getOpenAIAccount: () => ({
@@ -440,9 +441,9 @@ describe("mountResponsesRoutes", () => {
         expiresAt: Date.now() + 60 * 60 * 1000,
         enabled: true,
       }),
-      forwardOpenAI: async () => new Response("upstream boom", {
+      forwardOpenAI: async () => new Response(errorBody, {
         status: 429,
-        headers: { "content-type": "text/event-stream" },
+        headers: { "content-type": "application/json" },
       }),
     });
 
@@ -454,8 +455,8 @@ describe("mountResponsesRoutes", () => {
       });
 
       expect(res.status).toBe(429);
-      expect(res.headers.get("content-type")).toContain("text/plain");
-      expect(await res.text()).toBe("upstream boom");
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.text()).toBe(errorBody);
     });
   });
 });

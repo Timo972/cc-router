@@ -2,7 +2,7 @@ import { parseSseLines } from "./sse.js";
 
 export type CollectedCodexResponse =
   | { kind: "json"; status: number; body: unknown }
-  | { kind: "text"; status: number; body: string };
+  | { kind: "text"; status: number; contentType?: string; body: string };
 
 interface CodexStreamEvent {
   type?: string;
@@ -24,7 +24,8 @@ export async function collectCodexResponseStream(
   upstream: globalThis.Response,
 ): Promise<CollectedCodexResponse> {
   if (!upstream.ok) {
-    return { kind: "text", status: upstream.status, body: await upstream.text() };
+    const contentType = upstream.headers.get("content-type") ?? undefined;
+    return { kind: "text", status: upstream.status, contentType, body: await upstream.text() };
   }
 
   const contentType = upstream.headers.get("content-type") ?? "";
