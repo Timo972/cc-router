@@ -106,25 +106,32 @@ A new module `src/protocol/openai-responses-collect.ts` exports
   which must additionally translate to an Anthropic message and so
   reconstructs a minimal shape.)
 - Watches for `response.failed` and error events.
-- Returns a discriminated result the handler mirrors verbatim as
-  `res.status(result.status)` plus the given content-type and body. There are
-  three outcomes:
-  - `{ ok: true, status, contentType: "application/json", response }` — upstream
-    was 2xx and a terminal `response.completed` event was observed. `status` is
-    the upstream status (200) and `response` is the verbatim completed object.
-  - `{ ok: false, status, body }` (passthrough) — upstream was **not** 2xx. The
-    reconciler reads the body as text and returns it with the upstream status
-    and `content-type: text/plain` (the true content-type was already clobbered
-    to `text/event-stream` upstream, so it cannot be relied on), without
-    attempting to parse it as an event stream.
-  - `{ ok: false, status: 502, body }` (incomplete) — upstream was 2xx but the
-    stream ended with no `response.completed`, or emitted a `response.failed` /
-    error event. `body` is `{ error: { type: "upstream_error", message } }`.
+- Returns a `CollectedCodexResponse`, a two-variant discriminated union on
+  `kind` that the handler mirrors directly:
+  - `{ kind: "json", status, body }` → handler sends `res.status(status).json(body)`.
+  - `{ kind: "text", status, body }` → handler sends
+    `res.status(status).type("text/plain").send(body)`.
 
-Because `ensureEventStreamContentType` force-relabels every upstream response
-(including non-2xx bodies) as `text/event-stream`, the reconciler must not
-trust the content-type. It decides purely on `upstream.ok` (2xx passthrough vs.
-parse) and the parsed events (completed vs. incomplete).
+The collector maps upstream outcomes to those variants:
+
+- upstream **not** 2xx → `{ kind: "text", status: <upstream>, body: <upstream text> }`.
+  The true content-type was clobbered to `text/event-stream` upstream, so the
+  body is read as text and returned as `text/plain` rather than parsed.
+- upstream 2xx with an `application/json` body →
+  `{ kind: "json", status: 200, body: <parsed JSON> }`. This handles a genuine
+  JSON 200 and keeps the existing non-SSE handler tests (model-prefix strip,
+  aliases, refresh) valid.
+- upstream 2xx SSE with a terminal `response.completed` →
+  `{ kind: "json", status: 200, body: <verbatim .response> }`.
+- upstream 2xx SSE that ends with no `response.completed`, or emits
+  `response.failed` / `error` →
+  `{ kind: "json", status: 502, body: { error: { type: "upstream_error", message } } }`.
+
+Content-type is consulted only to distinguish a genuine JSON 200 from an SSE
+200. That is safe because `ensureEventStreamContentType` only ever *adds* an
+event-stream label (it never mislabels a real SSE stream as JSON), and the
+dangerous case — a clobbered non-2xx error mislabeled as event-stream — is
+handled first by the not-ok branch.
 
 `ensureEventStreamContentType` is left unchanged; the streaming passthrough
 path still relies on it. Only the reconcile path bypasses content-type.
