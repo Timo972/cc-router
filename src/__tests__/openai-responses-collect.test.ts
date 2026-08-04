@@ -87,4 +87,74 @@ describe("collectCodexResponseStream", () => {
       body: { error: { type: "upstream_error", message: "boom" } },
     });
   });
+
+  it("reassembles a response.completed event split across chunks", async () => {
+    const upstream = sseResponse([
+      'data: {"type":"response.completed","response":{"id":"split"',
+      "}}\n\n",
+    ]);
+
+    const result = await collectCodexResponseStream(upstream);
+
+    expect(result).toEqual({
+      kind: "json",
+      status: 200,
+      body: { id: "split" },
+    });
+  });
+
+  it("flushes a final event with no trailing newline", async () => {
+    const upstream = sseResponse([
+      'data: {"type":"response.completed","response":{"id":"tail"}}',
+    ]);
+
+    const result = await collectCodexResponseStream(upstream);
+
+    expect(result).toEqual({
+      kind: "json",
+      status: 200,
+      body: { id: "tail" },
+    });
+  });
+
+  it("maps an error event to a 502 upstream_error carrying its message", async () => {
+    const upstream = sseResponse([
+      'data: {"type":"error","error":{"message":"stream exploded"}}\n\n',
+    ]);
+
+    const result = await collectCodexResponseStream(upstream);
+
+    expect(result).toEqual({
+      kind: "json",
+      status: 502,
+      body: { error: { type: "upstream_error", message: "stream exploded" } },
+    });
+  });
+
+  it("maps a malformed SSE data line to a 502 upstream_error", async () => {
+    const upstream = sseResponse(["data: {this is not valid json\n\n"]);
+
+    const result = await collectCodexResponseStream(upstream);
+
+    expect(result).toEqual({
+      kind: "json",
+      status: 502,
+      body: { error: { type: "upstream_error", message: "Malformed upstream stream" } },
+    });
+  });
+
+  it("maps a malformed application/json body to a 502 upstream_error", async () => {
+    const upstream = new Response("{not json", {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+
+    const result = await collectCodexResponseStream(upstream);
+
+    expect(result).toEqual({
+      kind: "json",
+      status: 502,
+      body: { error: { type: "upstream_error", message: "Malformed upstream JSON body" } },
+    });
+  });
 });

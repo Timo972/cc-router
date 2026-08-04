@@ -29,7 +29,11 @@ export async function collectCodexResponseStream(
 
   const contentType = upstream.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
-    return { kind: "json", status: upstream.status, body: await upstream.json() };
+    try {
+      return { kind: "json", status: upstream.status, body: await upstream.json() };
+    } catch {
+      return upstreamError("Malformed upstream JSON body");
+    }
   }
 
   const reader = upstream.body?.getReader();
@@ -37,7 +41,7 @@ export async function collectCodexResponseStream(
 
   const decoder = new TextDecoder();
   let remainder = "";
-  let completed: unknown | undefined;
+  let completed: unknown;
   let failure: string | undefined;
 
   const applyEvent = (event: unknown): void => {
@@ -53,16 +57,20 @@ export async function collectCodexResponseStream(
     }
   };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }));
-    remainder = parsed.remainder;
-    for (const event of parsed.events) applyEvent(event);
-  }
-  const tail = remainder + decoder.decode();
-  if (tail.length > 0) {
-    for (const event of parseSseLines(tail + "\n").events) applyEvent(event);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }));
+      remainder = parsed.remainder;
+      for (const event of parsed.events) applyEvent(event);
+    }
+    const tail = remainder + decoder.decode();
+    if (tail.length > 0) {
+      for (const event of parseSseLines(tail + "\n").events) applyEvent(event);
+    }
+  } catch {
+    return upstreamError("Malformed upstream stream");
   }
 
   if (failure !== undefined) return upstreamError(failure);
