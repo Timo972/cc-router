@@ -26,6 +26,10 @@ export function logError(accountId: string, status: number, message: string): vo
   console.log(chalk.red(`[${ts()}] [ERROR] ${accountId}:${statusStr} ${message}`));
 }
 
+export function logWarn(context: string, message: string): void {
+  console.log(chalk.yellow(`[${ts()}] [WARN] ${context}: ${message}`));
+}
+
 export interface StartupAccountCounts {
   anthropic: number;
   openai: number;
