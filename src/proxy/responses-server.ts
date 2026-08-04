@@ -90,6 +90,17 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       return;
     }
 
+    if (req.body.max_output_tokens !== undefined) {
+      recordActivity({
+        ts: Date.now(),
+        accountId: "-",
+        model: req.body.model,
+        type: "warn",
+        details: "max_output_tokens ignored — unsupported by the Codex backend",
+      });
+      logWarn("responses", "max_output_tokens is unsupported by the Codex backend and was dropped");
+    }
+
     const route = selectRoute(req.body.model, opts.modelRouting);
     if (route.provider !== "openai_subscription") {
       res.status(501).json({

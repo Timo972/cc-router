@@ -346,4 +346,47 @@ describe("mountResponsesRoutes", () => {
       });
     }
   });
+
+  it("warns on an explicit max_output_tokens, then forwards and reconciles", async () => {
+    const record = vi.fn();
+    const forward = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "resp_1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const app = express();
+
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60_000,
+        enabled: true,
+      }),
+      forwardOpenAI: forward,
+      recordActivity: record,
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], max_output_tokens: 256 }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(forward).toHaveBeenCalledOnce();
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "warn",
+          accountId: "-",
+          details: expect.stringContaining("max_output_tokens"),
+        }),
+      );
+    });
+  });
 });
