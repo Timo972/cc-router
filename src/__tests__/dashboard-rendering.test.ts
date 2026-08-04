@@ -135,4 +135,95 @@ describe("Dashboard rendering", () => {
       await exitResult;
     }
   });
+
+  it("renders a warn activity row with the warn glyph and details", async () => {
+    const health = {
+      status: "ok",
+      mode: "direct",
+      target: "chatgpt.com",
+      uptime: 60_000,
+      totalRequests: 0,
+      totalErrors: 0,
+      totalRefreshes: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreationTokens: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      operational: {
+        auth: { required: false },
+        providers: {
+          anthropic: { configured: false, accounts: 0, healthy: 0, enabled: 0 },
+          openai: { configured: true, accounts: 1, healthy: 1, enabled: 1 },
+        },
+        endpoints: {
+          health: "/cc-router/health",
+          accounts: "/cc-router/accounts",
+          messages: "/v1/messages",
+          responses: "/v1/responses",
+          models: "/v1/models",
+        },
+        routing: { anthropicAliases: [], openAIAliases: [] },
+        capabilities: {
+          anthropicMessages: true,
+          openAIResponses: true,
+          crossProviderMessages: false,
+          dynamicModels: true,
+          accountManagement: true,
+        },
+      },
+      accounts: [],
+      recentLogs: [{
+        ts: 1,
+        accountId: "-",
+        model: "gpt-5.5",
+        type: "warn",
+        details: "max_output_tokens ignored — unsupported by the Codex backend",
+      }],
+    };
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(health)));
+
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode: vi.fn(),
+      ref: vi.fn(),
+      unref: vi.fn(),
+    }) as unknown as NodeJS.ReadStream;
+    const stdout = Object.assign(new PassThrough(), {
+      columns: 240,
+      rows: 100,
+    }) as unknown as NodeJS.WriteStream;
+    const stderr = Object.assign(new PassThrough(), {
+      columns: 240,
+      rows: 100,
+    }) as unknown as NodeJS.WriteStream;
+    let output = "";
+    stdout.on("data", chunk => { output += chunk.toString(); });
+
+    const instance = render(
+      React.createElement(Dashboard, { port: 3456 }),
+      { stdin, stdout, stderr, debug: true, exitOnCtrlC: false, patchConsole: false },
+    );
+    const exitResult = instance.waitUntilExit().then(
+      () => ({ kind: "exit" as const }),
+      (error: unknown) => ({ kind: "error" as const, error }),
+    );
+
+    try {
+      const rendered = vi.waitFor(
+        () => {
+          expect(output).toContain("⚠");
+          expect(output).toContain("max_output_tokens ignored");
+        },
+        { timeout: 1_000, interval: 10 },
+      ).then(() => ({ kind: "rendered" as const }));
+
+      const outcome = await Promise.race([rendered, exitResult]);
+      if (outcome.kind === "error") throw outcome.error;
+      expect(outcome.kind).toBe("rendered");
+    } finally {
+      instance.unmount();
+      await exitResult;
+    }
+  });
 });
