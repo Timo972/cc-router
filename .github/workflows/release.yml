@@ -13,7 +13,8 @@ jobs:
     permissions:
       # Least privilege: the job only publishes to npm.
       contents: read
-      # Required for npm provenance / OIDC Trusted Publishing.
+      # Required for OIDC Trusted Publishing. This is now the ONLY publish
+      # credential — there is no NPM_TOKEN fallback (see the Publish step).
       id-token: write
 
     steps:
@@ -21,11 +22,30 @@ jobs:
 
       - uses: pnpm/action-setup@v6
 
+      # No dependency cache in release builds: a poisoned cache entry would be
+      # baked into a published artifact.
+      #
+      # OIDC needs Node >= 22.14.0, and pnpm >= 11.1.3 — pnpm 11.0.x forwarded
+      # setup-node's unresolved ${NODE_AUTH_TOKEN} placeholder as a literal
+      # bearer token and got a 404 back (pnpm/pnpm#11513). packageManager pins
+      # a compliant pnpm.
       - uses: actions/setup-node@v7
         with:
-          node-version: '22'
-          cache: pnpm
+          node-version: '24'
           registry-url: https://registry.npmjs.org
+
+      # Fail before doing any work if the tag and manifest disagree. An npm
+      # version can never be reused, so a mismatched publish is unrecoverable.
+      # GITHUB_REF_NAME is read at runtime, not interpolated into the script.
+      - name: Verify tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Tag v${TAG} does not match package.json version ${PKG}" >&2
+            exit 1
+          fi
+          echo "Publishing version ${PKG}"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -39,14 +59,20 @@ jobs:
       - name: Test
         run: pnpm test
 
-      # Publish with provenance so consumers can verify the build's origin.
+      # Authenticated purely by OIDC Trusted Publishing — no NODE_AUTH_TOKEN, so
+      # a misconfiguration fails loudly instead of silently falling back to a
+      # long-lived token.
       #
-      # RECOMMENDED (maintainer action, one-time): enable npm Trusted Publishing
-      # for this package at https://www.npmjs.com/package/@timo972/cc-router/access and
-      # then DELETE the NPM_TOKEN secret — OIDC (id-token: write) replaces the
-      # long-lived, exfiltratable token entirely. Until then the token is used as
-      # a fallback.
+      # One-time maintainer setup at
+      # https://www.npmjs.com/package/@timo972/cc-router/access
+      #   repository: Timo972/cc-router
+      #   workflow:   release.yml
+      #   action:     npm publish
+      # npm does not validate that config on save; errors surface only at publish.
+      #
+      # --provenance is omitted deliberately: attestations are generated
+      # automatically for OIDC publishes from a public repo.
+      # --no-git-checks is required because a tag push checks out a detached
+      # HEAD, which pnpm's default publish-branch check would reject.
       - name: Publish
-        run: pnpm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: pnpm publish --no-git-checks --access public
