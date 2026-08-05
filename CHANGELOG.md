@@ -8,6 +8,93 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+---
+
+## [0.9.0] — 2026-08-04
+
+### Added
+
+- **Non-streaming `/v1/responses` requests are served correctly.** A caller that
+  posts `stream: false` — the public Responses API default — now receives a
+  single JSON Responses object. The Codex backend is SSE-only, so the router
+  reconciles the forced event stream into one body instead of returning raw SSE
+  bytes the client cannot parse. Streaming callers (the Codex CLI) are
+  unaffected.
+- A distinct `warn` activity type with its own `logWarn` console channel,
+  rendered as its own row style on the status dashboard so advisories are
+  visually separate from routing errors.
+
+### Changed
+
+- `/v1/responses` rejects an explicit `store: true` with a `400`
+  `invalid_request_error` instead of silently rewriting it to `false`. The Codex
+  subscription backend is stateless and cannot offer server-side response
+  retrieval by id. An omitted `store` is still normalized to `false` silently.
+- An explicit `max_output_tokens` is still dropped — the backend does not
+  support it — but each drop now surfaces as a warning in both the console log
+  and the dashboard activity feed, so the ignored cap is observable.
+
+### Fixed
+
+- Malformed upstream data from the Codex backend (a bad JSON body or a malformed
+  SSE stream) maps to a `502 upstream_error` instead of throwing out of the
+  async Express handler, which left the client connection hanging indefinitely.
+- Non-2xx Codex passthrough preserves the upstream content-type instead of
+  hardcoding `text/plain`, which broke SDK clients that parse errors by
+  content-type.
+
+---
+
+## [0.8.3] — 2026-08-04
+
+### Fixed
+
+- Accounts added while the proxy is running (`accounts add`, `add-openai`,
+  `login-openai`) are now loaded into the live pool immediately — routable and
+  visible in `accounts list` without a restart. Previously only removals were
+  applied at runtime; adds required restarting the proxy. When no proxy is
+  running the add still falls back to a plain disk write.
+
+---
+
+## [0.8.2] — 2026-08-03
+
+### Fixed
+
+- The interactive status dashboard no longer crashes when model-scoped usage
+  reports an unknown reset timestamp as zero.
+
+### Internal
+
+- GitHub Actions bumped to v7.
+- The Codex config-path test uses the platform-native location instead of a
+  hardcoded POSIX path.
+
+---
+
+## [0.8.1] — 2026-08-03
+
+### Fixed
+
+- Anthropic model-scoped usage rows using the current nested `scope.model`
+  shape are parsed correctly, so exhausting Fable capacity no longer creates
+  an account-global cooldown that also blocks Opus routing.
+
+### Changed
+
+- Hosting guidance about sharing accounts across a team was removed from the
+  docs.
+
+### Internal
+
+- CI installs with pnpm and runs the suite across the supported Node versions.
+
+---
+
+## [0.8.0] — 2026-08-01
+
 ### Added
 
 - **Model-aware Anthropic allowance routing.** Requested Messages models now
@@ -28,25 +115,28 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   endpoint with bounded concurrency, timeout, and backoff, while response
   headers remain the graceful-degradation source when that endpoint is
   unavailable.
+- The README leads with the fork's positioning, and the account-sharing use
+  case was dropped.
 
 ### Fixed
 
-- The interactive status dashboard no longer crashes when model-scoped usage
-  reports an unknown reset timestamp as zero.
-- Anthropic model-scoped usage rows using the current nested `scope.model`
-  shape are parsed correctly, so exhausting Fable capacity no longer creates
-  an account-global cooldown that also blocks Opus routing.
 - When all accounts are hard-blocked, the router now returns a local
   Anthropic-shaped 429 when any blocker is rate-limit or quota related, adding
   the earliest trustworthy `Retry-After` only when known. A 503 is used only
   for entirely non-rate-limit unavailability. These local errors make no
   Anthropic Messages request, and fallback no longer sends requests to cooling
   or upstream-rate-limited accounts.
-- Accounts added while the proxy is running (`accounts add`, `add-openai`,
-  `login-openai`) are now loaded into the live pool immediately — routable and
-  visible in `accounts list` without a restart. Previously only removals were
-  applied at runtime; adds required restarting the proxy. When no proxy is
-  running the add still falls back to a plain disk write.
+- `accounts remove` now removes the account from the running proxy instead of
+  only rewriting `accounts.json`, so a removed account stops being routed
+  without a restart.
+- A per-account cap of 100% is no longer treated as over-cap at full
+  utilization, so sessions on accounts running on paid extra usage stay sticky
+  on their bound account.
+
+### Internal
+
+- Package management switched from npm to pnpm (`pnpm-lock.yaml`,
+  `pnpm-workspace.yaml`).
 
 ---
 
@@ -137,4 +227,9 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
+[0.9.0]: https://github.com/Timo972/cc-router/releases/tag/v0.9.0
+[0.8.3]: https://github.com/Timo972/cc-router/releases/tag/v0.8.3
+[0.8.2]: https://github.com/Timo972/cc-router/releases/tag/v0.8.2
+[0.8.1]: https://github.com/Timo972/cc-router/releases/tag/v0.8.1
+[0.8.0]: https://github.com/Timo972/cc-router/releases/tag/v0.8.0
 [0.7.0]: https://github.com/Timo972/cc-router/releases/tag/v0.7.0
