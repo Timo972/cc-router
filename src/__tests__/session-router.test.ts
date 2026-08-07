@@ -4,6 +4,7 @@ import type { RoutedAccountLease } from "../proxy/session-router.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS, type RouteContext } from "../proxy/types.js";
+import type { AccountLease as GenericAccountLease, AccountPool } from "../proxy/account-pool.js";
 
 function makeAccount(id: string): Account {
   return {
@@ -458,5 +459,43 @@ describe("SessionRouter", () => {
     expect(route.modelFamily).toBe("haiku");
     expect(router.getBindingCount()).toBe(0);
     route.release();
+  });
+});
+
+interface FakePoolAccount {
+  readonly id: string;
+  readonly flavor: "codex";
+}
+
+class FakeAccountPool implements AccountPool<FakePoolAccount> {
+  readonly acquired: string[] = [];
+  constructor(private readonly accounts: FakePoolAccount[]) {}
+
+  acquireBest(): GenericAccountLease<FakePoolAccount> {
+    const account = this.accounts[0]!;
+    this.acquired.push(account.id);
+    return { account, fallback: false, release: () => undefined };
+  }
+
+  tryAcquire(accountId: string): GenericAccountLease<FakePoolAccount> | null {
+    const account = this.accounts.find(a => a.id === accountId);
+    if (!account) return null;
+    this.acquired.push(`sticky:${account.id}`);
+    return { account, fallback: false, release: () => undefined };
+  }
+}
+
+describe("SessionRouter over a non-Anthropic AccountPool", () => {
+  it("binds and reuses accounts from any pool implementing AccountPool", () => {
+    const pool = new FakeAccountPool([{ id: "openai-a", flavor: "codex" }]);
+    const router = new SessionRouter<FakePoolAccount>(pool);
+
+    const first = router.acquire("session-1");
+    expect(first.reason).toBe("new-session");
+    expect(first.account.flavor).toBe("codex");
+
+    const second = router.acquire("session-1");
+    expect(second.reason).toBe("sticky");
+    expect(pool.acquired).toEqual(["openai-a", "sticky:openai-a"]);
   });
 });
