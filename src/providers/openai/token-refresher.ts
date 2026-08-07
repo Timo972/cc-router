@@ -18,6 +18,9 @@ export type OpenAISubscriptionAccount = ProviderAccount & {
   accessToken: string;
   refreshToken: string;
   expiresAt: number;
+  scopes?: string[];
+  sessionLimitPercent?: number;
+  weeklyLimitPercent?: number;
 };
 
 export function needsOpenAIRefresh(account: Pick<OpenAISubscriptionAccount, "expiresAt">): boolean {
