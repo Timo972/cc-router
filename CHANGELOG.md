@@ -6,10 +6,18 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## Unreleased
 
 ### Added
-
+- OpenAI/Codex sticky session routing: sessions pin to one account for prompt-cache
+  locality (`session_id` → `x-claude-code-session-id` → `prompt_cache_key`), with
+  load- and headroom-aware selection for new sessions.
+- Codex usage tracking from `x-codex-*` response headers: default 5h/weekly windows
+  plus dynamically discovered model-scoped metered buckets, credits, and plan.
+- Scoped cooldowns on upstream failures: bucket-scoped via `x-codex-active-limit`,
+  account-global otherwise; local 429/503 responses when no account is eligible.
+- Dashboard: OpenAI accounts now show 5h/weekly bars, per-bucket rows, credits,
+  plan, request/error/in-flight/session counts, and cooldown state.
 - **Model-aware Anthropic allowance routing.** Requested Messages models now
   participate in account eligibility and headroom ranking through dynamic
   model-scoped weekly limits. Account-based session affinity is retained while
@@ -19,7 +27,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   requested-model cooldown summaries.
 
 ### Changed
-
+- OpenAI account records persist `scopes`, `sessionLimitPercent`, and `weeklyLimitPercent`.
+- The stateless OpenAI round-robin picker was removed in favor of `OpenAITokenPool`.
 - Anthropic cooldowns, upstream quota exhaustion, disabled or unhealthy state,
   and invalid authentication are hard routing exclusions. The only fallback is
   an explicit bypass of configured per-account percentage caps when every

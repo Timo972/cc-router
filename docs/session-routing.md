@@ -208,12 +208,69 @@ before assuming the routing is at fault.
 
 ---
 
+## OpenAI/Codex routing
+
+OpenAI subscription accounts route Codex CLI requests and also support Claude
+Code cross-routing with OpenAI models. Like Claude accounts, OpenAI accounts
+benefit from sticky session routing to preserve prompt-cache locality.
+
+### Session affinity
+
+Codex CLI sends a `session_id` header; CC-Router resolves the affinity key in this
+priority order:
+
+1. `session_id` header (Codex CLI default)
+2. `x-claude-code-session-id` header (fallback for cross-routing)
+3. `prompt_cache_key` in the request body (cache key as session identity)
+4. Unscoped (load-aware per-request routing, no affinity)
+
+When a session ID is resolved, it is bound to an OpenAI account, and subsequent
+requests with the same session reuse that account for prompt-cache locality. The
+binding behavior mirrors Anthropic: **1 hour TTL**, **10,000-entry capacity**,
+**LRU eviction**, and **per-request eligibility checks** for the requested model.
+
+When an account returns a 401, 429, or 529, the binding is invalidated and the
+client's next request selects another account. Session headers that do not match
+a single non-empty string of at most 256 bytes are rejected and fall back to
+unscoped routing.
+
+### Usage tracking and buckets
+
+OpenAI (Codex) usage is bucket-based. CC-Router maintains:
+
+- **Default account-level `codex` bucket**: A primary 5-hour window and secondary
+  7-day all-models window, shared by all models at model-specific burn rates
+  (e.g., different models consume different amounts of the same shared bucket).
+- **Model-scoped metered buckets** (optional): Discovered dynamically from
+  `x-codex-<limit>-*` response header families when present. These are never
+  configured and apply only to the model that reported them.
+
+Usage is derived from response headers only in this release; the `wham/usage`
+endpoint and `codex.rate_limits` stream events are future enhancements. Credits
+are displayed in the dashboard but not used for account selection.
+
+Cooldowns on rate-limit failures are either account-global (default) or
+bucket-scoped when `x-codex-active-limit` indicates a specific bucket. Load-aware
+account selection follows the same ranking as Claude (fewest in-flight requests,
+fewest bound sessions, included allowance before paid extra, headroom, round-robin).
+
+### Dashboard display
+
+OpenAI account rows show:
+- 5-hour and 7-day usage bars (if data is available)
+- Per-bucket rows when model-scoped buckets are reported
+- Remaining credits and plan name
+- Request, error, in-flight, and session counts
+- Cooldown state (scope and remaining duration)
+
+---
+
 ## Troubleshooting
 
 **Cache hit rates look worse than expected.**
-Confirm requests actually carry `X-Claude-Code-Session-Id`. Without it every
-request is `unscoped` and affinity never applies. Claude Desktop always behaves
-this way.
+Confirm requests actually carry `X-Claude-Code-Session-Id` (Claude) or `session_id`
+(Codex CLI). Without a session header, every request is `unscoped` and affinity
+never applies. Claude Desktop always behaves this way.
 
 **One account is doing all the work.**
 Expected if your team is running one long session each — affinity holds them in
