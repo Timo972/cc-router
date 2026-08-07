@@ -119,13 +119,25 @@ export function createCodexUsageObserver(): {
 
   return {
     push(chunk: Uint8Array): void {
-      const parsed = parseSseLines(remainder + decoder.decode(chunk, { stream: true }));
-      remainder = parsed.remainder;
-      parsed.events.forEach(applyEvent);
+      // Best-effort: a malformed SSE frame from upstream must never throw
+      // here. This observer only watches bytes that are already being
+      // relayed to the client verbatim — a parse failure just means usage
+      // for this chunk goes uncaptured, never that the response breaks.
+      try {
+        const parsed = parseSseLines(remainder + decoder.decode(chunk, { stream: true }));
+        remainder = parsed.remainder;
+        parsed.events.forEach(applyEvent);
+      } catch {
+        // swallow — passive observer, see comment above
+      }
     },
     finish(): CodexUsageTotals | undefined {
-      const tail = decoder.decode();
-      if (tail || remainder) parseSseLines(remainder + tail + "\n").events.forEach(applyEvent);
+      try {
+        const tail = decoder.decode();
+        if (tail || remainder) parseSseLines(remainder + tail + "\n").events.forEach(applyEvent);
+      } catch {
+        // swallow — passive observer, see comment above
+      }
       remainder = "";
       return totals;
     },

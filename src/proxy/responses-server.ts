@@ -72,8 +72,8 @@ async function sendUpstreamResponse(
       const { value, done } = await reader.read();
       if (done) break;
       if (value) {
-        onChunk?.(value);
         res.write(Buffer.from(value));
+        onChunk?.(value);
       }
     }
   } finally {
@@ -128,6 +128,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         model: req.body.model,
         type: "warn",
         statusCode: 400,
+        path: "/v1/responses",
         details: "store:true rejected — Codex backend is stateless (store:false only)",
       });
       logWarn("responses", "store:true is not supported by the Codex backend; rejecting request");
@@ -146,6 +147,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         accountId: "-",
         model: req.body.model,
         type: "warn",
+        path: "/v1/responses",
         details: "max_output_tokens ignored — unsupported by the Codex backend",
       });
       logWarn("responses", "max_output_tokens is unsupported by the Codex backend and was dropped");
@@ -199,6 +201,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         model: route.upstreamModel,
         type: "error",
         statusCode: 401,
+        path: "/v1/responses",
         details: "openai token refresh failed",
       });
       res.status(401).json({

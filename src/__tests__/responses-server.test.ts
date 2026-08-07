@@ -545,6 +545,39 @@ describe("mountResponsesRoutes sticky routing", () => {
     expect(entry?.cacheReadTokens).toBe(60);
   });
 
+  it("relays a stream byte-for-byte and still records activity when a malformed SSE data line precedes a valid frame", async () => {
+    const account = makeRuntimeAccount("openai-a");
+    const malformedChunk = "data: not-json\n\n";
+    const encoder = new TextEncoder();
+    const upstreamStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(malformedChunk));
+        controller.enqueue(encoder.encode(SSE_BODY));
+        controller.close();
+      },
+    });
+    const forwardOpenAI = vi.fn(async () => new Response(upstreamStream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }));
+    const { app, activity } = mountWithPool([account], forwardOpenAI);
+
+    let bodyText = "";
+    await withServer(app, async baseUrl => {
+      const response = await post(baseUrl, {});
+      expect(response.status).toBe(200);
+      bodyText = await response.text();
+    });
+
+    // Byte-for-byte relay: the malformed frame never blocks or mutates the
+    // stream written to the client, it only breaks usage capture for the
+    // observer (which is allowed to miss tokens, never to throw).
+    expect(bodyText).toBe(malformedChunk + SSE_BODY);
+
+    const entry = activity.find(e => e.type === "route");
+    expect(entry).toBeDefined();
+  });
+
   it("keeps returning 503 no_accounts for an empty pool", async () => {
     const { app } = mountWithPool([], vi.fn() as never);
     await withServer(app, async baseUrl => {

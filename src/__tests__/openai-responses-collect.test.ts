@@ -183,4 +183,22 @@ describe("createCodexUsageObserver", () => {
     observer.push(encoder.encode("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"));
     expect(observer.finish()).toBeUndefined();
   });
+
+  it("never throws on a malformed SSE data line — push() and finish() swallow the parse error", () => {
+    const observer = createCodexUsageObserver();
+    expect(() => observer.push(encoder.encode("data: not-json\n\n"))).not.toThrow();
+    expect(() => observer.finish()).not.toThrow();
+    expect(observer.finish()).toBeUndefined();
+  });
+
+  it("still captures usage from a later valid chunk after an earlier chunk had a malformed data line", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode("data: not-json\n\n"));
+    const event = `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: { id: "resp_1", usage: { input_tokens: 8, output_tokens: 3, input_tokens_details: { cached_tokens: 1 } } },
+    })}\n\n`;
+    observer.push(encoder.encode(event));
+    expect(observer.finish()).toEqual({ inputTokens: 8, cachedInputTokens: 1, outputTokens: 3 });
+  });
 });
