@@ -233,7 +233,7 @@ describe("createHealthAccountViews", () => {
       "x-codex-primary-used-percent": "42",
       "x-codex-credits-has-credits": "true",
       "x-codex-credits-unlimited": "false",
-      "x-codex-credits-balance": "12[31mX",
+      "x-codex-credits-balance": "12\x1b[31mX",
     }, Date.now()), Date.now());
 
     const views = createHealthAccountViews([], [account], undefined, () => ({
@@ -244,7 +244,7 @@ describe("createHealthAccountViews", () => {
     const codex = views[0]!.codexRateLimits!;
     expect(codex.credits?.balance).toBe("12[31mX");
     const serialized = JSON.stringify(views[0]);
-    expect(serialized).not.toContain("");
+    expect(serialized).not.toContain("\x1b");
   });
 
   it("never exposes tokens or raw header values in the OpenAI health view", () => {

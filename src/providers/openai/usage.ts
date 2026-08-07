@@ -15,6 +15,11 @@ export interface CodexLimitBucket {
   limitName?: string;
   primary?: CodexRateWindow;
   secondary?: CodexRateWindow;
+  /** Unix ms of this bucket's own last header update — set at merge time,
+   *  never by pure parsing. Staleness self-healing keys off this rather than
+   *  the account-wide lastUpdated so traffic on other buckets cannot defer a
+   *  quiet bucket's recovery. */
+  lastSeenAt?: number;
 }
 
 export interface CodexCredits {

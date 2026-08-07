@@ -137,6 +137,46 @@ describe("sweepCodexRateLimits", () => {
     expect(swept.primary?.resetAt).toBe(0);
   });
 
+  it("self-heals a stale exhausted named bucket even while other traffic keeps the account snapshot fresh", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "100",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+    expect(bucketForModel(account, "gpt-5.6-sol")?.limitId).toBe("codex_bengalfox");
+
+    // Other models keep hitting the account: only the default bucket refreshes,
+    // keeping the account-wide lastUpdated fresh the whole time.
+    const staleAt = NOW_MS + 5 * 60 * 60 * 1000 + 1;
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "10",
+    }, staleAt - 1), staleAt - 1);
+
+    // The named bucket's own snapshot is 5h old — it must still self-heal.
+    const recovered = sweepCodexRateLimits(account, staleAt);
+    expect(recovered).toBe(true);
+    expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(false);
+    expect(account.modelBuckets.size).toBe(0);
+  });
+
+  it("keeps a fresh exhausted named bucket while an older default bucket goes stale", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "100",
+    }, NOW_MS), NOW_MS);
+
+    // The named bucket arrives much later; its own snapshot is still fresh at
+    // sweep time even though the account first reported usage 5h ago.
+    const laterMs = NOW_MS + 5 * 60 * 60 * 1000;
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "100",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, laterMs), laterMs);
+
+    sweepCodexRateLimits(account, laterMs + 60_000);
+    expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(true);
+  });
+
   it("does not clear an exhausted default window with resetAt 0 while its snapshot is still fresh", () => {
     const account = createOpenAIAccount(record());
     applyCodexRateLimits(account, parseCodexRateLimits({

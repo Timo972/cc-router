@@ -435,7 +435,7 @@ function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView):
     }));
   const credits = rl.credits;
   const balance = typeof credits?.balance === "string"
-    ? credits.balance.replace(/[ -]/g, "").trim().slice(0, 32)
+    ? credits.balance.replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 32)
     : "";
   return {
     status: rl.status === "rate_limited" ? "rate_limited" : "ok",

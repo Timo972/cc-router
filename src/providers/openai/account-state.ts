@@ -77,6 +77,7 @@ export function applyCodexRateLimits(
     if (primary) merged.primary = primary;
     const secondary = bucket.secondary ?? existing?.secondary;
     if (secondary) merged.secondary = secondary;
+    merged.lastSeenAt = nowMs;
     limits.buckets.set(bucket.limitId, merged);
   }
   if (update.credits) limits.credits = update.credits;
@@ -136,12 +137,12 @@ export function bucketForModel(
  */
 function isStaleExhaustedWindow(
   window: CodexRateWindow | undefined,
-  lastUpdated: number,
+  lastSeenAtMs: number,
   nowMs: number,
 ): boolean {
   if (!window || window.resetAt !== 0 || window.utilization < 1) return false;
   const staleAfterMs = (window.windowMinutes > 0 ? window.windowMinutes : STALE_DEFAULT_WINDOW_MINUTES) * 60_000;
-  return nowMs - lastUpdated > staleAfterMs;
+  return nowMs - lastSeenAtMs > staleAfterMs;
 }
 
 export function sweepCodexRateLimits(
@@ -149,14 +150,16 @@ export function sweepCodexRateLimits(
   nowMs: number,
 ): boolean {
   const nowSec = Math.floor(nowMs / 1000);
-  const lastUpdated = account.rateLimits.lastUpdated;
   let recovered = false;
 
   for (const [limitId, bucket] of account.rateLimits.buckets) {
+    // Buckets recorded before lastSeenAt existed fall back to the
+    // account-wide timestamp.
+    const bucketSeenAt = bucket.lastSeenAt ?? account.rateLimits.lastUpdated;
     const windows = [bucket.primary, bucket.secondary];
     const expired = windows.map(window =>
       window !== undefined
-      && ((window.resetAt > 0 && nowSec >= window.resetAt) || isStaleExhaustedWindow(window, lastUpdated, nowMs)),
+      && ((window.resetAt > 0 && nowSec >= window.resetAt) || isStaleExhaustedWindow(window, bucketSeenAt, nowMs)),
     );
 
     if (limitId === DEFAULT_CODEX_LIMIT_ID) {
