@@ -142,12 +142,12 @@ function header(headers: FailureHeaders, name: string): string | number | undefi
   return undefined;
 }
 
-function futureExpiry(expiryMs: number, nowMs: number): number | undefined {
+export function futureExpiry(expiryMs: number, nowMs: number): number | undefined {
   if (!Number.isFinite(expiryMs) || expiryMs <= nowMs) return undefined;
   return expiryMs - nowMs <= MAX_RATE_LIMIT_COOLDOWN_MS ? expiryMs : undefined;
 }
 
-function retryAfterExpiry(value: unknown, nowMs: number): number | undefined {
+export function retryAfterExpiry(value: unknown, nowMs: number): number | undefined {
   if (typeof value !== "string" && typeof value !== "number") return undefined;
   if (typeof value === "string" && value.trim().length === 0) return undefined;
   const numeric = Number(value);
@@ -159,7 +159,7 @@ function retryAfterExpiry(value: unknown, nowMs: number): number | undefined {
   return futureExpiry(Date.parse(value), nowMs);
 }
 
-function resetHeaderExpiry(value: unknown, nowMs: number): number | undefined {
+export function resetHeaderExpiry(value: unknown, nowMs: number): number | undefined {
   if (typeof value !== "string" && typeof value !== "number") return undefined;
   if (typeof value === "string" && value.trim().length === 0) return undefined;
   const numeric = Number(value);
