@@ -251,8 +251,10 @@ are displayed in the dashboard but not used for account selection.
 
 Cooldowns on rate-limit failures are either account-global (default) or
 bucket-scoped when `x-codex-active-limit` indicates a specific bucket. Load-aware
-account selection follows the same ranking as Claude (fewest in-flight requests,
-fewest bound sessions, included allowance before paid extra, headroom, round-robin).
+account selection ranks eligible accounts by: fewest in-flight requests, then
+fewest active session bindings, then greatest remaining rate-limit headroom, with
+round-robin order as the deterministic tie-break (similar to Claude's ranking,
+but without the paid-extra tier—credits are display-only).
 
 ### Dashboard display
 
