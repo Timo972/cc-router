@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { collectCodexResponseStream } from "../protocol/openai-responses-collect.js";
+import { collectCodexResponseStream, createCodexUsageObserver } from "../protocol/openai-responses-collect.js";
 
 function sseResponse(chunks: string[], init?: ResponseInit): Response {
   const encoder = new TextEncoder();
@@ -157,5 +157,30 @@ describe("collectCodexResponseStream", () => {
       status: 502,
       body: { error: { type: "upstream_error", message: "Malformed upstream JSON body" } },
     });
+  });
+});
+
+describe("createCodexUsageObserver", () => {
+  const encoder = new TextEncoder();
+
+  it("captures usage from a response.completed event split across chunks", () => {
+    const observer = createCodexUsageObserver();
+    const event = `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_1",
+        usage: { input_tokens: 100, output_tokens: 25, input_tokens_details: { cached_tokens: 60 } },
+      },
+    })}\n\n`;
+    const mid = Math.floor(event.length / 2);
+    observer.push(encoder.encode(event.slice(0, mid)));
+    observer.push(encoder.encode(event.slice(mid)));
+    expect(observer.finish()).toEqual({ inputTokens: 100, cachedInputTokens: 60, outputTokens: 25 });
+  });
+
+  it("returns undefined when no completed event arrives", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"));
+    expect(observer.finish()).toBeUndefined();
   });
 });

@@ -20,6 +20,9 @@ import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { createOpenAIAccountPicker } from "../providers/openai/account-pool.js";
 import { prepareOpenAIAccountForRequest, startOpenAIRefreshLoop } from "../providers/openai/token-refresher.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
+import { createOpenAIAccount } from "../providers/openai/account-state.js";
+import type { OpenAIAccount } from "../providers/openai/account-state.js";
+import { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { mountResponsesRoutes } from "./responses-server.js";
 import { mountMessagesCrossProviderRoute } from "./messages-cross-route.js";
 import { mountModelsRoute } from "./models-server.js";
@@ -487,6 +490,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     };
   };
   const pickOpenAIAccount = createOpenAIAccountPicker(openAIAccounts);
+  const openAIRuntimeAccounts = openAIAccounts.map(createOpenAIAccount);
+  const openAIPool = new OpenAITokenPool(openAIRuntimeAccounts);
+  const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
   const initialConfig = readConfig();
   const modelRouting = initialConfig.modelRouting ?? {};
 
@@ -904,7 +910,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   });
 
   mountResponsesRoutes(app, {
-    getOpenAIAccount: pickOpenAIAccount,
+    openAIRouter,
+    openAIPool,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
     modelRouting,
   });

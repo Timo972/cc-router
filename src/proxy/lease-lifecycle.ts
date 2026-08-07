@@ -89,7 +89,7 @@ export type RouteFailureReason =
 export function routeFailureDetails(
   route: RouteSummary,
   failure: RouteFailureReason,
-  limitingScope?: "global" | `model:${string}`,
+  limitingScope?: "global" | `model:${string}` | `bucket:${string}`,
 ): string {
   return `${routeReasonDetails(route)}:${failure}${limitingScope ? `:${limitingScope}` : ""}`;
 }
