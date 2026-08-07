@@ -40,6 +40,8 @@ export const DEFAULT_CODEX_LIMIT_ID = "codex";
 
 const USED_PERCENT_SUFFIX = "-primary-used-percent";
 const MS_TIMESTAMP_THRESHOLD = 100_000_000_000;
+/** Strips ASCII control characters (including ESC) from upstream-controlled header text. */
+const CONTROL_CHAR_PATTERN = /[\x00-\x1f\x7f]/g;
 
 export function createEmptyCodexRateLimits(): CodexRateLimits {
   return { status: "ok", buckets: new Map(), lastUpdated: 0 };
@@ -115,7 +117,9 @@ function parseCredits(headers: Record<string, unknown>): CodexCredits | undefine
   const hasCredits = headerBool(headers, "x-codex-credits-has-credits");
   const unlimited = headerBool(headers, "x-codex-credits-unlimited");
   if (hasCredits === undefined && unlimited === undefined) return undefined;
-  const balance = headerString(headers, "x-codex-credits-balance")?.trim();
+  const balance = headerString(headers, "x-codex-credits-balance")
+    ?.replace(CONTROL_CHAR_PATTERN, "")
+    .trim();
   return {
     hasCredits: hasCredits === true,
     unlimited: unlimited === true,

@@ -114,4 +114,39 @@ describe("sweepCodexRateLimits", () => {
     expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(false);
     expect(account.modelBuckets.size).toBe(0);
   });
+
+  it("self-heals a stale exhausted default window that has no trustworthy resetAt", () => {
+    const account = createOpenAIAccount(record());
+    // No reset-at / reset-after-seconds header at all: parseResetAtSeconds falls
+    // back to 0 (untrustworthy), same as a past or malformed reset would.
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "100",
+    }, NOW_MS), NOW_MS);
+    const bucket = account.rateLimits.buckets.get(DEFAULT_CODEX_LIMIT_ID)!;
+    expect(bucket.primary?.resetAt).toBe(0);
+    expect(bucket.primary?.utilization).toBe(1);
+
+    // 5 hours (the default staleness window, since no windowMinutes was reported)
+    // after the snapshot was last refreshed: the window is treated as stale and
+    // self-heals, reporting recovery so the pool's cooldown-expiry hook fires.
+    const staleAt = NOW_MS + 5 * 60 * 60 * 1000 + 1;
+    const recovered = sweepCodexRateLimits(account, staleAt);
+    expect(recovered).toBe(true);
+    const swept = account.rateLimits.buckets.get(DEFAULT_CODEX_LIMIT_ID)!;
+    expect(swept.primary?.utilization).toBe(0);
+    expect(swept.primary?.resetAt).toBe(0);
+  });
+
+  it("does not clear an exhausted default window with resetAt 0 while its snapshot is still fresh", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "100",
+    }, NOW_MS), NOW_MS);
+
+    const recovered = sweepCodexRateLimits(account, NOW_MS + 60_000);
+    expect(recovered).toBe(false);
+    const bucket = account.rateLimits.buckets.get(DEFAULT_CODEX_LIMIT_ID)!;
+    expect(bucket.primary?.utilization).toBe(1);
+    expect(bucket.primary?.resetAt).toBe(0);
+  });
 });

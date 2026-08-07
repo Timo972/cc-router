@@ -23,6 +23,21 @@ export type OpenAISubscriptionAccount = ProviderAccount & {
   weeklyLimitPercent?: number;
 };
 
+/**
+ * Runtime health-tracking fields that live on `OpenAIAccount` (see
+ * `account-state.ts`) but are not part of the persisted `OpenAISubscriptionAccount`
+ * shape. The refresh loop is handed the live `OpenAIAccount[]` array from the pool
+ * (typed here as `OpenAISubscriptionAccount[]` for the persisted-account API), so
+ * these fields are present at runtime even though the static type doesn't declare
+ * them. They're optional here and only written when already present, so refresher
+ * unit tests that construct bare `OpenAISubscriptionAccount` fixtures are unaffected.
+ */
+type OpenAIRuntimeHealthFields = {
+  healthy?: boolean;
+  consecutiveErrors?: number;
+  lastRefresh?: number;
+};
+
 export function needsOpenAIRefresh(account: Pick<OpenAISubscriptionAccount, "expiresAt">): boolean {
   return account.expiresAt - Date.now() < REFRESH_BUFFER_MS;
 }
@@ -86,5 +101,15 @@ async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
   account.accessToken = data.access_token;
   account.refreshToken = data.refresh_token ?? account.refreshToken;
   account.expiresAt = Date.now() + data.expires_in * 1000;
+
+  // A successful refresh recovers an account the pool previously excluded for
+  // being unhealthy (e.g. after a prior failed refresh). Without this, the pool's
+  // hard `!healthy` block means the account never gets acquired again — and thus
+  // never gets another chance to refresh — so it stays excluded until restart.
+  const runtime = account as OpenAISubscriptionAccount & OpenAIRuntimeHealthFields;
+  if (runtime.healthy !== undefined) runtime.healthy = true;
+  if (runtime.consecutiveErrors !== undefined) runtime.consecutiveErrors = 0;
+  if (runtime.lastRefresh !== undefined) runtime.lastRefresh = Date.now();
+
   return true;
 }

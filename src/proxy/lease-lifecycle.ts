@@ -164,7 +164,9 @@ export function resetHeaderExpiry(value: unknown, nowMs: number): number | undef
   if (typeof value === "string" && value.trim().length === 0) return undefined;
   const numeric = Number(value);
   if (Number.isFinite(numeric)) {
-    const milliseconds = numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
+    // Threshold matches usage.ts's MS_TIMESTAMP_THRESHOLD, so a seconds- vs.
+    // milliseconds-epoch reset value is classified the same way across providers.
+    const milliseconds = numeric < 100_000_000_000 ? numeric * 1_000 : numeric;
     return futureExpiry(milliseconds, nowMs);
   }
   if (typeof value !== "string") return undefined;

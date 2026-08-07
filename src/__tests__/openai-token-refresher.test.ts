@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { needsOpenAIRefresh, prepareOpenAIAccountForRequest, refreshOpenAISubscriptionToken, startOpenAIRefreshLoop } from "../providers/openai/token-refresher.js";
+import { createOpenAIAccount } from "../providers/openai/account-state.js";
+import { OpenAITokenPool } from "../providers/openai/token-pool.js";
+import { NoEligibleAccountError } from "../proxy/account-pool.js";
 
 describe("OpenAI subscription token refresher", () => {
   afterEach(() => {
@@ -113,5 +116,43 @@ describe("OpenAI subscription token refresher", () => {
     expect(save).toHaveBeenCalled();
     expect(account.accessToken).toBe("new-access");
     vi.useRealTimers();
+  });
+
+  it("recovers a previously-unhealthy account's routability after a successful refresh", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }),
+    } as Response);
+
+    const account = createOpenAIAccount({
+      id: "openai-recovering",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    });
+    // Simulate a prior failed refresh: the ingress routes mark the account
+    // unhealthy, which the pool hard-blocks from further selection.
+    account.healthy = false;
+    account.consecutiveErrors = 2;
+
+    const pool = new OpenAITokenPool([account]);
+    expect(() => pool.acquireBest(new Map())).toThrow(NoEligibleAccountError);
+
+    const save = vi.fn();
+    const ok = await prepareOpenAIAccountForRequest(account, [account], save);
+
+    expect(ok).toBe(true);
+    expect(account.healthy).toBe(true);
+    expect(account.consecutiveErrors).toBe(0);
+
+    const lease = pool.acquireBest(new Map());
+    expect(lease.account.id).toBe("openai-recovering");
   });
 });

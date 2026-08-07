@@ -434,6 +434,9 @@ function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView):
       ),
     }));
   const credits = rl.credits;
+  const balance = typeof credits?.balance === "string"
+    ? credits.balance.replace(/[ -]/g, "").trim().slice(0, 32)
+    : "";
   return {
     status: rl.status === "rate_limited" ? "rate_limited" : "ok",
     plan: publicCodexPlan(rl.plan),
@@ -442,7 +445,7 @@ function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView):
       credits: {
         hasCredits: credits.hasCredits === true,
         unlimited: credits.unlimited === true,
-        ...(typeof credits.balance === "string" && credits.balance ? { balance: credits.balance.slice(0, 32) } : {}),
+        ...(balance ? { balance } : {}),
       },
     } : {}),
     lastUpdated: publicTimestamp(rl.lastUpdated),

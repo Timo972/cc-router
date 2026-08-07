@@ -236,6 +236,18 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       applyCodexUsage(entry, observer.finish());
     } else {
       const collected = await collectCodexResponseStream(upstream);
+      // Mirror upstream headers (e.g. Retry-After, x-codex-*) before sending the
+      // collected body, so failure responses reach the client unchanged per the
+      // same contract the streaming path already honors via sendUpstreamResponse.
+      // content-type is deliberately excluded here: Express's res.json() only sets
+      // it when unset, so a mirrored content-type would silently win over the
+      // application/json the .json() call below is supposed to set. .json()/.type()
+      // remain the single source of truth for content-type, as today.
+      upstream.headers.forEach((value, key) => {
+        const lower = key.toLowerCase();
+        if (lower === "content-type") return;
+        if (!HOP_BY_HOP_HEADERS.has(lower)) res.setHeader(key, value);
+      });
       if (collected.kind === "json") {
         applyCodexUsage(entry, usageFromResponseBody(collected.body));
         res.status(collected.status).json(collected.body);

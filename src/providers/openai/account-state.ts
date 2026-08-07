@@ -7,10 +7,20 @@ import {
   type CodexLimitBucket,
   type CodexRateLimits,
   type CodexRateLimitsUpdate,
+  type CodexRateWindow,
 } from "./usage.js";
 
 const MAX_MODEL_BUCKET_ENTRIES = 32;
 const DEFAULT_OPENAI_SCOPES = ["openid", "profile", "email", "offline_access"];
+
+// Fallback staleness window used when a rate-limit window is fully exhausted
+// (utilization >= 1) but its resetAt is untrustworthy (0 — past, absent, or
+// malformed per usage.ts's parseResetAtSeconds). Without a reset to wait out,
+// such a window would otherwise block the account forever. Once the snapshot
+// backing it hasn't been refreshed for longer than its own reported window
+// length (or this default when no window length was reported), we treat it as
+// stale and self-heal by clearing it on the next sweep.
+const STALE_DEFAULT_WINDOW_MINUTES = 300;
 
 export interface OpenAIAccount extends OpenAISubscriptionAccount {
   scopes: string[];
@@ -117,17 +127,36 @@ export function bucketForModel(
   return undefined;
 }
 
+/**
+ * A window that's fully exhausted (utilization >= 1) but reports resetAt === 0
+ * (untrustworthy — past, absent, or malformed, per parseResetAtSeconds) has no
+ * trustworthy expiry to wait out. Treat it as expired once the snapshot behind
+ * it hasn't been refreshed for longer than its own window length, so the
+ * account isn't excluded forever.
+ */
+function isStaleExhaustedWindow(
+  window: CodexRateWindow | undefined,
+  lastUpdated: number,
+  nowMs: number,
+): boolean {
+  if (!window || window.resetAt !== 0 || window.utilization < 1) return false;
+  const staleAfterMs = (window.windowMinutes > 0 ? window.windowMinutes : STALE_DEFAULT_WINDOW_MINUTES) * 60_000;
+  return nowMs - lastUpdated > staleAfterMs;
+}
+
 export function sweepCodexRateLimits(
   account: Pick<OpenAIAccount, "rateLimits" | "modelBuckets">,
   nowMs: number,
 ): boolean {
   const nowSec = Math.floor(nowMs / 1000);
+  const lastUpdated = account.rateLimits.lastUpdated;
   let recovered = false;
 
   for (const [limitId, bucket] of account.rateLimits.buckets) {
     const windows = [bucket.primary, bucket.secondary];
     const expired = windows.map(window =>
-      window !== undefined && window.resetAt > 0 && nowSec >= window.resetAt,
+      window !== undefined
+      && ((window.resetAt > 0 && nowSec >= window.resetAt) || isStaleExhaustedWindow(window, lastUpdated, nowMs)),
     );
 
     if (limitId === DEFAULT_CODEX_LIMIT_ID) {

@@ -382,6 +382,33 @@ describe("mountResponsesRoutes", () => {
       expect(await res.text()).toBe(errorBody);
     });
   });
+
+  it("mirrors upstream Retry-After and x-codex-* headers on a non-streaming failure relay", async () => {
+    const errorBody = JSON.stringify({ error: { message: "rate limited" } });
+    const forward: ForwardOpenAI = async () => new Response(errorBody, {
+      status: 429,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "120",
+        "x-codex-primary-used-percent": "100",
+      },
+    });
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get("retry-after")).toBe("120");
+      expect(res.headers.get("x-codex-primary-used-percent")).toBe("100");
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.text()).toBe(errorBody);
+    });
+  });
 });
 
 const SSE_BODY = `event: response.completed\ndata: ${JSON.stringify({
