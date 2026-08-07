@@ -8,10 +8,22 @@ import { encodeSseEvent, parseSseLines } from "../protocol/sse.js";
 import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.js";
 import type { AnthropicMessagesRequest } from "../protocol/anthropic-types.js";
 import type { OpenAIResponseCompleted } from "../protocol/openai-responses-types.js";
-import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
+import { usageFromResponseBody, type CodexUsageTotals } from "../protocol/openai-responses-collect.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 import type { RouteContext } from "./types.js";
 import { extractAnthropicRouteContext } from "./request-model.js";
+import { stats, createLocalRoutingErrorLog, applyCodexUsage } from "./stats.js";
+import type { LogEntry } from "./stats.js";
+import { EmptyPoolError, NoEligibleAccountError } from "./account-pool.js";
+import type { SessionRouter, RoutedAccountLease } from "./session-router.js";
+import { acquireRequestRoute, routeReasonDetails, routeFailureDetails } from "./lease-lifecycle.js";
+import { extractCodexSessionKey } from "./openai-routing.js";
+import { sendAnthropicNoEligibleResponse } from "./anthropic-routing.js";
+import { applyCodexRateLimits, type OpenAIAccount } from "../providers/openai/account-state.js";
+import { headersToRecord, parseCodexRateLimits } from "../providers/openai/usage.js";
+import { applyCodexFailureRouting } from "../providers/openai/failure-routing.js";
+import { needsOpenAIRefresh } from "../providers/openai/token-refresher.js";
+import type { OpenAITokenPool } from "../providers/openai/token-pool.js";
 
 declare module "express-serve-static-core" {
   interface Request {
@@ -23,10 +35,13 @@ declare module "express-serve-static-core" {
 type ForwardOpenAI = typeof forwardOpenAICodexResponse;
 
 export interface MessagesCrossProviderRouteOptions {
-  getOpenAIAccount: () => OpenAISubscriptionAccount | null;
-  prepareOpenAIAccount?: (account: OpenAISubscriptionAccount) => Promise<boolean>;
+  openAIRouter: SessionRouter<OpenAIAccount>;
+  openAIPool: OpenAITokenPool;
+  prepareOpenAIAccount?: (account: OpenAIAccount) => Promise<boolean>;
   forwardOpenAI?: ForwardOpenAI;
   modelRouting?: ModelRoutingConfig;
+  recordActivity?: (entry: LogEntry) => void;
+  now?: () => number;
 }
 
 function isAnthropicMessagesRequest(value: unknown): value is AnthropicMessagesRequest {
@@ -41,15 +56,18 @@ async function sendOpenAIAsAnthropic(
   upstream: globalThis.Response,
   res: Response,
   requestedStream: boolean,
+  onUsage?: (usage: CodexUsageTotals | undefined) => void,
 ): Promise<void> {
   const contentType = upstream.headers.get("content-type") ?? "";
   if (contentType.includes("text/event-stream")) {
     if (requestedStream) {
-      await sendOpenAIStreamAsAnthropic(upstream, res);
+      await sendOpenAIStreamAsAnthropic(upstream, res, onUsage);
       return;
     }
 
-    res.status(upstream.status).json(await collectOpenAIStreamAsAnthropicMessage(upstream));
+    const collected = await collectOpenAIStreamAsAnthropicMessage(upstream);
+    onUsage?.(collected.usage);
+    res.status(upstream.status).json(collected.message);
     return;
   }
 
@@ -61,13 +79,20 @@ async function sendOpenAIAsAnthropic(
   }
 
   const json = await upstream.json() as OpenAIResponseCompleted;
+  onUsage?.(usageFromResponseBody(json));
   res.status(upstream.status).json(openAIResponseToAnthropicMessage(json));
 }
 
-async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Response): Promise<ReturnType<typeof openAIResponseToAnthropicMessage>> {
+async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Response): Promise<{
+  message: ReturnType<typeof openAIResponseToAnthropicMessage>;
+  usage: CodexUsageTotals | undefined;
+}> {
   const reader = upstream.body?.getReader();
   if (!reader) {
-    return openAIResponseToAnthropicMessage({ id: "", model: "", output: [], usage: {} });
+    return {
+      message: openAIResponseToAnthropicMessage({ id: "", model: "", output: [], usage: {} }),
+      usage: undefined,
+    };
   }
 
   const decoder = new TextDecoder();
@@ -121,19 +146,26 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
     parseSseLines(remainder + tail + "\n").events.forEach(applyEvent);
   }
 
-  return openAIResponseToAnthropicMessage({
-    id,
-    model,
-    output: text ? [{
-      type: "message",
-      role: "assistant",
-      content: [{ type: "output_text", text }],
-    }] : [],
-    usage,
-  });
+  return {
+    message: openAIResponseToAnthropicMessage({
+      id,
+      model,
+      output: text ? [{
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      }] : [],
+      usage,
+    }),
+    usage: usageFromResponseBody({ usage }),
+  };
 }
 
-async function sendOpenAIStreamAsAnthropic(upstream: globalThis.Response, res: Response): Promise<void> {
+async function sendOpenAIStreamAsAnthropic(
+  upstream: globalThis.Response,
+  res: Response,
+  onUsage?: (usage: CodexUsageTotals | undefined) => void,
+): Promise<void> {
   res.status(upstream.status);
   res.setHeader("content-type", "text/event-stream");
   res.setHeader("cache-control", "no-cache");
@@ -149,6 +181,13 @@ async function sendOpenAIStreamAsAnthropic(upstream: globalThis.Response, res: R
   const decoder = new TextDecoder();
   let remainder = "";
 
+  const captureUsage = (event: unknown): void => {
+    if (typeof event !== "object" || event === null) return;
+    const typed = event as { type?: unknown; response?: unknown };
+    if (typed.type !== "response.completed") return;
+    onUsage?.(usageFromResponseBody(typed.response));
+  };
+
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -157,6 +196,7 @@ async function sendOpenAIStreamAsAnthropic(upstream: globalThis.Response, res: R
       const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }));
       remainder = parsed.remainder;
       for (const event of parsed.events) {
+        captureUsage(event);
         for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
           res.write(encodeSseEvent(mapped));
         }
@@ -167,6 +207,7 @@ async function sendOpenAIStreamAsAnthropic(upstream: globalThis.Response, res: R
     if (tail || remainder) {
       const parsed = parseSseLines(remainder + tail + "\n");
       for (const event of parsed.events) {
+        captureUsage(event);
         for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
           res.write(encodeSseEvent(mapped));
         }
@@ -183,6 +224,8 @@ export function mountMessagesCrossProviderRoute(
 ): void {
   const forwardOpenAI = opts.forwardOpenAI ?? forwardOpenAICodexResponse;
   const prepareOpenAIAccount = opts.prepareOpenAIAccount ?? (async () => true);
+  const recordActivity = opts.recordActivity ?? ((entry: LogEntry) => stats.addLog(entry));
+  const now = opts.now ?? Date.now;
 
   app.post(
     "/v1/messages",
@@ -212,37 +255,99 @@ export function mountMessagesCrossProviderRoute(
         return;
       }
 
-      const account = opts.getOpenAIAccount();
-      if (!account) {
-        res.status(503).json({
-          type: "error",
-          error: {
-            type: "no_accounts",
-            message: "No OpenAI subscription accounts are configured",
-          },
-        });
-        return;
+      let selected: { route: RoutedAccountLease<OpenAIAccount>; release: () => void; details: string };
+      try {
+        selected = acquireRequestRoute(
+          extractCodexSessionKey(req, req.body),
+          res,
+          opts.openAIRouter,
+          { requestedModel: route.upstreamModel },
+        );
+      } catch (error) {
+        if (error instanceof EmptyPoolError) {
+          res.status(503).json({
+            type: "error",
+            error: { type: "no_accounts", message: "No OpenAI subscription accounts are configured" },
+          });
+          return;
+        }
+        if (error instanceof NoEligibleAccountError) {
+          recordActivity(createLocalRoutingErrorLog(error.reason, route.upstreamModel));
+          sendAnthropicNoEligibleResponse(error, res, now());
+          return;
+        }
+        throw error;
       }
 
+      const account = selected.route.account;
+      const startedAt = now();
+      const needed = needsOpenAIRefresh(account);
       const ready = await prepareOpenAIAccount(account);
       if (!ready) {
+        selected.release();
+        account.errorCount++;
+        account.healthy = false;
+        recordActivity({
+          ts: now(),
+          accountId: account.id,
+          model: route.upstreamModel,
+          type: "error",
+          statusCode: 401,
+          path: "/v1/messages",
+          details: "openai token refresh failed",
+        });
         res.status(401).json({
           type: "error",
-          error: {
-            type: "authentication_error",
-            message: "OpenAI subscription token refresh failed",
-          },
+          error: { type: "authentication_error", message: "OpenAI subscription token refresh failed" },
         });
         return;
       }
+      account.healthy = true;
+      if (needed) account.lastRefresh = now();
 
       const body = anthropicToOpenAIResponses(req.body, opts.modelRouting);
-      const upstream = await forwardOpenAI({
-        account,
-        body,
-        stream: body.stream === true,
-      });
-      await sendOpenAIAsAnthropic(upstream, res, req.body.stream === true);
+      const upstream = await forwardOpenAI({ account, body, stream: body.stream === true });
+
+      const headerRecord = headersToRecord(upstream.headers);
+      applyCodexRateLimits(account, parseCodexRateLimits(headerRecord, now()), now());
+
+      const failed = upstream.status === 401 || upstream.status === 429 || upstream.status >= 500;
+      let details = routeReasonDetails(selected.route);
+      if (failed) {
+        account.errorCount++;
+        account.consecutiveErrors++;
+        stats.totalErrors++;
+        const applied = applyCodexFailureRouting(
+          upstream.status,
+          headerRecord,
+          selected.route,
+          route.upstreamModel,
+          opts.openAIRouter,
+          opts.openAIPool,
+          now,
+        );
+        details = routeFailureDetails(
+          selected.route,
+          upstream.status === 401 ? "token-invalid" : upstream.status === 429 ? "rate-limited" : "service-overloaded",
+          applied.limitingScope,
+        );
+      } else {
+        account.consecutiveErrors = 0;
+        stats.totalRequests++;
+      }
+
+      const entry: LogEntry = {
+        ts: startedAt,
+        accountId: account.id,
+        model: route.upstreamModel,
+        type: failed ? "error" : "route",
+        statusCode: upstream.status,
+        path: "/v1/messages",
+        details,
+      };
+      await sendOpenAIAsAnthropic(upstream, res, req.body.stream === true, usage => applyCodexUsage(entry, usage));
+      entry.durationMs = now() - startedAt;
+      recordActivity(entry);
     },
   );
 }

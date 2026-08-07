@@ -1,4 +1,5 @@
 import type { StreamLifecycleState } from "./stream-lifecycle.js";
+import type { CodexUsageTotals } from "../protocol/openai-responses-collect.js";
 
 export interface LogEntry {
   ts: number;
@@ -66,3 +67,14 @@ class ProxyStats {
 
 // Singleton — shared across server and health endpoint
 export const stats = new ProxyStats();
+
+/** Record Codex token usage on both the request's log entry and the running totals. */
+export function applyCodexUsage(entry: LogEntry, usage: CodexUsageTotals | undefined): void {
+  if (!usage) return;
+  entry.inputTokens = usage.inputTokens;
+  entry.outputTokens = usage.outputTokens;
+  entry.cacheReadTokens = usage.cachedInputTokens;
+  stats.totalInputTokens += usage.inputTokens;
+  stats.totalOutputTokens += usage.outputTokens;
+  stats.totalCacheReadTokens += usage.cachedInputTokens;
+}

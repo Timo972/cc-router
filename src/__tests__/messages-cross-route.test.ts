@@ -3,21 +3,103 @@ import { createServer } from "http";
 import express from "express";
 import { ReadableStream } from "stream/web";
 import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.js";
+import type { MessagesCrossProviderRouteOptions } from "../proxy/messages-cross-route.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
+import { SessionRouter } from "../proxy/session-router.js";
+import { OpenAITokenPool } from "../providers/openai/token-pool.js";
+import { applyCodexRateLimits, createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
+import { parseCodexRateLimits } from "../providers/openai/usage.js";
+import type { LogEntry } from "../proxy/stats.js";
+
+type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean }) => Promise<Response>;
+
+async function withServer(
+  app: ReturnType<typeof express>,
+  fn: (baseUrl: string) => Promise<void>,
+): Promise<void> {
+  const server = createServer(app);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+    await fn(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close(err => err ? reject(err) : resolve());
+    });
+  }
+}
+
+function makeRuntimeAccount(id: string): OpenAIAccount {
+  return createOpenAIAccount({
+    id,
+    provider: "openai_subscription",
+    accessToken: "header.e30.sig",
+    refreshToken: "rt",
+    expiresAt: Date.now() + 3_600_000,
+    enabled: true,
+  });
+}
+
+function mountWithPool(
+  accounts: OpenAIAccount[],
+  forwardOpenAI: ForwardOpenAI,
+  extra: Partial<MessagesCrossProviderRouteOptions> = {},
+) {
+  const app = express();
+  const openAIPool = new OpenAITokenPool(accounts);
+  const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
+  const activity: LogEntry[] = [];
+  mountMessagesCrossProviderRoute(app, {
+    openAIRouter,
+    openAIPool,
+    forwardOpenAI,
+    recordActivity: entry => activity.push(entry),
+    ...extra,
+  });
+  // Terminal handler so next()-passthrough cases (non-OpenAI models) resolve
+  // instead of hanging when the test doesn't register its own downstream
+  // middleware.
+  app.use("/v1/messages", (_req, res) => {
+    res.status(404).json({ notFound: true });
+  });
+  return { app, openAIPool, openAIRouter, activity };
+}
+
+function postMessages(baseUrl: string, body: Record<string, unknown>, headers: Record<string, string> = {}) {
+  return fetch(`${baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify({
+      model: "openai/gpt-5.6-luna",
+      max_tokens: 128,
+      messages: [{ role: "user", content: "hi" }],
+      ...body,
+    }),
+  });
+}
+
+const CROSS_SSE_BODY = `event: response.completed\ndata: ${JSON.stringify({
+  type: "response.completed",
+  response: { id: "resp_1", model: "gpt-5.6-luna", usage: { input_tokens: 10, output_tokens: 5 } },
+})}\n\n`;
+
+function crossSseResponse(headers: Record<string, string> = {}): Response {
+  return new Response(CROSS_SSE_BODY, {
+    status: 200,
+    headers: { "content-type": "text/event-stream", ...headers },
+  });
+}
 
 describe("mountMessagesCrossProviderRoute", () => {
   it("does not continue OpenAI-routed messages into Anthropic account selection", async () => {
     const anthropicSelection = vi.fn();
     const app = express();
+    const openAIPool = new OpenAITokenPool([makeRuntimeAccount("openai-victor")]);
+    const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
     mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
+      openAIRouter,
+      openAIPool,
       forwardOpenAI: async () => new Response(JSON.stringify({
         id: "resp_1",
         model: "gpt-5.5",
@@ -31,13 +113,9 @@ describe("mountMessagesCrossProviderRoute", () => {
       anthropicSelection();
       res.status(500).end();
     });
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
 
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -48,53 +126,33 @@ describe("mountMessagesCrossProviderRoute", () => {
 
       expect(res.status).toBe(200);
       expect(anthropicSelection).not.toHaveBeenCalled();
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
   it("translates Claude Code openai/* messages into Responses and returns Anthropic-shaped JSON", async () => {
     const forwardedBodies: OpenAIResponsesRequest[] = [];
-    const app = express();
+    const forward: ForwardOpenAI = async ({ body }) => {
+      forwardedBodies.push(body);
+      return new Response(JSON.stringify({
+        id: "resp_1",
+        model: "gpt-5.5",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Done." }],
+          },
+        ],
+        usage: { input_tokens: 4, output_tokens: 2 },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async ({ body }) => {
-        forwardedBodies.push(body);
-        return new Response(JSON.stringify({
-          id: "resp_1",
-          model: "gpt-5.5",
-          output: [
-            {
-              type: "message",
-              role: "assistant",
-              content: [{ type: "output_text", text: "Done." }],
-            },
-          ],
-          usage: { input_tokens: 4, output_tokens: 2 },
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      },
-    });
-
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -126,48 +184,29 @@ describe("mountMessagesCrossProviderRoute", () => {
           stream: false,
         },
       ]);
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
   it("applies configured OpenAI aliases when Claude Code cross-routes to OpenAI", async () => {
     const forwardedBodies: OpenAIResponsesRequest[] = [];
-    const app = express();
-
-    mountMessagesCrossProviderRoute(app, {
+    const forward: ForwardOpenAI = async ({ body }) => {
+      forwardedBodies.push(body);
+      return new Response(JSON.stringify({
+        id: "resp_1",
+        model: "gpt-5-codex",
+        output: [],
+        usage: {},
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward, {
       modelRouting: { openAIAliases: { codex: "gpt-5-codex" } },
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async ({ body }) => {
-        forwardedBodies.push(body);
-        return new Response(JSON.stringify({
-          id: "resp_1",
-          model: "gpt-5-codex",
-          output: [],
-          usage: {},
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      },
     });
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -179,11 +218,7 @@ describe("mountMessagesCrossProviderRoute", () => {
 
       expect(res.status).toBe(200);
       expect(forwardedBodies[0].model).toBe("gpt-5-codex");
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
   it("refreshes the selected OpenAI account before Claude Code cross-routing", async () => {
@@ -197,28 +232,12 @@ describe("mountMessagesCrossProviderRoute", () => {
       status: 200,
       headers: { "content-type": "application/json" },
     }));
-    const app = express();
-
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60_000,
-        enabled: true,
-      }),
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward, {
       prepareOpenAIAccount: prepare,
-      forwardOpenAI: forward,
     });
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -230,49 +249,29 @@ describe("mountMessagesCrossProviderRoute", () => {
       expect(res.status).toBe(200);
       expect(prepare).toHaveBeenCalledOnce();
       expect(forward).toHaveBeenCalledOnce();
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
   it("collapses OpenAI Responses SSE into Anthropic-shaped JSON for non-stream messages", async () => {
-    const app = express();
-
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async () => new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\"}}\n\n"));
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Done.\"}\n\n"));
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n"));
-            controller.close();
-          },
-        }) as BodyInit,
-        {
-          status: 200,
-          headers: { "content-type": "text/event-stream" },
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Done.\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n"));
+          controller.close();
         },
-      ),
-    });
+      }) as BodyInit,
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -295,49 +294,29 @@ describe("mountMessagesCrossProviderRoute", () => {
         stop_sequence: null,
         usage: { input_tokens: 4, output_tokens: 2 },
       });
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
   it("streams OpenAI Responses SSE back as Anthropic Messages SSE", async () => {
-    const app = express();
-
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async () => new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n"));
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"));
-            controller.close();
-          },
-        }) as BodyInit,
-        {
-          status: 200,
-          headers: { "content-type": "text/event-stream" },
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"));
+          controller.close();
         },
-      ),
-    });
+      }) as BodyInit,
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -354,19 +333,18 @@ describe("mountMessagesCrossProviderRoute", () => {
       expect(text).toContain("data: {\"type\":\"message_start\"");
       expect(text).toContain("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}");
       expect(text).toContain("data: {\"type\":\"message_stop\"}");
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
   it("passes non-openai models to later Anthropic proxy middleware with route context and replayable raw body", async () => {
     const app = express();
     const nextSpy = vi.fn();
+    const openAIPool = new OpenAITokenPool([]);
+    const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
 
     mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => null,
+      openAIRouter,
+      openAIPool,
       forwardOpenAI: async () => new Response("unused"),
     });
     app.use("/v1/messages", (req, res) => {
@@ -377,17 +355,12 @@ describe("mountMessagesCrossProviderRoute", () => {
       });
     });
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
+    await withServer(app, async baseUrl => {
       const body = {
         model: "claude/sonnet",
         messages: [{ role: "user", content: "hi" }],
       };
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
@@ -402,31 +375,26 @@ describe("mountMessagesCrossProviderRoute", () => {
         },
       });
       expect(nextSpy).toHaveBeenCalledOnce();
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
   it.each([42, { future: "model" }])(
     "treats a non-string Messages model as the default Anthropic route: %j",
     async (model) => {
       const app = express();
+      const openAIPool = new OpenAITokenPool([]);
+      const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
       mountMessagesCrossProviderRoute(app, {
-        getOpenAIAccount: () => null,
+        openAIRouter,
+        openAIPool,
         forwardOpenAI: async () => new Response("unused"),
       });
       app.use("/v1/messages", (req, res) => {
         res.json({ routeContext: req._ccRouteContext });
       });
-      const server = createServer(app);
-      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
 
-      try {
-        const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+      await withServer(app, async baseUrl => {
+        const res = await fetch(`${baseUrl}/v1/messages`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
@@ -442,11 +410,92 @@ describe("mountMessagesCrossProviderRoute", () => {
             modelFamily: "sonnet",
           },
         });
-      } finally {
-        await new Promise<void>((resolve, reject) => {
-          server.close(err => err ? reject(err) : resolve());
-        });
-      }
+      });
     },
   );
+});
+
+describe("messages cross-route sticky routing", () => {
+  it("routes repeated x-claude-code-session-id requests to the same account", async () => {
+    const accounts = [makeRuntimeAccount("openai-a"), makeRuntimeAccount("openai-b")];
+    const seen: string[] = [];
+    const forwardOpenAI = vi.fn(async (opts: { account: OpenAIAccount }) => {
+      seen.push(opts.account.id);
+      return crossSseResponse();
+    });
+    const { app } = mountWithPool(accounts, forwardOpenAI);
+
+    await withServer(app, async baseUrl => {
+      await (await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s1" })).text();
+      await (await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s1" })).text();
+      await (await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s2" })).text();
+    });
+
+    expect(seen).toHaveLength(3);
+    expect(seen[0]).toBe(seen[1]);
+    expect(seen[2]).not.toBe(seen[0]);
+  });
+
+  it("applies x-codex-* headers from cross-route responses to the account snapshot", async () => {
+    const account = makeRuntimeAccount("openai-a");
+    const { app } = mountWithPool([account], vi.fn(async () => crossSseResponse({
+      "x-codex-primary-used-percent": "33",
+    })));
+
+    await withServer(app, async baseUrl => {
+      await (await postMessages(baseUrl, {})).text();
+    });
+
+    expect(account.rateLimits.buckets.get("codex")?.primary?.utilization).toBeCloseTo(0.33);
+  });
+
+  it("relays an upstream 429, cools the account, and rebinds the session's next request", async () => {
+    const accounts = [makeRuntimeAccount("openai-a"), makeRuntimeAccount("openai-b")];
+    const seen: string[] = [];
+    const forwardOpenAI = vi.fn(async (opts: { account: OpenAIAccount }) => {
+      seen.push(opts.account.id);
+      if (seen.length === 1) {
+        return new Response("{\"error\":\"limit\"}", {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": "60" },
+        });
+      }
+      return crossSseResponse();
+    });
+    const { app, openAIPool } = mountWithPool(accounts, forwardOpenAI);
+
+    await withServer(app, async baseUrl => {
+      const first = await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s1" });
+      expect(first.status).toBe(429);
+      await first.text();
+      expect(openAIPool.isCoolingDown(seen[0]!)).toBe(true);
+
+      const second = await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s1" });
+      expect(second.status).toBe(200);
+      await second.text();
+    });
+
+    expect(seen[1]).not.toBe(seen[0]);
+  });
+
+  it("returns a local Anthropic-envelope 429 with Retry-After when everything is blocked", async () => {
+    const account = makeRuntimeAccount("openai-a");
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1000) + 600),
+    }, Date.now()), Date.now());
+    const forwardOpenAI = vi.fn();
+    const { app } = mountWithPool([account], forwardOpenAI as never);
+
+    await withServer(app, async baseUrl => {
+      const response = await postMessages(baseUrl, {});
+      expect(response.status).toBe(429);
+      expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
+      const body = await response.json() as { type: string; error: { type: string } };
+      expect(body.type).toBe("error");
+      expect(body.error.type).toBe("rate_limit_error");
+    });
+
+    expect(forwardOpenAI).not.toHaveBeenCalled();
+  });
 });

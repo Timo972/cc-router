@@ -6,10 +6,10 @@ import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.
 import {
   collectCodexResponseStream,
   createCodexUsageObserver,
-  type CodexUsageTotals,
+  usageFromResponseBody,
 } from "../protocol/openai-responses-collect.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
-import { stats, createLocalRoutingErrorLog } from "./stats.js";
+import { stats, createLocalRoutingErrorLog, applyCodexUsage } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { logWarn } from "./logger.js";
 import { EmptyPoolError, NoEligibleAccountError } from "./account-pool.js";
@@ -79,29 +79,6 @@ async function sendUpstreamResponse(
   } finally {
     res.end();
   }
-}
-
-function usageFromResponseBody(body: unknown): CodexUsageTotals | undefined {
-  if (typeof body !== "object" || body === null) return undefined;
-  const usage = (body as { usage?: { input_tokens?: unknown; output_tokens?: unknown; input_tokens_details?: { cached_tokens?: unknown } } }).usage;
-  if (usage === undefined || typeof usage !== "object") return undefined;
-  const num = (value: unknown): number =>
-    typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
-  return {
-    inputTokens: num(usage.input_tokens),
-    cachedInputTokens: num(usage.input_tokens_details?.cached_tokens),
-    outputTokens: num(usage.output_tokens),
-  };
-}
-
-function applyCodexUsage(entry: LogEntry, usage: CodexUsageTotals | undefined): void {
-  if (!usage) return;
-  entry.inputTokens = usage.inputTokens;
-  entry.outputTokens = usage.outputTokens;
-  entry.cacheReadTokens = usage.cachedInputTokens;
-  stats.totalInputTokens += usage.inputTokens;
-  stats.totalOutputTokens += usage.outputTokens;
-  stats.totalCacheReadTokens += usage.cachedInputTokens;
 }
 
 export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions): void {

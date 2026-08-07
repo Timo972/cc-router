@@ -17,7 +17,6 @@ import type { LogEntry } from "./stats.js";
 import { PROXY_PORT, LITELLM_URL } from "../config/paths.js";
 import { writePid, removePid } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
-import { createOpenAIAccountPicker } from "../providers/openai/account-pool.js";
 import { prepareOpenAIAccountForRequest, startOpenAIRefreshLoop } from "../providers/openai/token-refresher.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import { createOpenAIAccount } from "../providers/openai/account-state.js";
@@ -489,7 +488,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       };
     };
   };
-  const pickOpenAIAccount = createOpenAIAccountPicker(openAIAccounts);
   const openAIRuntimeAccounts = openAIAccounts.map(createOpenAIAccount);
   const openAIPool = new OpenAITokenPool(openAIRuntimeAccounts);
   const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
@@ -917,7 +915,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   });
 
   mountMessagesCrossProviderRoute(app, {
-    getOpenAIAccount: pickOpenAIAccount,
+    openAIRouter,
+    openAIPool,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
     modelRouting,
   });

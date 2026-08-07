@@ -90,6 +90,23 @@ function usageNumber(value: unknown): number {
 }
 
 /**
+ * Extract usage totals from a response-shaped object (i.e. something with a
+ * `.usage` field directly — the Responses `response.completed` payload, or
+ * an object wrapping one). Shared by every ingress that needs to report
+ * Codex token usage from a fully-materialized body.
+ */
+export function usageFromResponseBody(body: unknown): CodexUsageTotals | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  const usage = (body as { usage?: { input_tokens?: unknown; output_tokens?: unknown; input_tokens_details?: { cached_tokens?: unknown } } }).usage;
+  if (usage === undefined || typeof usage !== "object") return undefined;
+  return {
+    inputTokens: usageNumber(usage.input_tokens),
+    cachedInputTokens: usageNumber(usage.input_tokens_details?.cached_tokens),
+    outputTokens: usageNumber(usage.output_tokens),
+  };
+}
+
+/**
  * Passive usage reader for the byte-transparent streaming path: it only
  * observes chunks that are already being piped downstream unchanged.
  */
