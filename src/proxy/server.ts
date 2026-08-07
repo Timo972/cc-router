@@ -18,10 +18,12 @@ import { PROXY_PORT, LITELLM_URL } from "../config/paths.js";
 import { writePid, removePid } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { prepareOpenAIAccountForRequest, startOpenAIRefreshLoop } from "../providers/openai/token-refresher.js";
-import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import { createOpenAIAccount } from "../providers/openai/account-state.js";
 import type { OpenAIAccount } from "../providers/openai/account-state.js";
 import { OpenAITokenPool } from "../providers/openai/token-pool.js";
+import type { OpenAICooldownView } from "../providers/openai/token-pool.js";
+import { DEFAULT_CODEX_LIMIT_ID } from "../providers/openai/usage.js";
+import type { CodexLimitBucket, CodexRateWindow } from "../providers/openai/usage.js";
 import { mountResponsesRoutes } from "./responses-server.js";
 import { mountMessagesCrossProviderRoute } from "./messages-cross-route.js";
 import { mountModelsRoute } from "./models-server.js";
@@ -88,6 +90,29 @@ export interface HealthAccountView {
   cooldownUntilMs?: number;
   globalCooldownUntilMs?: number;
   modelCooldowns?: PublicModelCooldown[];
+  codexRateLimits?: PublicCodexRateLimits;
+}
+
+export interface PublicCodexWindow {
+  utilization: number;   // clamped 0..1
+  resetAt: number;       // Unix seconds, 0 unknown
+  windowMinutes: number; // 0 unknown
+}
+
+export interface PublicCodexBucket {
+  limitId: string;         // /^[a-z0-9_]{1,64}$/ else "unknown"
+  label: string;           // sanitized limitName, fallback limitId
+  primary?: PublicCodexWindow;
+  secondary?: PublicCodexWindow;
+  cooldownUntilMs: number; // 0 when not cooling
+}
+
+export interface PublicCodexRateLimits {
+  status: "ok" | "rate_limited";
+  plan: string; // sanitized, "" when unknown
+  buckets: PublicCodexBucket[]; // default bucket first, max 8
+  credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  lastUpdated: number;
 }
 
 export interface PublicRateLimitWindow {
@@ -230,14 +255,18 @@ export function createOperationalStatus(opts: {
 
 export function createHealthAccountViews(
   anthropicAccounts: Account[],
-  openAIAccounts: OpenAISubscriptionAccount[],
+  openAIAccounts: OpenAIAccount[],
   resolveRoutingMetrics: RoutingMetricsResolver = zeroRoutingMetrics,
+  resolveOpenAIRouting?: (accountId: string) => { metrics: AccountRoutingMetrics; cooldowns: OpenAICooldownView },
 ): HealthAccountView[] {
   return [
     ...anthropicAccounts.map(account => (
       publicAnthropicAccountView(account, resolveRoutingMetrics(account.id))
     )),
-    ...openAIAccounts.map(publicOpenAIAccountView),
+    ...openAIAccounts.map(account => publicOpenAIAccountView(
+      account,
+      resolveOpenAIRouting?.(account.id) ?? { metrics: zeroRoutingMetrics(account.id), cooldowns: { globalUntilMs: 0, bucketCooldowns: [] } },
+    )),
   ];
 }
 
@@ -361,22 +390,84 @@ function publicRepresentativeClaim(claim: unknown): string {
   return "unknown";
 }
 
-function publicOpenAIAccountView(a: OpenAISubscriptionAccount): HealthAccountView {
+function publicOpenAIAccountView(
+  a: OpenAIAccount,
+  routing: { metrics: AccountRoutingMetrics; cooldowns: OpenAICooldownView },
+): HealthAccountView {
   const expiresInMs = a.expiresAt - Date.now();
   return {
     id: a.id,
     provider: "openai_subscription",
     enabled: a.enabled !== false,
-    healthy: a.enabled !== false && expiresInMs > 0,
-    busy: false,
-    inFlightRequests: 0,
-    activeSessions: 0,
-    requestCount: 0,
-    errorCount: 0,
+    sessionLimitPercent: a.sessionLimitPercent,
+    weeklyLimitPercent: a.weeklyLimitPercent,
+    healthy: a.enabled !== false && a.healthy && expiresInMs > 0,
+    busy: routing.metrics.coolingDown,
+    cooldownUntilMs: routing.metrics.cooldownUntilMs ?? 0,
+    globalCooldownUntilMs: routing.cooldowns.globalUntilMs,
+    inFlightRequests: routing.metrics.inFlightRequests,
+    activeSessions: routing.metrics.activeSessions,
+    requestCount: a.requestCount,
+    errorCount: a.errorCount,
     expiresInMs,
-    lastUsedMs: 0,
-    lastRefreshMs: 0,
+    lastUsedMs: a.lastUsed,
+    lastRefreshMs: a.lastRefresh,
+    codexRateLimits: publicCodexRateLimits(a, routing.cooldowns),
   };
+}
+
+function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView): PublicCodexRateLimits {
+  const rl = a.rateLimits;
+  const buckets = [...rl.buckets.values()]
+    .sort((left, right) =>
+      left.limitId === DEFAULT_CODEX_LIMIT_ID ? -1
+        : right.limitId === DEFAULT_CODEX_LIMIT_ID ? 1
+        : left.limitId.localeCompare(right.limitId))
+    .slice(0, 8)
+    .map(bucket => ({
+      limitId: publicCodexLimitId(bucket.limitId),
+      label: publicCodexLabel(bucket),
+      ...(bucket.primary ? { primary: publicCodexWindow(bucket.primary) } : {}),
+      ...(bucket.secondary ? { secondary: publicCodexWindow(bucket.secondary) } : {}),
+      cooldownUntilMs: publicTimestamp(
+        cooldowns.bucketCooldowns.find(c => c.limitId === bucket.limitId)?.untilMs ?? 0,
+      ),
+    }));
+  const credits = rl.credits;
+  return {
+    status: rl.status === "rate_limited" ? "rate_limited" : "ok",
+    plan: publicCodexPlan(rl.plan),
+    buckets,
+    ...(credits ? {
+      credits: {
+        hasCredits: credits.hasCredits === true,
+        unlimited: credits.unlimited === true,
+        ...(typeof credits.balance === "string" && credits.balance ? { balance: credits.balance.slice(0, 32) } : {}),
+      },
+    } : {}),
+    lastUpdated: publicTimestamp(rl.lastUpdated),
+  };
+}
+
+function publicCodexWindow(window: CodexRateWindow): PublicCodexWindow {
+  return {
+    utilization: publicUtilization(window.utilization),
+    resetAt: publicTimestamp(window.resetAt),
+    windowMinutes: publicNonNegativeInteger(window.windowMinutes),
+  };
+}
+
+function publicCodexLimitId(value: string): string {
+  return /^[a-z0-9_]{1,64}$/.test(value) ? value : "unknown";
+}
+
+function publicCodexLabel(bucket: CodexLimitBucket): string {
+  const name = bucket.limitName?.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 64);
+  return name || publicCodexLimitId(bucket.limitId);
+}
+
+function publicCodexPlan(value: string | undefined): string {
+  return typeof value === "string" && /^[a-z0-9_-]{1,32}$/.test(value) ? value : "";
 }
 
 function providerStatus(accounts: HealthAccountView[]): ProviderOperationalStatus {
@@ -465,7 +556,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   migrateLegacyAccountProviders(accountsPath);
   const accounts = accountsPath ? readAccountsFromPath(accountsPath) : loadAccounts();
-  const openAIAccounts = loadOpenAIAccounts(accountsPath);
+  const openAIAccounts = loadOpenAIAccounts(accountsPath).map(createOpenAIAccount);
   if (accounts.length === 0 && openAIAccounts.length === 0) {
     console.error(chalk.red("\n✗ No accounts found in accounts.json."));
     console.error(chalk.yellow("  Run: cc-router setup\n"));
@@ -488,9 +579,17 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       };
     };
   };
-  const openAIRuntimeAccounts = openAIAccounts.map(createOpenAIAccount);
-  const openAIPool = new OpenAITokenPool(openAIRuntimeAccounts);
+  const openAIPool = new OpenAITokenPool(openAIAccounts);
   const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
+  const resolveOpenAIRouting = (accountId: string) => ({
+    metrics: {
+      inFlightRequests: openAIPool.getInFlight(accountId),
+      activeSessions: openAIRouter.getActiveSessionCountsSnapshot().get(accountId) ?? 0,
+      coolingDown: openAIPool.isCoolingDown(accountId),
+      cooldownUntilMs: openAIPool.getEarliestCooldownUntil(accountId),
+    },
+    cooldowns: openAIPool.getCooldownView(accountId),
+  });
   const initialConfig = readConfig();
   const modelRouting = initialConfig.modelRouting ?? {};
 
@@ -507,6 +606,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   pool.onCooldownExpired = (a) => {
     const msg = `${a.id} cooldown expired — rate limit cleared`;
     stats.addLog({ ts: Date.now(), accountId: a.id, model: "-", type: "route", details: msg });
+  };
+
+  openAIPool.onCapBypass = (a) => {
+    const msg = `all OpenAI accounts capped — routing to ${a.id}`;
+    stats.addLog({ ts: Date.now(), accountId: a.id, model: "-", type: "error", details: msg });
+  };
+  openAIPool.onCooldownExpired = (a) => {
+    stats.addLog({ ts: Date.now(), accountId: a.id, model: "-", type: "route", details: `${a.id} cooldown expired — rate limit cleared` });
   };
 
   startRefreshLoop(accounts);
@@ -565,11 +672,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // Sweep expired cooldowns on each poll so the dashboard reflects recovery
     // even during idle periods when no /v1 request would trigger getNext().
     pool.sweepExpiredCooldowns();
+    openAIPool.sweepExpiredCooldowns();
     const resolveRoutingMetrics = createRoutingMetricsResolver();
     const accountViews = createHealthAccountViews(
       pool.getAll(),
       openAIAccounts,
       resolveRoutingMetrics,
+      resolveOpenAIRouting,
     );
     const status = accountViews.some(a => a.healthy) ? "ok" : "degraded";
 
@@ -617,6 +726,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         pool.getAll(),
         openAIAccounts,
         resolveRoutingMetrics,
+        resolveOpenAIRouting,
       ),
     });
   });
@@ -771,7 +881,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       return;
     }
     // IDs are unique across providers, so a new account may not collide with an
-    // existing account in either the Claude pool or the OpenAI picker.
+    // existing account in either the Claude pool or the OpenAI pool.
     if (pool.findById(body.id) || openAIAccounts.some(a => a.id === body.id)) {
       res.status(409).json({ error: `Account "${body.id}" already exists` });
       return;
@@ -797,7 +907,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
         return;
       }
-      res.status(201).json({ account: publicOpenAIAccountView(addedOpenAI) });
+      res.status(201).json({ account: publicOpenAIAccountView(addedOpenAI, resolveOpenAIRouting(addedOpenAI.id)) });
       return;
     }
 

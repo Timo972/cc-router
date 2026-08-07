@@ -9,6 +9,8 @@ import { applyUpstreamFailureRouting } from "../proxy/lease-lifecycle.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
+import { applyCodexRateLimits, createOpenAIAccount } from "../providers/openai/account-state.js";
+import { parseCodexRateLimits } from "../providers/openai/usage.js";
 
 function makeAnthropicAccount(): Account {
   return {
@@ -54,7 +56,7 @@ describe("createHealthAccountViews", () => {
       enabled: true,
     };
 
-    const views = createHealthAccountViews([makeAnthropicAccount()], [openAIAccount]);
+    const views = createHealthAccountViews([makeAnthropicAccount()], [createOpenAIAccount(openAIAccount)]);
 
     expect(views.map(view => [view.id, view.provider])).toEqual([
       ["max-account-1", "anthropic_subscription"],
@@ -88,7 +90,7 @@ describe("createHealthAccountViews", () => {
 
     const views = createHealthAccountViews(
       [makeAnthropicAccount()],
-      [openAIAccount],
+      [createOpenAIAccount(openAIAccount)],
       accountId => accountId === "max-account-1"
         ? { inFlightRequests: 2, activeSessions: 3, coolingDown: true }
         : { inFlightRequests: 0, activeSessions: 0, coolingDown: false },
@@ -194,6 +196,60 @@ describe("createHealthAccountViews", () => {
       "internal-upstream-detail", "usedMinor", "currency",
     ]) expect(serialized).not.toContain(forbidden);
   });
+
+  it("reports real OpenAI counters, buckets, credits, and cooldowns in the health view", () => {
+    const account = createOpenAIAccount({ id: "openai-a", provider: "openai_subscription", accessToken: "header.e30.sig", refreshToken: "rt", expiresAt: Date.now() + 3_600_000, enabled: true });
+    account.requestCount = 7;
+    account.errorCount = 2;
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "42",
+      "x-codex-secondary-used-percent": "5",
+      "x-codex-bengalfox-primary-used-percent": "88",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+      "x-codex-credits-has-credits": "true",
+      "x-codex-credits-unlimited": "false",
+    }, Date.now()), Date.now());
+
+    const views = createHealthAccountViews([], [account], undefined, () => ({
+      metrics: { inFlightRequests: 3, activeSessions: 2, coolingDown: false, cooldownUntilMs: 0 },
+      cooldowns: { globalUntilMs: 0, bucketCooldowns: [] },
+    }));
+
+    const view = views[0]!;
+    expect(view.requestCount).toBe(7);
+    expect(view.errorCount).toBe(2);
+    expect(view.inFlightRequests).toBe(3);
+    expect(view.activeSessions).toBe(2);
+    const codex = view.codexRateLimits!;
+    expect(codex.buckets[0]?.limitId).toBe("codex");
+    expect(codex.buckets[0]?.primary?.utilization).toBeCloseTo(0.42);
+    expect(codex.buckets[1]).toMatchObject({ limitId: "codex_bengalfox", label: "gpt-5.6-sol" });
+    expect(codex.credits).toEqual({ hasCredits: true, unlimited: false });
+  });
+
+  it("never exposes tokens or raw header values in the OpenAI health view", () => {
+    const account = createOpenAIAccount({
+      id: "openai-a",
+      provider: "openai_subscription",
+      accessToken: "header.e30.super-secret-access-token",
+      refreshToken: "super-secret-refresh-token",
+      expiresAt: Date.now() + 3_600_000,
+      enabled: true,
+    });
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "42",
+      "x-codex-bengalfox-primary-used-percent": "88",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+      "x-codex-credits-has-credits": "true",
+      "x-codex-credits-balance": "raw-header-balance-value",
+    }, Date.now()), Date.now());
+
+    const [view] = createHealthAccountViews([], [account]);
+
+    const serialized = JSON.stringify(view);
+    expect(serialized).not.toContain("header.e30.super-secret-access-token");
+    expect(serialized).not.toContain("super-secret-refresh-token");
+  });
 });
 
 describe("applyRateLimitHeaders", () => {
@@ -252,7 +308,7 @@ describe("createOperationalStatus", () => {
       mode: "standalone",
       target: "https://api.anthropic.com",
       authRequired: true,
-      accounts: createHealthAccountViews([anthropicAccount], [openAIAccount]),
+      accounts: createHealthAccountViews([anthropicAccount], [createOpenAIAccount(openAIAccount)]),
       modelRouting: {
         anthropicDefaultModel: "claude-sonnet-4-6",
         openAIDefaultModel: "gpt-5-codex",

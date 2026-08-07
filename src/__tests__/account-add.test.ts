@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { addOpenAIAccountTransaction } from "../proxy/account-add.js";
-import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
+import { createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
 
 function makeInput(id: string) {
   return {
@@ -14,9 +14,9 @@ function makeInput(id: string) {
 
 describe("addOpenAIAccountTransaction", () => {
   it("appends the account in place and persists the mutated live array", () => {
-    const accounts: OpenAISubscriptionAccount[] = [];
-    const persist = vi.fn((next: OpenAISubscriptionAccount[]) => {
-      // persistence sees the same array reference the live picker/refresh loop hold
+    const accounts: OpenAIAccount[] = [];
+    const persist = vi.fn((next: OpenAIAccount[]) => {
+      // persistence sees the same array reference the live pool/router/refresh loop hold
       expect(next).toBe(accounts);
       expect(next.map(a => a.id)).toEqual(["openai-a"]);
     });
@@ -35,7 +35,7 @@ describe("addOpenAIAccountTransaction", () => {
   });
 
   it("defaults enabled to true when omitted", () => {
-    const accounts: OpenAISubscriptionAccount[] = [];
+    const accounts: OpenAIAccount[] = [];
     const { id, accessToken, refreshToken, expiresAt } = makeInput("openai-b");
     const added = addOpenAIAccountTransaction({
       record: { id, accessToken, refreshToken, expiresAt },
@@ -46,15 +46,15 @@ describe("addOpenAIAccountTransaction", () => {
   });
 
   it("rolls the in-place append back out when persistence fails", () => {
-    const existing: OpenAISubscriptionAccount = {
+    const existing: OpenAIAccount = createOpenAIAccount({
       id: "openai-existing",
       provider: "openai_subscription",
       accessToken: "a",
       refreshToken: "r",
       expiresAt: Date.now() + 60_000,
       enabled: true,
-    };
-    const accounts: OpenAISubscriptionAccount[] = [existing];
+    });
+    const accounts: OpenAIAccount[] = [existing];
     const persist = vi.fn(() => { throw new Error("disk full"); });
 
     expect(() => addOpenAIAccountTransaction({ record: makeInput("openai-a"), accounts, persist }))
