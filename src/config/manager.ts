@@ -151,6 +151,9 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
       refreshToken: a.refreshToken,
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
+      ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
+      ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
+      ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
     }));
 }
 
@@ -164,8 +167,10 @@ export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void 
     accessToken: a.accessToken,
     refreshToken: a.refreshToken,
     expiresAt: a.expiresAt,
-    scopes: ["openid", "profile", "email", "offline_access"],
+    scopes: a.scopes ?? ["openid", "profile", "email", "offline_access"],
     enabled: a.enabled,
+    ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
+    ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
   }));
   writeAccountsAtomicToPath(ACCOUNTS_PATH, [...nonOpenAI, ...records]);
 }

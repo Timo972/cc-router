@@ -1,31 +1,16 @@
 import type { Account, AccountRecord, RouteContext } from "./types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "./types.js";
 import { canUseExtraUsage, normalizeModelFamily } from "../providers/anthropic/usage.js";
+import {
+  EmptyPoolError,
+  NoEligibleAccountError,
+  type AccountLease as GenericAccountLease,
+  type AccountPool,
+} from "./account-pool.js";
 
-export class EmptyPoolError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "EmptyPoolError";
-  }
-}
-
-export class NoEligibleAccountError extends Error {
-  readonly reason: "rate_limited" | "unavailable";
-  readonly retryAtMs?: number;
-  readonly blockedAccounts: number;
-
-  constructor(
-    reason: "rate_limited" | "unavailable",
-    blockedAccounts: number,
-    retryAtMs?: number,
-  ) {
-    super("no account is currently eligible for routing");
-    this.name = "NoEligibleAccountError";
-    this.reason = reason;
-    this.blockedAccounts = blockedAccounts;
-    if (retryAtMs !== undefined) this.retryAtMs = retryAtMs;
-  }
-}
+// Re-export so existing importers (anthropic-routing.ts, tests) keep working.
+export { EmptyPoolError, NoEligibleAccountError };
+export type AccountLease = GenericAccountLease<Account>;
 
 interface CapacityWindow {
   utilization: number;
@@ -157,17 +142,11 @@ export interface AccountPatch {
   weeklyLimitPercent?: number;
 }
 
-export interface AccountLease {
-  readonly account: Account;
-  readonly fallback: boolean;
-  release(): void;
-}
-
 export interface TokenPoolOptions {
   now?: () => number;
 }
 
-export class TokenPool {
+export class TokenPool implements AccountPool<Account> {
   private readonly inFlight = new Map<string, number>();
   private readonly cooldowns = new Map<Account, AccountCooldowns>();
   private readonly now: () => number;

@@ -45,7 +45,7 @@ export interface AnthropicRoutingMiddlewareOptions {
 const NO_ELIGIBLE_ACCOUNT_MESSAGE =
   "All configured accounts are unavailable for the requested model";
 
-function sendNoEligibleAccountResponse(
+export function sendAnthropicNoEligibleResponse(
   error: NoEligibleAccountError,
   response: Response,
   now: number,
@@ -98,7 +98,7 @@ export function createAnthropicRoutingMiddleware(
       }
       if (error instanceof NoEligibleAccountError) {
         options.onNoEligibleAccount?.(error, request, response);
-        sendNoEligibleAccountResponse(error, response, (options.now ?? Date.now)());
+        sendAnthropicNoEligibleResponse(error, response, (options.now ?? Date.now)());
         return;
       }
       next(error);

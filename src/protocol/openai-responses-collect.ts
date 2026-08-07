@@ -78,3 +78,85 @@ export async function collectCodexResponseStream(
   if (completed === undefined) return upstreamError("Stream ended before response.completed");
   return { kind: "json", status: upstream.status, body: completed };
 }
+
+export interface CodexUsageTotals {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+}
+
+function usageNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+/**
+ * Extract usage totals from a response-shaped object (i.e. something with a
+ * `.usage` field directly — the Responses `response.completed` payload, or
+ * an object wrapping one). Shared by every ingress that needs to report
+ * Codex token usage from a fully-materialized body.
+ */
+export function usageFromResponseBody(body: unknown): CodexUsageTotals | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  const usage = (body as { usage?: { input_tokens?: unknown; output_tokens?: unknown; input_tokens_details?: { cached_tokens?: unknown } } }).usage;
+  if (usage === undefined || typeof usage !== "object") return undefined;
+  return {
+    inputTokens: usageNumber(usage.input_tokens),
+    cachedInputTokens: usageNumber(usage.input_tokens_details?.cached_tokens),
+    outputTokens: usageNumber(usage.output_tokens),
+  };
+}
+
+/**
+ * Passive usage reader for the byte-transparent streaming path: it only
+ * observes chunks that are already being piped downstream unchanged.
+ */
+export function createCodexUsageObserver(): {
+  push(chunk: Uint8Array): void;
+  finish(): CodexUsageTotals | undefined;
+} {
+  const decoder = new TextDecoder();
+  let remainder = "";
+  let totals: CodexUsageTotals | undefined;
+
+  const applyEvent = (event: unknown): void => {
+    if (typeof event !== "object" || event === null) return;
+    const typed = event as {
+      type?: unknown;
+      response?: { usage?: { input_tokens?: unknown; output_tokens?: unknown; input_tokens_details?: { cached_tokens?: unknown } } };
+    };
+    if (typed.type !== "response.completed") return;
+    const usage = typed.response?.usage;
+    if (usage === undefined || typeof usage !== "object") return;
+    totals = {
+      inputTokens: usageNumber(usage.input_tokens),
+      cachedInputTokens: usageNumber(usage.input_tokens_details?.cached_tokens),
+      outputTokens: usageNumber(usage.output_tokens),
+    };
+  };
+
+  return {
+    push(chunk: Uint8Array): void {
+      // Best-effort: a malformed SSE frame from upstream must never throw
+      // here. This observer only watches bytes that are already being
+      // relayed to the client verbatim — a parse failure just means usage
+      // for this chunk goes uncaptured, never that the response breaks.
+      try {
+        const parsed = parseSseLines(remainder + decoder.decode(chunk, { stream: true }));
+        remainder = parsed.remainder;
+        parsed.events.forEach(applyEvent);
+      } catch {
+        // swallow — passive observer, see comment above
+      }
+    },
+    finish(): CodexUsageTotals | undefined {
+      try {
+        const tail = decoder.decode();
+        if (tail || remainder) parseSseLines(remainder + tail + "\n").events.forEach(applyEvent);
+      } catch {
+        // swallow — passive observer, see comment above
+      }
+      remainder = "";
+      return totals;
+    },
+  };
+}

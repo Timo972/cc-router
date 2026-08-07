@@ -89,7 +89,7 @@ export type RouteFailureReason =
 export function routeFailureDetails(
   route: RouteSummary,
   failure: RouteFailureReason,
-  limitingScope?: "global" | `model:${string}`,
+  limitingScope?: "global" | `model:${string}` | `bucket:${string}`,
 ): string {
   return `${routeReasonDetails(route)}:${failure}${limitingScope ? `:${limitingScope}` : ""}`;
 }
@@ -142,12 +142,12 @@ function header(headers: FailureHeaders, name: string): string | number | undefi
   return undefined;
 }
 
-function futureExpiry(expiryMs: number, nowMs: number): number | undefined {
+export function futureExpiry(expiryMs: number, nowMs: number): number | undefined {
   if (!Number.isFinite(expiryMs) || expiryMs <= nowMs) return undefined;
   return expiryMs - nowMs <= MAX_RATE_LIMIT_COOLDOWN_MS ? expiryMs : undefined;
 }
 
-function retryAfterExpiry(value: unknown, nowMs: number): number | undefined {
+export function retryAfterExpiry(value: unknown, nowMs: number): number | undefined {
   if (typeof value !== "string" && typeof value !== "number") return undefined;
   if (typeof value === "string" && value.trim().length === 0) return undefined;
   const numeric = Number(value);
@@ -159,12 +159,14 @@ function retryAfterExpiry(value: unknown, nowMs: number): number | undefined {
   return futureExpiry(Date.parse(value), nowMs);
 }
 
-function resetHeaderExpiry(value: unknown, nowMs: number): number | undefined {
+export function resetHeaderExpiry(value: unknown, nowMs: number): number | undefined {
   if (typeof value !== "string" && typeof value !== "number") return undefined;
   if (typeof value === "string" && value.trim().length === 0) return undefined;
   const numeric = Number(value);
   if (Number.isFinite(numeric)) {
-    const milliseconds = numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
+    // Threshold matches usage.ts's MS_TIMESTAMP_THRESHOLD, so a seconds- vs.
+    // milliseconds-epoch reset value is classified the same way across providers.
+    const milliseconds = numeric < 100_000_000_000 ? numeric * 1_000 : numeric;
     return futureExpiry(milliseconds, nowMs);
   }
   if (typeof value !== "string") return undefined;

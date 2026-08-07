@@ -440,9 +440,32 @@ describe("loadOpenAIAccounts", () => {
         accessToken: "openai-access",
         refreshToken: "openai-refresh",
         expiresAt: 1999999999000,
+        scopes: ["openid", "profile", "email", "offline_access"],
         enabled: true,
       },
     ]);
+  });
+
+  it("round-trips scopes and user caps through load and save", () => {
+    writeAccountsAtomic([
+      {
+        id: "openai-a",
+        provider: "openai_subscription",
+        accessToken: "at",
+        refreshToken: "rt",
+        expiresAt: 1234,
+        scopes: ["openid", "profile"],
+        enabled: true,
+        sessionLimitPercent: 80,
+        weeklyLimitPercent: 90,
+      },
+    ]);
+
+    const loaded = loadOpenAIAccounts(accountsPath());
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]?.scopes).toEqual(["openid", "profile"]);
+    expect(loaded[0]?.sessionLimitPercent).toBe(80);
+    expect(loaded[0]?.weeklyLimitPercent).toBe(90);
   });
 });
 
