@@ -229,10 +229,12 @@ requests with the same session reuse that account for prompt-cache locality. The
 binding behavior mirrors Anthropic: **1 hour TTL**, **10,000-entry capacity**,
 **LRU eviction**, and **per-request eligibility checks** for the requested model.
 
-When an account returns a 401, 429, or 529, the binding is invalidated and the
-client's next request selects another account. Session headers that do not match
-a single non-empty string of at most 256 bytes are rejected and fall back to
-unscoped routing.
+When an account returns a 401, 429, or an overload response (503 or 529), the
+binding is invalidated and the client's next request selects another account.
+Other 5xx statuses (500, 502, 504, ...) are treated as isolated per-request
+failures — they count toward error stats but do not invalidate the binding or
+cool the account down. Session headers that do not match a single non-empty
+string of at most 256 bytes are rejected and fall back to unscoped routing.
 
 ### Usage tracking and buckets
 

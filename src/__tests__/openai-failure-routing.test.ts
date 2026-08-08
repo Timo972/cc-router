@@ -68,7 +68,7 @@ describe("applyCodexFailureRouting", () => {
     expect(account.rateLimits.status).toBe("ok"); // named-bucket 429 is not account-global
   });
 
-  it("prefers the greatest trustworthy expiry among Retry-After and reset headers", () => {
+  it("prefers Retry-After over a reset header for a window that isn't reported exhausted", () => {
     const account = makeAccount();
     const pool = makePool();
     applyCodexFailureRouting(
@@ -79,7 +79,55 @@ describe("applyCodexFailureRouting", () => {
       },
       { account }, undefined, makeRouter(), pool, () => NOW_MS,
     );
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 600_000);
+    // The primary-reset header carries no accompanying used-percent, so that
+    // window isn't known to be exhausted — Retry-After is the only trusted
+    // candidate, not the furthest-out reset merely because it was mentioned.
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 120_000);
+  });
+
+  it("waits out only the reset(s) of windows reported exhausted (used-percent >= 100)", () => {
+    const account = makeAccount();
+    const pool = makePool();
+    applyCodexFailureRouting(
+      429,
+      {
+        "x-codex-primary-used-percent": "100",
+        "x-codex-primary-reset-at": String(NOW_SEC + 18_000), // 5h window, exhausted
+        "x-codex-secondary-reset-at": String(NOW_SEC + 604_800), // 7d window, not reported exhausted
+      },
+      { account }, undefined, makeRouter(), pool, () => NOW_MS,
+    );
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 18_000_000);
+  });
+
+  it("waits out the later reset when both windows are reported exhausted", () => {
+    const account = makeAccount();
+    const pool = makePool();
+    applyCodexFailureRouting(
+      429,
+      {
+        "x-codex-primary-used-percent": "100",
+        "x-codex-primary-reset-at": String(NOW_SEC + 18_000), // 5h window, exhausted
+        "x-codex-secondary-used-percent": "100",
+        "x-codex-secondary-reset-at": String(NOW_SEC + 604_800), // 7d window, exhausted
+      },
+      { account }, undefined, makeRouter(), pool, () => NOW_MS,
+    );
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 604_800_000);
+  });
+
+  it("falls back to the soonest known window reset when nothing is reported exhausted", () => {
+    const account = makeAccount();
+    const pool = makePool();
+    applyCodexFailureRouting(
+      429,
+      {
+        "x-codex-primary-reset-at": String(NOW_SEC + 18_000), // 5h window
+        "x-codex-secondary-reset-at": String(NOW_SEC + 604_800), // 7d window
+      },
+      { account }, undefined, makeRouter(), pool, () => NOW_MS,
+    );
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 18_000_000);
   });
 
   it("uses the snapshot bucket reset when headers carry none", () => {
@@ -104,11 +152,28 @@ describe("applyCodexFailureRouting", () => {
     expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 60_000);
   });
 
-  it("401 and 5xx set short account-global cooldowns", () => {
+  it("401 and overload (503/529) set short account-global cooldowns and invalidate the binding", () => {
     const account = makeAccount();
     const pool = makePool();
-    expect(applyCodexFailureRouting(401, {}, { account }, undefined, makeRouter(), pool, () => NOW_MS).cooldownSeconds).toBe(30);
-    expect(applyCodexFailureRouting(503, {}, { account }, undefined, makeRouter(), pool, () => NOW_MS).cooldownSeconds).toBe(30);
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledTimes(2);
+    const router = makeRouter();
+    const route = { account, sessionId: "s1", bindingGeneration: 1 };
+    expect(applyCodexFailureRouting(401, {}, route, undefined, router, pool, () => NOW_MS).cooldownSeconds).toBe(30);
+    expect(applyCodexFailureRouting(503, {}, route, undefined, router, pool, () => NOW_MS).cooldownSeconds).toBe(30);
+    expect(applyCodexFailureRouting(529, {}, route, undefined, router, pool, () => NOW_MS).cooldownSeconds).toBe(30);
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledTimes(3);
+    expect(router.invalidate).toHaveBeenCalledTimes(3);
+  });
+
+  it("an isolated 5xx (e.g. 500) is a no-op: no cooldown, no binding invalidation", () => {
+    const account = makeAccount();
+    const pool = makePool();
+    const router = makeRouter();
+    const result = applyCodexFailureRouting(
+      500, {}, { account, sessionId: "s1", bindingGeneration: 1 }, undefined, router, pool, () => NOW_MS,
+    );
+    expect(result).toEqual({});
+    expect(pool.setGlobalCooldownForAccount).not.toHaveBeenCalled();
+    expect(pool.setBucketCooldownForAccount).not.toHaveBeenCalled();
+    expect(router.invalidate).not.toHaveBeenCalled();
   });
 });

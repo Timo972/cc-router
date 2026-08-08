@@ -103,29 +103,40 @@ export function learnModelBucket(
   account.modelBuckets.set(model, limitId);
 }
 
-export function bucketForModel(
+/**
+ * Resolve the rate-limit bucket id a model is mapped to, without requiring a
+ * bucket snapshot to exist. A header-only 429 (no accompanying rate-limit
+ * snapshot for that bucket) still learns and keeps a model->limitId mapping
+ * via `learnModelBucket`, and callers that only need the id to look up an
+ * independently-tracked cooldown (e.g. `OpenAITokenPool.hardBlock`) must not
+ * lose that mapping just because no bucket snapshot has arrived yet.
+ */
+export function bucketIdForModel(
   account: Pick<OpenAIAccount, "rateLimits" | "modelBuckets">,
   modelSlug: string | undefined,
-): CodexLimitBucket | undefined {
+): string | undefined {
   const model = normalizeModelSlug(modelSlug);
   if (!model) return undefined;
 
   const mapped = account.modelBuckets.get(model);
-  if (mapped !== undefined) {
-    const bucket = account.rateLimits.buckets.get(mapped);
-    if (bucket) return bucket;
-    account.modelBuckets.delete(model);
-    return undefined;
-  }
+  if (mapped !== undefined) return mapped;
 
   for (const bucket of account.rateLimits.buckets.values()) {
     if (bucket.limitId === DEFAULT_CODEX_LIMIT_ID) continue;
     if (bucket.limitName?.trim().toLowerCase() === model) {
       learnModelBucket(account, model, bucket.limitId);
-      return bucket;
+      return bucket.limitId;
     }
   }
   return undefined;
+}
+
+export function bucketForModel(
+  account: Pick<OpenAIAccount, "rateLimits" | "modelBuckets">,
+  modelSlug: string | undefined,
+): CodexLimitBucket | undefined {
+  const limitId = bucketIdForModel(account, modelSlug);
+  return limitId === undefined ? undefined : account.rateLimits.buckets.get(limitId);
 }
 
 /**
@@ -162,20 +173,28 @@ export function sweepCodexRateLimits(
       && ((window.resetAt > 0 && nowSec >= window.resetAt) || isStaleExhaustedWindow(window, bucketSeenAt, nowMs)),
     );
 
-    if (limitId === DEFAULT_CODEX_LIMIT_ID) {
-      windows.forEach((window, index) => {
-        if (!window || !expired[index]) return;
-        if (window.utilization >= 1) recovered = true;
-        window.utilization = 0;
-        window.resetAt = 0;
-      });
-      continue;
-    }
+    // Zero each individually-expired window in place — for both the default
+    // bucket and named buckets alike. A named bucket reporting a 5h primary
+    // window and a 6-day secondary window must recover the primary the
+    // moment it resets, not sit on it until the secondary also clears.
+    let anyWindowExpiredHere = false;
+    windows.forEach((window, index) => {
+      if (!window || !expired[index]) return;
+      anyWindowExpiredHere = true;
+      if (window.utilization >= 1) recovered = true;
+      window.utilization = 0;
+      window.resetAt = 0;
+    });
 
-    const stillBlocking = windows.some((window, index) => window !== undefined && !expired[index]);
-    const anyExpired = expired.some(Boolean);
-    if (!stillBlocking && anyExpired) {
-      if (windows.some(window => window !== undefined && window.utilization >= 1)) recovered = true;
+    if (limitId === DEFAULT_CODEX_LIMIT_ID) continue;
+
+    // Named buckets (and their model mappings) are only cleaned up entirely
+    // once nothing they still report is exhausted — i.e. a window expired
+    // this sweep and every window the bucket still carries is now below
+    // 100% utilization. This is bounded cleanup: mappings are capped at 32
+    // entries and are otherwise only ever evicted here.
+    const stillExhausted = windows.some(window => window !== undefined && window.utilization >= 1);
+    if (anyWindowExpiredHere && !stillExhausted) {
       account.rateLimits.buckets.delete(limitId);
       for (const [model, mappedLimitId] of account.modelBuckets) {
         if (mappedLimitId === limitId) account.modelBuckets.delete(model);

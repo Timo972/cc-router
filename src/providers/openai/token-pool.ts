@@ -5,7 +5,7 @@ import {
   type AccountPool,
 } from "../../proxy/account-pool.js";
 import type { RouteContext } from "../../proxy/types.js";
-import { bucketForModel, sweepCodexRateLimits, type OpenAIAccount } from "./account-state.js";
+import { bucketForModel, bucketIdForModel, sweepCodexRateLimits, type OpenAIAccount } from "./account-state.js";
 import { DEFAULT_CODEX_LIMIT_ID, type CodexLimitBucket, type CodexRateWindow } from "./usage.js";
 
 const MAX_TRUSTED_RATE_LIMIT_RESET_MS = 8 * 24 * 60 * 60 * 1_000;
@@ -124,15 +124,20 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     };
   }
 
-  getEarliestCooldownUntil(accountId: string): number {
-    const view = this.getCooldownView(accountId);
-    const expiries = [view.globalUntilMs, ...view.bucketCooldowns.map(c => c.untilMs)]
-      .filter(value => value > 0);
-    return expiries.length > 0 ? Math.min(...expiries) : 0;
+  /**
+   * The account-wide (global-scope) cooldown expiry only — never a
+   * bucket-scoped one. A niche model bucket's cooldown must not make the
+   * whole account appear busy, and a long global cooldown must not be
+   * reported as "recovering soon" just because some unrelated bucket
+   * cooldown happens to expire sooner. Per-bucket cooldowns remain visible
+   * individually via `getCooldownView`.
+   */
+  getGlobalCooldownUntil(accountId: string): number {
+    return this.getCooldownView(accountId).globalUntilMs;
   }
 
   isCoolingDown(accountId: string): boolean {
-    return this.getEarliestCooldownUntil(accountId) > 0;
+    return this.getGlobalCooldownUntil(accountId) > 0;
   }
 
   sweepExpiredCooldowns(): void {
@@ -179,13 +184,22 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
       if (window !== undefined && window.utilization >= 1) blockingWindows.push(window);
     }
 
-    const modelBucket = this.modelBucket(account, context);
-    if (modelBucket !== undefined) {
-      const bucketCooldown = state?.bucketUntil.get(modelBucket.limitId) ?? 0;
+    // A bucket cooldown can be learned from a header-only 429 that carried no
+    // rate-limit snapshot for that bucket (`setBucketCooldownForAccount` was
+    // called, but `account.rateLimits.buckets` has no entry for it yet).
+    // Resolve the model's mapped limitId independently of whether a bucket
+    // snapshot exists so that cooldown is still enforced; the window-based
+    // exhaustion check below still only applies when a snapshot is present.
+    const modelLimitId = bucketIdForModel(account, context?.requestedModel);
+    if (modelLimitId !== undefined) {
+      const bucketCooldown = state?.bucketUntil.get(modelLimitId) ?? 0;
       if (bucketCooldown > nowMs) {
         rateLimited = true;
         timedBlockers.push(bucketCooldown);
       }
+    }
+    const modelBucket = this.modelBucket(account, context);
+    if (modelBucket !== undefined) {
       for (const window of [modelBucket.primary, modelBucket.secondary]) {
         if (window !== undefined && window.utilization >= 1) blockingWindows.push(window);
       }

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { EmptyPoolError, NoEligibleAccountError } from "../proxy/account-pool.js";
-import { createOpenAIAccount, applyCodexRateLimits } from "../providers/openai/account-state.js";
+import { createOpenAIAccount, applyCodexRateLimits, learnModelBucket } from "../providers/openai/account-state.js";
 import type { OpenAIAccount } from "../providers/openai/account-state.js";
 import { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { parseCodexRateLimits } from "../providers/openai/usage.js";
@@ -112,6 +112,44 @@ describe("OpenAITokenPool cooldowns", () => {
     const view = pool.getCooldownView("a");
     expect(view.globalUntilMs).toBe(0);
     expect(view.bucketCooldowns).toEqual([{ limitId: "codex_bengalfox", untilMs: NOW_MS + 60_000 }]);
+  });
+
+  it("enforces a bucket cooldown learned from a header-only 429 with no bucket snapshot", () => {
+    const a = makeAccount("a");
+    // Mirrors what applyCodexFailureRouting does for a 429 whose headers name
+    // an active limit but carry no rate-limit snapshot for it: the model is
+    // mapped to a limitId, and a cooldown is set on that limitId, without any
+    // entry ever landing in account.rateLimits.buckets.
+    learnModelBucket(a, "gpt-5.6-sol", "codex_bengalfox");
+    const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
+    pool.setBucketCooldownForAccount(a, "codex_bengalfox", 60_000);
+
+    expect(() => pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-sol" }))
+      .toThrow(NoEligibleAccountError);
+    expect(pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-luna" }).account.id).toBe("a");
+  });
+
+  it("getGlobalCooldownUntil/isCoolingDown reflect only the global scope, not a shorter bucket cooldown", () => {
+    const a = makeAccount("a");
+    applyHeaders(a, {
+      "x-codex-bengalfox-primary-used-percent": "50",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    });
+    const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
+    pool.setGlobalCooldownForAccount(a, 60 * 60_000); // 1h global
+    pool.setBucketCooldownForAccount(a, "codex_bengalfox", 60_000); // 60s bucket, expires sooner
+
+    expect(pool.getGlobalCooldownUntil("a")).toBe(NOW_MS + 60 * 60_000);
+    expect(pool.isCoolingDown("a")).toBe(true);
+  });
+
+  it("a bucket-only cooldown does not mark the account as globally cooling down", () => {
+    const a = makeAccount("a");
+    const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
+    pool.setBucketCooldownForAccount(a, "codex_bengalfox", 60_000);
+
+    expect(pool.getGlobalCooldownUntil("a")).toBe(0);
+    expect(pool.isCoolingDown("a")).toBe(false);
   });
 });
 

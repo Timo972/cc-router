@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyCodexRateLimits,
   bucketForModel,
+  bucketIdForModel,
   createOpenAIAccount,
   learnModelBucket,
   sweepCodexRateLimits,
@@ -69,11 +70,17 @@ describe("bucketForModel", () => {
     expect(bucketForModel(account, "gpt-5.6-luna")).toBeUndefined();
   });
 
-  it("drops a stale mapping whose bucket no longer exists", () => {
+  it("retains a mapping to a limitId with no bucket snapshot yet, for cooldown lookups", () => {
     const account = createOpenAIAccount(record());
     learnModelBucket(account, "gpt-5.6-sol", "codex_gone");
+    // No snapshot exists for "codex_gone" yet (e.g. a header-only 429 learned
+    // the mapping before any rate-limit snapshot arrived for that bucket).
+    // bucketForModel correctly has nothing to return, but must not delete the
+    // mapping — bucketIdForModel still resolves it so a cooldown keyed on
+    // that limitId keeps being enforced.
     expect(bucketForModel(account, "gpt-5.6-sol")).toBeUndefined();
-    expect(account.modelBuckets.has("gpt-5.6-sol")).toBe(false);
+    expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("codex_gone");
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_gone");
   });
 
   it("never maps the default limit id and bounds the map", () => {
@@ -175,6 +182,50 @@ describe("sweepCodexRateLimits", () => {
 
     sweepCodexRateLimits(account, laterMs + 60_000);
     expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(true);
+  });
+
+  it("recovers a named bucket's individually-expired window without waiting on its other window", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "100",
+      "x-codex-bengalfox-primary-reset-at": String(NOW_SEC + 5 * 3600), // 5h window, exhausted
+      "x-codex-bengalfox-secondary-used-percent": "30",
+      "x-codex-bengalfox-secondary-reset-at": String(NOW_SEC + 6 * 24 * 3600), // 6d window, not exhausted
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+    expect(bucketForModel(account, "gpt-5.6-sol")).toBeDefined();
+
+    // Just after the 5h primary window resets, well before the 6d secondary
+    // window does.
+    const staleAt = NOW_MS + 5 * 3600 * 1000 + 1000;
+    const recovered = sweepCodexRateLimits(account, staleAt);
+    expect(recovered).toBe(true);
+    // Nothing the bucket still reports remains exhausted (primary just
+    // cleared, secondary was never exhausted), so the bucket and its model
+    // mapping are cleaned up and the model is routable again.
+    expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(false);
+    expect(bucketForModel(account, "gpt-5.6-sol")).toBeUndefined();
+  });
+
+  it("zeroes an individually-expired named-bucket window in place while the bucket stays blocked by its other window", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "100",
+      "x-codex-bengalfox-primary-reset-at": String(NOW_SEC + 5 * 3600), // 5h window, exhausted
+      "x-codex-bengalfox-secondary-used-percent": "100",
+      "x-codex-bengalfox-secondary-reset-at": String(NOW_SEC + 6 * 24 * 3600), // 6d window, exhausted
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+
+    const staleAt = NOW_MS + 5 * 3600 * 1000 + 1000;
+    const recovered = sweepCodexRateLimits(account, staleAt);
+    expect(recovered).toBe(true);
+    const bucket = account.rateLimits.buckets.get("codex_bengalfox");
+    expect(bucket).toBeDefined();
+    expect(bucket?.primary?.utilization).toBe(0);
+    expect(bucket?.primary?.resetAt).toBe(0);
+    expect(bucket?.secondary?.utilization).toBe(1); // still exhausted — still blocking
+    expect(bucketForModel(account, "gpt-5.6-sol")).toBeDefined();
   });
 
   it("does not clear an exhausted default window with resetAt 0 while its snapshot is still fresh", () => {

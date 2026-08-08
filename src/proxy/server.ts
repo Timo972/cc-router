@@ -593,7 +593,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       inFlightRequests: openAIPool.getInFlight(accountId),
       activeSessions: openAIRouter.getActiveSessionCountsSnapshot().get(accountId) ?? 0,
       coolingDown: openAIPool.isCoolingDown(accountId),
-      cooldownUntilMs: openAIPool.getEarliestCooldownUntil(accountId),
+      cooldownUntilMs: openAIPool.getGlobalCooldownUntil(accountId),
     },
     cooldowns: openAIPool.getCooldownView(accountId),
   });
