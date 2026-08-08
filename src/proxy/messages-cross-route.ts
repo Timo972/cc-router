@@ -12,18 +12,18 @@ import { usageFromResponseBody, type CodexUsageTotals } from "../protocol/openai
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 import type { RouteContext } from "./types.js";
 import { extractAnthropicRouteContext } from "./request-model.js";
-import { stats, createLocalRoutingErrorLog, applyCodexUsage } from "./stats.js";
+import { stats, applyCodexUsage } from "./stats.js";
 import type { LogEntry } from "./stats.js";
-import { EmptyPoolError, NoEligibleAccountError } from "./account-pool.js";
-import type { SessionRouter, RoutedAccountLease } from "./session-router.js";
-import { acquireRequestRoute, routeReasonDetails, routeFailureDetails } from "./lease-lifecycle.js";
+import type { SessionRouter } from "./session-router.js";
 import { extractCodexSessionKey } from "./openai-routing.js";
 import { sendAnthropicNoEligibleResponse } from "./anthropic-routing.js";
-import { applyCodexRateLimits, type OpenAIAccount } from "../providers/openai/account-state.js";
-import { headersToRecord, parseCodexRateLimits } from "../providers/openai/usage.js";
-import { applyCodexFailureRouting } from "../providers/openai/failure-routing.js";
-import { needsOpenAIRefresh } from "../providers/openai/token-refresher.js";
+import type { OpenAIAccount } from "../providers/openai/account-state.js";
 import type { OpenAITokenPool } from "../providers/openai/token-pool.js";
+import {
+  runOpenAIIngress,
+  type ForwardOpenAI,
+  type OpenAIIngressEnvelope,
+} from "./openai-ingress.js";
 
 declare module "express-serve-static-core" {
   interface Request {
@@ -31,8 +31,6 @@ declare module "express-serve-static-core" {
     _ccRouteContext?: RouteContext;
   }
 }
-
-type ForwardOpenAI = typeof forwardOpenAICodexResponse;
 
 export interface MessagesCrossProviderRouteOptions {
   openAIRouter: SessionRouter<OpenAIAccount>;
@@ -42,7 +40,13 @@ export interface MessagesCrossProviderRouteOptions {
   modelRouting?: ModelRoutingConfig;
   recordActivity?: (entry: LogEntry) => void;
   now?: () => number;
+  onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
 }
+
+const MESSAGES_ENVELOPE: OpenAIIngressEnvelope = {
+  wrap: (type, message) => ({ type: "error", error: { type, message } }),
+  sendNoEligible: (error, res, nowMs) => sendAnthropicNoEligibleResponse(error, res, nowMs),
+};
 
 function isAnthropicMessagesRequest(value: unknown): value is AnthropicMessagesRequest {
   return (
@@ -255,99 +259,28 @@ export function mountMessagesCrossProviderRoute(
         return;
       }
 
-      let selected: { route: RoutedAccountLease<OpenAIAccount>; release: () => void; details: string };
-      try {
-        selected = acquireRequestRoute(
-          extractCodexSessionKey(req, req.body),
-          res,
-          opts.openAIRouter,
-          { requestedModel: route.upstreamModel },
-        );
-      } catch (error) {
-        if (error instanceof EmptyPoolError) {
-          res.status(503).json({
-            type: "error",
-            error: { type: "no_accounts", message: "No OpenAI subscription accounts are configured" },
-          });
-          return;
-        }
-        if (error instanceof NoEligibleAccountError) {
-          recordActivity(createLocalRoutingErrorLog(error.reason, route.upstreamModel));
-          sendAnthropicNoEligibleResponse(error, res, now());
-          return;
-        }
-        throw error;
-      }
-
-      const account = selected.route.account;
-      const startedAt = now();
-      const needed = needsOpenAIRefresh(account);
-      const ready = await prepareOpenAIAccount(account);
-      if (!ready) {
-        selected.release();
-        account.errorCount++;
-        account.healthy = false;
-        recordActivity({
-          ts: now(),
-          accountId: account.id,
-          model: route.upstreamModel,
-          type: "error",
-          statusCode: 401,
-          path: "/v1/messages",
-          details: "openai token refresh failed",
-        });
-        res.status(401).json({
-          type: "error",
-          error: { type: "authentication_error", message: "OpenAI subscription token refresh failed" },
-        });
-        return;
-      }
-      account.healthy = true;
-      if (needed) account.lastRefresh = now();
-
       const body = anthropicToOpenAIResponses(req.body, opts.modelRouting);
-      const upstream = await forwardOpenAI({ account, body, stream: body.stream === true });
+      const requestedStream = req.body.stream === true;
 
-      const headerRecord = headersToRecord(upstream.headers);
-      applyCodexRateLimits(account, parseCodexRateLimits(headerRecord, now()), now());
-
-      const failed = upstream.status === 401 || upstream.status === 429 || upstream.status >= 500;
-      let details = routeReasonDetails(selected.route);
-      if (failed) {
-        account.errorCount++;
-        account.consecutiveErrors++;
-        stats.totalErrors++;
-        const applied = applyCodexFailureRouting(
-          upstream.status,
-          headerRecord,
-          selected.route,
-          route.upstreamModel,
-          opts.openAIRouter,
-          opts.openAIPool,
-          now,
-        );
-        details = routeFailureDetails(
-          selected.route,
-          upstream.status === 401 ? "token-invalid" : upstream.status === 429 ? "rate-limited" : "service-overloaded",
-          applied.limitingScope,
-        );
-      } else {
-        account.consecutiveErrors = 0;
-        stats.totalRequests++;
-      }
-
-      const entry: LogEntry = {
-        ts: startedAt,
-        accountId: account.id,
-        model: route.upstreamModel,
-        type: failed ? "error" : "route",
-        statusCode: upstream.status,
+      await runOpenAIIngress({
+        res,
+        sessionKey: extractCodexSessionKey(req, req.body),
+        requestedModel: route.upstreamModel,
         path: "/v1/messages",
-        details,
-      };
-      await sendOpenAIAsAnthropic(upstream, res, req.body.stream === true, usage => applyCodexUsage(entry, usage));
-      entry.durationMs = now() - startedAt;
-      recordActivity(entry);
+        openAIRouter: opts.openAIRouter,
+        openAIPool: opts.openAIPool,
+        prepareOpenAIAccount,
+        forwardOpenAI,
+        forwardBody: body,
+        recordActivity,
+        now,
+        envelope: MESSAGES_ENVELOPE,
+        onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
+        relay: async (upstream, res, entry) => {
+          await sendOpenAIAsAnthropic(upstream, res, requestedStream, usage => applyCodexUsage(entry, usage));
+          return { statusCode: upstream.status };
+        },
+      });
     },
   );
 }

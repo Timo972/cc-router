@@ -17,7 +17,11 @@ import type { LogEntry } from "./stats.js";
 import { PROXY_PORT, LITELLM_URL } from "../config/paths.js";
 import { writePid, removePid } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
-import { prepareOpenAIAccountForRequest, startOpenAIRefreshLoop } from "../providers/openai/token-refresher.js";
+import {
+  prepareOpenAIAccountForRequest,
+  refreshOpenAISubscriptionToken,
+  startOpenAIRefreshLoop,
+} from "../providers/openai/token-refresher.js";
 import { createOpenAIAccount } from "../providers/openai/account-state.js";
 import type { OpenAIAccount } from "../providers/openai/account-state.js";
 import { OpenAITokenPool } from "../providers/openai/token-pool.js";
@@ -1020,11 +1024,24 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
   });
 
+  // A relayed upstream 401 means the subscription token is stale — kick off a
+  // refresh in the background so the *next* request succeeds without making
+  // this client wait on it. Best-effort: failures are swallowed here since
+  // the ingress lifecycle has already recorded the 401 for this request.
+  const onOpenAIUpstreamAuthFailure = (account: OpenAIAccount): void => {
+    refreshOpenAISubscriptionToken(account)
+      .then(ok => {
+        if (ok) saveOpenAIAccounts(openAIAccounts);
+      })
+      .catch(() => {});
+  };
+
   mountResponsesRoutes(app, {
     openAIRouter,
     openAIPool,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
     modelRouting,
+    onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
   });
 
   mountMessagesCrossProviderRoute(app, {
@@ -1032,6 +1049,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     openAIPool,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
     modelRouting,
+    onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
   });
 
   // ─── Proxy middleware ──────────────────────────────────────────────────────

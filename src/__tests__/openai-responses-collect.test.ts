@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { collectCodexResponseStream, createCodexUsageObserver } from "../protocol/openai-responses-collect.js";
+import {
+  collectCodexResponseStream,
+  createCodexUsageObserver,
+  usageFromResponseBody,
+} from "../protocol/openai-responses-collect.js";
 
 function sseResponse(chunks: string[], init?: ResponseInit): Response {
   const encoder = new TextEncoder();
@@ -200,5 +204,27 @@ describe("createCodexUsageObserver", () => {
     })}\n\n`;
     observer.push(encoder.encode(event));
     expect(observer.finish()).toEqual({ inputTokens: 8, cachedInputTokens: 1, outputTokens: 3 });
+  });
+});
+
+describe("usageFromResponseBody", () => {
+  it("extracts input/output/cached token totals from a valid usage object", () => {
+    const body = {
+      usage: { input_tokens: 10, output_tokens: 5, input_tokens_details: { cached_tokens: 2 } },
+    };
+    expect(usageFromResponseBody(body)).toEqual({ inputTokens: 10, cachedInputTokens: 2, outputTokens: 5 });
+  });
+
+  it("returns undefined when usage is null", () => {
+    expect(usageFromResponseBody({ usage: null })).toBeUndefined();
+  });
+
+  it("returns undefined when usage is missing entirely", () => {
+    expect(usageFromResponseBody({ id: "resp_1" })).toBeUndefined();
+  });
+
+  it("returns undefined for a non-object body", () => {
+    expect(usageFromResponseBody(null)).toBeUndefined();
+    expect(usageFromResponseBody("not an object")).toBeUndefined();
   });
 });

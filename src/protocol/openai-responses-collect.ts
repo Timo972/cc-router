@@ -98,7 +98,7 @@ function usageNumber(value: unknown): number {
 export function usageFromResponseBody(body: unknown): CodexUsageTotals | undefined {
   if (typeof body !== "object" || body === null) return undefined;
   const usage = (body as { usage?: { input_tokens?: unknown; output_tokens?: unknown; input_tokens_details?: { cached_tokens?: unknown } } }).usage;
-  if (usage === undefined || typeof usage !== "object") return undefined;
+  if (usage === undefined || usage === null || typeof usage !== "object") return undefined;
   return {
     inputTokens: usageNumber(usage.input_tokens),
     cachedInputTokens: usageNumber(usage.input_tokens_details?.cached_tokens),

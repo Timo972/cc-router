@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import express from "express";
+import type { Response as ExpressResponse } from "express";
 import { createServer } from "http";
 import { forwardOpenAICodexResponse, toCodexBackendRequest } from "../providers/openai/codex-transport.js";
 import { mountResponsesRoutes } from "../proxy/responses-server.js";
@@ -9,7 +10,7 @@ import { SessionRouter } from "../proxy/session-router.js";
 import { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { applyCodexRateLimits, createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
 import { parseCodexRateLimits } from "../providers/openai/usage.js";
-import type { LogEntry } from "../proxy/stats.js";
+import { stats, type LogEntry } from "../proxy/stats.js";
 
 type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean }) => Promise<Response>;
 
@@ -408,6 +409,281 @@ describe("mountResponsesRoutes", () => {
       expect(res.headers.get("content-type")).toContain("application/json");
       expect(await res.text()).toBe(errorBody);
     });
+  });
+});
+
+describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("returns a local 502 when forwardOpenAI rejects, and does not crash the process (F1a)", async () => {
+    const forward: ForwardOpenAI = async () => {
+      throw new Error("network down");
+    };
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual(
+        expect.objectContaining({ error: expect.objectContaining({ type: "upstream_error" }) }),
+      );
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
+  it("returns a local 401 when prepareOpenAIAccount throws (F1b)", async () => {
+    const forward = vi.fn();
+    const prepare = vi.fn().mockRejectedValue(new Error("refresh exploded"));
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward, {
+      prepareOpenAIAccount: prepare,
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual(
+        expect.objectContaining({ error: expect.objectContaining({ type: "authentication_error" }) }),
+      );
+    });
+
+    expect(forward).not.toHaveBeenCalled();
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 401)).toBe(true);
+  });
+
+  it("returns a local 500 proxy_error when routing itself throws unexpectedly (F1c)", async () => {
+    const app = express();
+    const openAIPool = new OpenAITokenPool([makeRuntimeAccount("openai-victor")]);
+    const brokenRouter = {
+      acquire: () => {
+        throw new Error("routing exploded");
+      },
+    } as unknown as SessionRouter<OpenAIAccount>;
+    const activity: LogEntry[] = [];
+    const forward = vi.fn();
+    mountResponsesRoutes(app, {
+      openAIRouter: brokenRouter,
+      openAIPool,
+      forwardOpenAI: forward,
+      recordActivity: entry => activity.push(entry),
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual(
+        expect.objectContaining({ error: expect.objectContaining({ type: "proxy_error" }) }),
+      );
+    });
+
+    expect(forward).not.toHaveBeenCalled();
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 500)).toBe(true);
+  });
+
+  it("returns a local 502 when the relay throws before any bytes reach the client (F1d)", async () => {
+    const forward: ForwardOpenAI = async () => new Response("data: x\n\n", {
+      status: 200,
+      headers: { "content-type": "text/event-stream", "x-boom": "1" },
+    });
+    const app = express();
+    // Force the relay's header-mirroring loop to throw for one specific
+    // header, before res.status()/write() ever runs — simulates a relay
+    // failure that happens strictly before any upstream bytes are committed.
+    app.use((_req, res: ExpressResponse, next) => {
+      const original = res.setHeader.bind(res);
+      res.setHeader = ((name: string, value: unknown) => {
+        if (String(name).toLowerCase() === "x-boom") throw new Error("setHeader boom");
+        return original(name, value);
+      }) as typeof res.setHeader;
+      next();
+    });
+    const openAIPool = new OpenAITokenPool([makeRuntimeAccount("openai-victor")]);
+    const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
+    const activity: LogEntry[] = [];
+    mountResponsesRoutes(app, {
+      openAIRouter,
+      openAIPool,
+      forwardOpenAI: forward,
+      recordActivity: entry => activity.push(entry),
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual(
+        expect.objectContaining({ error: expect.objectContaining({ type: "upstream_error" }) }),
+      );
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
+  it("tears down gracefully and still records an error entry when the relay throws after bytes were already flushed (F1e)", async () => {
+    const forward: ForwardOpenAI = async () => {
+      let calls = 0;
+      const reader = {
+        read: async () => {
+          calls++;
+          if (calls === 1) {
+            return { value: new TextEncoder().encode("data: partial\n\n"), done: false };
+          }
+          throw new Error("connection reset mid-stream");
+        },
+      };
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body: { getReader: () => reader },
+      } as unknown as Response;
+    };
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+
+      // Status/headers were already committed before the failure — the best
+      // we can do is stop, not retract what was already sent.
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("data: partial\n\n");
+    });
+
+    expect(activity.some(entry => entry.type === "error")).toBe(true);
+  });
+
+  it("does not crash when upstream response classification (header/rate-limit parsing) throws", async () => {
+    let forEachCalls = 0;
+    const fakeUpstream = {
+      ok: true,
+      status: 200,
+      headers: {
+        get: (name: string) => (name.toLowerCase() === "content-type" ? "application/json" : null),
+        forEach: (_cb: (value: string, key: string) => void) => {
+          forEachCalls++;
+          if (forEachCalls === 1) throw new Error("headers boom");
+          // Second call is the relay's own header-mirror loop — a no-op here.
+        },
+      },
+      // Deliberately no .json() method, so if classification's throw were
+      // ever left unguarded and crashed the daemon, this test would hang or
+      // reject instead of observing a clean response below.
+    } as unknown as Response;
+    const forward: ForwardOpenAI = async () => fakeUpstream;
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(502);
+    });
+
+    expect(activity.some(entry => entry.type === "error")).toBe(true);
+  });
+
+  it("never mirrors content-encoding or set-cookie to the client, but keeps retry-after intact (F6)", async () => {
+    const rawBody = "plain-text-body-not-actually-gzipped";
+    const forward: ForwardOpenAI = async () => new Response(rawBody, {
+      status: 429,
+      headers: {
+        "content-type": "text/plain",
+        "content-encoding": "gzip",
+        "set-cookie": "sess=abc; HttpOnly",
+        "retry-after": "120",
+      },
+    });
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get("content-encoding")).toBeNull();
+      expect(res.headers.get("set-cookie")).toBeNull();
+      expect(res.headers.get("retry-after")).toBe("120");
+      // If content-encoding leaked through, fetch would try to gunzip a body
+      // that was never actually compressed and .text() would throw instead
+      // of resolving — a stronger signal than just checking header absence.
+      await expect(res.text()).resolves.toBe(rawBody);
+    });
+  });
+
+  it("classifies a synthesized 502 (upstream 200 SSE ending in response.failed) as a client-facing error, not a success (F10)", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      'data: {"type":"response.failed","response":{"error":{"message":"boom"}}}\n\n',
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+    const before = stats.totalErrors;
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual(
+        expect.objectContaining({ error: expect.objectContaining({ type: "upstream_error", message: "boom" }) }),
+      );
+    });
+
+    expect(stats.totalErrors).toBe(before + 1);
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
+  it("invokes onUpstreamAuthFailure with the routed account when a relayed upstream 401 occurs (F5)", async () => {
+    const account = makeRuntimeAccount("openai-victor");
+    const forward: ForwardOpenAI = async () => new Response(
+      JSON.stringify({ error: { message: "invalid token" } }),
+      { status: 401, headers: { "content-type": "application/json" } },
+    );
+    const onUpstreamAuthFailure = vi.fn();
+    const { app } = mountWithPool([account], forward, { onUpstreamAuthFailure });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+      expect(res.status).toBe(401);
+    });
+
+    expect(onUpstreamAuthFailure).toHaveBeenCalledTimes(1);
+    expect(onUpstreamAuthFailure).toHaveBeenCalledWith(expect.objectContaining({ id: "openai-victor" }));
   });
 });
 

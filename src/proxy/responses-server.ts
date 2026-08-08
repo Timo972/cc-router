@@ -9,22 +9,19 @@ import {
   usageFromResponseBody,
 } from "../protocol/openai-responses-collect.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
-import { stats, createLocalRoutingErrorLog, applyCodexUsage } from "./stats.js";
+import { stats, applyCodexUsage } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { logWarn } from "./logger.js";
-import { EmptyPoolError, NoEligibleAccountError } from "./account-pool.js";
-import type { SessionRouter, RoutedAccountLease } from "./session-router.js";
-import { acquireRequestRoute, routeReasonDetails, routeFailureDetails } from "./lease-lifecycle.js";
+import type { SessionRouter } from "./session-router.js";
 import { extractCodexSessionKey, sendOpenAINoEligibleResponse } from "./openai-routing.js";
-import { applyCodexRateLimits, type OpenAIAccount } from "../providers/openai/account-state.js";
-import { headersToRecord, parseCodexRateLimits } from "../providers/openai/usage.js";
-import { applyCodexFailureRouting } from "../providers/openai/failure-routing.js";
-import { needsOpenAIRefresh } from "../providers/openai/token-refresher.js";
+import type { OpenAIAccount } from "../providers/openai/account-state.js";
 import type { OpenAITokenPool } from "../providers/openai/token-pool.js";
-
-type ForwardOpenAI = typeof forwardOpenAICodexResponse;
-
-const HOP_BY_HOP_HEADERS = new Set(["content-length", "transfer-encoding", "connection", "keep-alive"]);
+import {
+  runOpenAIIngress,
+  EXCLUDED_UPSTREAM_RELAY_HEADERS,
+  type ForwardOpenAI,
+  type OpenAIIngressEnvelope,
+} from "./openai-ingress.js";
 
 export interface ResponsesRoutesOptions {
   openAIRouter: SessionRouter<OpenAIAccount>;
@@ -34,7 +31,13 @@ export interface ResponsesRoutesOptions {
   modelRouting?: ModelRoutingConfig;
   recordActivity?: (entry: LogEntry) => void;
   now?: () => number;
+  onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
 }
+
+const RESPONSES_ENVELOPE: OpenAIIngressEnvelope = {
+  wrap: (type, message) => ({ error: { type, message } }),
+  sendNoEligible: (error, res, nowMs) => sendOpenAINoEligibleResponse(error, res, nowMs),
+};
 
 function isResponsesRequest(value: unknown): value is OpenAIResponsesRequest {
   return (
@@ -51,7 +54,7 @@ async function sendUpstreamResponse(
   onChunk?: (chunk: Uint8Array) => void,
 ): Promise<void> {
   upstream.headers.forEach((value, key) => {
-    if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) res.setHeader(key, value);
+    if (!EXCLUDED_UPSTREAM_RELAY_HEADERS.has(key.toLowerCase())) res.setHeader(key, value);
   });
 
   const contentType = upstream.headers.get("content-type");
@@ -141,121 +144,51 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       return;
     }
 
-    let selected: { route: RoutedAccountLease<OpenAIAccount>; release: () => void; details: string };
-    try {
-      selected = acquireRequestRoute(
-        extractCodexSessionKey(req, req.body),
-        res,
-        opts.openAIRouter,
-        { requestedModel: route.upstreamModel },
-      );
-    } catch (error) {
-      if (error instanceof EmptyPoolError) {
-        res.status(503).json({
-          error: { type: "no_accounts", message: "No OpenAI subscription accounts are configured" },
-        });
-        return;
-      }
-      if (error instanceof NoEligibleAccountError) {
-        recordActivity(createLocalRoutingErrorLog(error.reason, route.upstreamModel));
-        sendOpenAINoEligibleResponse(error, res, now());
-        return;
-      }
-      throw error;
-    }
-
-    const account = selected.route.account;
-    const startedAt = now();
-    const needed = needsOpenAIRefresh(account);
-    const ready = await prepareOpenAIAccount(account);
-    if (!ready) {
-      selected.release();
-      account.errorCount++;
-      account.healthy = false;
-      recordActivity({
-        ts: now(),
-        accountId: account.id,
-        model: route.upstreamModel,
-        type: "error",
-        statusCode: 401,
-        path: "/v1/responses",
-        details: "openai token refresh failed",
-      });
-      res.status(401).json({
-        error: { type: "authentication_error", message: "OpenAI subscription token refresh failed" },
-      });
-      return;
-    }
-    account.healthy = true;
-    if (needed) account.lastRefresh = now();
-
     const body: OpenAIResponsesRequest = { ...req.body, model: route.upstreamModel };
-    const upstream = await forwardOpenAI({ account, body, stream: body.stream === true });
 
-    const headerRecord = headersToRecord(upstream.headers);
-    applyCodexRateLimits(account, parseCodexRateLimits(headerRecord, now()), now());
-
-    const failed = upstream.status === 401 || upstream.status === 429 || upstream.status >= 500;
-    let details = routeReasonDetails(selected.route);
-    if (failed) {
-      account.errorCount++;
-      account.consecutiveErrors++;
-      stats.totalErrors++;
-      const applied = applyCodexFailureRouting(
-        upstream.status,
-        headerRecord,
-        selected.route,
-        route.upstreamModel,
-        opts.openAIRouter,
-        opts.openAIPool,
-        now,
-      );
-      details = routeFailureDetails(
-        selected.route,
-        upstream.status === 401 ? "token-invalid" : upstream.status === 429 ? "rate-limited" : "service-overloaded",
-        applied.limitingScope,
-      );
-    } else {
-      account.consecutiveErrors = 0;
-      stats.totalRequests++;
-    }
-
-    const entry: LogEntry = {
-      ts: startedAt,
-      accountId: account.id,
-      model: route.upstreamModel,
-      type: failed ? "error" : "route",
-      statusCode: upstream.status,
+    await runOpenAIIngress({
+      res,
+      sessionKey: extractCodexSessionKey(req, req.body),
+      requestedModel: route.upstreamModel,
       path: "/v1/responses",
-      details,
-    };
+      openAIRouter: opts.openAIRouter,
+      openAIPool: opts.openAIPool,
+      prepareOpenAIAccount,
+      forwardOpenAI,
+      forwardBody: body,
+      recordActivity,
+      now,
+      envelope: RESPONSES_ENVELOPE,
+      onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
+      relay: async (upstream, res, entry) => {
+        if (body.stream === true) {
+          const observer = createCodexUsageObserver();
+          await sendUpstreamResponse(upstream, res, chunk => observer.push(chunk));
+          applyCodexUsage(entry, observer.finish());
+          return { statusCode: upstream.status };
+        }
 
-    if (body.stream === true) {
-      const observer = createCodexUsageObserver();
-      await sendUpstreamResponse(upstream, res, chunk => observer.push(chunk));
-      applyCodexUsage(entry, observer.finish());
-    } else {
-      const collected = await collectCodexResponseStream(upstream);
-      // Mirror upstream headers (e.g. Retry-After, x-codex-*) before sending the
-      // collected body, so failure responses reach the client unchanged per the
-      // same contract the streaming path already honors via sendUpstreamResponse.
-      // content-type is deliberately excluded here: Express's res.json() only sets
-      // it when unset, so a mirrored content-type would silently win over the
-      // application/json the .json() call below is supposed to set. .json()/.type()
-      // remain the single source of truth for content-type, as today.
-      upstream.headers.forEach((value, key) => {
-        const lower = key.toLowerCase();
-        if (lower === "content-type") return;
-        if (!HOP_BY_HOP_HEADERS.has(lower)) res.setHeader(key, value);
-      });
-      if (collected.kind === "json") {
-        applyCodexUsage(entry, usageFromResponseBody(collected.body));
-        res.status(collected.status).json(collected.body);
-      } else {
-        res.status(collected.status).type(collected.contentType ?? "text/plain").send(collected.body);
-      }
-    }
-    entry.durationMs = now() - startedAt;
-    recordActivity(entry);
+        const collected = await collectCodexResponseStream(upstream);
+        // Mirror upstream headers (e.g. Retry-After, x-codex-*) before sending the
+        // collected body, so failure responses reach the client unchanged per the
+        // same contract the streaming path already honors via sendUpstreamResponse.
+        // content-type is deliberately excluded here: Express's res.json() only sets
+        // it when unset, so a mirrored content-type would silently win over the
+        // application/json the .json() call below is supposed to set. .json()/.type()
+        // remain the single source of truth for content-type, as today.
+        upstream.headers.forEach((value, key) => {
+          const lower = key.toLowerCase();
+          if (lower === "content-type") return;
+          if (!EXCLUDED_UPSTREAM_RELAY_HEADERS.has(lower)) res.setHeader(key, value);
+        });
+        if (collected.kind === "json") {
+          applyCodexUsage(entry, usageFromResponseBody(collected.body));
+          res.status(collected.status).json(collected.body);
+        } else {
+          res.status(collected.status).type(collected.contentType ?? "text/plain").send(collected.body);
+        }
+        return { statusCode: collected.status };
+      },
+    });
   });
 }

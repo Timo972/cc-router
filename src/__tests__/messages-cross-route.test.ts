@@ -415,6 +415,29 @@ describe("mountMessagesCrossProviderRoute", () => {
   );
 });
 
+describe("mountMessagesCrossProviderRoute crash safety (F1)", () => {
+  it("returns a local 502 in the Anthropic error envelope when forwardOpenAI rejects, and does not crash the process", async () => {
+    const forward: ForwardOpenAI = async () => {
+      throw new Error("network down");
+    };
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual(
+        expect.objectContaining({
+          type: "error",
+          error: expect.objectContaining({ type: "upstream_error" }),
+        }),
+      );
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+});
+
 describe("messages cross-route sticky routing", () => {
   it("routes repeated x-claude-code-session-id requests to the same account", async () => {
     const accounts = [makeRuntimeAccount("openai-a"), makeRuntimeAccount("openai-b")];

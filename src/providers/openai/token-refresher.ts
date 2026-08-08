@@ -73,7 +73,13 @@ export function startOpenAIRefreshLoop(
 ): () => void {
   const check = async () => {
     for (const account of accounts) {
-      await prepareOpenAIAccountForRequest(account, accounts, saveAccounts);
+      // One account's refresh throwing must not skip every account after it
+      // in this tick — isolate failures per-account.
+      try {
+        await prepareOpenAIAccountForRequest(account, accounts, saveAccounts);
+      } catch (error) {
+        console.error(error);
+      }
     }
   };
 
@@ -89,15 +95,23 @@ async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
     refresh_token: account.refreshToken,
   });
 
-  const res = await fetch(TOKEN_ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
+  let data: OpenAIRefreshResponse;
+  try {
+    const res = await fetch(TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+    });
 
-  if (!res.ok) return false;
+    if (!res.ok) return false;
 
-  const data = await res.json() as OpenAIRefreshResponse;
+    data = await res.json() as OpenAIRefreshResponse;
+  } catch {
+    // Network failure (or malformed response body) must resolve to `false`,
+    // exactly like a non-ok HTTP response — never propagate as a rejection.
+    return false;
+  }
+
   account.accessToken = data.access_token;
   account.refreshToken = data.refresh_token ?? account.refreshToken;
   account.expiresAt = Date.now() + data.expires_in * 1000;

@@ -137,8 +137,9 @@ describe("OpenAI subscription token refresher", () => {
       expiresAt: Date.now() + 60_000,
       enabled: true,
     });
-    // Simulate a prior failed refresh: the ingress routes mark the account
-    // unhealthy, which the pool hard-blocks from further selection.
+    // Simulate an account that starts out unhealthy (e.g. from some prior,
+    // unrelated failure) — the pool hard-blocks it from selection until it
+    // recovers. A successful refresh below is what should restore that.
     account.healthy = false;
     account.consecutiveErrors = 2;
 
@@ -154,5 +155,53 @@ describe("OpenAI subscription token refresher", () => {
 
     const lease = pool.acquireBest(new Map());
     expect(lease.account.id).toBe("openai-recovering");
+  });
+
+  it("continues refreshing remaining accounts in a tick after one account's refresh throws", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }),
+    } as Response);
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const first = {
+      id: "openai-first",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access-first",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    };
+    const second = {
+      id: "openai-second",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access-second",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    };
+
+    // Every persist call throws (e.g. a disk-full error). Without a
+    // per-account try/catch around `await prepareOpenAIAccountForRequest(...)`,
+    // the first account's rejection would break out of the loop and `second`
+    // would never even attempt a refresh.
+    const save = vi.fn(() => {
+      throw new Error("disk full");
+    });
+
+    const stop = startOpenAIRefreshLoop([first, second], save);
+    await vi.runOnlyPendingTimersAsync();
+    stop();
+
+    expect(first.accessToken).toBe("new-access");
+    expect(second.accessToken).toBe("new-access");
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
   });
 });
