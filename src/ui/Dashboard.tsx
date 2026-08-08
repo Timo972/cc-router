@@ -234,6 +234,21 @@ export function getCodexCapacityRows(
   return rows;
 }
 
+/**
+ * True when an OpenAI/Codex account is hard-blocked from routing: the
+ * account-wide status reports `rate_limited`, or the default bucket
+ * (`limitId === "codex"`) has a fully exhausted primary or secondary window.
+ * Named model-scoped buckets exhausting on their own does not count — the
+ * account can still serve other models via those buckets' fallback.
+ */
+export function isCodexLimited(codex: CodexRateLimitsView | undefined): boolean {
+  if (!codex) return false;
+  if (codex.status === "rate_limited") return true;
+  const defaultBucket = codex.buckets.find(bucket => bucket.limitId === "codex");
+  if (!defaultBucket) return false;
+  return (defaultBucket.primary?.utilization ?? 0) >= 1 || (defaultBucket.secondary?.utilization ?? 0) >= 1;
+}
+
 interface HealthData {
   status: "ok" | "degraded";
   mode: string;
@@ -510,10 +525,6 @@ function LiveDashboard({
 
   const doSetLimit = useCallback(async (field: "sessionLimitPercent" | "weeklyLimitPercent", value: number) => {
     if (!selectedAccount) return;
-    if (selectedAccount.provider === "openai_subscription") {
-      showBanner("OpenAI accounts do not use Anthropic caps", "yellow");
-      return;
-    }
     try {
       await api.patch(selectedAccount.id, { [field]: value });
       const label = field === "sessionLimitPercent" ? "5h cap" : "7d cap";
@@ -662,11 +673,9 @@ function LiveDashboard({
       if (input === "a") { void doToggleProvider("anthropic_subscription"); return; }
       if (input === "o") { void doToggleProvider("openai_subscription"); return; }
       if (input === "w") {
-        if (!selectedAccountIsAnthropic) { showBanner("OpenAI accounts do not use Anthropic caps", "yellow"); return; }
         setMode("editWeekly"); setEditBuffer(""); return;
       }
       if (input === "s") {
-        if (!selectedAccountIsAnthropic) { showBanner("OpenAI accounts do not use Anthropic caps", "yellow"); return; }
         setMode("editSession"); setEditBuffer(""); return;
       }
       if (input === "d") {
@@ -1029,7 +1038,7 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
   const capacityRows = isOpenAI
     ? getCodexCapacityRows(a.codexRateLimits, a.globalCooldownUntilMs)
     : getAccountCapacityRows(a);
-  const isLimited = rl.status === "rate_limited";
+  const isLimited = isOpenAI ? isCodexLimited(a.codexRateLimits) : rl.status === "rate_limited";
   const isDisabled = a.enabled === false;
 
   const dot = isDisabled ? "⊘" : isLimited ? "⊘" : a.busy ? "◌" : a.healthy ? "●" : "●";

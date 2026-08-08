@@ -17,6 +17,7 @@ import type { LogEntry } from "./stats.js";
 import { PROXY_PORT, LITELLM_URL } from "../config/paths.js";
 import { writePid, removePid } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
+import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
 import {
   prepareOpenAIAccountForRequest,
   refreshOpenAISubscriptionToken,
@@ -824,52 +825,66 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       weeklyLimitPercent?: unknown;
     };
 
-    const patch: { enabled?: boolean; sessionLimitPercent?: number; weeklyLimitPercent?: number } = {};
-    if (body.enabled !== undefined) {
-      if (typeof body.enabled !== "boolean") {
-        res.status(400).json({ error: "enabled must be boolean" });
-        return;
-      }
-      patch.enabled = body.enabled;
+    const validation = validateAccountPatchBody(body);
+    if (!validation.ok) {
+      res.status(400).json({ error: validation.error });
+      return;
     }
-    for (const key of ["sessionLimitPercent", "weeklyLimitPercent"] as const) {
-      const v = body[key];
-      if (v === undefined) continue;
-      if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 100) {
-        res.status(400).json({ error: `${key} must be a number between 0 and 100` });
-        return;
-      }
-      patch[key] = v;
-    }
+    const patch = validation.patch;
 
     // Snapshot the previous values so we can roll back on persistence failure
     const existing = pool.findById(id);
-    if (!existing) {
+    if (existing) {
+      const prev = {
+        enabled: existing.enabled,
+        sessionLimitPercent: existing.sessionLimitPercent,
+        weeklyLimitPercent: existing.weeklyLimitPercent,
+      };
+
+      const updated = pool.updateAccount(id, patch);
+      if (!updated) {
+        res.status(404).json({ error: `Account "${id}" not found` });
+        return;
+      }
+
+      const result = tryPersist(() => {
+        pool.updateAccount(id, prev);
+      });
+      if (!result.ok) {
+        res.status(500).json({ error: `Failed to persist accounts.json: ${result.message}` });
+        return;
+      }
+      if (patch.enabled === false) sessionRouter.invalidateAccount(id);
+      res.json({
+        account: publicAnthropicAccountView(updated, createRoutingMetricsResolver()(updated.id)),
+      });
+      return;
+    }
+
+    // Not a Claude account — try the OpenAI pool. `OpenAITokenPool` has no
+    // `updateAccount` of its own, so the runtime `OpenAIAccount` is patched
+    // and persisted directly via the same transaction contract used to add
+    // and delete OpenAI accounts.
+    let updatedOpenAI: OpenAIAccount | undefined;
+    try {
+      updatedOpenAI = applyOpenAIAccountPatch({
+        id,
+        patch,
+        accounts: openAIAccounts,
+        persist: saveOpenAIAccounts,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError("accounts", 0, `Failed to persist accounts.json: ${message}`);
+      res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
+      return;
+    }
+    if (!updatedOpenAI) {
       res.status(404).json({ error: `Account "${id}" not found` });
       return;
     }
-    const prev = {
-      enabled: existing.enabled,
-      sessionLimitPercent: existing.sessionLimitPercent,
-      weeklyLimitPercent: existing.weeklyLimitPercent,
-    };
-
-    const updated = pool.updateAccount(id, patch);
-    if (!updated) {
-      res.status(404).json({ error: `Account "${id}" not found` });
-      return;
-    }
-
-    const result = tryPersist(() => {
-      pool.updateAccount(id, prev);
-    });
-    if (!result.ok) {
-      res.status(500).json({ error: `Failed to persist accounts.json: ${result.message}` });
-      return;
-    }
-    if (patch.enabled === false) sessionRouter.invalidateAccount(id);
     res.json({
-      account: publicAnthropicAccountView(updated, createRoutingMetricsResolver()(updated.id)),
+      account: publicOpenAIAccountView(updatedOpenAI, resolveOpenAIRouting(updatedOpenAI.id)),
     });
   });
 
@@ -904,6 +919,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             refreshToken: body.refreshToken,
             expiresAt: body.expiresAt,
             enabled: body.enabled,
+            sessionLimitPercent: body.sessionLimitPercent,
+            weeklyLimitPercent: body.weeklyLimitPercent,
           },
           accounts: openAIAccounts,
           persist: saveOpenAIAccounts,

@@ -45,6 +45,31 @@ describe("addOpenAIAccountTransaction", () => {
     expect(added.enabled).toBe(true);
   });
 
+  it("passes session/weekly caps through to the created account", () => {
+    const accounts: OpenAIAccount[] = [];
+    const persist = vi.fn((next: OpenAIAccount[]) => {
+      expect(next[0].sessionLimitPercent).toBe(40);
+      expect(next[0].weeklyLimitPercent).toBe(60);
+    });
+
+    const added = addOpenAIAccountTransaction({
+      record: { ...makeInput("openai-caps"), sessionLimitPercent: 40, weeklyLimitPercent: 60 },
+      accounts,
+      persist,
+    });
+
+    expect(added.sessionLimitPercent).toBe(40);
+    expect(added.weeklyLimitPercent).toBe(60);
+    expect(persist).toHaveBeenCalledTimes(1);
+  });
+
+  it("defaults caps to 100 when omitted", () => {
+    const accounts: OpenAIAccount[] = [];
+    const added = addOpenAIAccountTransaction({ record: makeInput("openai-nocaps"), accounts, persist: vi.fn() });
+    expect(added.sessionLimitPercent).toBe(100);
+    expect(added.weeklyLimitPercent).toBe(100);
+  });
+
   it("rolls the in-place append back out when persistence fails", () => {
     const existing: OpenAIAccount = createOpenAIAccount({
       id: "openai-existing",

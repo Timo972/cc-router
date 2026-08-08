@@ -6,6 +6,8 @@ export interface AddOpenAIAccountInput {
   refreshToken: string;
   expiresAt: number;
   enabled?: boolean;
+  sessionLimitPercent?: number;
+  weeklyLimitPercent?: number;
 }
 
 export interface AddOpenAIAccountOptions {
@@ -34,6 +36,8 @@ export function addOpenAIAccountTransaction(
     refreshToken: options.record.refreshToken,
     expiresAt: options.record.expiresAt,
     enabled: options.record.enabled !== false,
+    sessionLimitPercent: options.record.sessionLimitPercent,
+    weeklyLimitPercent: options.record.weeklyLimitPercent,
   });
 
   options.accounts.push(account);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getCodexCapacityRows, type CodexRateLimitsView } from "../ui/Dashboard.js";
+import { getCodexCapacityRows, isCodexLimited, type CodexRateLimitsView } from "../ui/Dashboard.js";
 
 const NOW = 1_754_000_000_000;
 
@@ -39,5 +39,39 @@ describe("getCodexCapacityRows", () => {
 
     expect(rows[0]).toMatchObject({ label: "gpt-5.6-terra", state: "bucket cooldown", color: "yellow" });
     expect(rows[rows.length - 1]).toMatchObject({ label: "cooldown", state: "global", color: "red" });
+  });
+});
+
+describe("isCodexLimited", () => {
+  it("is limited when the account-wide status is rate_limited", () => {
+    expect(isCodexLimited(codexView({ status: "rate_limited" }))).toBe(true);
+  });
+
+  it("is limited when the default bucket's primary window is fully exhausted", () => {
+    expect(isCodexLimited(codexView({
+      buckets: [{
+        limitId: "codex", label: "codex", cooldownUntilMs: 0,
+        primary: { utilization: 1, resetAt: 0, windowMinutes: 300 },
+      }],
+    }))).toBe(true);
+  });
+
+  it("is not limited when only a named bucket is exhausted", () => {
+    expect(isCodexLimited(codexView({
+      buckets: [
+        { limitId: "codex", label: "codex", cooldownUntilMs: 0, primary: { utilization: 0.2, resetAt: 0, windowMinutes: 300 } },
+        {
+          limitId: "codex_bengalfox", label: "gpt-5.6-sol", cooldownUntilMs: 0,
+          primary: { utilization: 1, resetAt: 0, windowMinutes: 300 },
+        },
+      ],
+    }))).toBe(false);
+  });
+
+  it("is not limited for a healthy account", () => {
+    expect(isCodexLimited(codexView({
+      buckets: [{ limitId: "codex", label: "codex", cooldownUntilMs: 0, primary: { utilization: 0.4, resetAt: 0, windowMinutes: 300 } }],
+    }))).toBe(false);
+    expect(isCodexLimited(undefined)).toBe(false);
   });
 });

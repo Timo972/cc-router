@@ -56,6 +56,32 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   visible in `accounts list` without a restart. Previously only removals were
   applied at runtime; adds required restarting the proxy. When no proxy is
   running the add still falls back to a plain disk write.
+- Network and other unexpected failures partway through a shared-ingress
+  request (upstream connection errors, mid-stream aborts) no longer crash the
+  proxy or leave an account's in-flight/lease bookkeeping stuck — failures are
+  caught and routed the same way for both providers.
+- Cooldowns are scoped correctly: only the limiting rate-limit window (not
+  the whole account) is cooled down, only 503/529 responses are treated as
+  provider overload, and the dashboard's global-cooldown badge reflects an
+  account-wide block rather than a single bucket's state.
+- OpenAI/Codex cooldowns learned purely from response headers (no
+  accompanying rate-limit snapshot) are now actually enforced by the pool
+  instead of being recorded but ignored.
+- Named Codex rate-limit buckets recover their primary and secondary windows
+  independently as each expires, instead of staying blocked until every
+  window on the bucket clears.
+- OpenAI accounts' `sessionLimitPercent`/`weeklyLimitPercent` caps can now be
+  set on creation (`POST /cc-router/accounts`) and updated afterward
+  (`PATCH /cc-router/accounts/:id`), and the dashboard's cap-editing keys
+  (`w`/`s`) work for OpenAI accounts the same way they do for Claude accounts.
+- The dashboard now shows `LIMITED` for an OpenAI account that is hard-blocked
+  from routing (account-wide rate limit, or its default usage window fully
+  exhausted), instead of a misleading green `ok` dot.
+- Upstream response headers that describe the upstream's own transport
+  (`content-encoding`, `set-cookie`) are no longer relayed verbatim to the
+  client, which could otherwise mismatch the body cc-router actually sends.
+- Recent-activity accounting distinguishes a local 502 from a genuine 200,
+  so a failed upstream call is no longer counted as a successful request.
 
 ---
 
