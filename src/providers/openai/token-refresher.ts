@@ -63,7 +63,17 @@ export async function prepareOpenAIAccountForRequest(
   if (!needsOpenAIRefresh(account)) return true;
 
   const ok = await refreshOpenAISubscriptionToken(account);
-  if (ok) saveAccounts(allAccounts);
+  if (ok) {
+    // The refreshed token is already live in memory, so a persistence failure
+    // must not fail this request — it only means the new token isn't on disk
+    // yet (the next successful save re-syncs it). Throwing here would turn a
+    // usable token into a client-facing 401.
+    try {
+      saveAccounts(allAccounts);
+    } catch (error) {
+      console.error(error);
+    }
+  }
   return ok;
 }
 
@@ -111,6 +121,13 @@ async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
     // exactly like a non-ok HTTP response — never propagate as a rejection.
     return false;
   }
+
+  // A 200 with an unusable payload is a failed refresh, not a successful one.
+  // Writing it through would leave `expiresAt` as NaN, which then reads as
+  // "never needs refreshing" in `needsOpenAIRefresh` and permanently strands
+  // the account on a broken token.
+  if (typeof data?.access_token !== "string" || data.access_token.length === 0) return false;
+  if (typeof data.expires_in !== "number" || !Number.isFinite(data.expires_in)) return false;
 
   account.accessToken = data.access_token;
   account.refreshToken = data.refresh_token ?? account.refreshToken;

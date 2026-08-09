@@ -32,11 +32,21 @@ export interface DeleteAnthropicAccountOptions {
   persist(accounts: Account[]): void;
 }
 
-export interface DeleteOpenAIAccountOptions {
+export interface DeleteOpenAIAccountOptions<
+  TAccount extends OpenAISubscriptionAccount = OpenAISubscriptionAccount,
+> {
   id: string;
-  accounts: OpenAISubscriptionAccount[];
+  accounts: TAccount[];
   otherAccountCount: number;
-  persist(accounts: OpenAISubscriptionAccount[]): void;
+  persist(accounts: TAccount[]): void;
+  /**
+   * Drop the removed account's pool-side routing state (in-flight counts,
+   * cooldowns). Without it those entries outlive the account and a re-added
+   * account reusing the id inherits them.
+   */
+  forgetAccount?(account: TAccount): void;
+  /** Discard sticky session bindings that still point at the removed account. */
+  invalidateAccount?(id: string): void;
 }
 
 /** Persist prospective state before irreversibly removing runtime routing state. */
@@ -68,10 +78,12 @@ export async function deleteAnthropicAccountTransaction(
   }
 }
 
-/** Persist prospective OpenAI state before removing it from the live picker array. */
-export function deleteOpenAIAccountTransaction(
-  options: DeleteOpenAIAccountOptions,
-): OpenAISubscriptionAccount {
+/** Persist prospective OpenAI state before removing it from the live pool array. */
+export function deleteOpenAIAccountTransaction<
+  TAccount extends OpenAISubscriptionAccount,
+>(
+  options: DeleteOpenAIAccountOptions<TAccount>,
+): TAccount {
   const account = options.accounts.find(candidate => candidate.id === options.id);
   if (!account) throw new Error(`Account "${options.id}" not found`);
   if (options.accounts.length + options.otherAccountCount <= 1) {
@@ -84,5 +96,9 @@ export function deleteOpenAIAccountTransaction(
   const index = options.accounts.indexOf(account);
   if (index < 0) throw new AccountDeletionConflictError(options.id);
   options.accounts.splice(index, 1);
+  // Only after the account is out of the live array — mirrors the Anthropic
+  // transaction, which removes pool state and then invalidates bindings.
+  options.forgetAccount?.(account);
+  options.invalidateAccount?.(options.id);
   return account;
 }

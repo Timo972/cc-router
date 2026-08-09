@@ -146,7 +146,12 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
       const windowRecovered = sweepCodexRateLimits(account, now);
       const cooldownRecovered = this.clearExpiredCooldownState(account);
 
-      if (account.rateLimits.status === "rate_limited" && !this.isCoolingDown(account.id)) {
+      // Read the account's global cooldown directly: the account object is
+      // already in hand here, so going through isCoolingDown() would re-scan
+      // the pool by id and rebuild the sorted public cooldown view once per
+      // account, making this sweep quadratic for no gain.
+      const globalUntil = this.cooldowns.get(account)?.globalUntil ?? 0;
+      if (account.rateLimits.status === "rate_limited" && globalUntil <= 0) {
         const defaultBucket = account.rateLimits.buckets.get(DEFAULT_CODEX_LIMIT_ID);
         const exhausted = [defaultBucket?.primary, defaultBucket?.secondary]
           .some(window => window !== undefined && window.utilization >= 1);
@@ -158,6 +163,26 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
 
   findById(id: string): OpenAIAccount | null {
     return this.accounts.find(account => account.id === id) ?? null;
+  }
+
+  /**
+   * Drop every piece of per-account routing state after the account has been
+   * removed from the shared `accounts` array. The array splice itself is owned
+   * by the deletion transaction (it persists a prospective state first), so
+   * this only clears what the pool holds on the side.
+   *
+   * Without this, `createLease`'s release guard (`findById(id) !== account`)
+   * means an in-flight request on a deleted account never decrements its
+   * counter, and re-adding the same id inherits a phantom in-flight count that
+   * permanently deprioritizes it in `selectEligible`. Mirrors the cleanup in
+   * the Anthropic `TokenPool.removeAccount`.
+   */
+  forgetAccount(account: OpenAIAccount): void {
+    this.cooldowns.delete(account);
+    this.inFlight.delete(account.id);
+    this.currentIndex = this.accounts.length === 0
+      ? 0
+      : this.currentIndex % this.accounts.length;
   }
 
   getAll(): OpenAIAccount[] {

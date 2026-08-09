@@ -461,6 +461,42 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     expect(activity.some(entry => entry.type === "error" && entry.statusCode === 401)).toBe(true);
   });
 
+  it("fails a session over to another account after a token refresh failure", async () => {
+    const forward = vi.fn().mockResolvedValue(new Response("{}", {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    // Only the first account's refresh is broken; the second is healthy.
+    const prepare = vi.fn(async (account: OpenAIAccount) => account.id !== "openai-broken");
+    const { app, openAIPool } = mountWithPool(
+      [makeRuntimeAccount("openai-broken"), makeRuntimeAccount("openai-good")],
+      forward,
+      { prepareOpenAIAccount: prepare },
+    );
+
+    await withServer(app, async baseUrl => {
+      const send = () => fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json", session_id: "session-failover" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      // The pool ranks the broken account first, so the sticky session binds
+      // to it and gets a local 401.
+      const first = await send();
+      expect(first.status).toBe(401);
+
+      // Without binding invalidation + cooldown the session would stay pinned
+      // to the broken account and 401 forever.
+      const second = await send();
+      expect(second.status).toBe(200);
+    });
+
+    expect(openAIPool.getGlobalCooldownUntil("openai-broken")).toBeGreaterThan(0);
+    expect(forward).toHaveBeenCalledOnce();
+    expect(forward.mock.calls[0][0].account.id).toBe("openai-good");
+  });
+
   it("returns a local 500 proxy_error when routing itself throws unexpectedly (F1c)", async () => {
     const app = express();
     const openAIPool = new OpenAITokenPool([makeRuntimeAccount("openai-victor")]);

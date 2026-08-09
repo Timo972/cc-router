@@ -8,7 +8,11 @@ import { encodeSseEvent, parseSseLines } from "../protocol/sse.js";
 import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.js";
 import type { AnthropicMessagesRequest } from "../protocol/anthropic-types.js";
 import type { OpenAIResponseCompleted } from "../protocol/openai-responses-types.js";
-import { usageFromResponseBody, type CodexUsageTotals } from "../protocol/openai-responses-collect.js";
+import {
+  usageFromCompletedEvent,
+  usageFromResponseBody,
+  type CodexUsageTotals,
+} from "../protocol/openai-responses-collect.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 import type { RouteContext } from "./types.js";
 import { extractAnthropicRouteContext } from "./request-model.js";
@@ -56,46 +60,81 @@ function isAnthropicMessagesRequest(value: unknown): value is AnthropicMessagesR
   );
 }
 
+/**
+ * Relay an upstream Codex response in Anthropic Messages shape and report the
+ * status the client actually received — which is not always `upstream.status`:
+ * the Codex backend signals in-stream failures as a `response.failed`/`error`
+ * SSE event on an HTTP 200, and those must not be reported as success.
+ */
 async function sendOpenAIAsAnthropic(
   upstream: globalThis.Response,
   res: Response,
   requestedStream: boolean,
-  onUsage?: (usage: CodexUsageTotals | undefined) => void,
-): Promise<void> {
+  entry: LogEntry,
+): Promise<number> {
+  const onUsage = (usage: CodexUsageTotals | undefined) => applyCodexUsage(entry, usage);
   const contentType = upstream.headers.get("content-type") ?? "";
   if (contentType.includes("text/event-stream")) {
     if (requestedStream) {
-      await sendOpenAIStreamAsAnthropic(upstream, res, onUsage);
-      return;
+      // Headers are already flushed by the time a mid-stream failure surfaces,
+      // so the client keeps the partial stream; reporting 502 here keeps the
+      // activity log and error totals honest about what happened.
+      const failure = await sendOpenAIStreamAsAnthropic(upstream, res, onUsage);
+      return failure === undefined ? upstream.status : 502;
     }
 
     const collected = await collectOpenAIStreamAsAnthropicMessage(upstream);
-    onUsage?.(collected.usage);
+    onUsage(collected.usage);
+    if (collected.failure !== undefined) {
+      // Mirrors collectCodexResponseStream on the /v1/responses path: a stream
+      // that ended in failure is a 502, never an empty 200 "success".
+      res.status(502).json({
+        type: "error",
+        error: { type: "upstream_error", message: collected.failure },
+      });
+      return 502;
+    }
     res.status(upstream.status).json(collected.message);
-    return;
+    return upstream.status;
   }
 
   if (!contentType.includes("application/json")) {
     res.status(upstream.status);
     res.setHeader("content-type", contentType || "text/plain");
     res.send(await upstream.text());
-    return;
+    return upstream.status;
   }
 
   const json = await upstream.json() as OpenAIResponseCompleted;
-  onUsage?.(usageFromResponseBody(json));
+  // An upstream failure body is not a Responses payload — translating it would
+  // hand the client an empty `type:"message"` envelope instead of an error.
+  if (!upstream.ok) {
+    const message = (json as { error?: { message?: unknown } }).error?.message;
+    res.status(upstream.status).json({
+      type: "error",
+      error: {
+        type: upstream.status === 429 ? "rate_limit_error" : "upstream_error",
+        message: typeof message === "string" && message ? message : `Upstream returned ${upstream.status}`,
+      },
+    });
+    return upstream.status;
+  }
+  onUsage(usageFromResponseBody(json));
   res.status(upstream.status).json(openAIResponseToAnthropicMessage(json));
+  return upstream.status;
 }
 
 async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Response): Promise<{
   message: ReturnType<typeof openAIResponseToAnthropicMessage>;
   usage: CodexUsageTotals | undefined;
+  failure: string | undefined;
 }> {
   const reader = upstream.body?.getReader();
   if (!reader) {
     return {
       message: openAIResponseToAnthropicMessage({ id: "", model: "", output: [], usage: {} }),
       usage: undefined,
+      failure: undefined,
     };
   }
 
@@ -104,6 +143,7 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
   let id = "";
   let model = "";
   let text = "";
+  let failure: string | undefined;
   let usage: OpenAIResponseCompleted["usage"] = {};
 
   const applyEvent = (event: unknown) => {
@@ -111,12 +151,24 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
     const openAIEvent = event as {
       type?: string;
       delta?: string;
+      error?: { message?: string };
       response?: {
         id?: string;
         model?: string;
+        error?: { message?: string };
         usage?: OpenAIResponseCompleted["usage"];
       };
     };
+
+    if (openAIEvent.type === "response.failed") {
+      failure = openAIEvent.response?.error?.message ?? "Response failed";
+      return;
+    }
+
+    if (openAIEvent.type === "error") {
+      failure = openAIEvent.error?.message ?? "Upstream error event";
+      return;
+    }
 
     if (openAIEvent.type === "response.created") {
       id = openAIEvent.response?.id ?? id;
@@ -140,14 +192,14 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
     const { value, done } = await reader.read();
     if (done) break;
 
-    const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }));
+    const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }), { tolerant: true });
     remainder = parsed.remainder;
     parsed.events.forEach(applyEvent);
   }
 
   const tail = decoder.decode();
   if (tail || remainder) {
-    parseSseLines(remainder + tail + "\n").events.forEach(applyEvent);
+    parseSseLines(remainder + tail + "\n", { tolerant: true }).events.forEach(applyEvent);
   }
 
   return {
@@ -162,14 +214,16 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
       usage,
     }),
     usage: usageFromResponseBody({ usage }),
+    failure,
   };
 }
 
+/** Returns the upstream failure message when the stream ended in one. */
 async function sendOpenAIStreamAsAnthropic(
   upstream: globalThis.Response,
   res: Response,
   onUsage?: (usage: CodexUsageTotals | undefined) => void,
-): Promise<void> {
+): Promise<string | undefined> {
   res.status(upstream.status);
   res.setHeader("content-type", "text/event-stream");
   res.setHeader("cache-control", "no-cache");
@@ -179,17 +233,36 @@ async function sendOpenAIStreamAsAnthropic(
   const reader = upstream.body?.getReader();
   if (!reader) {
     res.end();
-    return;
+    return undefined;
   }
 
   const decoder = new TextDecoder();
   let remainder = "";
+  // Usage is applied once, after the stream ends: `applyCodexUsage`
+  // accumulates into the process-wide totals, so calling it per
+  // `response.completed` event would double-count a stream that carried more
+  // than one. Mirrors `createCodexUsageObserver`'s finish()-once contract.
+  let totals: CodexUsageTotals | undefined;
+  let failure: string | undefined;
 
-  const captureUsage = (event: unknown): void => {
+  const inspect = (event: unknown): void => {
+    totals = usageFromCompletedEvent(event) ?? totals;
     if (typeof event !== "object" || event === null) return;
-    const typed = event as { type?: unknown; response?: unknown };
-    if (typed.type !== "response.completed") return;
-    onUsage?.(usageFromResponseBody(typed.response));
+    const typed = event as { type?: unknown; error?: { message?: string }; response?: { error?: { message?: string } } };
+    if (typed.type === "response.failed") {
+      failure = typed.response?.error?.message ?? "Response failed";
+    } else if (typed.type === "error") {
+      failure = typed.error?.message ?? "Upstream error event";
+    }
+  };
+
+  const relayEvents = (events: unknown[]): void => {
+    for (const event of events) {
+      inspect(event);
+      for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
+        res.write(encodeSseEvent(mapped));
+      }
+    }
   };
 
   try {
@@ -197,29 +270,23 @@ async function sendOpenAIStreamAsAnthropic(
       const { value, done } = await reader.read();
       if (done) break;
 
-      const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }));
+      // Tolerant: one malformed frame must not abort the relay (which would
+      // silently truncate the client's stream) nor discard the valid events
+      // decoded from the same chunk.
+      const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }), { tolerant: true });
       remainder = parsed.remainder;
-      for (const event of parsed.events) {
-        captureUsage(event);
-        for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
-          res.write(encodeSseEvent(mapped));
-        }
-      }
+      relayEvents(parsed.events);
     }
 
     const tail = decoder.decode();
     if (tail || remainder) {
-      const parsed = parseSseLines(remainder + tail + "\n");
-      for (const event of parsed.events) {
-        captureUsage(event);
-        for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
-          res.write(encodeSseEvent(mapped));
-        }
-      }
+      relayEvents(parseSseLines(remainder + tail + "\n", { tolerant: true }).events);
     }
   } finally {
     res.end();
+    onUsage?.(totals);
   }
+  return failure;
 }
 
 export function mountMessagesCrossProviderRoute(
@@ -277,8 +344,8 @@ export function mountMessagesCrossProviderRoute(
         envelope: MESSAGES_ENVELOPE,
         onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
         relay: async (upstream, res, entry) => {
-          await sendOpenAIAsAnthropic(upstream, res, requestedStream, usage => applyCodexUsage(entry, usage));
-          return { statusCode: upstream.status };
+          const statusCode = await sendOpenAIAsAnthropic(upstream, res, requestedStream, entry);
+          return { statusCode };
         },
       });
     },

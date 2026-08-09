@@ -423,7 +423,16 @@ function publicOpenAIAccountView(
 
 function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView): PublicCodexRateLimits {
   const rl = a.rateLimits;
-  const buckets = [...rl.buckets.values()]
+  // A bucket cooldown can exist without any snapshot for that bucket: a
+  // header-only 429 (an `x-codex-active-limit` with no accompanying
+  // rate-limit headers) sets a cooldown the pool enforces in `hardBlock`.
+  // Synthesizing a window-less entry for those keeps the health view honest —
+  // otherwise the account renders fully available while it is actually being
+  // skipped for that model.
+  const cooldownOnly: CodexLimitBucket[] = cooldowns.bucketCooldowns
+    .filter(cooldown => !rl.buckets.has(cooldown.limitId))
+    .map(cooldown => ({ limitId: cooldown.limitId }));
+  const buckets = [...rl.buckets.values(), ...cooldownOnly]
     .sort((left, right) =>
       left.limitId === DEFAULT_CODEX_LIMIT_ID ? -1
         : right.limitId === DEFAULT_CODEX_LIMIT_ID ? 1
@@ -589,15 +598,26 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   };
   const openAIPool = new OpenAITokenPool(openAIAccounts);
   const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
-  const resolveOpenAIRouting = (accountId: string) => ({
-    metrics: {
-      inFlightRequests: openAIPool.getInFlight(accountId),
-      activeSessions: openAIRouter.getActiveSessionCountsSnapshot().get(accountId) ?? 0,
-      coolingDown: openAIPool.isCoolingDown(accountId),
-      cooldownUntilMs: openAIPool.getGlobalCooldownUntil(accountId),
-    },
-    cooldowns: openAIPool.getCooldownView(accountId),
-  });
+  // Factory, mirroring `createRoutingMetricsResolver`: the active-session
+  // snapshot is taken once per request rather than rebuilt (sweeping every
+  // binding and copying the map) for each account, and the cooldown view is
+  // computed once per account instead of three times.
+  const createOpenAIRoutingResolver = () => {
+    const activeSessionCounts = openAIRouter.getActiveSessionCountsSnapshot();
+    return (accountId: string) => {
+      const cooldowns = openAIPool.getCooldownView(accountId);
+      return {
+        metrics: {
+          inFlightRequests: openAIPool.getInFlight(accountId),
+          activeSessions: activeSessionCounts.get(accountId) ?? 0,
+          coolingDown: cooldowns.globalUntilMs > 0,
+          cooldownUntilMs: cooldowns.globalUntilMs,
+        },
+        cooldowns,
+      };
+    };
+  };
+  const resolveOpenAIRouting = (accountId: string) => createOpenAIRoutingResolver()(accountId);
   const initialConfig = readConfig();
   const modelRouting = initialConfig.modelRouting ?? {};
 
@@ -686,7 +706,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       pool.getAll(),
       openAIAccounts,
       resolveRoutingMetrics,
-      resolveOpenAIRouting,
+      createOpenAIRoutingResolver(),
     );
     const status = accountViews.some(a => a.healthy) ? "ok" : "degraded";
 
@@ -734,7 +754,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         pool.getAll(),
         openAIAccounts,
         resolveRoutingMetrics,
-        resolveOpenAIRouting,
+        createOpenAIRoutingResolver(),
       ),
     });
   });
@@ -783,12 +803,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     applyRuntime(enabled);
     try {
+      const isAnthropic = provider === "anthropic_subscription";
       const changed = persistProviderEnabledState({
         provider,
         enabled,
-        accountIds: pool.getAll().map(account => account.id),
+        accountIds: isAnthropic
+          ? pool.getAll().map(account => account.id)
+          : openAIAccounts.map(account => account.id),
         persist: () => setProviderAccountsEnabled(provider, enabled, accountsPath),
-        invalidateAccount: accountId => sessionRouter.invalidateAccount(accountId),
+        invalidateAccount: accountId => (isAnthropic ? sessionRouter : openAIRouter)
+          .invalidateAccount(accountId),
       });
       res.json({ provider, enabled, changed });
     } catch (err) {
@@ -883,6 +907,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       res.status(404).json({ error: `Account "${id}" not found` });
       return;
     }
+    // Same contract as the Anthropic branch above: disabling an account drops
+    // its sticky bindings immediately instead of leaving them (and their
+    // active-session counts) attributed to it until the binding TTL expires.
+    if (patch.enabled === false) openAIRouter.invalidateAccount(id);
     res.json({
       account: publicOpenAIAccountView(updatedOpenAI, resolveOpenAIRouting(updatedOpenAI.id)),
     });
@@ -900,6 +928,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     if (typeof body.id !== "string" || typeof body.accessToken !== "string" ||
         typeof body.refreshToken !== "string" || typeof body.expiresAt !== "number") {
       res.status(400).json({ error: "Invalid field types on account record" });
+      return;
+    }
+    // Same cap validation the PATCH endpoint applies, so the two writers of
+    // these fields agree instead of POST silently clamping a bad value to 100.
+    const capValidation = validateAccountPatchBody({
+      sessionLimitPercent: body.sessionLimitPercent,
+      weeklyLimitPercent: body.weeklyLimitPercent,
+    });
+    if (!capValidation.ok) {
+      res.status(400).json({ error: capValidation.error });
       return;
     }
     // IDs are unique across providers, so a new account may not collide with an
@@ -977,11 +1015,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     if (openAIExisting && !existing) {
       try {
-        deleteOpenAIAccountTransaction({
+        deleteOpenAIAccountTransaction<OpenAIAccount>({
           id,
           accounts: openAIAccounts,
           otherAccountCount: pool.getAll().length,
           persist: saveOpenAIAccounts,
+          forgetAccount: account => openAIPool.forgetAccount(account),
+          invalidateAccount: accountId => { openAIRouter.invalidateAccount(accountId); },
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

@@ -183,7 +183,8 @@ export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" |
 }
 
 function codexWindowLabel(windowMinutes: number, fallback: "5h" | "weekly"): string {
-  if (windowMinutes === 300) return "5h";
+  // 10_080 minutes reads better as "weekly" than the generic "168h"; 300 needs
+  // no special case because the generic branch already renders it as "5h".
   if (windowMinutes === 10_080) return "weekly";
   if (windowMinutes > 0) {
     return windowMinutes % 60 === 0 ? `${windowMinutes / 60}h` : `${windowMinutes}m`;

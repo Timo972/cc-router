@@ -83,6 +83,7 @@ export type RouteFailureReason =
   | "token-invalid"
   | "rate-limited"
   | "service-overloaded"
+  | "upstream-error"
   | "proxy-error";
 
 /** Retain bounded routing context when a later failure updates the log. */

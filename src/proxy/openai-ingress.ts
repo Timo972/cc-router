@@ -16,6 +16,14 @@ import { acquireRequestRoute, routeReasonDetails, routeFailureDetails } from "./
 export type ForwardOpenAI = typeof forwardOpenAICodexResponse;
 
 /**
+ * Cooldown applied when a *local* token refresh fails. Matches the upstream-401
+ * cooldown in `failure-routing.ts`: a refresh that cannot produce a usable token
+ * is an auth failure, and without a cooldown the pool would immediately hand the
+ * same account back to the next request.
+ */
+const REFRESH_FAILURE_COOLDOWN_MS = 30_000;
+
+/**
  * Response headers that must never be mirrored to the local client when
  * relaying an upstream response verbatim:
  *  - hop-by-hop headers (content-length, transfer-encoding, connection,
@@ -98,10 +106,15 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     selected = acquireRequestRoute(sessionKey, res, openAIRouter, { requestedModel });
   } catch (error) {
     if (error instanceof EmptyPoolError) {
+      stats.totalErrors++;
       res.status(503).json(envelope.wrap("no_accounts", "No OpenAI subscription accounts are configured"));
       return;
     }
     if (error instanceof NoEligibleAccountError) {
+      // Local rejections are client-facing failures and must show up in the
+      // shared error total, exactly as the Anthropic routing middleware counts
+      // its own no-eligible-account rejections.
+      stats.totalErrors++;
       recordActivity(createLocalRoutingErrorLog(error.reason, requestedModel));
       envelope.sendNoEligible(error, res, now());
       return;
@@ -140,10 +153,20 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   if (!ready) {
     selected.release();
     account.errorCount++;
+    stats.totalErrors++;
     // Intentionally does not touch `account.healthy`: a single failed
     // refresh fails only this request. Disabling the account here would
     // hard-block it from every future request until a manual recovery, even
     // though the very next request naturally retries the refresh.
+    //
+    // It must, however, break session affinity and cool the account down.
+    // A sticky binding survives this failure, so without both the session
+    // would re-acquire the same broken account on every retry and never fail
+    // over — 401ing forever while healthy accounts sit idle.
+    if (selected.route.sessionId !== undefined && selected.route.bindingGeneration !== undefined) {
+      openAIRouter.invalidate(selected.route.sessionId, account.id, selected.route.bindingGeneration);
+    }
+    openAIPool.setGlobalCooldownForAccount(account, REFRESH_FAILURE_COOLDOWN_MS);
     recordActivity({
       ts: now(),
       accountId: account.id,
@@ -210,7 +233,13 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       );
       details = routeFailureDetails(
         selected.route,
-        upstream.status === 401 ? "token-invalid" : upstream.status === 429 ? "rate-limited" : "service-overloaded",
+        upstream.status === 401 ? "token-invalid"
+          : upstream.status === 429 ? "rate-limited"
+          // Only 503/529 are treated as upstream overload for cooldown
+          // purposes; labelling an isolated 500/502/504 "service-overloaded"
+          // would contradict the routing decision actually taken.
+          : upstream.status === 503 || upstream.status === 529 ? "service-overloaded"
+          : "upstream-error",
         applied.limitingScope,
       );
       if (upstream.status === 401) onUpstreamAuthFailure?.(account);

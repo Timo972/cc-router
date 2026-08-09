@@ -436,6 +436,71 @@ describe("mountMessagesCrossProviderRoute crash safety (F1)", () => {
 
     expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
   });
+
+  it("turns an upstream response.failed on a 200 SSE stream into a 502, not an empty success", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n"
+      + "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"model overloaded\"}}}\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "model overloaded" },
+      });
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
+  it("relays an upstream JSON failure body as an Anthropic error envelope", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      JSON.stringify({ error: { message: "rate limit reached" } }),
+      { status: 429, headers: { "content-type": "application/json" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+
+      expect(res.status).toBe(429);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "rate_limit_error", message: "rate limit reached" },
+      });
+    });
+  });
+
+  it("keeps relaying valid events when a malformed SSE frame shares the chunk", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n"
+      + "data: not-json\n\n"
+      + "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
+      + "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      const body = await res.text();
+
+      expect(res.status).toBe(200);
+      // The malformed frame is skipped; the surrounding valid events survive.
+      expect(body).toContain("message_start");
+      expect(body).toContain("hello");
+      expect(body).toContain("message_stop");
+    });
+
+    const routed = activity.find(entry => entry.path === "/v1/messages");
+    expect(routed?.inputTokens).toBe(7);
+    expect(routed?.outputTokens).toBe(3);
+  });
 });
 
 describe("messages cross-route sticky routing", () => {

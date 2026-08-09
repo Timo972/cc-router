@@ -203,4 +203,39 @@ describe("OpenAITokenPool leases", () => {
     pool.setGlobalCooldownForAccount(a, 60_000);
     expect(pool.tryAcquire("a")).toBeNull();
   });
+
+  it("forgetAccount clears in-flight state so a re-added id starts clean", () => {
+    const a = makeAccount("a");
+    const b = makeAccount("b");
+    const accounts = [a, b];
+    const pool = new OpenAITokenPool(accounts, { now: () => NOW_MS });
+
+    const lease = pool.acquireBest(new Map());
+    expect(pool.getInFlight(lease.account.id)).toBe(1);
+
+    // Delete mid-flight, exactly as deleteOpenAIAccountTransaction does.
+    accounts.splice(accounts.indexOf(lease.account), 1);
+    pool.forgetAccount(lease.account);
+    // The lease's own release() no-ops now that the account is gone, so the
+    // counter must already have been cleared by forgetAccount.
+    lease.release();
+
+    expect(pool.getInFlight(lease.account.id)).toBe(0);
+  });
+
+  it("forgetAccount drops the removed account's cooldown state", () => {
+    const a = makeAccount("a");
+    const b = makeAccount("b");
+    const accounts = [a, b];
+    const pool = new OpenAITokenPool(accounts, { now: () => NOW_MS });
+
+    pool.setGlobalCooldownForAccount(a, 60_000);
+    expect(pool.getGlobalCooldownUntil("a")).toBeGreaterThan(0);
+
+    accounts.splice(0, 1);
+    pool.forgetAccount(a);
+
+    expect(pool.getGlobalCooldownUntil("a")).toBe(0);
+    expect(pool.getCooldownView("a")).toEqual({ globalUntilMs: 0, bucketCooldowns: [] });
+  });
 });

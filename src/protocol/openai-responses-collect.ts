@@ -107,6 +107,19 @@ export function usageFromResponseBody(body: unknown): CodexUsageTotals | undefin
 }
 
 /**
+ * Extract usage totals from a `response.completed` SSE event, or `undefined`
+ * for any other event. Single definition shared by every streaming ingress so
+ * `/v1/responses` and `/v1/messages` can never report different token totals
+ * for the same stream.
+ */
+export function usageFromCompletedEvent(event: unknown): CodexUsageTotals | undefined {
+  if (typeof event !== "object" || event === null) return undefined;
+  const typed = event as { type?: unknown; response?: unknown };
+  if (typed.type !== "response.completed") return undefined;
+  return usageFromResponseBody(typed.response);
+}
+
+/**
  * Passive usage reader for the byte-transparent streaming path: it only
  * observes chunks that are already being piped downstream unchanged.
  */
@@ -119,29 +132,18 @@ export function createCodexUsageObserver(): {
   let totals: CodexUsageTotals | undefined;
 
   const applyEvent = (event: unknown): void => {
-    if (typeof event !== "object" || event === null) return;
-    const typed = event as {
-      type?: unknown;
-      response?: { usage?: { input_tokens?: unknown; output_tokens?: unknown; input_tokens_details?: { cached_tokens?: unknown } } };
-    };
-    if (typed.type !== "response.completed") return;
-    const usage = typed.response?.usage;
-    if (usage === undefined || typeof usage !== "object") return;
-    totals = {
-      inputTokens: usageNumber(usage.input_tokens),
-      cachedInputTokens: usageNumber(usage.input_tokens_details?.cached_tokens),
-      outputTokens: usageNumber(usage.output_tokens),
-    };
+    totals = usageFromCompletedEvent(event) ?? totals;
   };
 
   return {
     push(chunk: Uint8Array): void {
       // Best-effort: a malformed SSE frame from upstream must never throw
       // here. This observer only watches bytes that are already being
-      // relayed to the client verbatim — a parse failure just means usage
-      // for this chunk goes uncaptured, never that the response breaks.
+      // relayed to the client verbatim — a parse failure just means that one
+      // frame goes uncaptured, never that the response breaks. Tolerant
+      // parsing keeps the rest of the chunk's valid events.
       try {
-        const parsed = parseSseLines(remainder + decoder.decode(chunk, { stream: true }));
+        const parsed = parseSseLines(remainder + decoder.decode(chunk, { stream: true }), { tolerant: true });
         remainder = parsed.remainder;
         parsed.events.forEach(applyEvent);
       } catch {
@@ -151,7 +153,9 @@ export function createCodexUsageObserver(): {
     finish(): CodexUsageTotals | undefined {
       try {
         const tail = decoder.decode();
-        if (tail || remainder) parseSseLines(remainder + tail + "\n").events.forEach(applyEvent);
+        if (tail || remainder) {
+          parseSseLines(remainder + tail + "\n", { tolerant: true }).events.forEach(applyEvent);
+        }
       } catch {
         // swallow — passive observer, see comment above
       }

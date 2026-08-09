@@ -40,7 +40,6 @@ describe("persistProviderEnabledState", () => {
 
   it.each([
     ["anthropic_subscription", true],
-    ["openai_subscription", false],
     ["openai_subscription", true],
   ] as const)("does not invalidate for provider %s with enabled=%s", (provider, enabled) => {
     const invalidateAccount = vi.fn();
@@ -52,6 +51,37 @@ describe("persistProviderEnabledState", () => {
       persist: () => 1,
       invalidateAccount,
     });
+
+    expect(invalidateAccount).not.toHaveBeenCalled();
+  });
+
+  // Both providers now own a SessionRouter, so disabling either must drop that
+  // provider's sticky bindings; the caller supplies the matching account ids
+  // and invalidator.
+  it("invalidates OpenAI bindings after a successful disable", () => {
+    const invalidateAccount = vi.fn();
+
+    persistProviderEnabledState({
+      provider: "openai_subscription",
+      enabled: false,
+      accountIds: ["openai-a", "openai-b"],
+      persist: () => 1,
+      invalidateAccount,
+    });
+
+    expect(invalidateAccount.mock.calls).toEqual([["openai-a"], ["openai-b"]]);
+  });
+
+  it("does not invalidate OpenAI bindings when persistence fails", () => {
+    const invalidateAccount = vi.fn();
+
+    expect(() => persistProviderEnabledState({
+      provider: "openai_subscription",
+      enabled: false,
+      accountIds: ["openai-a"],
+      persist: () => { throw new Error("disk full"); },
+      invalidateAccount,
+    })).toThrow("disk full");
 
     expect(invalidateAccount).not.toHaveBeenCalled();
   });
