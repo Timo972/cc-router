@@ -388,6 +388,74 @@ describe("exception sanitization", () => {
     expect(JSON.stringify(result)).not.toContain(unrelatedCanary);
   });
 
+  it("drops project frames with UUID-shaped retained path segments from output and grouping", () => {
+    const firstUuid = "dd934345-a43a-4f98-844e-bd14d8080e9f";
+    const secondUuid = "3ae28467-dfd0-4f91-9998-c592ea0e2e7d";
+    const first = new Error("PRIVATE_PROJECT_UUID_A");
+    first.stack = [
+      "Error: PRIVATE_PROJECT_UUID_A",
+      `    at run (${PROJECT_ROOT}/dist/${firstUuid}/run.js:17:3)`,
+    ].join("\n");
+    const second = new Error("PRIVATE_PROJECT_UUID_B");
+    second.stack = [
+      "Error: PRIVATE_PROJECT_UUID_B",
+      `    at run (${PROJECT_ROOT}/dist/${secondUuid}/run.js:17:3)`,
+    ].join("\n");
+
+    const firstResult = sanitizeException(first, context, {
+      installationId: INSTALL_ID,
+      diagnosticId: DIAGNOSTIC_ID,
+    }, TRUSTED_SOURCE);
+    const secondResult = sanitizeException(second, context, {
+      installationId: INSTALL_ID,
+      diagnosticId: NEXT_DIAGNOSTIC_ID,
+    }, TRUSTED_SOURCE);
+
+    expect(firstResult?.frames).toEqual([]);
+    expect(secondResult?.frames).toEqual([]);
+    expect(firstResult?.fingerprint).toBe(secondResult?.fingerprint);
+    for (const canary of [firstUuid, secondUuid]) {
+      expect(firstResult?.error.stack).not.toContain(canary);
+      expect(secondResult?.error.stack).not.toContain(canary);
+      expect(JSON.stringify(firstResult)).not.toContain(canary);
+      expect(JSON.stringify(secondResult)).not.toContain(canary);
+    }
+  });
+
+  it("drops dependency frames with UUID-shaped retained path segments from output and grouping", () => {
+    const firstUuid = "6440847e-8ad3-484c-a759-684eadfed32c";
+    const secondUuid = "F43DDC3D-4CB8-46CC-9368-841245BE97EB";
+    const first = new Error("PRIVATE_DEPENDENCY_UUID_A");
+    first.stack = [
+      "Error: PRIVATE_DEPENDENCY_UUID_A",
+      `    at load (${PROJECT_ROOT}/node_modules/safe-package/cache/${firstUuid}/index.js:9:2)`,
+    ].join("\n");
+    const second = new Error("PRIVATE_DEPENDENCY_UUID_B");
+    second.stack = [
+      "Error: PRIVATE_DEPENDENCY_UUID_B",
+      `    at load (${PROJECT_ROOT}/node_modules/safe-package/cache/${secondUuid}/index.js:9:2)`,
+    ].join("\n");
+
+    const firstResult = sanitizeException(first, context, {
+      installationId: INSTALL_ID,
+      diagnosticId: DIAGNOSTIC_ID,
+    }, TRUSTED_SOURCE);
+    const secondResult = sanitizeException(second, context, {
+      installationId: INSTALL_ID,
+      diagnosticId: NEXT_DIAGNOSTIC_ID,
+    }, TRUSTED_SOURCE);
+
+    expect(firstResult?.frames).toEqual([]);
+    expect(secondResult?.frames).toEqual([]);
+    expect(firstResult?.fingerprint).toBe(secondResult?.fingerprint);
+    for (const canary of [firstUuid, secondUuid]) {
+      expect(firstResult?.error.stack).not.toContain(canary);
+      expect(secondResult?.error.stack).not.toContain(canary);
+      expect(JSON.stringify(firstResult)).not.toContain(canary);
+      expect(JSON.stringify(secondResult)).not.toContain(canary);
+    }
+  });
+
   it.each([
     undefined,
     { projectRoot: "relative/cc-router" },

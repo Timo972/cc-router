@@ -198,6 +198,7 @@ function safePathSegments(path: string): boolean {
   return segments.every((segment) => segment.length > 0
     && segment !== "."
     && segment !== ".."
+    && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment)
     && /^[0-9A-Za-z@._+~-]+$/.test(segment));
 }
 
