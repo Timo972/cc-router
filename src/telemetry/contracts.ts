@@ -240,7 +240,19 @@ export interface SafeStackFrame {
   column?: number;
 }
 
+/** Closed caller-supplied classification for an exception occurrence. */
+export interface SafeExceptionContext {
+  category: "setup" | "runtime";
+  reason: SetupReason;
+  operation?: Operation;
+  provider?: Provider;
+  setupStage?: SetupStage;
+  runtimeMode?: RuntimeMode;
+}
+
 export interface SafeExceptionContract {
+  /** The only Error object that may be passed to a remote exception client. */
+  error: Error;
   category: "setup" | "runtime";
   reason: SetupReason;
   errorKind: ErrorKind;

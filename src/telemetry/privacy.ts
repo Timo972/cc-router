@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   ANALYTICS_EVENT_NAMES,
   CPU_ARCHITECTURES,
@@ -9,6 +10,8 @@ import {
   MAX_ATTEMPT,
   MAX_CONCURRENCY,
   MAX_DURATION_MS,
+  MAX_STACK_FRAMES,
+  MAX_STACK_FRAME_PATH_LENGTH,
   MAX_TIMESTAMP_MS,
   MAX_TOKEN_COUNT,
   MAX_VERSION_LENGTH,
@@ -27,11 +30,13 @@ import {
   SPAN_KINDS,
   SPAN_STATUS_CODES,
   STREAM_OUTCOMES,
+  SYSTEM_ERROR_CODES,
 } from "./constants.js";
 import type {
   AnalyticsEventName,
   CpuArchitecture,
   DurationBucket,
+  ErrorKind,
   HttpMethod,
   InstallationId,
   InstrumentationScope,
@@ -44,6 +49,9 @@ import type {
   Route,
   RuntimeMode,
   SafeAnalyticsEvent,
+  SafeExceptionContract,
+  SafeExceptionContext,
+  SafeFingerprint,
   SafeLog,
   SafeResource,
   SafeRuntimeEventProperties,
@@ -52,6 +60,7 @@ import type {
   SafeSetupEventProperties,
   SafeSpan,
   SafeSpanAttributes,
+  SafeStackFrame,
   SetupMethod,
   SetupReason,
   SetupStage,
@@ -59,6 +68,7 @@ import type {
   SpanKind,
   SpanStatusCode,
   StreamOutcome,
+  SystemErrorCode,
   TrustedTelemetryIdentity,
   DiagnosticId,
 } from "./contracts.js";
@@ -148,6 +158,181 @@ function setupMethodForProvider(provider: "anthropic" | "openai", value: unknown
 
 function assignIfDefined<T extends object, K extends string, V>(target: T, key: K, value: V | undefined): void {
   if (value !== undefined) Object.assign(target, { [key]: value });
+}
+
+function ownDataProperty(input: object, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isErrorObject(input: unknown): input is Error {
+  try {
+    return input instanceof Error;
+  } catch {
+    return false;
+  }
+}
+
+function errorKind(input: Error): ErrorKind {
+  try {
+    if (typeof AggregateError !== "undefined" && input instanceof AggregateError) return "aggregate_error";
+    if (input instanceof TypeError) return "type_error";
+    if (input instanceof RangeError) return "range_error";
+    if (input instanceof ReferenceError) return "reference_error";
+    if (input instanceof SyntaxError) return "syntax_error";
+    if (input instanceof URIError) return "uri_error";
+    if (input instanceof EvalError) return "eval_error";
+  } catch {
+    return "error";
+  }
+  return "error";
+}
+
+function safePathSegments(path: string): boolean {
+  const segments = path.split("/");
+  return segments.every((segment) => segment.length > 0
+    && segment !== "."
+    && segment !== ".."
+    && /^[0-9A-Za-z@._+~-]+$/.test(segment));
+}
+
+function normalizedFramePath(rawPath: string): SafeStackFrame["path"] | undefined {
+  let path = rawPath.trim().replace(/\\/g, "/");
+  const openingParenthesis = path.lastIndexOf("(");
+  if (openingParenthesis >= 0) path = path.slice(openingParenthesis + 1);
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(path) && !path.startsWith("file://")) return undefined;
+  if (path.startsWith("file://")) path = path.slice("file://".length);
+  if (/[?#\u0000-\u001f\u007f]/.test(path)) return undefined;
+
+  const dependencyMarker = "/node_modules/";
+  const dependencyIndex = path.lastIndexOf(dependencyMarker);
+  if (dependencyIndex >= 0) {
+    const relative = path.slice(dependencyIndex + 1);
+    const segments = relative.split("/");
+    const packageSegmentCount = segments[1]?.startsWith("@") ? 2 : 1;
+    if (segments.length < packageSegmentCount + 2 || !safePathSegments(relative)) return undefined;
+    return relative.length <= MAX_STACK_FRAME_PATH_LENGTH
+      ? relative as SafeStackFrame["path"]
+      : undefined;
+  }
+
+  const projectMarker = "/dist/";
+  const projectIndex = path.lastIndexOf(projectMarker);
+  const relative = projectIndex >= 0
+    ? path.slice(projectIndex + 1)
+    : path.startsWith("dist/") ? path : undefined;
+  if (!relative || relative.length > MAX_STACK_FRAME_PATH_LENGTH || !safePathSegments(relative)) return undefined;
+  return relative as SafeStackFrame["path"];
+}
+
+function normalizedFrames(input: Error): readonly SafeStackFrame[] {
+  let stack: unknown;
+  try {
+    stack = input.stack;
+  } catch {
+    return [];
+  }
+  if (typeof stack !== "string") return [];
+
+  const frames: SafeStackFrame[] = [];
+  for (const line of stack.split("\n").slice(1)) {
+    if (frames.length >= MAX_STACK_FRAMES) break;
+    const match = line.match(/(?:\(|\bat\s+)(.+):(\d+):(\d+)\)?\s*$/);
+    if (!match) continue;
+    const path = normalizedFramePath(match[1]);
+    const frameLine = boundedInteger(Number(match[2]), Number.MAX_SAFE_INTEGER, 1);
+    const column = boundedInteger(Number(match[3]), Number.MAX_SAFE_INTEGER, 1);
+    if (!path || frameLine === undefined || column === undefined) continue;
+    frames.push({ path, line: frameLine, column });
+  }
+  return frames;
+}
+
+function sanitizedError(reason: SetupReason, frames: readonly SafeStackFrame[]): Error {
+  const error = new Error(reason);
+  error.stack = [
+    `Error: ${reason}`,
+    ...frames.map((frame) => `    at ${frame.path}${frame.line === undefined ? "" : `:${frame.line}`}${frame.column === undefined ? "" : `:${frame.column}`}`),
+  ].join("\n");
+  return error;
+}
+
+function fingerprint(
+  kind: ErrorKind,
+  context: SafeExceptionContext,
+  systemErrorCode: SystemErrorCode | undefined,
+  status: number | undefined,
+  frames: readonly SafeStackFrame[],
+): SafeFingerprint {
+  const safeInput = {
+    errorKind: kind,
+    category: context.category,
+    reason: context.reason,
+    operation: context.operation,
+    provider: context.provider,
+    setupStage: context.setupStage,
+    runtimeMode: context.runtimeMode,
+    systemErrorCode,
+    httpStatusCode: status,
+    frames,
+  };
+  return createHash("sha256").update(JSON.stringify(safeInput)).digest("hex") as SafeFingerprint;
+}
+
+function exceptionContext(input: unknown): SafeExceptionContext | undefined {
+  if (!isRecord(input)) return undefined;
+  const category = input.category === "setup" || input.category === "runtime" ? input.category : undefined;
+  const reason = otherEnum(SETUP_REASONS, input.reason) as SetupReason | undefined;
+  if (!category || !reason) return undefined;
+
+  const output: SafeExceptionContext = { category, reason };
+  assignIfDefined(output, "operation", member(OPERATIONS, input.operation) as Operation | undefined);
+  assignIfDefined(output, "provider", otherEnum(PROVIDERS, input.provider) as Provider | undefined);
+  assignIfDefined(output, "setupStage", member(SETUP_STAGES, input.setupStage) as SetupStage | undefined);
+  assignIfDefined(output, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode) as RuntimeMode | undefined);
+  return output;
+}
+
+/**
+ * Reconstruct an exception from closed safe values. No original Error object or
+ * arbitrary thrown-value property escapes this boundary.
+ */
+export function sanitizeException(
+  input: unknown,
+  candidateContext: unknown,
+  identity: TrustedTelemetryIdentity,
+): SafeExceptionContract | undefined {
+  const trustedInstallationId = installationId(identity);
+  if (!trustedInstallationId) return undefined;
+  const trustedDiagnosticId = diagnosticId(identity, trustedInstallationId);
+  const context = exceptionContext(candidateContext);
+  if (!trustedDiagnosticId || !context) return undefined;
+
+  const isError = isErrorObject(input);
+  const kind: ErrorKind = isError ? errorKind(input) : "unexpected_error";
+  const frames = isError ? normalizedFrames(input) : [];
+  const code = isError
+    ? member(SYSTEM_ERROR_CODES, ownDataProperty(input, "code")) as SystemErrorCode | undefined
+    : undefined;
+  const status = isError
+    ? httpStatusCode(ownDataProperty(input, "statusCode"))
+      ?? httpStatusCode(ownDataProperty(input, "status"))
+    : undefined;
+  const output: SafeExceptionContract = {
+    error: sanitizedError(context.reason, frames),
+    ...context,
+    errorKind: kind,
+    frames,
+    fingerprint: fingerprint(kind, context, code, status, frames),
+    diagnosticId: trustedDiagnosticId,
+  };
+  assignIfDefined(output, "systemErrorCode", code);
+  assignIfDefined(output, "httpStatusCode", status);
+  return output;
 }
 
 export function reconstructResource(
