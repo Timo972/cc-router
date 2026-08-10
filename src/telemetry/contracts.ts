@@ -51,10 +51,26 @@ export type LogEventCode = ValueOf<typeof LOG_EVENT_CODES>;
 export type AnalyticsEventName = ValueOf<typeof ANALYTICS_EVENT_NAMES>;
 export type SystemErrorCode = ValueOf<typeof SYSTEM_ERROR_CODES>;
 
+declare const installationIdBrand: unique symbol;
+declare const diagnosticIdBrand: unique symbol;
+
+export type InstallationId = string & { readonly [installationIdBrand]: true };
+export type DiagnosticId = string & { readonly [diagnosticIdBrand]: true };
+
+/**
+ * Identity values supplied outside the untrusted telemetry candidate. Callers
+ * source installationId from getTelemetrySnapshot() and create diagnosticId
+ * once per setup attempt or exception occurrence.
+ */
+export interface TrustedTelemetryIdentity {
+  installationId: string;
+  diagnosticId?: string;
+}
+
 export interface SafeResource {
   "service.name": "cc-router";
   "service.version": string;
-  "service.instance.id": string;
+  "service.instance.id": InstallationId;
   "process.runtime.version": string;
   "os.type": OsFamily;
   "host.arch": CpuArchitecture;
@@ -104,7 +120,7 @@ export interface SafeSetupDiagnosticAttributes {
   serviceVersion?: string;
   osFamily?: OsFamily;
   runtimeMode?: RuntimeMode;
-  diagnosticId?: string;
+  diagnosticId: DiagnosticId;
 }
 
 export interface SafeRuntimeFailureAttributes {
@@ -120,10 +136,11 @@ export interface SafeRuntimeFailureAttributes {
   serviceVersion?: string;
   osFamily?: OsFamily;
   runtimeMode?: RuntimeMode;
-  diagnosticId?: string;
+  diagnosticId?: DiagnosticId;
 }
 
 interface SafeLogBase {
+  scope: InstrumentationScope;
   severity: Severity;
   timestampMs: number;
   traceId?: string;
@@ -154,11 +171,11 @@ export interface SafeSetupEventProperties extends SafeRuntimeEventProperties {
   stage: SetupStage;
   reason?: SetupReason;
   durationBucket?: DurationBucket;
-  diagnosticId?: string;
+  diagnosticId: DiagnosticId;
 }
 
 interface SafeAnalyticsEventBase {
-  distinctId: string;
+  distinctId: InstallationId;
   processPersonProfile: false;
   disableGeoip: true;
 }
@@ -235,5 +252,5 @@ export interface SafeExceptionContract {
   runtimeMode?: RuntimeMode;
   frames: readonly SafeStackFrame[];
   fingerprint: SafeFingerprint;
-  diagnosticId: string;
+  diagnosticId: DiagnosticId;
 }

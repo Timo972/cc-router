@@ -8,9 +8,15 @@ import {
 
 const INSTALL_ID = "70d8062e-1fa0-4ae4-a115-bf782ecca462";
 const DIAGNOSTIC_ID = "ad94f035-1e08-4e29-8517-fd56bdc83d99";
+const ACCOUNT_UUID = "57b50aa2-fb24-40af-965b-cd5f2e506cdc";
+const SESSION_UUID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
 const TRACE_ID = "0123456789abcdef0123456789abcdef";
 const SPAN_ID = "0123456789abcdef";
 const PARENT_SPAN_ID = "fedcba9876543210";
+const trustedIdentity = {
+  installationId: INSTALL_ID,
+  diagnosticId: DIAGNOSTIC_ID,
+};
 
 const validResource = {
   serviceName: "cc-router",
@@ -19,7 +25,7 @@ const validResource = {
   osFamily: "macos",
   cpuArchitecture: "arm64",
   runtimeMode: "daemon",
-  serviceInstanceId: INSTALL_ID,
+  serviceInstanceId: ACCOUNT_UUID,
 };
 
 const validSpan = {
@@ -54,6 +60,7 @@ const validSpan = {
 };
 
 const validLog = {
+  scope: "cc-router",
   body: "account.setup.diagnostic",
   severity: "warn",
   timestampMs: 1_800_000_000_000,
@@ -70,13 +77,13 @@ const validLog = {
     serviceVersion: "0.8.2",
     osFamily: "macos",
     runtimeMode: "foreground",
-    diagnosticId: DIAGNOSTIC_ID,
+    diagnosticId: ACCOUNT_UUID,
   },
 };
 
 const validEvent = {
   event: "account_setup.failed",
-  distinctId: INSTALL_ID,
+  distinctId: SESSION_UUID,
   properties: {
     provider: "openai",
     method: "device_oauth",
@@ -86,13 +93,13 @@ const validEvent = {
     serviceVersion: "0.8.2",
     osFamily: "macos",
     runtimeMode: "foreground",
-    diagnosticId: DIAGNOSTIC_ID,
+    diagnosticId: SESSION_UUID,
   },
 };
 
 describe("closed telemetry reconstruction", () => {
   it("reconstructs only the approved resource attributes", () => {
-    const result = reconstructResource(validResource);
+    const result = reconstructResource(validResource, trustedIdentity);
 
     expect(result).toEqual({
       "service.name": "cc-router",
@@ -143,9 +150,10 @@ describe("closed telemetry reconstruction", () => {
   });
 
   it("reconstructs a fixed-code setup diagnostic log", () => {
-    const result = reconstructLog(validLog);
+    const result = reconstructLog(validLog, trustedIdentity);
 
     expect(result).toEqual({
+      scope: "cc-router",
       body: "account.setup.diagnostic",
       severity: "warn",
       timestampMs: 1_800_000_000_000,
@@ -170,7 +178,7 @@ describe("closed telemetry reconstruction", () => {
   });
 
   it("reconstructs a typed analytics event with privacy flags forced on", () => {
-    const result = reconstructAnalyticsEvent(validEvent);
+    const result = reconstructAnalyticsEvent(validEvent, trustedIdentity);
 
     expect(result).toEqual({
       event: "account_setup.failed",
@@ -196,11 +204,11 @@ describe("closed telemetry reconstruction", () => {
 
 describe("closed allowlists", () => {
   it.each([
-    ["resource", () => reconstructResource({ ...validResource, runtimeMode: "cron" })],
+    ["resource", () => reconstructResource({ ...validResource, runtimeMode: "cron" }, trustedIdentity)],
     ["span scope", () => reconstructSpan({ ...validSpan, scope: "unknown-library" })],
     ["span operation", () => reconstructSpan({ ...validSpan, operation: "/v1/messages/private" })],
-    ["log code", () => reconstructLog({ ...validLog, body: "user.supplied.message" })],
-    ["event name", () => reconstructAnalyticsEvent({ ...validEvent, event: "telemetry_disabled" })],
+    ["log code", () => reconstructLog({ ...validLog, body: "user.supplied.message" }, trustedIdentity)],
+    ["event name", () => reconstructAnalyticsEvent({ ...validEvent, event: "telemetry_disabled" }, trustedIdentity)],
   ])("drops a record with an unknown fixed %s", (_name, reconstruct) => {
     expect(reconstruct()).toBeUndefined();
   });
@@ -225,11 +233,11 @@ describe("closed allowlists", () => {
         reason: "private raw failure",
         outcome: "never-seen-before",
       },
-    });
+    }, trustedIdentity);
     const event = reconstructAnalyticsEvent({
       ...validEvent,
       properties: { ...validEvent.properties, reason: "private raw failure" },
-    });
+    }, trustedIdentity);
 
     expect(span?.attributes).toEqual(expect.objectContaining({
       provider: "other",
@@ -247,22 +255,29 @@ describe("closed allowlists", () => {
     expect(reconstructLog({
       ...validLog,
       attributes: { ...validLog.attributes, provider: "anthropic", method: "device_oauth" },
-    })).toBeUndefined();
+    }, trustedIdentity)).toBeUndefined();
     expect(reconstructAnalyticsEvent({
       ...validEvent,
       properties: { ...validEvent.properties, provider: "openai", method: "macos_keychain" },
-    })).toBeUndefined();
+    }, trustedIdentity)).toBeUndefined();
+  });
+
+  it("drops logs with missing or unknown instrumentation scopes", () => {
+    const { scope: _scope, ...withoutScope } = validLog;
+
+    expect(reconstructLog(withoutScope, trustedIdentity)).toBeUndefined();
+    expect(reconstructLog({ ...validLog, scope: "unknown-library" }, trustedIdentity)).toBeUndefined();
   });
 });
 
 describe("bounded primitives and identifiers", () => {
   it("drops records with invalid required identifiers, strings, timestamps, or durations", () => {
-    expect(reconstructResource({ ...validResource, serviceVersion: "x".repeat(200) })).toBeUndefined();
-    expect(reconstructResource({ ...validResource, serviceInstanceId: "not-a-uuid" })).toBeUndefined();
+    expect(reconstructResource({ ...validResource, serviceVersion: "x".repeat(200) }, trustedIdentity)).toBeUndefined();
+    expect(reconstructResource(validResource, { installationId: "not-a-uuid" })).toBeUndefined();
     expect(reconstructSpan({ ...validSpan, traceId: "not-a-trace-id" })).toBeUndefined();
     expect(reconstructSpan({ ...validSpan, durationMs: Number.POSITIVE_INFINITY })).toBeUndefined();
-    expect(reconstructLog({ ...validLog, timestampMs: -1 })).toBeUndefined();
-    expect(reconstructAnalyticsEvent({ ...validEvent, distinctId: "not-a-uuid" })).toBeUndefined();
+    expect(reconstructLog({ ...validLog, timestampMs: -1 }, trustedIdentity)).toBeUndefined();
+    expect(reconstructAnalyticsEvent(validEvent, { installationId: "not-a-uuid" })).toBeUndefined();
   });
 
   it("omits invalid optional identifiers and unbounded numeric attributes", () => {
@@ -329,7 +344,55 @@ describe("reconstruction is the privacy boundary", () => {
   };
 
   it.each([
-    ["resource", () => reconstructResource({ ...validResource, ...hostile })],
+    ["UUID-shaped account ID", ACCOUNT_UUID],
+    ["UUID-shaped session ID", SESSION_UUID],
+    ["raw account ID", rawAccountId],
+    ["SHA-256 account digest", sha256AccountId],
+    ["SHA-1 account digest", sha1AccountId],
+    ["base64 account encoding", base64AccountId],
+  ])("uses trusted installation identity instead of candidate %s", (_name, candidateIdentity) => {
+    const resource = reconstructResource({
+      ...validResource,
+      serviceInstanceId: candidateIdentity,
+      distinctId: candidateIdentity,
+      installationId: candidateIdentity,
+    }, trustedIdentity);
+    const event = reconstructAnalyticsEvent({
+      ...validEvent,
+      distinctId: candidateIdentity,
+      serviceInstanceId: candidateIdentity,
+      installationId: candidateIdentity,
+    }, trustedIdentity);
+
+    expect(resource?.["service.instance.id"]).toBe(INSTALL_ID);
+    expect(event?.distinctId).toBe(INSTALL_ID);
+    expect(JSON.stringify({ resource, event })).not.toContain(candidateIdentity);
+  });
+
+  it("uses only the trusted per-attempt diagnostic ID and keeps it distinct from installation identity", () => {
+    const log = reconstructLog({
+      ...validLog,
+      diagnosticId: ACCOUNT_UUID,
+      attributes: { ...validLog.attributes, diagnosticId: ACCOUNT_UUID },
+    }, trustedIdentity);
+    const event = reconstructAnalyticsEvent({
+      ...validEvent,
+      diagnosticId: SESSION_UUID,
+      properties: { ...validEvent.properties, diagnosticId: SESSION_UUID },
+    }, trustedIdentity);
+
+    expect(log?.attributes.diagnosticId).toBe(DIAGNOSTIC_ID);
+    expect(event?.properties).toEqual(expect.objectContaining({ diagnosticId: DIAGNOSTIC_ID }));
+    expect(JSON.stringify({ log, event })).not.toContain(ACCOUNT_UUID);
+    expect(JSON.stringify({ log, event })).not.toContain(SESSION_UUID);
+
+    const reusedStableIdentity = { installationId: INSTALL_ID, diagnosticId: INSTALL_ID };
+    expect(reconstructLog(validLog, reusedStableIdentity)).toBeUndefined();
+    expect(reconstructAnalyticsEvent(validEvent, reusedStableIdentity)).toBeUndefined();
+  });
+
+  it.each([
+    ["resource", () => reconstructResource({ ...validResource, ...hostile }, trustedIdentity)],
     ["span", () => reconstructSpan({
       ...validSpan,
       ...hostile,
@@ -342,12 +405,12 @@ describe("reconstruction is the privacy boundary", () => {
       ...validLog,
       ...hostile,
       attributes: { ...validLog.attributes, ...hostile },
-    })],
+    }, trustedIdentity)],
     ["event", () => reconstructAnalyticsEvent({
       ...validEvent,
       ...hostile,
       properties: { ...validEvent.properties, ...hostile },
-    })],
+    }, trustedIdentity)],
   ])("does not serialize raw or reconstructable identity and canary fields from %s", (_name, reconstruct) => {
     const result = reconstruct();
     const serialized = JSON.stringify(result);
@@ -363,10 +426,10 @@ describe("reconstruction is the privacy boundary", () => {
   });
 
   it.each([
-    ["resource", validResource, reconstructResource],
+    ["resource", validResource, (input: unknown) => reconstructResource(input, trustedIdentity)],
     ["span", validSpan, reconstructSpan],
-    ["log", validLog, reconstructLog],
-    ["event", validEvent, reconstructAnalyticsEvent],
+    ["log", validLog, (input: unknown) => reconstructLog(input, trustedIdentity)],
+    ["event", validEvent, (input: unknown) => reconstructAnalyticsEvent(input, trustedIdentity)],
   ] as const)("never mutates the %s input", (_name, input, reconstruct) => {
     const snapshot = structuredClone(input);
 

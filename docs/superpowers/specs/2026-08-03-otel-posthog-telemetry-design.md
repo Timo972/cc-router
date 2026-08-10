@@ -170,6 +170,19 @@ PostHog distinct ID and OTel `service.instance.id`, allowing repeated failures
 from one installation to be correlated. It is never derived from a user,
 account, hostname, network address, or machine identifier.
 
+Outbound reconstruction receives that installation UUID separately from the
+untrusted signal candidate, sourced from the authoritative telemetry snapshot.
+Candidate `distinctId`, `service.instance.id`, installation, account, and
+session identity fields are ignored; they can never select the outbound
+pseudonym.
+
+The stable installation pseudonym is distinct from a diagnostic ID. A
+diagnostic ID is a fresh random UUID for one setup attempt or one exception
+occurrence, shared only with the related detailed local log. It is never used as
+the PostHog distinct ID or OTel `service.instance.id`, never derived from user,
+account, or session data, cannot equal the installation UUID, and is not reused
+across unrelated attempts or occurrences.
+
 All analytics events set `$process_person_profile: false` and request disabled
 GeoIP at the event level as well as in client configuration. Sanitized exception
 properties also request disabled GeoIP. No identify, alias, group, person
@@ -310,8 +323,9 @@ Known safe reason codes include:
 - `user_cancelled`.
 
 Each diagnostic may include provider, method, stage, reason, exact HTTP status,
-duration bucket, application version, OS family, installation UUID, and a
-random diagnostic ID. It never includes an account ID, token, scope list,
+duration bucket, application version, OS family, the stable installation UUID,
+and the attempt's separate random diagnostic ID. It never includes an account
+ID, token, scope list,
 device/user code, URL, OAuth response body, exception message, or prompt answer.
 
 Setup helpers must retain raw causes for local error messages while attaching a

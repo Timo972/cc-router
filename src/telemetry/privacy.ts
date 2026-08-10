@@ -33,6 +33,7 @@ import type {
   CpuArchitecture,
   DurationBucket,
   HttpMethod,
+  InstallationId,
   InstrumentationScope,
   ModelFamily,
   Operation,
@@ -58,6 +59,8 @@ import type {
   SpanKind,
   SpanStatusCode,
   StreamOutcome,
+  TrustedTelemetryIdentity,
+  DiagnosticId,
 } from "./contracts.js";
 
 type UnknownRecord = Record<string, unknown>;
@@ -108,6 +111,19 @@ function uuid(value: unknown): string | undefined {
     : undefined;
 }
 
+function installationId(identity: TrustedTelemetryIdentity): InstallationId | undefined {
+  return uuid(identity?.installationId) as InstallationId | undefined;
+}
+
+function diagnosticId(
+  identity: TrustedTelemetryIdentity,
+  trustedInstallationId: InstallationId,
+): DiagnosticId | undefined {
+  if (identity?.diagnosticId === undefined) return undefined;
+  const value = uuid(identity.diagnosticId);
+  return value && value !== trustedInstallationId ? value as DiagnosticId : undefined;
+}
+
 function hexId(value: unknown, length: 16 | 32): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.toLowerCase();
@@ -134,12 +150,15 @@ function assignIfDefined<T extends object, K extends string, V>(target: T, key: 
   if (value !== undefined) Object.assign(target, { [key]: value });
 }
 
-export function reconstructResource(input: unknown): SafeResource | undefined {
+export function reconstructResource(
+  input: unknown,
+  identity: TrustedTelemetryIdentity,
+): SafeResource | undefined {
   if (!isRecord(input) || input.serviceName !== "cc-router") return undefined;
 
   const serviceVersion = version(input.serviceVersion);
   const nodeVersion = version(input.nodeVersion);
-  const serviceInstanceId = uuid(input.serviceInstanceId);
+  const serviceInstanceId = installationId(identity);
   const runtimeMode = member(RUNTIME_MODES, input.runtimeMode);
   const osFamily = otherEnum(OS_FAMILIES, input.osFamily);
   const cpuArchitecture = otherEnum(CPU_ARCHITECTURES, input.cpuArchitecture);
@@ -211,7 +230,7 @@ export function reconstructSpan(input: unknown): SafeSpan | undefined {
   return output;
 }
 
-function setupAttributes(input: unknown): SafeSetupDiagnosticAttributes | undefined {
+function setupAttributes(input: unknown, trustedDiagnosticId: DiagnosticId): SafeSetupDiagnosticAttributes | undefined {
   if (!isRecord(input)) return undefined;
   const provider = member(PROVIDERS, input.provider);
   if (provider !== "anthropic" && provider !== "openai") return undefined;
@@ -219,7 +238,12 @@ function setupAttributes(input: unknown): SafeSetupDiagnosticAttributes | undefi
   const stage = member(SETUP_STAGES, input.stage) as SetupStage | undefined;
   if (!method || !stage) return undefined;
 
-  const output: SafeSetupDiagnosticAttributes = { provider, method, stage };
+  const output: SafeSetupDiagnosticAttributes = {
+    provider,
+    method,
+    stage,
+    diagnosticId: trustedDiagnosticId,
+  };
   assignIfDefined(output, "reason", otherEnum(SETUP_REASONS, input.reason) as SetupReason | undefined);
   assignIfDefined(output, "outcome", otherEnum(OUTCOMES, input.outcome) as Outcome | undefined);
   assignIfDefined(output, "httpStatusCode", httpStatusCode(input.httpStatusCode));
@@ -227,11 +251,13 @@ function setupAttributes(input: unknown): SafeSetupDiagnosticAttributes | undefi
   assignIfDefined(output, "serviceVersion", version(input.serviceVersion));
   assignIfDefined(output, "osFamily", otherEnum(OS_FAMILIES, input.osFamily) as OsFamily | undefined);
   assignIfDefined(output, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode) as RuntimeMode | undefined);
-  assignIfDefined(output, "diagnosticId", uuid(input.diagnosticId));
   return output;
 }
 
-function runtimeFailureAttributes(input: unknown): SafeRuntimeFailureAttributes | undefined {
+function runtimeFailureAttributes(
+  input: unknown,
+  trustedDiagnosticId: DiagnosticId | undefined,
+): SafeRuntimeFailureAttributes | undefined {
   if (!isRecord(input)) return undefined;
   const operation = member(OPERATIONS, input.operation) as Operation | undefined;
   const reason = otherEnum(SETUP_REASONS, input.reason) as SetupReason | undefined;
@@ -247,29 +273,38 @@ function runtimeFailureAttributes(input: unknown): SafeRuntimeFailureAttributes 
   assignIfDefined(output, "serviceVersion", version(input.serviceVersion));
   assignIfDefined(output, "osFamily", otherEnum(OS_FAMILIES, input.osFamily) as OsFamily | undefined);
   assignIfDefined(output, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode) as RuntimeMode | undefined);
-  assignIfDefined(output, "diagnosticId", uuid(input.diagnosticId));
+  assignIfDefined(output, "diagnosticId", trustedDiagnosticId);
   return output;
 }
 
-export function reconstructLog(input: unknown): SafeLog | undefined {
+export function reconstructLog(input: unknown, identity: TrustedTelemetryIdentity): SafeLog | undefined {
   if (!isRecord(input)) return undefined;
+  const scope = member(INSTRUMENTATION_SCOPES, input.scope) as InstrumentationScope | undefined;
   const body = member(LOG_EVENT_CODES, input.body);
   const severity = member(SEVERITIES, input.severity) as Severity | undefined;
   const timestampMs = boundedNumber(input.timestampMs, MAX_TIMESTAMP_MS);
-  if (!body || !severity || timestampMs === undefined) return undefined;
+  const trustedInstallationId = installationId(identity);
+  if (!scope || !body || !severity || timestampMs === undefined || !trustedInstallationId) return undefined;
+
+  const trustedDiagnosticId = diagnosticId(
+    identity,
+    trustedInstallationId,
+  );
+  if (body === "account.setup.diagnostic" && !trustedDiagnosticId) return undefined;
+  if (identity.diagnosticId !== undefined && !trustedDiagnosticId) return undefined;
 
   const attributes = body === "account.setup.diagnostic"
-    ? setupAttributes(input.attributes)
-    : runtimeFailureAttributes(input.attributes);
+    ? setupAttributes(input.attributes, trustedDiagnosticId as DiagnosticId)
+    : runtimeFailureAttributes(input.attributes, trustedDiagnosticId);
   if (!attributes) return undefined;
 
   const context: { traceId?: string; spanId?: string } = {};
   assignIfDefined(context, "traceId", hexId(input.traceId, 32));
   assignIfDefined(context, "spanId", hexId(input.spanId, 16));
   if (body === "account.setup.diagnostic") {
-    return { body, severity, timestampMs, ...context, attributes: attributes as SafeSetupDiagnosticAttributes };
+    return { scope, body, severity, timestampMs, ...context, attributes: attributes as SafeSetupDiagnosticAttributes };
   }
-  return { body, severity, timestampMs, ...context, attributes: attributes as SafeRuntimeFailureAttributes };
+  return { scope, body, severity, timestampMs, ...context, attributes: attributes as SafeRuntimeFailureAttributes };
 }
 
 function runtimeEventProperties(input: unknown): SafeRuntimeEventProperties | undefined {
@@ -281,31 +316,42 @@ function runtimeEventProperties(input: unknown): SafeRuntimeEventProperties | un
   return output;
 }
 
-function setupEventProperties(input: unknown): SafeSetupEventProperties | undefined {
-  const attributes = setupAttributes(input);
+function setupEventProperties(
+  input: unknown,
+  trustedDiagnosticId: DiagnosticId,
+): SafeSetupEventProperties | undefined {
+  const attributes = setupAttributes(input, trustedDiagnosticId);
   if (!attributes) return undefined;
   const output: SafeSetupEventProperties = {
     provider: attributes.provider,
     method: attributes.method,
     stage: attributes.stage,
+    diagnosticId: trustedDiagnosticId,
   };
   assignIfDefined(output, "reason", attributes.reason);
   assignIfDefined(output, "durationBucket", attributes.durationBucket);
   assignIfDefined(output, "serviceVersion", attributes.serviceVersion);
   assignIfDefined(output, "osFamily", attributes.osFamily);
   assignIfDefined(output, "runtimeMode", attributes.runtimeMode);
-  assignIfDefined(output, "diagnosticId", attributes.diagnosticId);
   return output;
 }
 
-export function reconstructAnalyticsEvent(input: unknown): SafeAnalyticsEvent | undefined {
+export function reconstructAnalyticsEvent(
+  input: unknown,
+  identity: TrustedTelemetryIdentity,
+): SafeAnalyticsEvent | undefined {
   if (!isRecord(input)) return undefined;
   const event = member(ANALYTICS_EVENT_NAMES, input.event) as AnalyticsEventName | undefined;
-  const distinctId = uuid(input.distinctId);
+  const distinctId = installationId(identity);
   if (!event || !distinctId) return undefined;
 
-  const properties = event.startsWith("account_setup.")
-    ? setupEventProperties(input.properties)
+  const isSetupEvent = event.startsWith("account_setup.");
+  const trustedDiagnosticId = diagnosticId(identity, distinctId);
+  if (isSetupEvent && !trustedDiagnosticId) return undefined;
+  if (identity.diagnosticId !== undefined && !trustedDiagnosticId) return undefined;
+
+  const properties = isSetupEvent
+    ? setupEventProperties(input.properties, trustedDiagnosticId as DiagnosticId)
     : runtimeEventProperties(input.properties);
   if (!properties) return undefined;
 
