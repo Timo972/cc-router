@@ -81,6 +81,32 @@ describe("parseCodexRateLimits", () => {
     expect(update.buckets[0]?.secondary?.resetAt).toBe(NOW_SEC + 600);
   });
 
+  it("rejects a reset-at implausibly far in the future (beyond the 8-day trust horizon)", () => {
+    const THIRTY_DAYS_SEC = 30 * 24 * 60 * 60;
+    const update = parseCodexRateLimits({
+      "x-codex-primary-used-percent": "50",
+      "x-codex-primary-reset-at": String(NOW_SEC + THIRTY_DAYS_SEC),
+    }, NOW_MS);
+    expect(update.buckets[0]?.primary?.resetAt).toBe(0);
+  });
+
+  it("rejects a reset-after-seconds implausibly far in the future", () => {
+    const THIRTY_DAYS_SEC = 30 * 24 * 60 * 60;
+    const update = parseCodexRateLimits({
+      "x-codex-primary-used-percent": "50",
+      "x-codex-primary-reset-after-seconds": String(THIRTY_DAYS_SEC),
+    }, NOW_MS);
+    expect(update.buckets[0]?.primary?.resetAt).toBe(0);
+  });
+
+  it("clamps an absurd window-minutes value to the 8-day trust horizon", () => {
+    const update = parseCodexRateLimits({
+      "x-codex-primary-used-percent": "50",
+      "x-codex-primary-window-minutes": String(1_000_000_000),
+    }, NOW_MS);
+    expect(update.buckets[0]?.primary?.windowMinutes).toBe(8 * 24 * 60);
+  });
+
   it("emits no bucket when a family has no usable data", () => {
     const update = parseCodexRateLimits({ "x-codex-bengalfox-limit-name": "gpt-5.6-sol" }, NOW_MS);
     expect(update.buckets).toHaveLength(0);

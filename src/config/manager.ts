@@ -157,9 +157,12 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
     }));
 }
 
-export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void {
+/** Persist OpenAI subscription accounts to an explicit accounts file, preserving
+ *  every other provider's records already in that file. Shared by `saveOpenAIAccounts`
+ *  (default path) and any caller bound to a custom `--accounts <path>`. */
+export function saveOpenAIAccountsToPath(accounts: OpenAISubscriptionAccount[], path: string): void {
   ensureConfigDir();
-  const existing = readAccountsRaw() as AccountRecord[];
+  const existing = readRawFromPath(path) as AccountRecord[];
   const nonOpenAI = existing.filter(a => a.provider !== "openai_subscription");
   const records: AccountRecord[] = accounts.map(a => ({
     id: a.id,
@@ -172,7 +175,11 @@ export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void 
     ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
     ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
   }));
-  writeAccountsAtomicToPath(ACCOUNTS_PATH, [...nonOpenAI, ...records]);
+  writeAccountsAtomicToPath(path, [...nonOpenAI, ...records]);
+}
+
+export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void {
+  saveOpenAIAccountsToPath(accounts, ACCOUNTS_PATH);
 }
 
 // ─── Proxy config (password, future settings) ─────────────────────────────────

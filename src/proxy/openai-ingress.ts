@@ -13,6 +13,17 @@ import { EmptyPoolError, NoEligibleAccountError } from "./account-pool.js";
 import type { SessionRouter, RoutedAccountLease } from "./session-router.js";
 import { acquireRequestRoute, routeReasonDetails, routeFailureDetails } from "./lease-lifecycle.js";
 
+/**
+ * Mirrors `anthropic-routing.ts`'s `requestTerminated` check. This ingress
+ * path never threads the raw `Request` through (only `Response`), so it
+ * checks just the response side: `res.destroyed`/`res.writableEnded` are
+ * enough to detect a client that disconnected while we were off awaiting a
+ * token refresh.
+ */
+function responseTerminated(res: Response): boolean {
+  return res.destroyed || res.writableEnded;
+}
+
 export type ForwardOpenAI = typeof forwardOpenAICodexResponse;
 
 /**
@@ -122,6 +133,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     // Never let an unexpected routing failure crash the daemon or reject
     // this handler's promise — no account lease was taken, so there is
     // nothing to release.
+    stats.totalErrors++;
     const message = error instanceof Error ? error.message : String(error);
     logError("proxy", 500, `unexpected routing failure: ${message}`);
     recordActivity({
@@ -179,6 +191,15 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     res.status(401).json(envelope.wrap("authentication_error", "OpenAI subscription token refresh failed"));
     return;
   }
+  if (responseTerminated(res)) {
+    // The client disconnected while the token refresh was in flight. Forwarding
+    // now would burn an upstream request nobody can receive the response to.
+    // Just release the lease and stop — no response to send, and it is safe to
+    // release again even if the response's own close/finish listener already
+    // did so (`attachLeaseLifecycle`'s release() is idempotent).
+    selected.release();
+    return;
+  }
   account.healthy = true;
   if (needed) account.lastRefresh = now();
 
@@ -211,6 +232,13 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   // change based on how the relay later renders the response to the client.
   const upstreamFailed = upstream.status === 401 || upstream.status === 429 || upstream.status >= 500;
   let details = routeReasonDetails(selected.route);
+  // Tracks whether `account.errorCount`/`consecutiveErrors` were already
+  // incremented for this request by the upstream-classification branch below,
+  // so a relay-synthesized failure (e.g. a byte-transparent stream that
+  // observed an upstream `response.failed`/`error` event on an otherwise-200
+  // response) can still increment them once further down without double
+  // counting an upstream 401/429/5xx that already did.
+  let accountFailureCounted = false;
   try {
     // Header/rate-limit parsing and cooldown bookkeeping run on live upstream
     // data between the two request-level try/catches above — a throw here
@@ -222,6 +250,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     if (upstreamFailed) {
       account.errorCount++;
       account.consecutiveErrors++;
+      accountFailureCounted = true;
       const applied = applyCodexFailureRouting(
         upstream.status,
         headerRecord,
@@ -287,6 +316,15 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   const failedFinal = upstreamFailed || relayFailed || finalStatus >= 400;
   if (failedFinal) {
     stats.totalErrors++;
+    // Upstream classification above only counts 401/429/5xx against the
+    // account. A relay-synthesized failure on an otherwise-successful
+    // upstream status (e.g. a streamed `response.failed` event, or a relay
+    // exception after upstream returned 200) is just as real a failure for
+    // this account and must not be dropped on the floor.
+    if (!accountFailureCounted) {
+      account.errorCount++;
+      account.consecutiveErrors++;
+    }
   } else {
     account.consecutiveErrors = 0;
     stats.totalRequests++;

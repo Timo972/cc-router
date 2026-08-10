@@ -47,6 +47,17 @@ const USED_PERCENT_SUFFIX = "-primary-used-percent";
 const MS_TIMESTAMP_THRESHOLD = 100_000_000_000;
 /** Strips ASCII control characters (including ESC) from upstream-controlled header text. */
 const CONTROL_CHAR_PATTERN = /[\x00-\x1f\x7f]/g;
+/**
+ * Reject a parsed reset timestamp (or clamp a window length) implausibly far
+ * in the future rather than trust it verbatim. Matches the same 8-day trust
+ * horizon already enforced downstream by `MAX_TRUSTED_RATE_LIMIT_RESET_MS`
+ * (token-pool.ts) and `MAX_RATE_LIMIT_COOLDOWN_MS` (lease-lifecycle.ts) — a
+ * malformed or malicious header must not be able to park an account in a
+ * cooldown/exhausted state for months. A reset beyond the horizon is treated
+ * as unknown (0), the same sentinel already used for "no usable reset value".
+ */
+const MAX_TRUSTED_RATE_LIMIT_HORIZON_SEC = 8 * 24 * 60 * 60;
+const MAX_TRUSTED_WINDOW_MINUTES = MAX_TRUSTED_RATE_LIMIT_HORIZON_SEC / 60;
 
 export function createEmptyCodexRateLimits(): CodexRateLimits {
   return { status: "ok", buckets: new Map(), lastUpdated: 0 };
@@ -92,13 +103,17 @@ function parseResetAtSeconds(
   nowMs: number,
 ): number {
   const nowSec = Math.floor(nowMs / 1000);
+  const horizonSec = nowSec + MAX_TRUSTED_RATE_LIMIT_HORIZON_SEC;
   const absolute = headerNumber(headers, `${prefix}-${kind}-reset-at`);
   if (absolute !== undefined && absolute > 0) {
     const seconds = absolute > MS_TIMESTAMP_THRESHOLD ? Math.floor(absolute / 1000) : Math.floor(absolute);
-    return seconds > nowSec ? seconds : 0;
+    return seconds > nowSec && seconds <= horizonSec ? seconds : 0;
   }
   const relative = headerNumber(headers, `${prefix}-${kind}-reset-after-seconds`);
-  if (relative !== undefined && relative > 0) return nowSec + Math.floor(relative);
+  if (relative !== undefined && relative > 0) {
+    const candidate = nowSec + Math.floor(relative);
+    return candidate <= horizonSec ? candidate : 0;
+  }
   return 0;
 }
 
@@ -114,7 +129,9 @@ function parseWindow(
   return {
     utilization: Math.max(0, Math.min(1, percent / 100)),
     resetAt: parseResetAtSeconds(headers, prefix, kind, nowMs),
-    windowMinutes: windowMinutes !== undefined && windowMinutes > 0 ? Math.floor(windowMinutes) : 0,
+    windowMinutes: windowMinutes !== undefined && windowMinutes > 0
+      ? Math.min(Math.floor(windowMinutes), MAX_TRUSTED_WINDOW_MINUTES)
+      : 0,
   };
 }
 

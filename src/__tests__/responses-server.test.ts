@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import express from "express";
 import type { Response as ExpressResponse } from "express";
-import { createServer } from "http";
+import { createServer, request as httpRequest, type ClientRequest } from "http";
+import type { AddressInfo } from "net";
 import { forwardOpenAICodexResponse, toCodexBackendRequest } from "../providers/openai/codex-transport.js";
 import { mountResponsesRoutes } from "../proxy/responses-server.js";
 import type { ResponsesRoutesOptions } from "../proxy/responses-server.js";
@@ -29,6 +30,12 @@ async function withServer(
       server.close(err => err ? reject(err) : resolve());
     });
   }
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
 }
 
 describe("forwardOpenAICodexResponse", () => {
@@ -461,6 +468,57 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     expect(activity.some(entry => entry.type === "error" && entry.statusCode === 401)).toBe(true);
   });
 
+  it("does not forward after the client disconnects during token refresh (P2 disconnect)", async () => {
+    const account = makeRuntimeAccount("openai-victor");
+    const refreshStarted = deferred<void>();
+    const refreshResult = deferred<boolean>();
+    const forward = vi.fn();
+    const prepare = vi.fn(async () => {
+      refreshStarted.resolve();
+      return refreshResult.promise;
+    });
+    const { app, openAIPool } = mountWithPool([account], forward, { prepareOpenAIAccount: prepare });
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({ model: "openai/gpt-5.5", input: [] });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/responses",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await refreshStarted.promise;
+      expect(openAIPool.getInFlight(account.id)).toBe(1);
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+
+      // Resolve the refresh only after the disconnect was observed — the
+      // handler must see the terminated response and stop before forwarding.
+      refreshResult.resolve(true);
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(forward).not.toHaveBeenCalled();
+      expect(openAIPool.getInFlight(account.id)).toBe(0);
+    } finally {
+      refreshResult.resolve(true);
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   it("fails a session over to another account after a token refresh failure", async () => {
     const forward = vi.fn().mockResolvedValue(new Response("{}", {
       status: 200,
@@ -513,6 +571,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
       forwardOpenAI: forward,
       recordActivity: entry => activity.push(entry),
     });
+    const before = stats.totalErrors;
 
     await withServer(app, async baseUrl => {
       const res = await fetch(`${baseUrl}/v1/responses`, {
@@ -529,6 +588,11 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
 
     expect(forward).not.toHaveBeenCalled();
     expect(activity.some(entry => entry.type === "error" && entry.statusCode === 500)).toBe(true);
+    // An unexpected routing failure must count toward totalErrors exactly
+    // like the empty-pool and no-eligible-account branches immediately above
+    // it in runOpenAIIngress — otherwise the daemon's stats would silently
+    // under-report a whole class of routing failures.
+    expect(stats.totalErrors).toBe(before + 1);
   });
 
   it("returns a local 502 when the relay throws before any bytes reach the client (F1d)", async () => {
@@ -698,6 +762,42 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
 
     expect(stats.totalErrors).toBe(before + 1);
     expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
+  it("relays a streamed upstream 200 ending in response.failed byte-for-byte, but reports it as a 502 error", async () => {
+    const failedBody = 'data: {"type":"response.failed","response":{"error":{"message":"stream boom"}}}\n\n';
+    const forward: ForwardOpenAI = async () => new Response(failedBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const account = makeRuntimeAccount("openai-victor");
+    const { app, activity } = mountWithPool([account], forward);
+    const before = stats.totalErrors;
+    const errorCountBefore = account.errorCount;
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+
+      // The client-visible status/body reflect the RELAY's synthesized
+      // failure for stats/activity purposes, but the bytes written to the
+      // wire are byte-identical to what upstream sent — the relay never
+      // rewrites the stream itself.
+      expect(await res.text()).toBe(failedBody);
+    });
+
+    expect(stats.totalErrors).toBe(before + 1);
+    const errorEntry = activity.find(entry => entry.type === "error");
+    expect(errorEntry).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+    // A relay-synthesized failure on an otherwise-200 upstream must still be
+    // counted against the account exactly once — not silently dropped, and
+    // not double-counted if upstream classification already counted it
+    // (it did not here, since upstream.status was 200).
+    expect(account.errorCount).toBe(errorCountBefore + 1);
+    expect(account.consecutiveErrors).toBe(1);
   });
 
   it("invokes onUpstreamAuthFailure with the routed account when a relayed upstream 401 occurs (F5)", async () => {

@@ -7,14 +7,14 @@ import type { Socket } from "net";
 import type { Request } from "express";
 import { TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
-import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccounts, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
 import { logRoute, logError, logStartup } from "./logger.js";
 import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
-import { PROXY_PORT, LITELLM_URL } from "../config/paths.js";
+import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
 import { writePid, removePid } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
@@ -22,6 +22,7 @@ import {
   prepareOpenAIAccountForRequest,
   refreshOpenAISubscriptionToken,
   startOpenAIRefreshLoop,
+  type OpenAISubscriptionAccount,
 } from "../providers/openai/token-refresher.js";
 import { createOpenAIAccount } from "../providers/openai/account-state.js";
 import type { OpenAIAccount } from "../providers/openai/account-state.js";
@@ -564,6 +565,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const mode = litellmUrl ? "litellm" : "standalone";
 
   const accountsPath = opts.accountsPath;
+  // Every OpenAI account write in this server must land in the same file the
+  // process was started against — a custom `--accounts <path>` must never
+  // silently fall back to writing the default accounts.json.
+  const persistOpenAIAccounts = (accountsToSave: OpenAISubscriptionAccount[]): void =>
+    saveOpenAIAccountsToPath(accountsToSave, accountsPath ?? ACCOUNTS_PATH);
 
   if (!accountsFileExists(accountsPath)) {
     console.error(chalk.red("\n✗ accounts.json not found."));
@@ -645,7 +651,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   };
 
   startRefreshLoop(accounts);
-  startOpenAIRefreshLoop(openAIAccounts, saveOpenAIAccounts);
+  startOpenAIRefreshLoop(openAIAccounts, persistOpenAIAccounts);
   const usageRefresher = new AnthropicUsageRefresher(pool);
   usageRefresher.start();
 
@@ -895,7 +901,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         id,
         patch,
         accounts: openAIAccounts,
-        persist: saveOpenAIAccounts,
+        persist: persistOpenAIAccounts,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -961,7 +967,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             weeklyLimitPercent: body.weeklyLimitPercent,
           },
           accounts: openAIAccounts,
-          persist: saveOpenAIAccounts,
+          persist: persistOpenAIAccounts,
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -1019,7 +1025,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           id,
           accounts: openAIAccounts,
           otherAccountCount: pool.getAll().length,
-          persist: saveOpenAIAccounts,
+          persist: persistOpenAIAccounts,
           forgetAccount: account => openAIPool.forgetAccount(account),
           invalidateAccount: accountId => { openAIRouter.invalidateAccount(accountId); },
         });
@@ -1078,7 +1084,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       Object.assign(modelRouting, next);
       writeConfig({ ...readConfig(), modelRouting: next });
     },
-    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
+    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
   });
 
   // A relayed upstream 401 means the subscription token is stale — kick off a
@@ -1088,7 +1094,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const onOpenAIUpstreamAuthFailure = (account: OpenAIAccount): void => {
     refreshOpenAISubscriptionToken(account)
       .then(ok => {
-        if (ok) saveOpenAIAccounts(openAIAccounts);
+        if (ok) persistOpenAIAccounts(openAIAccounts);
       })
       .catch(() => {});
   };
@@ -1096,7 +1102,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   mountResponsesRoutes(app, {
     openAIRouter,
     openAIPool,
-    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
+    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
   });
@@ -1104,7 +1110,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   mountMessagesCrossProviderRoute(app, {
     openAIRouter,
     openAIPool,
-    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
+    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
   });

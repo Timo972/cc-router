@@ -165,7 +165,11 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
           const observer = createCodexUsageObserver();
           await sendUpstreamResponse(upstream, res, chunk => observer.push(chunk));
           applyCodexUsage(entry, observer.finish());
-          return { statusCode: upstream.status };
+          // Bytes already written to the client are untouched — this only
+          // changes the REPORTED status (used for stats/activity/cooldown),
+          // matching a stream that upstream answered `200` but that ended in
+          // a `response.failed`/`error` SSE event instead of completing.
+          return { statusCode: observer.failure() !== undefined ? 502 : upstream.status };
         }
 
         const collected = await collectCodexResponseStream(upstream);

@@ -205,6 +205,44 @@ describe("createCodexUsageObserver", () => {
     observer.push(encoder.encode(event));
     expect(observer.finish()).toEqual({ inputTokens: 8, cachedInputTokens: 1, outputTokens: 3 });
   });
+
+  it("reports no failure when the stream completes normally", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBeUndefined();
+  });
+
+  it("records a failure message from a response.failed event without altering usage extraction", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode('data: {"type":"response.failed","response":{"error":{"message":"boom"}}}\n\n'));
+    expect(observer.finish()).toBeUndefined();
+    expect(observer.failure()).toBe("boom");
+  });
+
+  it("records a failure message from a bare error event", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode('data: {"type":"error","error":{"message":"upstream exploded"}}\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBe("upstream exploded");
+  });
+
+  it("falls back to a default failure message when response.failed omits an error message", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode('data: {"type":"response.failed","response":{}}\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBe("Response failed");
+  });
+
+  it("detects a response.failed event split across two push() chunks", () => {
+    const observer = createCodexUsageObserver();
+    const event = 'data: {"type":"response.failed","response":{"error":{"message":"late boom"}}}\n\n';
+    const mid = Math.floor(event.length / 2);
+    observer.push(encoder.encode(event.slice(0, mid)));
+    observer.push(encoder.encode(event.slice(mid)));
+    observer.finish();
+    expect(observer.failure()).toBe("late boom");
+  });
 });
 
 describe("usageFromResponseBody", () => {

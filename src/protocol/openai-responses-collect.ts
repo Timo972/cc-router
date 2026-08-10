@@ -121,18 +121,36 @@ export function usageFromCompletedEvent(event: unknown): CodexUsageTotals | unde
 
 /**
  * Passive usage reader for the byte-transparent streaming path: it only
- * observes chunks that are already being piped downstream unchanged.
+ * observes chunks that are already being piped downstream unchanged. It also
+ * watches for a `response.failed`/`error` event — the same terminal-failure
+ * signal `collectCodexResponseStream` above already detects for the
+ * non-streaming path — so a stream that upstream answered with `200` but
+ * ended in failure can still be reported (for stats/activity only) as the
+ * failure it was, without altering a single byte written to the client.
  */
 export function createCodexUsageObserver(): {
   push(chunk: Uint8Array): void;
   finish(): CodexUsageTotals | undefined;
+  /** The failure message observed via `response.failed`/`error`, if any. Only
+   *  meaningful after `finish()` has been called — earlier chunks may not yet
+   *  have carried the terminal event. */
+  failure(): string | undefined;
 } {
   const decoder = new TextDecoder();
   let remainder = "";
   let totals: CodexUsageTotals | undefined;
+  let failure: string | undefined;
 
   const applyEvent = (event: unknown): void => {
     totals = usageFromCompletedEvent(event) ?? totals;
+    if (typeof event !== "object" || event === null) return;
+    const e = event as CodexStreamEvent;
+    if (e.type === "response.failed") {
+      const err = (e.response as { error?: { message?: string } } | undefined)?.error;
+      failure = err?.message ?? "Response failed";
+    } else if (e.type === "error") {
+      failure = e.error?.message ?? "Upstream error event";
+    }
   };
 
   return {
@@ -161,6 +179,9 @@ export function createCodexUsageObserver(): {
       }
       remainder = "";
       return totals;
+    },
+    failure(): string | undefined {
+      return failure;
     },
   };
 }
