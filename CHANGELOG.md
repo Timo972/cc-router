@@ -29,32 +29,35 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Network and other unexpected failures partway through a shared-ingress
-  request (upstream connection errors, mid-stream aborts) no longer crash the
-  proxy or leave an account's in-flight/lease bookkeeping stuck — failures are
-  caught and routed the same way for both providers.
-- Cooldowns are scoped correctly: only the limiting rate-limit window (not
-  the whole account) is cooled down, only 503/529 responses are treated as
-  provider overload, and the dashboard's global-cooldown badge reflects an
-  account-wide block rather than a single bucket's state.
-- OpenAI/Codex cooldowns learned purely from response headers (no
-  accompanying rate-limit snapshot) are now actually enforced by the pool
-  instead of being recorded but ignored.
-- Named Codex rate-limit buckets recover their primary and secondary windows
-  independently as each expires, instead of staying blocked until every
-  window on the bucket clears.
-- OpenAI accounts' `sessionLimitPercent`/`weeklyLimitPercent` caps can now be
-  set on creation (`POST /cc-router/accounts`) and updated afterward
-  (`PATCH /cc-router/accounts/:id`), and the dashboard's cap-editing keys
-  (`w`/`s`) work for OpenAI accounts the same way they do for Claude accounts.
-- The dashboard now shows `LIMITED` for an OpenAI account that is hard-blocked
-  from routing (account-wide rate limit, or its default usage window fully
-  exhausted), instead of a misleading green `ok` dot.
-- Upstream response headers that describe the upstream's own transport
-  (`content-encoding`, `set-cookie`) are no longer relayed verbatim to the
-  client, which could otherwise mismatch the body cc-router actually sends.
-- Recent-activity accounting distinguishes a local 502 from a genuine 200,
-  so a failed upstream call is no longer counted as a successful request.
+- An unexpected failure partway through an OpenAI request — an upstream
+  connection error, a rejected token refresh, a mid-stream abort — no longer
+  takes down the proxy. Both `/v1/responses` and the `/v1/messages` OpenAI
+  branch awaited the upstream call without catching a rejection, so a single
+  network blip could kill the daemon and lose every account's routing state.
+- `/v1/messages` no longer reports an upstream OpenAI failure as a success. A
+  stream ending in `response.failed`, an `error` event, or a JSON error body
+  was translated into an empty Anthropic message with HTTP 200; each now
+  surfaces as an error response, so a rate limit reads as a rate limit instead
+  of an empty assistant turn.
+- A single malformed SSE frame no longer truncates a `/v1/messages` stream.
+  Parsing a chunk was all-or-nothing, so one bad frame discarded the valid
+  events beside it and ended the response as a clean `200` the client could
+  not tell apart from a complete answer.
+- OpenAI credentials are written back to the accounts file the proxy was
+  started with. Under `--accounts <path>` accounts were read from that file
+  but every refresh, add, delete, and update wrote the default
+  `accounts.json` — discarding the change and copying OAuth tokens into an
+  unrelated file.
+- OpenAI token refresh survives a malformed token response. A payload missing
+  `expires_in` produced a `NaN` expiry that read as "never needs refreshing",
+  so the account kept presenting a stale token indefinitely; a failure to
+  persist rotated credentials no longer fails the request that triggered the
+  refresh.
+- `PATCH /cc-router/accounts/:id` works for OpenAI accounts instead of
+  returning `404`, so a single OpenAI account can be enabled, disabled, or
+  capped without toggling the whole provider. `POST /cc-router/accounts` now
+  rejects an out-of-range percentage cap the same way `PATCH` does, rather
+  than silently coercing it.
 
 ---
 
