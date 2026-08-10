@@ -250,6 +250,11 @@ export interface SafeExceptionContext {
   runtimeMode?: RuntimeMode;
 }
 
+/** Filesystem trust supplied independently from the untrusted exception. */
+export interface TrustedExceptionSource {
+  projectRoot: string;
+}
+
 export interface SafeExceptionContract {
   /** The only Error object that may be passed to a remote exception client. */
   error: Error;

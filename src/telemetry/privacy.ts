@@ -69,6 +69,7 @@ import type {
   SpanStatusCode,
   StreamOutcome,
   SystemErrorCode,
+  TrustedExceptionSource,
   TrustedTelemetryIdentity,
   DiagnosticId,
 } from "./contracts.js";
@@ -200,13 +201,60 @@ function safePathSegments(path: string): boolean {
     && /^[0-9A-Za-z@._+~-]+$/.test(segment));
 }
 
-function normalizedFramePath(rawPath: string): SafeStackFrame["path"] | undefined {
+interface TrustedProjectRoot {
+  comparisonPath: string;
+  caseInsensitive: boolean;
+}
+
+function trustedProjectRoot(input: unknown): TrustedProjectRoot | undefined {
+  if (!isRecord(input)) return undefined;
+  let candidate: unknown;
+  try {
+    candidate = input.projectRoot;
+  } catch {
+    return undefined;
+  }
+  if (typeof candidate !== "string" || candidate.length === 0) return undefined;
+
+  let path = candidate.replace(/\\/g, "/");
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(path) || /[?#\u0000-\u001f\u007f]/.test(path)) {
+    return undefined;
+  }
+  while (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+
+  const windowsAbsolute = /^[A-Za-z]:\//.test(path);
+  const posixAbsolute = path.startsWith("/") && !path.startsWith("//");
+  if (!windowsAbsolute && !posixAbsolute) return undefined;
+  const segments = path.replace(/^[A-Za-z]:\//, "").replace(/^\//, "").split("/");
+  if (segments.length === 0 || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    return undefined;
+  }
+
+  return {
+    comparisonPath: windowsAbsolute ? path.toLowerCase() : path,
+    caseInsensitive: windowsAbsolute,
+  };
+}
+
+function normalizedFramePath(
+  rawPath: string,
+  projectRoot: TrustedProjectRoot,
+): SafeStackFrame["path"] | undefined {
   let path = rawPath.trim().replace(/\\/g, "/");
   const openingParenthesis = path.lastIndexOf("(");
   if (openingParenthesis >= 0) path = path.slice(openingParenthesis + 1);
   if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(path) && !path.startsWith("file://")) return undefined;
   if (path.startsWith("file://")) path = path.slice("file://".length);
+  if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
   if (/[?#\u0000-\u001f\u007f]/.test(path)) return undefined;
+
+  const comparisonPath = projectRoot.caseInsensitive ? path.toLowerCase() : path;
+  const projectDistPrefix = `${projectRoot.comparisonPath}/dist/`;
+  if (comparisonPath.startsWith(projectDistPrefix)) {
+    const relative = `dist/${path.slice(projectDistPrefix.length)}`;
+    if (relative.length > MAX_STACK_FRAME_PATH_LENGTH || !safePathSegments(relative)) return undefined;
+    return relative as SafeStackFrame["path"];
+  }
 
   const dependencyMarker = "/node_modules/";
   const dependencyIndex = path.lastIndexOf(dependencyMarker);
@@ -220,16 +268,28 @@ function normalizedFramePath(rawPath: string): SafeStackFrame["path"] | undefine
       : undefined;
   }
 
-  const projectMarker = "/dist/";
-  const projectIndex = path.lastIndexOf(projectMarker);
-  const relative = projectIndex >= 0
-    ? path.slice(projectIndex + 1)
-    : path.startsWith("dist/") ? path : undefined;
-  if (!relative || relative.length > MAX_STACK_FRAME_PATH_LENGTH || !safePathSegments(relative)) return undefined;
-  return relative as SafeStackFrame["path"];
+  return undefined;
 }
 
-function normalizedFrames(input: Error): readonly SafeStackFrame[] {
+function stackHeaderName(kind: ErrorKind): string {
+  switch (kind) {
+    case "type_error": return "TypeError";
+    case "range_error": return "RangeError";
+    case "reference_error": return "ReferenceError";
+    case "syntax_error": return "SyntaxError";
+    case "uri_error": return "URIError";
+    case "eval_error": return "EvalError";
+    case "aggregate_error": return "AggregateError";
+    case "error": return "Error";
+    case "unexpected_error": return "Error";
+  }
+}
+
+function normalizedFrames(
+  input: Error,
+  kind: ErrorKind,
+  projectRoot: TrustedProjectRoot,
+): readonly SafeStackFrame[] {
   let stack: unknown;
   try {
     stack = input.stack;
@@ -238,12 +298,19 @@ function normalizedFrames(input: Error): readonly SafeStackFrame[] {
   }
   if (typeof stack !== "string") return [];
 
+  const rawMessage = ownDataProperty(input, "message");
+  if (rawMessage !== undefined && typeof rawMessage !== "string") return [];
+  const message = rawMessage ?? "";
+  const header = `${stackHeaderName(kind)}${message.length === 0 ? "" : `: ${message}`}`;
+  if (stack === header) return [];
+  if (!stack.startsWith(`${header}\n`)) return [];
+
   const frames: SafeStackFrame[] = [];
-  for (const line of stack.split("\n").slice(1)) {
+  for (const line of stack.slice(header.length + 1).split("\n")) {
     if (frames.length >= MAX_STACK_FRAMES) break;
     const match = line.match(/(?:\(|\bat\s+)(.+):(\d+):(\d+)\)?\s*$/);
     if (!match) continue;
-    const path = normalizedFramePath(match[1]);
+    const path = normalizedFramePath(match[1], projectRoot);
     const frameLine = boundedInteger(Number(match[2]), Number.MAX_SAFE_INTEGER, 1);
     const column = boundedInteger(Number(match[3]), Number.MAX_SAFE_INTEGER, 1);
     if (!path || frameLine === undefined || column === undefined) continue;
@@ -305,16 +372,18 @@ export function sanitizeException(
   input: unknown,
   candidateContext: unknown,
   identity: TrustedTelemetryIdentity,
+  trustedSource: TrustedExceptionSource,
 ): SafeExceptionContract | undefined {
   const trustedInstallationId = installationId(identity);
   if (!trustedInstallationId) return undefined;
   const trustedDiagnosticId = diagnosticId(identity, trustedInstallationId);
   const context = exceptionContext(candidateContext);
-  if (!trustedDiagnosticId || !context) return undefined;
+  const projectRoot = trustedProjectRoot(trustedSource);
+  if (!trustedDiagnosticId || !context || !projectRoot) return undefined;
 
   const isError = isErrorObject(input);
   const kind: ErrorKind = isError ? errorKind(input) : "unexpected_error";
-  const frames = isError ? normalizedFrames(input) : [];
+  const frames = isError ? normalizedFrames(input, kind, projectRoot) : [];
   const code = isError
     ? member(SYSTEM_ERROR_CODES, ownDataProperty(input, "code")) as SystemErrorCode | undefined
     : undefined;
