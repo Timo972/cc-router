@@ -52,7 +52,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `expires_in` produced a `NaN` expiry that read as "never needs refreshing",
   so the account kept presenting a stale token indefinitely; a failure to
   persist rotated credentials no longer fails the request that triggered the
-  refresh.
+  refresh, and the write is now retried on subsequent requests (and the
+  background refresh loop) until it succeeds, so a rotated refresh token
+  still reaches disk.
 - `PATCH /cc-router/accounts/:id` works for OpenAI accounts instead of
   returning `404`, so a single OpenAI account can be enabled, disabled, or
   capped without toggling the whole provider. `POST /cc-router/accounts` now

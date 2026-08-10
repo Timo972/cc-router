@@ -37,24 +37,67 @@ const REFRESH_FAILURE_COOLDOWN_MS = 30_000;
 /**
  * Response headers that must never be mirrored to the local client when
  * relaying an upstream response verbatim:
- *  - hop-by-hop headers (content-length, transfer-encoding, connection,
- *    keep-alive) are meaningless (or actively wrong) once re-framed by our
- *    own HTTP server.
+ *  - hop-by-hop headers per RFC 7230 §6.1 (content-length, transfer-encoding,
+ *    connection, keep-alive, te, trailer, upgrade, proxy-authenticate,
+ *    proxy-authorization) are meaningless (or actively wrong/dangerous) once
+ *    re-framed by our own HTTP server — e.g. `upgrade` would claim a protocol
+ *    switch never negotiated with this client, and the two `proxy-*` headers
+ *    are scoped to the upstream hop's own (unrelated) proxy auth.
  *  - content-encoding is dropped because undici's fetch() already
  *    transparently decompresses the body while leaving this header intact —
  *    forwarding it would tell the client to gunzip bytes that are no longer
- *    compressed.
+ *    compressed. Deliberate drop, not RFC hop-by-hop.
  *  - set-cookie must never leak the upstream service's session cookies to a
- *    local client.
+ *    local client. Deliberate drop, not RFC hop-by-hop.
  */
 export const EXCLUDED_UPSTREAM_RELAY_HEADERS = new Set([
   "content-length",
   "transfer-encoding",
   "connection",
   "keep-alive",
+  "te",
+  "trailer",
+  "upgrade",
+  "proxy-authenticate",
+  "proxy-authorization",
   "content-encoding",
   "set-cookie",
 ]);
+
+/**
+ * The `Connection` header can nominate additional header names as hop-by-hop
+ * for this specific response (RFC 7230 §6.1), beyond the fixed set above —
+ * e.g. `Connection: close, X-Internal-Token` means `X-Internal-Token` is also
+ * hop-by-hop here and must not reach the client.
+ */
+function connectionNominatedHeaders(source: Headers): Set<string> {
+  const nominated = new Set<string>();
+  const connection = source.get("connection");
+  if (!connection) return nominated;
+  for (const token of connection.split(",")) {
+    const name = token.trim().toLowerCase();
+    if (name) nominated.add(name);
+  }
+  return nominated;
+}
+
+/**
+ * Single place that decides which upstream response headers are safe to
+ * mirror to the local client, so every relay site shares the same policy
+ * instead of re-implementing the exclusion set (and the dynamic `Connection`
+ * nomination) inline. `apply` is called once per header that passes the
+ * filter, in `source`'s own iteration order — callers still own their own
+ * per-header special cases (e.g. content-type) by skipping in `apply`.
+ */
+export function mirrorUpstreamHeaders(source: Headers, apply: (name: string, value: string) => void): void {
+  const nominated = connectionNominatedHeaders(source);
+  source.forEach((value, key) => {
+    const lower = key.toLowerCase();
+    if (EXCLUDED_UPSTREAM_RELAY_HEADERS.has(lower)) return;
+    if (nominated.has(lower)) return;
+    apply(key, value);
+  });
+}
 
 /** Route-specific error envelope shape (OpenAI Responses vs. Anthropic Messages). */
 export interface OpenAIIngressEnvelope {

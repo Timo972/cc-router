@@ -18,7 +18,7 @@ import type { OpenAIAccount } from "../providers/openai/account-state.js";
 import type { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import {
   runOpenAIIngress,
-  EXCLUDED_UPSTREAM_RELAY_HEADERS,
+  mirrorUpstreamHeaders,
   type ForwardOpenAI,
   type OpenAIIngressEnvelope,
 } from "./openai-ingress.js";
@@ -53,9 +53,7 @@ async function sendUpstreamResponse(
   res: Response,
   onChunk?: (chunk: Uint8Array) => void,
 ): Promise<void> {
-  upstream.headers.forEach((value, key) => {
-    if (!EXCLUDED_UPSTREAM_RELAY_HEADERS.has(key.toLowerCase())) res.setHeader(key, value);
-  });
+  mirrorUpstreamHeaders(upstream.headers, (key, value) => res.setHeader(key, value));
 
   const contentType = upstream.headers.get("content-type");
   res.status(upstream.status);
@@ -180,10 +178,9 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         // it when unset, so a mirrored content-type would silently win over the
         // application/json the .json() call below is supposed to set. .json()/.type()
         // remain the single source of truth for content-type, as today.
-        upstream.headers.forEach((value, key) => {
-          const lower = key.toLowerCase();
-          if (lower === "content-type") return;
-          if (!EXCLUDED_UPSTREAM_RELAY_HEADERS.has(lower)) res.setHeader(key, value);
+        mirrorUpstreamHeaders(upstream.headers, (key, value) => {
+          if (key.toLowerCase() === "content-type") return;
+          res.setHeader(key, value);
         });
         if (collected.kind === "json") {
           applyCodexUsage(entry, usageFromResponseBody(collected.body));

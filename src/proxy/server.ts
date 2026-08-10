@@ -20,7 +20,7 @@ import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
 import {
   prepareOpenAIAccountForRequest,
-  refreshOpenAISubscriptionToken,
+  refreshAndPersistOpenAIAccount,
   startOpenAIRefreshLoop,
   type OpenAISubscriptionAccount,
 } from "../providers/openai/token-refresher.js";
@@ -1092,11 +1092,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // this client wait on it. Best-effort: failures are swallowed here since
   // the ingress lifecycle has already recorded the 401 for this request.
   const onOpenAIUpstreamAuthFailure = (account: OpenAIAccount): void => {
-    refreshOpenAISubscriptionToken(account)
-      .then(ok => {
-        if (ok) persistOpenAIAccounts(openAIAccounts);
-      })
-      .catch(() => {});
+    refreshAndPersistOpenAIAccount(account, openAIAccounts, persistOpenAIAccounts).catch(() => {});
   };
 
   mountResponsesRoutes(app, {

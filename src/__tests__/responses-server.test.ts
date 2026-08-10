@@ -417,6 +417,45 @@ describe("mountResponsesRoutes", () => {
       expect(await res.text()).toBe(errorBody);
     });
   });
+
+  it("strips the full hop-by-hop header set, including Connection-nominated headers, on a non-streaming failure relay", async () => {
+    const errorBody = JSON.stringify({ error: { message: "rate limited" } });
+    const forward: ForwardOpenAI = async () => new Response(errorBody, {
+      status: 429,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "120",
+        "x-codex-primary-used-percent": "100",
+        te: "trailers",
+        trailer: "x-trace-id",
+        upgrade: "h2c",
+        "proxy-authenticate": "Basic",
+        connection: "close, x-internal-token",
+        "x-internal-token": "secret",
+      },
+    });
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get("retry-after")).toBe("120");
+      expect(res.headers.get("x-codex-primary-used-percent")).toBe("100");
+      // Fixed RFC 7230 hop-by-hop headers.
+      expect(res.headers.get("te")).toBeNull();
+      expect(res.headers.get("trailer")).toBeNull();
+      expect(res.headers.get("upgrade")).toBeNull();
+      expect(res.headers.get("proxy-authenticate")).toBeNull();
+      // Nominated dynamically via this response's own Connection header.
+      expect(res.headers.get("x-internal-token")).toBeNull();
+      expect(await res.text()).toBe(errorBody);
+    });
+  });
 });
 
 describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)", () => {
@@ -735,6 +774,46 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
       // If content-encoding leaked through, fetch would try to gunzip a body
       // that was never actually compressed and .text() would throw instead
       // of resolving — a stronger signal than just checking header absence.
+      await expect(res.text()).resolves.toBe(rawBody);
+    });
+  });
+
+  it("strips the full hop-by-hop header set on a streaming relay, without altering the relayed bytes", async () => {
+    const rawBody = JSON.stringify({ error: { message: "rate limited" } });
+    const forward: ForwardOpenAI = async () => new Response(rawBody, {
+      status: 429,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "120",
+        "x-codex-primary-used-percent": "100",
+        te: "trailers",
+        trailer: "x-trace-id",
+        upgrade: "h2c",
+        "proxy-authenticate": "Basic",
+        connection: "close, x-internal-token",
+        "x-internal-token": "secret",
+      },
+    });
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get("retry-after")).toBe("120");
+      expect(res.headers.get("x-codex-primary-used-percent")).toBe("100");
+      // Fixed RFC 7230 hop-by-hop headers.
+      expect(res.headers.get("te")).toBeNull();
+      expect(res.headers.get("trailer")).toBeNull();
+      expect(res.headers.get("upgrade")).toBeNull();
+      expect(res.headers.get("proxy-authenticate")).toBeNull();
+      // Nominated dynamically via this response's own Connection header.
+      expect(res.headers.get("x-internal-token")).toBeNull();
+      // The relay is byte-transparent: header filtering must never touch the body.
       await expect(res.text()).resolves.toBe(rawBody);
     });
   });

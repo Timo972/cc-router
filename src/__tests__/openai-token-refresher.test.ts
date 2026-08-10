@@ -1,8 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { needsOpenAIRefresh, prepareOpenAIAccountForRequest, refreshOpenAISubscriptionToken, startOpenAIRefreshLoop } from "../providers/openai/token-refresher.js";
+import {
+  hasPendingCredentialWrite,
+  needsOpenAIRefresh,
+  prepareOpenAIAccountForRequest,
+  refreshOpenAISubscriptionToken,
+  startOpenAIRefreshLoop,
+} from "../providers/openai/token-refresher.js";
 import { createOpenAIAccount } from "../providers/openai/account-state.js";
 import { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { NoEligibleAccountError } from "../proxy/account-pool.js";
+
+/** Matches the JWT-building helper used in openai-usage.test.ts. */
+function jwt(payload: Record<string, unknown>): string {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  return `header.${body}.signature`;
+}
 
 describe("OpenAI subscription token refresher", () => {
   afterEach(() => {
@@ -201,7 +213,119 @@ describe("OpenAI subscription token refresher", () => {
 
     expect(first.accessToken).toBe("new-access");
     expect(second.accessToken).toBe("new-access");
-    expect(consoleErrorSpy).toHaveBeenCalledTimes(2);
+    // `runOnlyPendingTimersAsync` fires the loop's immediate queued check plus
+    // one interval tick. The first check refreshes both accounts and each
+    // throwing persist logs once (2 calls) and marks the account pending; the
+    // second check finds neither account due for refresh but retries their
+    // still-pending write, which throws again and logs again (2 more calls).
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(4);
+    expect(hasPendingCredentialWrite(first)).toBe(true);
+    expect(hasPendingCredentialWrite(second)).toBe(true);
     vi.useRealTimers();
+  });
+
+  it("leaves nothing pending after a successful persist", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }),
+    } as Response);
+
+    const account = {
+      id: "openai-victor",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    };
+    const save = vi.fn();
+
+    const ok = await prepareOpenAIAccountForRequest(account, [account], save);
+
+    expect(ok).toBe(true);
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(hasPendingCredentialWrite(account)).toBe(false);
+  });
+
+  it("retries a rotated credential write on a later, otherwise-idle request until it succeeds", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }),
+    } as Response);
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const account = {
+      id: "openai-victor",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    };
+    const accounts = [account];
+
+    // First request: the refresh succeeds, but persisting it (e.g. a
+    // transient disk-full) throws. This must not fail the request that
+    // triggered the refresh — the caller already has a usable token in memory.
+    const failingSave = vi.fn(() => {
+      throw new Error("disk full");
+    });
+    const firstOk = await prepareOpenAIAccountForRequest(account, accounts, failingSave);
+
+    expect(firstOk).toBe(true);
+    expect(account.accessToken).toBe("new-access");
+    expect(hasPendingCredentialWrite(account)).toBe(true);
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
+
+    // Second request: no refresh is due (expiresAt was just rotated far into
+    // the future), but the account is still dirty from the first request, so
+    // this otherwise-idle call must retry — and clear — the pending write.
+    account.expiresAt = Date.now() + 60 * 60 * 1000;
+    const workingSave = vi.fn();
+    const secondOk = await prepareOpenAIAccountForRequest(account, accounts, workingSave);
+
+    expect(secondOk).toBe(true);
+    expect(workingSave).toHaveBeenCalledWith(accounts);
+    expect(hasPendingCredentialWrite(account)).toBe(false);
+  });
+
+  it("recomputes the account's plan from the rotated access token after a refresh", async () => {
+    const oldToken = jwt({ "https://api.openai.com/auth": { chatgpt_plan_type: "Plus" } });
+    const newToken = jwt({ "https://api.openai.com/auth": { chatgpt_plan_type: "Pro" } });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        access_token: newToken,
+        refresh_token: "new-refresh",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }),
+    } as Response);
+
+    const account = createOpenAIAccount({
+      id: "openai-plan-change",
+      provider: "openai_subscription" as const,
+      accessToken: oldToken,
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    });
+    expect(account.rateLimits.plan).toBe("plus");
+
+    const save = vi.fn();
+    const ok = await prepareOpenAIAccountForRequest(account, [account], save);
+
+    expect(ok).toBe(true);
+    expect(account.rateLimits.plan).toBe("pro");
   });
 });
