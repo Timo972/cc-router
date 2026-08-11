@@ -77,6 +77,7 @@ function unsafeSpan(overrides: Partial<ReadableSpan> = {}): ReadableSpan {
       "http.request.header.authorization": PRIVATE_CANARY,
       "url.full": PRIVATE_CANARY,
       prompt: PRIVATE_CANARY,
+      "private.canaries": Object.values(TELEMETRY_CANARY),
     },
     links: [{ context: { traceId: TRACE_ID, spanId: PARENT_SPAN_ID, traceFlags: 1 }, attributes: { prompt: PRIVATE_CANARY } }],
     events: [{ name: PRIVATE_CANARY, time: [1_800_000_000, 0], attributes: { prompt: PRIVATE_CANARY }, droppedAttributesCount: 0 }],
@@ -124,6 +125,7 @@ function unsafeLog(overrides: Partial<ReadableLogRecord> = {}): ReadableLogRecor
       "cc_router.diagnostic_id": CANDIDATE_ID,
       prompt: PRIVATE_CANARY,
       error: PRIVATE_CANARY,
+      "private.canaries": Object.values(TELEMETRY_CANARY),
     },
     droppedAttributesCount: 8,
   };
@@ -443,6 +445,172 @@ describe("privacy-safe log exporter", () => {
 
     expect(delegateCalls).toBe(0);
   });
+
+  it("caps every delegated log batch at the configured safe maximum", async () => {
+    const delegated: ReadableLogRecord[][] = [];
+    const delegate: LogRecordExporter = {
+      export(logs, callback) {
+        delegated.push(logs);
+        callback({ code: 0 });
+      },
+      forceFlush: async () => undefined,
+      shutdown: async () => undefined,
+    };
+    const exporter = createPrivacySafeLogExporter({
+      delegate,
+      getSnapshot: () => snapshot(),
+      getDiagnosticId: () => DIAGNOSTIC_ID,
+      maxBatchSize: 2,
+    });
+
+    await exportLogs(exporter, [unsafeLog(), unsafeLog(), unsafeLog()]);
+
+    expect(delegated).toHaveLength(1);
+    expect(delegated[0]).toHaveLength(2);
+  });
+
+  it("does not flush a log delegate after telemetry is disabled", async () => {
+    let flushes = 0;
+    const delegate: LogRecordExporter = {
+      export: (_logs, callback) => callback({ code: 0 }),
+      forceFlush: async () => {
+        flushes += 1;
+      },
+      shutdown: async () => undefined,
+    };
+    const exporter = createPrivacySafeLogExporter({
+      delegate,
+      getSnapshot: () => snapshot(false),
+      getDiagnosticId: () => DIAGNOSTIC_ID,
+    });
+
+    await exporter.forceFlush();
+
+    expect(flushes).toBe(0);
+  });
+
+  it("drops a reconstructed queued log batch when telemetry turns off before delegation", async () => {
+    let delegateCalls = 0;
+    let reads = 0;
+    const delegate: LogRecordExporter = {
+      export: (_logs, callback) => {
+        delegateCalls += 1;
+        callback({ code: 0 });
+      },
+      forceFlush: async () => undefined,
+      shutdown: async () => undefined,
+    };
+    const exporter = createPrivacySafeLogExporter({
+      delegate,
+      getSnapshot: () => {
+        reads += 1;
+        return snapshot(reads === 1);
+      },
+      getDiagnosticId: () => DIAGNOSTIC_ID,
+    });
+
+    await expect(exportLogs(exporter, [unsafeLog()])).resolves.toEqual({ code: 0 });
+
+    expect(reads).toBe(2);
+    expect(delegateCalls).toBe(0);
+  });
+
+  it("contains synchronous and callback log delegate failures without forwarding raw errors", async () => {
+    const thrown = createPrivacySafeLogExporter({
+      delegate: {
+        export() {
+          throw new Error(PRIVATE_CANARY);
+        },
+        forceFlush: async () => undefined,
+        shutdown: async () => undefined,
+      },
+      getSnapshot: () => snapshot(),
+      getDiagnosticId: () => DIAGNOSTIC_ID,
+    });
+    const callbackFailure = createPrivacySafeLogExporter({
+      delegate: {
+        export(_logs, callback) {
+          callback({ code: 1, error: new Error(PRIVATE_CANARY) });
+        },
+        forceFlush: async () => undefined,
+        shutdown: async () => undefined,
+      },
+      getSnapshot: () => snapshot(),
+      getDiagnosticId: () => DIAGNOSTIC_ID,
+    });
+
+    await expect(exportLogs(thrown, [unsafeLog()])).resolves.toEqual({ code: 1 });
+    await expect(exportLogs(callbackFailure, [unsafeLog()])).resolves.toEqual({ code: 1 });
+  });
+
+  it("bounds log force-flush and shutdown when the delegate never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const delegate: LogRecordExporter = {
+        export: () => undefined,
+        forceFlush: () => new Promise<void>(() => undefined),
+        shutdown: () => new Promise<void>(() => undefined),
+      };
+      const exporter = createPrivacySafeLogExporter({
+        delegate,
+        getSnapshot: () => snapshot(),
+        getDiagnosticId: () => DIAGNOSTIC_ID,
+        lifecycleTimeoutMillis: 10,
+      });
+
+      let flushSettled = false;
+      const flush = exporter.forceFlush().then(() => {
+        flushSettled = true;
+      });
+      await vi.advanceTimersByTimeAsync(9);
+      expect(flushSettled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      expect(flushSettled).toBe(true);
+      await expect(flush).resolves.toBeUndefined();
+
+      let shutdownSettled = false;
+      const shutdown = exporter.shutdown().then(() => {
+        shutdownSettled = true;
+      });
+      await vi.advanceTimersByTimeAsync(9);
+      expect(shutdownSettled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      expect(shutdownSettled).toBe(true);
+      await expect(shutdown).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails closed within a deadline when a log delegate never invokes its callback", async () => {
+    vi.useFakeTimers();
+    try {
+      const exporter = createPrivacySafeLogExporter({
+        delegate: {
+          export: () => undefined,
+          forceFlush: async () => undefined,
+          shutdown: async () => undefined,
+        },
+        getSnapshot: () => snapshot(),
+        getDiagnosticId: () => DIAGNOSTIC_ID,
+        exportTimeoutMillis: 10,
+      });
+
+      let resultCode: number | undefined;
+      const result = exportLogs(exporter, [unsafeLog()]).then(value => {
+        resultCode = value.code;
+        return value;
+      });
+      await vi.advanceTimersByTimeAsync(9);
+      expect(resultCode).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(2);
+      expect(resultCode).toBe(1);
+
+      await expect(result).resolves.toEqual({ code: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("official PostHog EU OTLP delegates", () => {
@@ -450,6 +618,7 @@ describe("official PostHog EU OTLP delegates", () => {
     const traceCapture = await startTransportCaptureServer();
     const logCapture = await startTransportCaptureServer();
     const log = unsafeLog();
+    const span = unsafeSpan();
     const exporters = createPostHogOtlpExporters({
       traceUrl: traceCapture.endpoint("/i/v1/traces"),
       logUrl: logCapture.endpoint("/i/v1/logs"),
@@ -459,7 +628,14 @@ describe("official PostHog EU OTLP delegates", () => {
     });
 
     try {
-      await expect(exportSpans(exporters.spanExporter, [unsafeSpan()])).resolves.toEqual({ code: 0 });
+      const spanCanaries = span.attributes["private.canaries"];
+      const logCanaries = log.attributes["private.canaries"];
+      for (const canary of Object.values(TELEMETRY_CANARY)) {
+        expect(spanCanaries).toContain(canary);
+        expect(logCanaries).toContain(canary);
+      }
+
+      await expect(exportSpans(exporters.spanExporter, [span])).resolves.toEqual({ code: 0 });
       await expect(exportLogs(exporters.logExporter, [log])).resolves.toEqual({ code: 0 });
 
       expect(traceCapture.requests).toHaveLength(1);
@@ -488,7 +664,7 @@ describe("official PostHog EU OTLP delegates", () => {
         CANDIDATE_ID,
       ]) {
         expect(traceBytes).not.toContain(forbidden);
-        expect(logBytes).not.toContain(forbidden);
+        expect(logBytes).not.toContain(JSON.stringify(forbidden).slice(1, -1));
       }
     } finally {
       await exporters.spanExporter.shutdown();
