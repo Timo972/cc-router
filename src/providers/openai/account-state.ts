@@ -152,7 +152,16 @@ export function learnModelBucket(
 ): void {
   const model = normalizeModelSlug(modelSlug);
   if (!model || limitId === DEFAULT_CODEX_LIMIT_ID) return;
-  if (!account.modelBuckets.has(model) && account.modelBuckets.size >= MAX_MODEL_BUCKET_ENTRIES) {
+  if (account.modelBuckets.has(model)) {
+    // A `Map.set` on an existing key keeps its original insertion position, so
+    // relearning a mapping would leave it first in line for eviction however
+    // recently it was used. Delete before re-adding to move it to the end and
+    // make the eviction below true LRU: otherwise a header-only 429 could
+    // learn a mapping and then have it evicted while its bucket cooldown is
+    // still live, which loses the model→bucket association `hardBlock` needs
+    // to keep that model off the cooling account.
+    account.modelBuckets.delete(model);
+  } else if (account.modelBuckets.size >= MAX_MODEL_BUCKET_ENTRIES) {
     const oldest = account.modelBuckets.keys().next().value;
     if (oldest !== undefined) account.modelBuckets.delete(oldest);
   }

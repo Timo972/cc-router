@@ -90,6 +90,23 @@ describe("bucketForModel", () => {
     for (let i = 0; i < 40; i++) learnModelBucket(account, `model-${i}`, "codex_x");
     expect(account.modelBuckets.size).toBeLessThanOrEqual(32);
   });
+
+  it("relearning a mapping refreshes its recency so eviction stays true LRU", () => {
+    const account = createOpenAIAccount(record());
+    // Fill the map exactly to capacity.
+    for (let i = 0; i < 32; i++) learnModelBucket(account, `model-${i}`, "codex_x");
+
+    // `model-0` is the oldest by insertion, but relearning it must move it to
+    // the back of the eviction queue — a plain Map.set would not.
+    learnModelBucket(account, "model-0", "codex_bengalfox");
+    learnModelBucket(account, "model-new", "codex_x");
+
+    expect(account.modelBuckets.size).toBe(32);
+    expect(account.modelBuckets.get("model-0")).toBe("codex_bengalfox");
+    expect(account.modelBuckets.has("model-new")).toBe(true);
+    // `model-1` was the oldest entry never touched since insertion.
+    expect(account.modelBuckets.has("model-1")).toBe(false);
+  });
 });
 
 describe("sweepCodexRateLimits", () => {

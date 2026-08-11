@@ -161,13 +161,23 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       relay: async (upstream, res, entry) => {
         if (body.stream === true) {
           const observer = createCodexUsageObserver();
+          // Only an upstream that actually promised a successful event stream
+          // can be judged on whether that stream completed. A non-OK response
+          // (a plain 401/429/5xx body) has no SSE events to observe, so
+          // `failure()` would always report a missing completion — and
+          // `sendUpstreamResponse` has already relayed the real status to the
+          // client, so reporting 502 here would log a 502 for a client that
+          // received a 429 and hide the actual failure from diagnostics.
+          const streamed = upstream.ok
+            && (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
           await sendUpstreamResponse(upstream, res, chunk => observer.push(chunk));
           applyCodexUsage(entry, observer.finish());
           // Bytes already written to the client are untouched — this only
           // changes the REPORTED status (used for stats/activity/cooldown),
           // matching a stream that upstream answered `200` but that ended in
           // a `response.failed`/`error` SSE event instead of completing.
-          return { statusCode: observer.failure() !== undefined ? 502 : upstream.status };
+          const synthesized = streamed && observer.failure() !== undefined;
+          return { statusCode: synthesized ? 502 : upstream.status };
         }
 
         const collected = await collectCodexResponseStream(upstream);

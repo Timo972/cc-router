@@ -1066,6 +1066,29 @@ describe("mountResponsesRoutes sticky routing", () => {
     expect(seen[1]).not.toBe(seen[0]);
   });
 
+  it("records the real upstream status for a streamed non-SSE error, not a synthesized 502", async () => {
+    // A stream:true request whose upstream answers with a plain JSON 429 has no
+    // SSE events to observe, so the missing-completion check must not fire —
+    // the client already received 429 and the activity log has to agree.
+    const account = makeRuntimeAccount("openai-a");
+    const forwardOpenAI = vi.fn(async () => new Response(
+      JSON.stringify({ error: { message: "rate limit reached" } }),
+      { status: 429, headers: { "content-type": "application/json", "retry-after": "60" } },
+    ));
+    const { app, activity } = mountWithPool([account], forwardOpenAI);
+
+    await withServer(app, async baseUrl => {
+      const res = await post(baseUrl, {});
+      expect(res.status).toBe(429);
+      expect(res.headers.get("retry-after")).toBe("60");
+      expect(await res.text()).toBe(JSON.stringify({ error: { message: "rate limit reached" } }));
+    });
+
+    const entry = activity.find(e => e.type === "error");
+    expect(entry?.statusCode).toBe(429);
+    expect(activity.some(e => e.statusCode === 502)).toBe(false);
+  });
+
   it("scopes a 429 with x-codex-active-limit to the named bucket only", async () => {
     const account = makeRuntimeAccount("openai-a");
     const forwardOpenAI = vi.fn(async () => {
