@@ -12,7 +12,7 @@ const execFileAsync = promisify(execFile);
 // Resolve the path to the compiled CLI entry point
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const CLI_ENTRY = join(__dirname, "index.js");
+const CLI_ENTRY = join(__dirname, "bootstrap.js");
 
 export function registerService(program: Command): void {
   const service = program

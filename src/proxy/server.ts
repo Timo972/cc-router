@@ -47,6 +47,9 @@ import {
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
 import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
+import { shutdownProxyTelemetryWithin } from "../telemetry/runtime.js";
+
+const TELEMETRY_SHUTDOWN_DEADLINE_MS = 500;
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
@@ -1181,14 +1184,25 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   }));
 
   // ─── Graceful shutdown ────────────────────────────────────────────────────
+  let shutdownStarted = false;
   const shutdown = () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
     console.log(chalk.yellow("\nShutting down — saving tokens..."));
     usageRefresher.stop();
     saveAccounts(pool.getAll());
     if (process.env["CC_ROUTER_DAEMON"] === "1") {
       removePid();
     }
-    process.exit(0);
+    void (async () => {
+      try {
+        await shutdownProxyTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS);
+      } catch {
+        // Telemetry shutdown is never allowed to change proxy exit behavior.
+      } finally {
+        process.exit(0);
+      }
+    })();
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);

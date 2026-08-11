@@ -15,6 +15,8 @@ import { launchDaemon } from "../daemon/launcher.js";
 import { isProxyRunning } from "../daemon/pid.js";
 import { installService } from "../daemon/service.js";
 import { getLocalIPs } from "../utils/network.js";
+import { startProxyTelemetry } from "../telemetry/runtime.js";
+import type { RuntimeMode } from "../telemetry/contracts.js";
 
 export function registerStart(program: Command): void {
   program
@@ -331,6 +333,12 @@ async function startForeground(opts: {
     process.env["HOST"] = "0.0.0.0";
   }
 
+  const runtimeMode: RuntimeMode = process.env["CC_ROUTER_SERVICE"] === "1"
+    ? "service"
+    : process.env["CC_ROUTER_DAEMON"] === "1"
+      ? "daemon"
+      : "foreground";
+  startProxyTelemetry(runtimeMode);
   const { startServer } = await import("../proxy/server.js");
   await startServer({
     port: parseInt(opts.port, 10),

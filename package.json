@@ -5,12 +5,12 @@
   "type": "module",
   "packageManager": "pnpm@11.18.0",
   "bin": {
-    "cc-router": "dist/cli/index.js"
+    "cc-router": "dist/cli/bootstrap.js"
   },
   "scripts": {
     "build": "tsc",
-    "dev": "tsx src/cli/index.ts",
-    "start": "node dist/cli/index.js",
+    "dev": "tsx src/cli/bootstrap.ts",
+    "start": "node dist/cli/bootstrap.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit"

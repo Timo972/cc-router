@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import { Command } from "commander";
 import { registerSetup } from "./cmd-setup.js";
 import { registerStart } from "./cmd-start.js";
@@ -63,4 +62,6 @@ if (!process.env["NO_UPDATE_NOTIFIER"] && !process.env["CI"]) {
   }).catch(() => { /* silent */ });
 }
 
-program.parse();
+export async function runCli(): Promise<void> {
+  await program.parseAsync();
+}

@@ -38,5 +38,5 @@ EXPOSE 3456
 
 # accounts.json is expected to be mounted at runtime via docker-compose volume
 # The container will exit with a clear error if it's not present
-ENTRYPOINT ["node", "dist/cli/index.js"]
+ENTRYPOINT ["node", "dist/cli/bootstrap.js"]
 CMD ["start"]
