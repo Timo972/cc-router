@@ -163,6 +163,7 @@ export interface SafeRuntimeEventProperties {
   serviceVersion?: string;
   osFamily?: OsFamily;
   runtimeMode?: RuntimeMode;
+  accountPoolSize?: number;
 }
 
 export interface SafeSetupEventProperties extends SafeRuntimeEventProperties {

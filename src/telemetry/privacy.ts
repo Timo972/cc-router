@@ -568,6 +568,7 @@ function runtimeEventProperties(input: unknown): SafeRuntimeEventProperties | un
   assignIfDefined(output, "serviceVersion", version(input.serviceVersion));
   assignIfDefined(output, "osFamily", otherEnum(OS_FAMILIES, input.osFamily) as OsFamily | undefined);
   assignIfDefined(output, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode) as RuntimeMode | undefined);
+  assignIfDefined(output, "accountPoolSize", boundedInteger(input.accountPoolSize, MAX_ACCOUNT_POOL_SIZE));
   return output;
 }
 

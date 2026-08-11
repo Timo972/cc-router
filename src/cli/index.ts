@@ -12,6 +12,7 @@ import { registerTelemetry } from "./cmd-telemetry.js";
 import { registerLogs } from "./cmd-logs.js";
 import { registerModels } from "./cmd-models.js";
 import { getCurrentVersion, checkForUpdate, printUpdateBanner } from "../utils/self-update.js";
+import { recordApplicationStart } from "../telemetry/facade.js";
 
 const program = new Command();
 
@@ -63,5 +64,6 @@ if (!process.env["NO_UPDATE_NOTIFIER"] && !process.env["CI"]) {
 }
 
 export async function runCli(): Promise<void> {
+  recordApplicationStart();
   await program.parseAsync();
 }

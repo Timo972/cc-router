@@ -59,7 +59,7 @@ function showStatus(): void {
   console.log();
   console.log(chalk.dim("  What we send:  version, OS, locale, lifecycle events (start, heartbeat)"));
   console.log(chalk.dim("  What we DON'T: IPs, tokens, prompts, request content, account names"));
-  console.log(chalk.dim("  Source code:   src/utils/telemetry.ts"));
+  console.log(chalk.dim("  Source code:   src/telemetry/"));
   console.log(chalk.dim("  Default:       on for new installs"));
   console.log();
   console.log(chalk.dim("  Disable:  cc-router telemetry off"));

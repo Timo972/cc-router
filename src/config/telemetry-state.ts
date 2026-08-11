@@ -22,6 +22,13 @@ export interface TelemetrySnapshot {
   enabled: boolean;
 }
 
+let pendingFirstStartInstallId: string | undefined;
+let firstStartClaimedByProcess = false;
+
+function markFreshStateForFirstStart(state: TelemetryState): void {
+  if (!firstStartClaimedByProcess) pendingFirstStartInstallId = state.installId;
+}
+
 function defaultState(): TelemetryState {
   return {
     enabled: true,
@@ -36,6 +43,7 @@ export function loadTelemetryState(): TelemetryState {
   if (!existsSync(TELEMETRY_PATH)) {
     const state = defaultState();
     writeTelemetryState(state);
+    markFreshStateForFirstStart(state);
     return state;
   }
   try {
@@ -43,6 +51,7 @@ export function loadTelemetryState(): TelemetryState {
     // Fill any missing fields to keep the file forward-compatible. Existing
     // boolean choices are always preserved; an older state without `enabled`
     // migrates to the default-on policy.
+    const createdInstallIdentity = !(typeof raw.installId === "string" && raw.installId);
     const state: TelemetryState = {
       enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,
       installId: typeof raw.installId === "string" && raw.installId ? raw.installId : randomUUID(),
@@ -57,10 +66,12 @@ export function loadTelemetryState(): TelemetryState {
     ) {
       writeTelemetryState(state);
     }
+    if (createdInstallIdentity) markFreshStateForFirstStart(state);
     return state;
   } catch {
     const state = defaultState();
     writeTelemetryState(state);
+    markFreshStateForFirstStart(state);
     return state;
   }
 }
@@ -82,6 +93,21 @@ export function getTelemetrySnapshot(): TelemetrySnapshot {
   const enabled = !environmentDisabled && state.enabled;
 
   return { state, environmentDisabled, enabled };
+}
+
+// Claim the one first-start event belonging to fresh state created by this
+// process. Reading an existing state file in a later process never qualifies.
+export function claimTelemetryFirstStart(): TelemetrySnapshot | undefined {
+  const pendingInstallId = pendingFirstStartInstallId;
+  if (!pendingInstallId) return undefined;
+  pendingFirstStartInstallId = undefined;
+  firstStartClaimedByProcess = true;
+  try {
+    const snapshot = getTelemetrySnapshot();
+    return snapshot.state.installId === pendingInstallId ? snapshot : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // Returns true only if the user has not opted out through any mechanism:

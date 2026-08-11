@@ -9,8 +9,11 @@ import { TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccounts, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner } from "../utils/self-update.js";
-import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
-import { loadTelemetryState } from "../config/telemetry.js";
+import {
+  recordProxyStarted,
+  shutdownTelemetryWithin,
+  startProxyHeartbeat,
+} from "../telemetry/facade.js";
 import { logRoute, logError, logStartup } from "./logger.js";
 import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
@@ -47,7 +50,6 @@ import {
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
 import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
-import { shutdownProxyTelemetryWithin } from "../telemetry/runtime.js";
 
 const TELEMETRY_SHUTDOWN_DEADLINE_MS = 500;
 
@@ -1196,7 +1198,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     }
     void (async () => {
       try {
-        await shutdownProxyTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS);
+        await shutdownTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS);
       } catch {
         // Telemetry shutdown is never allowed to change proxy exit behavior.
       } finally {
@@ -1284,21 +1286,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       ? chalk.gray("  Auto-update: enabled (patch/minor)")
       : chalk.gray("  Auto-update: off (notify-only) — run 'cc-router update' to install"));
 
-    // Anonymous telemetry — fire-and-forget, never blocks proxy startup.
-    try {
-      const telemetryState = loadTelemetryState();
-      // First-run detection: if the install is brand new, emit app_started too
-      const firstRunAge = Date.now() - new Date(telemetryState.firstRunAt).getTime();
-      if (firstRunAge < 5 * 60 * 1000) {
-        void trackEvent("app_started", { first_run: true });
-      }
-      void trackEvent("proxy_started", {
-        account_count: totalAccountCount,
-        mode,
-      });
-      startHeartbeat(totalAccountCount);
-    } catch {
-      // never let telemetry break the proxy
-    }
+    recordProxyStarted(totalAccountCount);
+    startProxyHeartbeat(totalAccountCount);
   });
 }
