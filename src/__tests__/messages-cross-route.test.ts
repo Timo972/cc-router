@@ -297,6 +297,76 @@ describe("mountMessagesCrossProviderRoute", () => {
     });
   });
 
+  it("reports a 502 when a non-stream collect never sees a completion event", async () => {
+    // The terminal frame is malformed JSON: tolerant parsing drops it rather
+    // than aborting the read, so without a completion check the collector
+    // would hand the client a fabricated empty message on a 200.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(502);
+      const body = await res.json() as { type: string; error: { type: string } };
+      expect(body.type).toBe("error");
+      expect(body.error.type).toBe("upstream_error");
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
+  it("reports a 502 when a non-stream collect gets a truncated stream", async () => {
+    // Every frame parses, but the stream simply stops before completing —
+    // partial text must not be dressed up as a finished answer.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(502);
+    });
+  });
+
   it("streams OpenAI Responses SSE back as Anthropic Messages SSE", async () => {
     const forward: ForwardOpenAI = async () => new Response(
       new ReadableStream({

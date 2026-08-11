@@ -131,10 +131,12 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
 }> {
   const reader = upstream.body?.getReader();
   if (!reader) {
+    // An event-stream response with no body cannot have completed. Reporting
+    // it as a failure keeps the caller from fabricating an empty 200.
     return {
       message: openAIResponseToAnthropicMessage({ id: "", model: "", output: [], usage: {} }),
       usage: undefined,
-      failure: undefined,
+      failure: "Upstream response had no body",
     };
   }
 
@@ -144,6 +146,7 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
   let model = "";
   let text = "";
   let failure: string | undefined;
+  let completed = false;
   let usage: OpenAIResponseCompleted["usage"] = {};
 
   const applyEvent = (event: unknown) => {
@@ -185,6 +188,7 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
       id = openAIEvent.response?.id ?? id;
       model = openAIEvent.response?.model ?? model;
       usage = openAIEvent.response?.usage ?? usage;
+      completed = true;
     }
   };
 
@@ -214,7 +218,15 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
       usage,
     }),
     usage: usageFromResponseBody({ usage }),
-    failure,
+    // Tolerant parsing skips a malformed frame rather than aborting the read,
+    // which keeps a bad nonterminal frame from truncating the stream — but it
+    // also means a malformed *terminal* `response.completed` frame would
+    // silently vanish. Without an observed completion there is no answer to
+    // return, so a stream that ends without one (dropped terminal frame, or
+    // an upstream that simply stopped mid-flight) is a failure rather than an
+    // empty success. An explicit `response.failed`/`error` message wins,
+    // since it says more about what went wrong.
+    failure: failure ?? (completed ? undefined : "Upstream stream ended without a completion event"),
   };
 }
 

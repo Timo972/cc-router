@@ -35,10 +35,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   branch awaited the upstream call without catching a rejection, so a single
   network blip could kill the daemon and lose every account's routing state.
 - `/v1/messages` no longer reports an upstream OpenAI failure as a success. A
-  stream ending in `response.failed`, an `error` event, or a JSON error body
-  was translated into an empty Anthropic message with HTTP 200; each now
-  surfaces as an error response, so a rate limit reads as a rate limit instead
-  of an empty assistant turn.
+  stream ending in `response.failed`, an `error` event, a JSON error body, or
+  no completion event at all — a stream that stopped mid-flight, or an
+  event-stream response with no body — was translated into an empty Anthropic
+  message with HTTP 200; each now surfaces as an error response, so a rate
+  limit reads as a rate limit instead of an empty assistant turn.
 - A single malformed SSE frame no longer truncates a `/v1/messages` stream.
   Parsing a chunk was all-or-nothing, so one bad frame discarded the valid
   events beside it and ended the response as a clean `200` the client could
