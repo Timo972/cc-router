@@ -9,6 +9,9 @@ import { bucketForModel, bucketIdForModel, sweepCodexRateLimits, type OpenAIAcco
 import { DEFAULT_CODEX_LIMIT_ID, type CodexLimitBucket, type CodexRateWindow } from "./usage.js";
 
 const MAX_TRUSTED_RATE_LIMIT_RESET_MS = 8 * 24 * 60 * 60 * 1_000;
+/** Matches the bucket-snapshot cap in account-state.ts: a real account has the
+ *  default bucket plus a handful of metered ones, never dozens. */
+const MAX_BUCKET_COOLDOWN_ENTRIES = 16;
 
 interface OpenAICooldowns {
   globalUntil: number;
@@ -107,7 +110,40 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     const expiry = this.proposedExpiry(account, durationMs);
     if (expiry === undefined) return;
     const state = this.cooldownsFor(account);
+    if (!state.bucketUntil.has(limitId)) this.makeRoomForBucketCooldown(state);
     state.bucketUntil.set(limitId, Math.max(state.bucketUntil.get(limitId) ?? 0, expiry));
+  }
+
+  /**
+   * Keep `bucketUntil` bounded before a new limit id is added. Every distinct
+   * `x-codex-active-limit` value an upstream 429 reports creates an entry that
+   * can live for up to the trust horizon, so without a cap a buggy (or
+   * hostile) upstream cycling fresh ids would grow this map with request
+   * volume — the bucket snapshots and model mappings are already capped, this
+   * was the one unbounded piece of per-account state.
+   *
+   * Expired entries go first since they no longer block anything. If that is
+   * not enough, the soonest-to-expire entry is dropped: it is the one with the
+   * least protection left to lose.
+   */
+  private makeRoomForBucketCooldown(state: OpenAICooldowns): void {
+    if (state.bucketUntil.size < MAX_BUCKET_COOLDOWN_ENTRIES) return;
+
+    const now = this.now();
+    for (const [limitId, until] of state.bucketUntil) {
+      if (until <= now) state.bucketUntil.delete(limitId);
+    }
+    if (state.bucketUntil.size < MAX_BUCKET_COOLDOWN_ENTRIES) return;
+
+    let soonestId: string | undefined;
+    let soonestUntil = Number.POSITIVE_INFINITY;
+    for (const [limitId, until] of state.bucketUntil) {
+      if (until < soonestUntil) {
+        soonestId = limitId;
+        soonestUntil = until;
+      }
+    }
+    if (soonestId !== undefined) state.bucketUntil.delete(soonestId);
   }
 
   getCooldownView(accountId: string): OpenAICooldownView {

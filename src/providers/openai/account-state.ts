@@ -183,17 +183,29 @@ export function bucketIdForModel(
   const model = normalizeModelSlug(modelSlug);
   if (!model) return undefined;
 
-  const mapped = account.modelBuckets.get(model);
-  if (mapped !== undefined) return mapped;
-
+  // A live bucket that names this model wins over the cached mapping. Upstream
+  // can move a model to a different limit id, and the freshly reported bucket
+  // is the one carrying current exhaustion data — trusting the cache first
+  // would keep consulting a superseded (or already-reaped) bucket, leaving an
+  // exhausted replacement eligible until a 429 happened to relearn it. When
+  // several buckets name the model, the most recently seen one is current.
+  let live: CodexLimitBucket | undefined;
   for (const bucket of account.rateLimits.buckets.values()) {
     if (bucket.limitId === DEFAULT_CODEX_LIMIT_ID) continue;
-    if (bucket.limitName?.trim().toLowerCase() === model) {
-      learnModelBucket(account, model, bucket.limitId);
-      return bucket.limitId;
-    }
+    if (bucket.limitName?.trim().toLowerCase() !== model) continue;
+    if (live === undefined || (bucket.lastSeenAt ?? 0) > (live.lastSeenAt ?? 0)) live = bucket;
   }
-  return undefined;
+  if (live !== undefined) {
+    // Re-learning also refreshes the mapping's LRU recency, so a model that
+    // keeps routing stays mapped.
+    learnModelBucket(account, model, live.limitId);
+    return live.limitId;
+  }
+
+  // No live bucket names this model. The cached mapping is what keeps a
+  // header-only 429's bucket cooldown enforceable — that path never carries a
+  // bucket snapshot, so the cache is the only association available.
+  return account.modelBuckets.get(model);
 }
 
 export function bucketForModel(

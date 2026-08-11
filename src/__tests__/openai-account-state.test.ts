@@ -91,6 +91,36 @@ describe("bucketForModel", () => {
     expect(account.modelBuckets.size).toBeLessThanOrEqual(32);
   });
 
+  it("prefers a newly reported live bucket over a stale cached mapping", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "10",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_bengalfox");
+
+    // Upstream moves the model to a different limit id and reports the new
+    // bucket as exhausted. The cached mapping still points at the old id, but
+    // the live bucket is the one with current exhaustion data.
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-newfox-primary-used-percent": "100",
+      "x-codex-newfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS + 1000), NOW_MS + 1000);
+
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_newfox");
+    expect(bucketForModel(account, "gpt-5.6-sol")?.primary?.utilization).toBe(1);
+    expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("codex_newfox");
+  });
+
+  it("falls back to the cached mapping when no live bucket names the model", () => {
+    const account = createOpenAIAccount(record());
+    // The header-only 429 path: a mapping exists with no bucket snapshot, and
+    // it must survive so the pool can still find that bucket's cooldown.
+    learnModelBucket(account, "gpt-5.6-sol", "codex_headeronly");
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_headeronly");
+    expect(bucketForModel(account, "gpt-5.6-sol")).toBeUndefined();
+  });
+
   it("relearning a mapping refreshes its recency so eviction stays true LRU", () => {
     const account = createOpenAIAccount(record());
     // Fill the map exactly to capacity.

@@ -114,6 +114,47 @@ describe("OpenAITokenPool cooldowns", () => {
     expect(view.bucketCooldowns).toEqual([{ limitId: "codex_bengalfox", untilMs: NOW_MS + 60_000 }]);
   });
 
+  it("makes room for a new bucket cooldown by dropping expired entries, not live ones", () => {
+    let now = NOW_MS;
+    const a = makeAccount("a");
+    learnModelBucket(a, "model-live", "codex_live_0");
+    const pool = new OpenAITokenPool([a], { now: () => now });
+
+    // One short cooldown that lapses, then fill the cap with long ones. The
+    // lapsed entry is what should make room for the 17th — a live cooldown
+    // must not be sacrificed while an expired one is still sitting there.
+    pool.setBucketCooldownForAccount(a, "codex_expired", 1_000);
+    for (let i = 0; i < 15; i++) {
+      pool.setBucketCooldownForAccount(a, `codex_live_${i}`, 60 * 60_000);
+    }
+    now += 2_000;
+    pool.setBucketCooldownForAccount(a, "codex_new", 60 * 60_000);
+
+    // Enforcement, not the display view (which caps its own list length).
+    expect(() => pool.acquireBest(new Map(), { requestedModel: "model-live" }))
+      .toThrow(NoEligibleAccountError);
+  });
+
+  it("evicts the soonest-to-expire bucket cooldown when every entry is still live", () => {
+    const a = makeAccount("a");
+    learnModelBucket(a, "model-soonest", "codex_soonest");
+    learnModelBucket(a, "model-longest", "codex_live_0");
+    const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
+
+    // 16 live entries with codex_soonest the shortest, so it has the least
+    // protection left to lose and is dropped to make room for the 17th.
+    pool.setBucketCooldownForAccount(a, "codex_soonest", 60_000);
+    for (let i = 0; i < 15; i++) {
+      pool.setBucketCooldownForAccount(a, `codex_live_${i}`, 60 * 60_000);
+    }
+    pool.setBucketCooldownForAccount(a, "codex_new", 60 * 60_000);
+
+    // The evicted bucket no longer blocks its model; a retained one still does.
+    expect(pool.acquireBest(new Map(), { requestedModel: "model-soonest" }).account.id).toBe("a");
+    expect(() => pool.acquireBest(new Map(), { requestedModel: "model-longest" }))
+      .toThrow(NoEligibleAccountError);
+  });
+
   it("enforces a bucket cooldown learned from a header-only 429 with no bucket snapshot", () => {
     const a = makeAccount("a");
     // Mirrors what applyCodexFailureRouting does for a 429 whose headers name
