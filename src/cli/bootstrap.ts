@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { register } from "node:module";
-import { getTelemetrySnapshot } from "../config/telemetry.js";
+import { getTelemetrySnapshot } from "../config/telemetry-state.js";
 
 function shouldPrepareProxyTelemetry(argv: readonly string[]): boolean {
   if (argv[2] !== "start") return false;

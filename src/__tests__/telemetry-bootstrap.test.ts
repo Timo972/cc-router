@@ -2,8 +2,8 @@ import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_pr
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { join, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { startTransportCaptureServer, type TransportCaptureServer } from "./telemetry-test-helpers.js";
 
@@ -180,6 +180,76 @@ describe("compiled ESM telemetry bootstrap", () => {
     await Promise.all(children.map(child => child.stop()));
     await Promise.all([close(target), telemetry.close()]);
   });
+
+  it("registers the OTel ESM hook before loading any general application module", () => {
+    const testHome = mkdtempSync(join(tmpdir(), "cc-router-import-order-"));
+    const telemetryPath = join(testHome, "telemetry.json");
+    const loaderPath = join(testHome, "import-order-loader.mjs");
+    const importLogPath = join(testHome, "imports.jsonl");
+    const packageJson = JSON.parse(readFileSync(join(PROJECT_ROOT, "package.json"), "utf8")) as {
+      bin: { "cc-router": string };
+    };
+    const binary = join(PROJECT_ROOT, packageJson.bin["cc-router"]);
+
+    writeFileSync(telemetryPath, JSON.stringify({
+      enabled: true,
+      installId: "33333333-3333-4333-8333-333333333333",
+      firstRunAt: "2026-08-01T00:00:00.000Z",
+    }));
+    writeFileSync(loaderPath, `
+import { appendFileSync } from "node:fs";
+export async function resolve(specifier, context, nextResolve) {
+  const result = await nextResolve(specifier, context);
+  appendFileSync(process.env.CC_ROUTER_IMPORT_LOG, JSON.stringify(result.url) + "\\n");
+  return result;
+}
+`);
+
+    try {
+      const result = spawnSync(process.execPath, [
+        "--experimental-loader", pathToFileURL(loaderPath).href,
+        binary,
+        "start",
+        "--help",
+      ], {
+        cwd: PROJECT_ROOT,
+        env: {
+          ...process.env,
+          HOME: testHome,
+          TELEMETRY_PATH: telemetryPath,
+          CC_ROUTER_IMPORT_LOG: importLogPath,
+          NO_UPDATE_NOTIFIER: "1",
+          CI: "1",
+        },
+        encoding: "utf8",
+      });
+      expect(result.status, result.stderr).toBe(0);
+
+      const imports = readFileSync(importLogPath, "utf8")
+        .trim()
+        .split("\n")
+        .map(line => JSON.parse(line) as string);
+      const hookIndex = imports.findIndex(url =>
+        url.includes("@opentelemetry/instrumentation/hook.mjs")
+      );
+      expect(hookIndex).toBeGreaterThanOrEqual(0);
+
+      const localModulesBeforeHook = imports
+        .slice(0, hookIndex)
+        .filter(url => url.startsWith(pathToFileURL(join(PROJECT_ROOT, "dist")).href))
+        .map(url => relative(PROJECT_ROOT, fileURLToPath(url)));
+      const bootstrapSafeModules = new Set([
+        "dist/cli/bootstrap.js",
+        "dist/config/telemetry-state.js",
+        "dist/config/directory.js",
+        "dist/config/paths.js",
+      ]);
+      expect(localModulesBeforeHook[0]).toBe("dist/cli/bootstrap.js");
+      expect(localModulesBeforeHook.filter(module => !bootstrapSafeModules.has(module))).toEqual([]);
+    } finally {
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it("loads the supported ESM hook before the proxy and exports Express and Undici spans", async () => {
     const probe = createServer();

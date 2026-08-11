@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, chmodSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, copyFileSync, chmodSync } from "fs";
 import { randomBytes } from "crypto";
-import { CONFIG_DIR, ACCOUNTS_PATH, CONFIG_PATH } from "./paths.js";
+import { ACCOUNTS_PATH, CONFIG_PATH } from "./paths.js";
+import { ensureConfigDir } from "./directory.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
@@ -8,18 +9,9 @@ import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 
 export const DEFAULT_PROXY_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
-/** Owner-only permissions for files/dirs that hold OAuth tokens or the proxy secret. */
+/** Owner-only permissions for files that hold OAuth tokens or the proxy secret. */
 const SECRET_FILE_MODE = 0o600;
-const SECRET_DIR_MODE = 0o700;
-
-export function ensureConfigDir(): void {
-  if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true, mode: SECRET_DIR_MODE });
-    return;
-  }
-  // Tighten an existing dir that may predate this hardening. No-op on Windows.
-  try { chmodSync(CONFIG_DIR, SECRET_DIR_MODE); } catch { /* best effort */ }
-}
+export { ensureConfigDir };
 
 /**
  * Atomic + private write for credential files: write tmp as 0600 (umask can

@@ -40,4 +40,5 @@ jobs:
         run: pnpm test
 
       - name: Verify CLI starts
-        run: node dist/cli/index.js --version
+        run: >-
+          node --input-type=module -e "import { spawnSync } from 'node:child_process'; import { readFileSync } from 'node:fs'; const expected = JSON.parse(readFileSync('package.json', 'utf8')).version; const result = spawnSync(process.execPath, ['dist/cli/bootstrap.js', '--version'], { encoding: 'utf8', env: { ...process.env, NO_UPDATE_NOTIFIER: '1', CI: '1' } }); const actual = result.stdout.trim(); if (result.status !== 0 || actual.length === 0 || actual !== expected) { console.error(result.stderr || ('Expected CLI version ' + expected + ', got ' + JSON.stringify(actual))); process.exit(1); }"
