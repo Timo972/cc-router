@@ -308,6 +308,15 @@ export function createPostHogTelemetryClient(
   let captureGeneration = 0;
   const preparedCaptureGenerations = new Map<string, number>();
 
+  const rememberPreparedCapture = (captureId: string, generation: number): void => {
+    preparedCaptureGenerations.set(captureId, generation);
+    while (preparedCaptureGenerations.size > POSTHOG_MAX_QUEUE_SIZE) {
+      const oldestCaptureId = preparedCaptureGenerations.keys().next().value as string | undefined;
+      if (!oldestCaptureId) break;
+      preparedCaptureGenerations.delete(oldestCaptureId);
+    }
+  };
+
   const beforeSend = (event: SdkEvent | null): SdkEvent | null => {
     try {
       if (!event || !isRecord(event.properties)) return null;
@@ -321,7 +330,7 @@ export function createPostHogTelemetryClient(
 
       if (event.event === "$exception") {
         const safe = reconstructExceptionEvent(event, installationId, captureId);
-        if (safe) preparedCaptureGenerations.set(captureId, eventGeneration as number);
+        if (safe) rememberPreparedCapture(captureId, eventGeneration as number);
         return safe;
       }
       const diagnosticId = own(event.properties, "diagnosticId");
@@ -333,7 +342,7 @@ export function createPostHogTelemetryClient(
         ...(typeof diagnosticId === "string" ? { diagnosticId } : {}),
       });
       if (!safe) return null;
-      preparedCaptureGenerations.set(captureId, eventGeneration as number);
+      rememberPreparedCapture(captureId, eventGeneration as number);
       return {
         event: safe.event,
         distinctId: safe.distinctId,
@@ -443,10 +452,11 @@ export function createPostHogTelemetryClient(
       }
     },
     async captureAnalyticsImmediate(event) {
+      let captureId: string | undefined;
       try {
         const active = getClient();
         if (!active) return;
-        const captureId = randomUUID();
+        captureId = randomUUID();
         await active.client.captureImmediate({
           event: event.event,
           distinctId: active.installationId,
@@ -461,6 +471,8 @@ export function createPostHogTelemetryClient(
         });
       } catch {
         // Immediate CLI capture must not change command behavior.
+      } finally {
+        if (captureId) preparedCaptureGenerations.delete(captureId);
       }
     },
     captureException(exception) {
@@ -478,10 +490,11 @@ export function createPostHogTelemetryClient(
       }
     },
     async captureExceptionImmediate(exception) {
+      let captureId: string | undefined;
       try {
         const active = getClient();
         if (!active) return;
-        const captureId = randomUUID();
+        captureId = randomUUID();
         await active.client.captureExceptionImmediate(
           exception.error,
           active.installationId,
@@ -489,6 +502,8 @@ export function createPostHogTelemetryClient(
         );
       } catch {
         // Immediate CLI capture must not change command behavior.
+      } finally {
+        if (captureId) preparedCaptureGenerations.delete(captureId);
       }
     },
     async flushWithin(deadlineMs) {
@@ -501,6 +516,7 @@ export function createPostHogTelemetryClient(
       shutdownStarted = true;
       if (!client) return;
       await settleWithin(() => client.shutdown(boundedDeadline(deadlineMs)), deadlineMs);
+      preparedCaptureGenerations.clear();
       sdkClient = undefined;
     },
     discardPending() {

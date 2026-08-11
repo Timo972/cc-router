@@ -384,6 +384,96 @@ describe("gated PostHog EU client", () => {
     releaseTransport?.();
   });
 
+  it.each([
+    ["analytics", "throw"],
+    ["analytics", "http_error"],
+    ["exception", "throw"],
+    ["exception", "http_error"],
+  ] as const)(
+    "forgets %s immediate capture provenance after a %s transport failure",
+    async (captureKind, failureMode) => {
+      let mode: "throw" | "http_error" | "success" = failureMode;
+      let gatedFetch: PostHogTransport | undefined;
+      let attemptedRequest: Parameters<PostHogTransport> | undefined;
+      let underlyingCalls = 0;
+      const transport: PostHogTransport = async (url, options) => {
+        underlyingCalls += 1;
+        attemptedRequest = [url, options];
+        if (mode === "throw") throw new Error("transport failed");
+        return { ...successfulResponse(), status: mode === "http_error" ? 500 : 200 };
+      };
+      const client = createPostHogTelemetryClient({
+        getSnapshot: () => snapshot(),
+        transport,
+        createSdkClient: (token, options) => {
+          gatedFetch = options.fetch;
+          return new PostHog(token, options);
+        },
+      });
+
+      if (captureKind === "analytics") {
+        await client.captureAnalyticsImmediate(analyticsEvent());
+      } else {
+        await client.captureExceptionImmediate(exceptionContract());
+      }
+      expect(underlyingCalls).toBe(1);
+      if (!gatedFetch || !attemptedRequest) throw new Error("test must capture the gated SDK request");
+
+      mode = "success";
+      await gatedFetch(...attemptedRequest);
+
+      expect(underlyingCalls).toBe(1);
+      await client.shutdownWithin(100);
+    },
+  );
+
+  it("fails closed for provenance evicted with the SDK's bounded queue", async () => {
+    let gatedFetch: PostHogTransport | undefined;
+    let sdkClient: PostHog | undefined;
+    const queuedMessages: Record<string, unknown>[] = [];
+    let underlyingCalls = 0;
+    const client = createPostHogTelemetryClient({
+      getSnapshot: () => snapshot(),
+      transport: async () => {
+        underlyingCalls += 1;
+        return successfulResponse();
+      },
+      createSdkClient: (token, options) => {
+        gatedFetch = options.fetch;
+        sdkClient = new PostHog(token, { ...options, flushAt: 100, maxQueueSize: 100, flushInterval: 0 });
+        sdkClient.flush = async () => undefined;
+        sdkClient.on("capture", message => {
+          if (typeof message === "object" && message !== null) {
+            queuedMessages.push(message as Record<string, unknown>);
+          }
+        });
+        return sdkClient;
+      },
+    });
+
+    for (let index = 0; index < 101; index += 1) client.captureAnalytics(analyticsEvent());
+    await waitForImmediate();
+
+    expect(queuedMessages).toHaveLength(101);
+    const evicted = queuedMessages[0];
+    if (!evicted || !gatedFetch || !sdkClient) throw new Error("test must observe the real SDK queue");
+    const queue = sdkClient.getPersistedProperty("queue" as Parameters<PostHog["getPersistedProperty"]>[0]) as Array<{
+      message?: Record<string, unknown>;
+    }>;
+    expect(queue).toHaveLength(100);
+    expect(queue.some(item => item.message?.uuid === evicted.uuid)).toBe(false);
+
+    await gatedFetch("https://eu.i.posthog.com/batch/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ batch: [evicted] }),
+    });
+
+    expect(underlyingCalls).toBe(0);
+    client.discardPending();
+    await client.shutdownWithin(100);
+  });
+
   it("swallows SDK initialization, capture, transport, flush, and shutdown failures", async () => {
     const throwingFactory = vi.fn((_token: string, _options: PostHogOptions): PostHogSdkClient => {
       throw new Error("initialization failed");
