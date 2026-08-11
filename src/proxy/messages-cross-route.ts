@@ -60,6 +60,38 @@ function isAnthropicMessagesRequest(value: unknown): value is AnthropicMessagesR
   );
 }
 
+/** Longest upstream error snippet echoed back when the body isn't JSON. */
+const MAX_UPSTREAM_ERROR_MESSAGE_LENGTH = 200;
+
+/** Anthropic error `type` for a relayed upstream HTTP failure status. */
+function anthropicErrorTypeForStatus(status: number): string {
+  if (status === 429) return "rate_limit_error";
+  if (status === 401) return "authentication_error";
+  if (status >= 500) return "upstream_error";
+  return "invalid_request_error";
+}
+
+/**
+ * Best-effort human-readable message for a non-OK upstream response: prefer
+ * a JSON `error.message`, else fall back to a bounded, control-character-free
+ * snippet of the raw body, else a generic status-only message.
+ */
+function extractUpstreamErrorMessage(bodyText: string, status: number): string {
+  const trimmed = bodyText.trim();
+  if (trimmed) {
+    try {
+      const parsed = JSON.parse(trimmed) as { error?: { message?: unknown } };
+      const message = parsed.error?.message;
+      if (typeof message === "string" && message) return message;
+    } catch {
+      // Not JSON — fall through to a bounded text snippet below.
+    }
+    const snippet = trimmed.replace(/[\x00-\x1f\x7f]/g, "").slice(0, MAX_UPSTREAM_ERROR_MESSAGE_LENGTH);
+    if (snippet) return snippet;
+  }
+  return `Upstream request failed with status ${status}`;
+}
+
 /**
  * Relay an upstream Codex response in Anthropic Messages shape and report the
  * status the client actually received — which is not always `upstream.status`:
@@ -73,6 +105,24 @@ async function sendOpenAIAsAnthropic(
   entry: LogEntry,
 ): Promise<number> {
   const onUsage = (usage: CodexUsageTotals | undefined) => applyCodexUsage(entry, usage);
+
+  // A non-OK response is never a Responses payload, whatever its content-type
+  // — parsing it as an event stream or a completed response would translate a
+  // real upstream failure (401/429/5xx) into an empty "success". Handle it
+  // before any content-type dispatch and relay the upstream status verbatim,
+  // never a synthesized 502.
+  if (!upstream.ok) {
+    const bodyText = await upstream.text();
+    res.status(upstream.status).json({
+      type: "error",
+      error: {
+        type: anthropicErrorTypeForStatus(upstream.status),
+        message: extractUpstreamErrorMessage(bodyText, upstream.status),
+      },
+    });
+    return upstream.status;
+  }
+
   const contentType = upstream.headers.get("content-type") ?? "";
   if (contentType.includes("text/event-stream")) {
     if (requestedStream) {
@@ -106,19 +156,6 @@ async function sendOpenAIAsAnthropic(
   }
 
   const json = await upstream.json() as OpenAIResponseCompleted;
-  // An upstream failure body is not a Responses payload — translating it would
-  // hand the client an empty `type:"message"` envelope instead of an error.
-  if (!upstream.ok) {
-    const message = (json as { error?: { message?: unknown } }).error?.message;
-    res.status(upstream.status).json({
-      type: "error",
-      error: {
-        type: upstream.status === 429 ? "rate_limit_error" : "upstream_error",
-        message: typeof message === "string" && message ? message : `Upstream returned ${upstream.status}`,
-      },
-    });
-    return upstream.status;
-  }
   onUsage(usageFromResponseBody(json));
   res.status(upstream.status).json(openAIResponseToAnthropicMessage(json));
   return upstream.status;
@@ -245,7 +282,10 @@ async function sendOpenAIStreamAsAnthropic(
   const reader = upstream.body?.getReader();
   if (!reader) {
     res.end();
-    return undefined;
+    // No body means no `response.completed` was ever possible either — mirror
+    // collectOpenAIStreamAsAnthropicMessage's `!reader` case below rather than
+    // reporting an empty stream as a success.
+    return "Upstream response had no body";
   }
 
   const decoder = new TextDecoder();
@@ -256,6 +296,7 @@ async function sendOpenAIStreamAsAnthropic(
   // than one. Mirrors `createCodexUsageObserver`'s finish()-once contract.
   let totals: CodexUsageTotals | undefined;
   let failure: string | undefined;
+  let completed = false;
 
   const inspect = (event: unknown): void => {
     totals = usageFromCompletedEvent(event) ?? totals;
@@ -265,6 +306,8 @@ async function sendOpenAIStreamAsAnthropic(
       failure = typed.response?.error?.message ?? "Response failed";
     } else if (typed.type === "error") {
       failure = typed.error?.message ?? "Upstream error event";
+    } else if (typed.type === "response.completed") {
+      completed = true;
     }
   };
 
@@ -298,7 +341,15 @@ async function sendOpenAIStreamAsAnthropic(
     res.end();
     onUsage?.(totals);
   }
-  return failure;
+  // Mirrors collectOpenAIStreamAsAnthropicMessage: tolerant parsing skips a
+  // malformed frame rather than aborting the relay, which also means a
+  // malformed *terminal* response.completed frame would silently vanish.
+  // Without an observed completion the client received a partial answer, not
+  // a finished one, so it is reported as a failure (bytes already relayed to
+  // the client are unaffected — only the status used for stats/activity
+  // changes). An explicit response.failed/error message wins, since it says
+  // more about what went wrong.
+  return failure ?? (completed ? undefined : "Upstream stream ended without a completion event");
 }
 
 export function mountMessagesCrossProviderRoute(

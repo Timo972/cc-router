@@ -129,6 +129,29 @@ describe("OpenAITokenPool cooldowns", () => {
     expect(pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-luna" }).account.id).toBe("a");
   });
 
+  it("keeps a named bucket's snapshot and mapping alive via an active cooldown even after its windows fully clear", () => {
+    let now = NOW_MS;
+    const a = makeAccount("a");
+    applyHeaders(a, {
+      "x-codex-bengalfox-primary-used-percent": "100",
+      "x-codex-bengalfox-primary-reset-at": String(NOW_SEC + 60),
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    });
+    const pool = new OpenAITokenPool([a], { now: () => now });
+    pool.setBucketCooldownForAccount(a, "codex_bengalfox", 10 * 60_000); // 10 minutes, set at NOW_MS
+
+    // Advance past the window's own 60s reset. A bare sweep would clear the
+    // window, but the pool-level cooldown on this limitId is still active for
+    // several more minutes, so the sweep must retain both the snapshot and
+    // the model mapping — and the model must stay blocked via the cooldown.
+    now = NOW_MS + 61_000;
+    expect(() => pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-sol" }))
+      .toThrow(NoEligibleAccountError);
+    expect(pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-luna" }).account.id).toBe("a");
+    expect(a.rateLimits.buckets.has("codex_bengalfox")).toBe(true);
+    expect(a.modelBuckets.get("gpt-5.6-sol")).toBe("codex_bengalfox");
+  });
+
   it("getGlobalCooldownUntil/isCoolingDown reflect only the global scope, not a shorter bucket cooldown", () => {
     const a = makeAccount("a");
     applyHeaders(a, {

@@ -184,7 +184,7 @@ describe("sweepCodexRateLimits", () => {
     expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(true);
   });
 
-  it("recovers a named bucket's individually-expired window without waiting on its other window", () => {
+  it("recovers a named bucket's individually-expired window in place while a still-live other window keeps the bucket alive", () => {
     const account = createOpenAIAccount(record());
     applyCodexRateLimits(account, parseCodexRateLimits({
       "x-codex-bengalfox-primary-used-percent": "100",
@@ -200,11 +200,16 @@ describe("sweepCodexRateLimits", () => {
     const staleAt = NOW_MS + 5 * 3600 * 1000 + 1000;
     const recovered = sweepCodexRateLimits(account, staleAt);
     expect(recovered).toBe(true);
-    // Nothing the bucket still reports remains exhausted (primary just
-    // cleared, secondary was never exhausted), so the bucket and its model
-    // mapping are cleaned up and the model is routable again.
-    expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(false);
-    expect(bucketForModel(account, "gpt-5.6-sol")).toBeUndefined();
+    // The primary recovers in place, but the secondary still carries live
+    // (nonzero) utilization — the bucket isn't "nothing left exhausted", it's
+    // still meaningfully tracking usage, so the bucket and its model mapping
+    // must survive rather than being tidied away.
+    const bucket = account.rateLimits.buckets.get("codex_bengalfox");
+    expect(bucket).toBeDefined();
+    expect(bucket?.primary?.utilization).toBe(0);
+    expect(bucket?.primary?.resetAt).toBe(0);
+    expect(bucket?.secondary?.utilization).toBeCloseTo(0.3);
+    expect(bucketForModel(account, "gpt-5.6-sol")?.limitId).toBe("codex_bengalfox");
   });
 
   it("zeroes an individually-expired named-bucket window in place while the bucket stays blocked by its other window", () => {
@@ -239,5 +244,127 @@ describe("sweepCodexRateLimits", () => {
     const bucket = account.rateLimits.buckets.get(DEFAULT_CODEX_LIMIT_ID)!;
     expect(bucket.primary?.utilization).toBe(1);
     expect(bucket.primary?.resetAt).toBe(0);
+  });
+
+  it("keeps a named bucket and its mapping alive via isRetained even though every window just zeroed out", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "0",
+      "x-codex-bengalfox-primary-reset-at": String(NOW_SEC + 60),
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+    expect(bucketForModel(account, "gpt-5.6-sol")).toBeDefined();
+
+    // Without isRetained this bucket would be removed (window expired this
+    // sweep, everything it reports is at zero utilization). An active
+    // bucket-scoped cooldown retains it regardless.
+    const recovered = sweepCodexRateLimits(account, NOW_MS + 61_000, {
+      isRetained: limitId => limitId === "codex_bengalfox",
+    });
+    expect(recovered).toBe(false); // utilization was already 0 — nothing to "recover"
+    expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(true);
+    expect(bucketForModel(account, "gpt-5.6-sol")?.limitId).toBe("codex_bengalfox");
+  });
+
+  it("reaps a named bucket the upstream has not mentioned in over the 8-day trust horizon", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "30",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+    expect(bucketForModel(account, "gpt-5.6-sol")).toBeDefined();
+
+    // No resetAt was ever reported for this window, and 30% never reaches
+    // full exhaustion, so nothing else would ever clear it — only the
+    // "upstream went silent on this bucket" reap can.
+    const longSilence = NOW_MS + 8 * 24 * 60 * 60 * 1000 + 1;
+    sweepCodexRateLimits(account, longSilence);
+    expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(false);
+    expect(bucketForModel(account, "gpt-5.6-sol")).toBeUndefined();
+  });
+
+  it("does not reap a stale unmentioned bucket while it is retained", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "30",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+
+    const longSilence = NOW_MS + 8 * 24 * 60 * 60 * 1000 + 1;
+    sweepCodexRateLimits(account, longSilence, { isRetained: limitId => limitId === "codex_bengalfox" });
+    expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(true);
+    expect(bucketForModel(account, "gpt-5.6-sol")?.limitId).toBe("codex_bengalfox");
+  });
+});
+
+describe("applyCodexRateLimits bucket cap", () => {
+  it("evicts the least-recently-seen named bucket once the cap is reached", () => {
+    const account = createOpenAIAccount(record());
+    for (let i = 0; i < 16; i++) {
+      applyCodexRateLimits(account, parseCodexRateLimits({
+        [`x-bucket${i}-primary-used-percent`]: "10",
+      }, NOW_MS + i), NOW_MS + i);
+    }
+    expect(account.rateLimits.buckets.size).toBe(16);
+    expect(account.rateLimits.buckets.has("bucket0")).toBe(true);
+
+    // A 17th distinct bucket forces an eviction. bucket0 was seen first (the
+    // lowest lastSeenAt), so it is the one that goes.
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-bucket16-primary-used-percent": "10",
+    }, NOW_MS + 100), NOW_MS + 100);
+
+    expect(account.rateLimits.buckets.size).toBe(16);
+    expect(account.rateLimits.buckets.has("bucket0")).toBe(false);
+    expect(account.rateLimits.buckets.has("bucket16")).toBe(true);
+  });
+
+  it("never evicts the default bucket to make room, even though it was seen before every named bucket", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "10",
+    }, NOW_MS), NOW_MS); // default bucket — oldest-seen entry overall
+    for (let i = 0; i < 15; i++) {
+      applyCodexRateLimits(account, parseCodexRateLimits({
+        [`x-bucket${i}-primary-used-percent`]: "10",
+      }, NOW_MS + 10 + i), NOW_MS + 10 + i);
+    }
+    expect(account.rateLimits.buckets.size).toBe(16); // default + 15 named = cap
+
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-bucket15-primary-used-percent": "10",
+    }, NOW_MS + 100), NOW_MS + 100);
+
+    expect(account.rateLimits.buckets.size).toBe(16);
+    expect(account.rateLimits.buckets.has(DEFAULT_CODEX_LIMIT_ID)).toBe(true); // never evicted
+    expect(account.rateLimits.buckets.has("bucket0")).toBe(false); // oldest *named* bucket evicted instead
+    expect(account.rateLimits.buckets.has("bucket15")).toBe(true);
+  });
+
+  it("leaves the evicted bucket's model mapping in place on cap-eviction", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-bucket0-primary-used-percent": "10",
+      "x-bucket0-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+    expect(bucketForModel(account, "gpt-5.6-sol")?.limitId).toBe("bucket0");
+
+    for (let i = 1; i < 16; i++) {
+      applyCodexRateLimits(account, parseCodexRateLimits({
+        [`x-bucket${i}-primary-used-percent`]: "10",
+      }, NOW_MS + i), NOW_MS + i);
+    }
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-bucket16-primary-used-percent": "10",
+    }, NOW_MS + 100), NOW_MS + 100);
+
+    // bucket0's snapshot is gone (evicted purely for space)...
+    expect(account.rateLimits.buckets.has("bucket0")).toBe(false);
+    // ...but the model->limitId mapping survives, so a cooldown keyed on it,
+    // or a future bucketIdForModel lookup, still resolves with no snapshot
+    // present — mirroring the header-only-429 case bucketIdForModel already
+    // supports.
+    expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("bucket0");
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("bucket0");
   });
 });

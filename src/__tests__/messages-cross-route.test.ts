@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer } from "http";
 import express from "express";
 import { ReadableStream } from "stream/web";
@@ -546,6 +546,68 @@ describe("mountMessagesCrossProviderRoute crash safety (F1)", () => {
     });
   });
 
+  it("reports a 502 for a streamed response whose terminal frame is malformed, without altering the relayed bytes", async () => {
+    // The terminal response.completed frame is malformed JSON: tolerant
+    // parsing drops it rather than aborting the relay, so without a
+    // completion check this stream would be reported as an ordinary success
+    // even though the client never received a finished answer.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      // Headers are already flushed by the time the missing completion is
+      // detected, so the client still gets the real HTTP 200 and whatever
+      // normalized events had already streamed — only message_stop, which is
+      // only emitted in response to response.completed, is missing.
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("message_start");
+      expect(text).toContain("\"text\":\"Hi\"");
+      expect(text).not.toContain("message_stop");
+    });
+
+    const errorEntry = activity.find(entry => entry.type === "error");
+    expect(errorEntry).toEqual(expect.objectContaining({ statusCode: 502 }));
+  });
+
+  it("reports a 502 for a streamed response that stops before response.completed, without altering the relayed bytes", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("message_start");
+      expect(text).not.toContain("message_stop");
+    });
+
+    const errorEntry = activity.find(entry => entry.type === "error");
+    expect(errorEntry).toEqual(expect.objectContaining({ statusCode: 502 }));
+  });
+
   it("keeps relaying valid events when a malformed SSE frame shares the chunk", async () => {
     const forward: ForwardOpenAI = async () => new Response(
       "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n"
@@ -570,6 +632,90 @@ describe("mountMessagesCrossProviderRoute crash safety (F1)", () => {
     const routed = activity.find(entry => entry.path === "/v1/messages");
     expect(routed?.inputTokens).toBe(7);
     expect(routed?.outputTokens).toBe(3);
+  });
+});
+
+describe("mountMessagesCrossProviderRoute P1: real transport error relay", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function mountWithRealTransport(account: OpenAIAccount) {
+    const app = express();
+    const openAIPool = new OpenAITokenPool([account]);
+    const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
+    // forwardOpenAI is deliberately omitted: mountMessagesCrossProviderRoute
+    // falls back to the real forwardOpenAICodexResponse transport, so these
+    // tests exercise its actual content-type handling end to end rather than
+    // a hand-rolled ForwardOpenAI stub.
+    mountMessagesCrossProviderRoute(app, { openAIRouter, openAIPool });
+    return { app };
+  }
+
+  /**
+   * Stubs only the Codex backend call, not `fetch` itself: `postMessages`
+   * below also calls the global `fetch` to reach this test's own local
+   * server, so a blanket `mockResolvedValue` would swallow that request too
+   * and never actually exercise the route under test.
+   */
+  function mockCodexUpstream(response: Response): void {
+    const realFetch = globalThis.fetch;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("chatgpt.com/backend-api/codex/responses")) return response;
+      return realFetch(input, init);
+    });
+  }
+
+  it("relays a real upstream 429 JSON failure through the actual Codex transport, not a synthesized 502", async () => {
+    mockCodexUpstream(new Response(
+      JSON.stringify({ error: { message: "rate limit reached" } }),
+      { status: 429, headers: { "content-type": "application/json" } },
+    ));
+    const { app } = mountWithRealTransport(makeRuntimeAccount("openai-victor"));
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(429);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "rate_limit_error", message: "rate limit reached" },
+      });
+    });
+  });
+
+  it("relays a real upstream 401 JSON failure through the actual Codex transport", async () => {
+    mockCodexUpstream(new Response(
+      JSON.stringify({ error: { message: "invalid bearer token" } }),
+      { status: 401, headers: { "content-type": "application/json" } },
+    ));
+    const { app } = mountWithRealTransport(makeRuntimeAccount("openai-victor"));
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "authentication_error", message: "invalid bearer token" },
+      });
+    });
+  });
+
+  it("relays a real upstream non-JSON error body through the actual Codex transport, keeping its own content-type", async () => {
+    mockCodexUpstream(new Response(
+      "Service Unavailable",
+      { status: 503, headers: { "content-type": "text/plain" } },
+    ));
+    const { app } = mountWithRealTransport(makeRuntimeAccount("openai-victor"));
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Service Unavailable" },
+      });
+    });
   });
 });
 

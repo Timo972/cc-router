@@ -94,6 +94,31 @@ describe("forwardOpenAICodexResponse", () => {
 
     expect(upstream.headers.get("content-type")).toBe("text/event-stream");
   });
+
+  it("keeps a non-OK response's real content-type instead of rewriting it to text/event-stream", async () => {
+    const errorBody = JSON.stringify({ error: { message: "rate limited" } });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(errorBody, {
+      status: 429,
+      headers: { "content-type": "application/json" },
+    }));
+
+    const upstream = await forwardOpenAICodexResponse({
+      account: {
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      },
+      body: { model: "gpt-5.5", input: [] },
+      stream: false,
+    });
+
+    expect(upstream.status).toBe(429);
+    expect(upstream.headers.get("content-type")).toBe("application/json");
+    expect(await upstream.text()).toBe(errorBody);
+  });
 });
 
 describe("toCodexBackendRequest", () => {
@@ -877,6 +902,56 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     // (it did not here, since upstream.status was 200).
     expect(account.errorCount).toBe(errorCountBefore + 1);
     expect(account.consecutiveErrors).toBe(1);
+  });
+
+  it("reports a 502 for a streamed upstream 200 whose terminal frame is malformed, but relays the bytes byte-for-byte", async () => {
+    // The terminal response.completed frame is malformed JSON: tolerant
+    // parsing drops it rather than aborting the relay, so without a
+    // completion check the observer would report an ordinary 200 success
+    // even though the client never actually received a finished answer.
+    const malformedTail = 'data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'
+      + 'data: {"type":"response.output_text.delta","delta":"Par"}\n\n'
+      + 'data: {"type":"response.completed","response":{"id":\n\n';
+    const forward: ForwardOpenAI = async () => new Response(malformedTail, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+      // Byte-transparent relay: what upstream sent is exactly what the client
+      // receives, regardless of how the relay classifies it for stats.
+      expect(await res.text()).toBe(malformedTail);
+    });
+
+    const errorEntry = activity.find(entry => entry.type === "error");
+    expect(errorEntry).toEqual(expect.objectContaining({ statusCode: 502 }));
+  });
+
+  it("reports a 502 for a streamed upstream 200 that stops before response.completed, but relays the bytes byte-for-byte", async () => {
+    const partialBody = 'data: {"type":"response.output_text.delta","delta":"Par"}\n\n';
+    const forward: ForwardOpenAI = async () => new Response(partialBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+      expect(await res.text()).toBe(partialBody);
+    });
+
+    const errorEntry = activity.find(entry => entry.type === "error");
+    expect(errorEntry).toEqual(expect.objectContaining({ statusCode: 502 }));
   });
 
   it("invokes onUpstreamAuthFailure with the routed account when a relayed upstream 401 occurs (F5)", async () => {

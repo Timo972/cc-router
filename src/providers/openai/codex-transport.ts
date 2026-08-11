@@ -44,6 +44,13 @@ function ensureEventStreamContentType(upstream: Response): Response {
   const contentType = upstream.headers.get("content-type");
   if (contentType?.includes("text/event-stream")) return upstream;
 
+  // Only a successful response is actually an event stream that lost its
+  // content-type header. A non-OK response (401/429/5xx) is typically a
+  // plain JSON or text error body — rewriting its content-type would make
+  // callers parse it as SSE and misreport a real upstream failure as an
+  // empty success. Let it pass through with whatever content-type it has.
+  if (!upstream.ok) return upstream;
+
   const headers = new Headers(upstream.headers);
   headers.set("content-type", "text/event-stream");
   return new Response(upstream.body, {

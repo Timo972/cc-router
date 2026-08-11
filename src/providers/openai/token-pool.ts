@@ -85,7 +85,8 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
   tryAcquire(accountId: string, context?: RouteContext): AccountLease<OpenAIAccount> | null {
     const account = this.findById(accountId);
     if (!account) return null;
-    sweepCodexRateLimits(account, this.now());
+    const now = this.now();
+    sweepCodexRateLimits(account, now, { isRetained: limitId => this.isBucketCoolingDown(account, limitId, now) });
     this.clearExpiredCooldownState(account);
     if (this.hardBlock(account, context) || this.overUserCap(account)) return null;
     return this.createLease(account, false);
@@ -143,7 +144,14 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
   sweepExpiredCooldowns(): void {
     const now = this.now();
     for (const account of this.accounts) {
-      const windowRecovered = sweepCodexRateLimits(account, now);
+      // Read cooldown retention before clearExpiredCooldownState (below)
+      // deletes any bucketUntil entry that just expired — a bucket must stay
+      // retained through this exact sweep for as long as its cooldown is
+      // still live at `now`, not react to the expiry the same call is about
+      // to perform.
+      const windowRecovered = sweepCodexRateLimits(account, now, {
+        isRetained: limitId => this.isBucketCoolingDown(account, limitId, now),
+      });
       const cooldownRecovered = this.clearExpiredCooldownState(account);
 
       // Read the account's global cooldown directly: the account object is
@@ -248,6 +256,11 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
 
   private modelBucket(account: OpenAIAccount, context?: RouteContext): CodexLimitBucket | undefined {
     return bucketForModel(account, context?.requestedModel);
+  }
+
+  /** True while `limitId` has an active bucket-scoped cooldown on `account`. */
+  private isBucketCoolingDown(account: OpenAIAccount, limitId: string, nowMs: number): boolean {
+    return (this.cooldowns.get(account)?.bucketUntil.get(limitId) ?? 0) > nowMs;
   }
 
   private overUserCap(account: OpenAIAccount): boolean {

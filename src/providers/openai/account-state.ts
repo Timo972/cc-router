@@ -2,6 +2,7 @@ import { ACCOUNT_USER_DEFAULTS, clampPercent } from "../../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "./token-refresher.js";
 import {
   DEFAULT_CODEX_LIMIT_ID,
+  MAX_TRUSTED_RATE_LIMIT_HORIZON_SEC,
   createEmptyCodexRateLimits,
   decodeOpenAIPlan,
   type CodexLimitBucket,
@@ -21,6 +22,28 @@ const DEFAULT_OPENAI_SCOPES = ["openid", "profile", "email", "offline_access"];
 // length (or this default when no window length was reported), we treat it as
 // stale and self-heal by clearing it on the next sweep.
 const STALE_DEFAULT_WINDOW_MINUTES = 300;
+
+// Named buckets are entirely upstream-controlled: every distinct limitId the
+// Codex backend ever mentions gets its own entry. A cap bounds memory growth
+// from a buggy or malicious upstream minting unbounded distinct ids. 16 is
+// generous for any real deployment (the default bucket plus a small handful
+// of per-model metered buckets) while still being a hard ceiling.
+const MAX_CODEX_BUCKETS = 16;
+
+// How long a named bucket can go completely unmentioned by upstream before
+// the sweep reaps it outright, independent of its last-known window state.
+// Reuses the same 8-day header-trust horizon already enforced when parsing
+// reset-at/window-minutes values (usage.ts) and when trusting a reset in
+// token-pool.ts: any resetAt a bucket last reported is itself capped to that
+// horizon, so once a bucket has gone unmentioned for longer than it, every
+// window it reported has necessarily already expired via the per-window
+// check below — this only catches the residual case where a window's
+// resetAt was untrustworthy (0) and it never reached full exhaustion, so
+// nothing else would ever clear it. Deliberately much larger than
+// STALE_DEFAULT_WINDOW_MINUTES above, which self-heals a single exhausted
+// window on the timescale of that window's own length (hours), not the
+// timescale of "upstream stopped mentioning this bucket at all" (days).
+const UNMENTIONED_BUCKET_STALE_MS = MAX_TRUSTED_RATE_LIMIT_HORIZON_SEC * 1_000;
 
 export interface OpenAIAccount extends OpenAISubscriptionAccount {
   scopes: string[];
@@ -62,6 +85,36 @@ export function createOpenAIAccount(record: OpenAISubscriptionAccount): OpenAIAc
   };
 }
 
+/**
+ * Evict the least-recently-seen named bucket to make room for a new one at
+ * the cap. Never touches the default bucket. Map insertion order does not
+ * track `lastSeenAt` (an existing entry re-touched via `.set()` keeps its
+ * original slot), so this scans for the minimum rather than relying on
+ * iteration order — unlike `learnModelBucket`'s LRU below, which can rely on
+ * insertion order because it never re-touches an existing key's position.
+ */
+function evictLeastRecentlySeenBucket(limits: CodexRateLimits): void {
+  let oldestId: string | undefined;
+  let oldestSeenAt = Infinity;
+  for (const [limitId, bucket] of limits.buckets) {
+    if (limitId === DEFAULT_CODEX_LIMIT_ID) continue;
+    const seenAt = bucket.lastSeenAt ?? 0;
+    if (seenAt < oldestSeenAt) {
+      oldestSeenAt = seenAt;
+      oldestId = limitId;
+    }
+  }
+  if (oldestId === undefined) return;
+  limits.buckets.delete(oldestId);
+  // Deliberately leave `modelBuckets` mappings alone: this evicts a bucket
+  // upstream is still actively mentioning (there just isn't room for its
+  // snapshot), unlike the sweep's staleness reap below, which only fires once
+  // a bucket is confirmed abandoned. The mapping is already bounded at
+  // MAX_MODEL_BUCKET_ENTRIES, and `bucketIdForModel` resolves a cooldown from
+  // it alone even with no bucket snapshot present, so dropping it here would
+  // only lose a still-live cooldown mapping for no benefit.
+}
+
 export function applyCodexRateLimits(
   account: Pick<OpenAIAccount, "rateLimits">,
   update: CodexRateLimitsUpdate,
@@ -70,6 +123,9 @@ export function applyCodexRateLimits(
   const limits = account.rateLimits;
   for (const bucket of update.buckets) {
     const existing = limits.buckets.get(bucket.limitId);
+    if (!existing && limits.buckets.size >= MAX_CODEX_BUCKETS) {
+      evictLeastRecentlySeenBucket(limits);
+    }
     const merged: CodexLimitBucket = { limitId: bucket.limitId };
     const limitName = bucket.limitName ?? existing?.limitName;
     if (limitName) merged.limitName = limitName;
@@ -159,7 +215,9 @@ function isStaleExhaustedWindow(
 export function sweepCodexRateLimits(
   account: Pick<OpenAIAccount, "rateLimits" | "modelBuckets">,
   nowMs: number,
+  options?: { isRetained?: (limitId: string) => boolean },
 ): boolean {
+  const isRetained = options?.isRetained ?? (() => false);
   const nowSec = Math.floor(nowMs / 1000);
   let recovered = false;
 
@@ -188,13 +246,28 @@ export function sweepCodexRateLimits(
 
     if (limitId === DEFAULT_CODEX_LIMIT_ID) continue;
 
-    // Named buckets (and their model mappings) are only cleaned up entirely
-    // once nothing they still report is exhausted — i.e. a window expired
-    // this sweep and every window the bucket still carries is now below
-    // 100% utilization. This is bounded cleanup: mappings are capped at 32
-    // entries and are otherwise only ever evicted here.
-    const stillExhausted = windows.some(window => window !== undefined && window.utilization >= 1);
-    if (anyWindowExpiredHere && !stillExhausted) {
+    // A bucket the pool is actively cooling down on (a bucket-scoped
+    // cooldown learned independently of this snapshot, e.g. from a
+    // header-only 429) must keep both its snapshot and its model mapping for
+    // as long as that cooldown is live, even if every window it reports has
+    // just been zeroed above.
+    if (isRetained(limitId)) continue;
+
+    // Named buckets (and their model mappings) are cleaned up entirely once
+    // every window the bucket still carries is at exactly zero utilization
+    // and a window expired this sweep — not merely "below 100%". A bucket
+    // reporting a zeroed 5h primary alongside a still-live 30% secondary is
+    // still meaningfully tracking usage and must be kept, snapshot and
+    // mapping intact, until the secondary clears too.
+    const allZero = windows.every(window => window === undefined || window.utilization === 0);
+
+    // Independently, a bucket upstream has simply stopped mentioning at all
+    // for longer than the header-trust horizon is reaped outright — see
+    // UNMENTIONED_BUCKET_STALE_MS above for why this can't collide with the
+    // zero-utilization check just above.
+    const unmentionedTooLong = nowMs - bucketSeenAt > UNMENTIONED_BUCKET_STALE_MS;
+
+    if ((anyWindowExpiredHere && allZero) || unmentionedTooLong) {
       account.rateLimits.buckets.delete(limitId);
       for (const [model, mappedLimitId] of account.modelBuckets) {
         if (mappedLimitId === limitId) account.modelBuckets.delete(model);

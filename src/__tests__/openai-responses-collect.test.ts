@@ -213,6 +213,22 @@ describe("createCodexUsageObserver", () => {
     expect(observer.failure()).toBeUndefined();
   });
 
+  it("reports a synthetic failure when the stream ends without ever observing response.completed", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode('data: {"type":"response.output_text.delta","delta":"partial"}\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBe("Upstream stream ended before response.completed");
+  });
+
+  it("reports a synthetic failure when the terminal response.completed frame is malformed", () => {
+    const observer = createCodexUsageObserver();
+    // Tolerant parsing drops the malformed frame instead of throwing, so
+    // without a completion check this would look identical to a clean 200.
+    observer.push(encoder.encode('data: {"type":"response.completed","response":{"id":\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBe("Upstream stream ended before response.completed");
+  });
+
   it("records a failure message from a response.failed event without altering usage extraction", () => {
     const observer = createCodexUsageObserver();
     observer.push(encoder.encode('data: {"type":"response.failed","response":{"error":{"message":"boom"}}}\n\n'));

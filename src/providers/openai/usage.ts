@@ -56,7 +56,7 @@ const CONTROL_CHAR_PATTERN = /[\x00-\x1f\x7f]/g;
  * cooldown/exhausted state for months. A reset beyond the horizon is treated
  * as unknown (0), the same sentinel already used for "no usable reset value".
  */
-const MAX_TRUSTED_RATE_LIMIT_HORIZON_SEC = 8 * 24 * 60 * 60;
+export const MAX_TRUSTED_RATE_LIMIT_HORIZON_SEC = 8 * 24 * 60 * 60;
 const MAX_TRUSTED_WINDOW_MINUTES = MAX_TRUSTED_RATE_LIMIT_HORIZON_SEC / 60;
 
 export function createEmptyCodexRateLimits(): CodexRateLimits {

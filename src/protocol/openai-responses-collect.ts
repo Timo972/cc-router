@@ -131,15 +131,17 @@ export function usageFromCompletedEvent(event: unknown): CodexUsageTotals | unde
 export function createCodexUsageObserver(): {
   push(chunk: Uint8Array): void;
   finish(): CodexUsageTotals | undefined;
-  /** The failure message observed via `response.failed`/`error`, if any. Only
-   *  meaningful after `finish()` has been called — earlier chunks may not yet
-   *  have carried the terminal event. */
+  /** The failure message observed via `response.failed`/`error`, or a
+   *  synthetic one if the stream ended without ever observing a valid
+   *  `response.completed`. Only meaningful after `finish()` has been called —
+   *  earlier chunks may not yet have carried the terminal event. */
   failure(): string | undefined;
 } {
   const decoder = new TextDecoder();
   let remainder = "";
   let totals: CodexUsageTotals | undefined;
   let failure: string | undefined;
+  let completed = false;
 
   const applyEvent = (event: unknown): void => {
     totals = usageFromCompletedEvent(event) ?? totals;
@@ -150,6 +152,8 @@ export function createCodexUsageObserver(): {
       failure = err?.message ?? "Response failed";
     } else if (e.type === "error") {
       failure = e.error?.message ?? "Upstream error event";
+    } else if (e.type === "response.completed") {
+      completed = true;
     }
   };
 
@@ -181,7 +185,13 @@ export function createCodexUsageObserver(): {
       return totals;
     },
     failure(): string | undefined {
-      return failure;
+      // Tolerant parsing drops a malformed frame instead of aborting, which
+      // also means a malformed *terminal* response.completed frame vanishes
+      // silently. Without an observed completion the stream never actually
+      // finished, so — mirroring collectCodexResponseStream's non-streaming
+      // check — that is reported as a failure too, unless an explicit
+      // response.failed/error already said more about what went wrong.
+      return failure ?? (completed ? undefined : "Upstream stream ended before response.completed");
     },
   };
 }
