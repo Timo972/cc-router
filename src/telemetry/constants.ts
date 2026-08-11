@@ -134,3 +134,15 @@ export const MAX_CONCURRENCY = 10_000;
 export const MAX_TOKEN_COUNT = 1_000_000_000;
 export const MAX_STACK_FRAMES = 20;
 export const MAX_STACK_FRAME_PATH_LENGTH = 256;
+
+export const POSTHOG_HOST = "https://eu.i.posthog.com";
+export const POSTHOG_INGESTION_HOSTNAME = "eu.i.posthog.com";
+export const POSTHOG_PROJECT_TOKEN = "phc_n7wcYbbfMSkNxRoB8JVd57PYQZf7DNaEGL2kUeUkxwV2";
+export const POSTHOG_REQUEST_TIMEOUT_MS = 2_000;
+export const POSTHOG_FLUSH_INTERVAL_MS = 5_000;
+export const POSTHOG_FLUSH_AT = 20;
+export const POSTHOG_MAX_QUEUE_SIZE = 100;
+
+if (!/^phc_[0-9A-Za-z]+$/.test(POSTHOG_PROJECT_TOKEN)) {
+  throw new Error("PostHog telemetry requires a public project token");
+}
