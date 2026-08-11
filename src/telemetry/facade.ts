@@ -117,7 +117,11 @@ export interface TelemetryFacade {
   recordSetupStage(input: SetupStageInput): void;
   recordSetupResult(input: SetupResultInput): void;
   recordExpectedSetupFailure(input: ExpectedSetupFailureInput): void;
-  recordUnexpectedException(error: unknown, context: SafeExceptionContext): DiagnosticId | undefined;
+  recordUnexpectedException(
+    error: unknown,
+    context: SafeExceptionContext,
+    diagnosticId?: string,
+  ): DiagnosticId | undefined;
   annotateActiveSpan(operation: Operation, attributes: SafeSpanAttributes): void;
   flushTelemetryWithin(deadlineMs: number): Promise<void>;
   shutdownTelemetryWithin(deadlineMs: number): Promise<void>;
@@ -471,13 +475,15 @@ export function createTelemetryFacade(
       captureAnalytics(snapshot, "account_setup.failed", properties, input.diagnosticId, true);
     },
 
-    recordUnexpectedException(error, context): DiagnosticId | undefined {
+    recordUnexpectedException(error, context, diagnosticId): DiagnosticId | undefined {
       const snapshot = enabledSnapshot();
       if (!snapshot) return undefined;
       try {
-        let candidate = dependencies.randomUUID();
+        let candidate = diagnosticId ?? dependencies.randomUUID();
         if (!isRandomUuid(candidate)) return undefined;
-        if (candidate === snapshot.state.installId) candidate = dependencies.randomUUID();
+        if (candidate === snapshot.state.installId && diagnosticId === undefined) {
+          candidate = dependencies.randomUUID();
+        }
         if (!isRandomUuid(candidate) || candidate === snapshot.state.installId) return undefined;
         const exception = dependencies.sanitizeException(error, context, {
           installationId: snapshot.state.installId,

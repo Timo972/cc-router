@@ -4,10 +4,179 @@ import { loadAccounts, loadOpenAIAccounts, accountsFileExists, upsertAccountReco
 import { saveAccounts } from "../proxy/token-refresher.js";
 import { formatExpiry, redactToken } from "../utils/token-extractor.js";
 import { PROXY_PORT } from "../config/paths.js";
-import { createOpenAIAccountRecord } from "../providers/openai/account-record.js";
-import { loginOpenAIWithDeviceCode } from "../providers/openai/device-oauth.js";
+import {
+  createOpenAIAccountRecord,
+  type CreateOpenAIAccountRecordInput,
+  type OpenAIAccountRecord,
+} from "../providers/openai/account-record.js";
+import {
+  loginOpenAIWithDeviceCode,
+  type LoginOpenAIWithDeviceCodeOptions,
+  type OpenAIDeviceCode,
+} from "../providers/openai/device-oauth.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
+import {
+  createSetupAttempt,
+  isPromptCancellation,
+  persistSetupAttempts,
+  type CreateSetupAttemptInput,
+  type SetupAttempt,
+  withSetupTelemetryFlush,
+} from "../telemetry/setup-diagnostics.js";
+import { flushTelemetryWithin } from "../telemetry/facade.js";
+
+export interface OpenAIManualAccountSetupDependencies {
+  collectInput(): Promise<CreateOpenAIAccountRecordInput>;
+  persist(record: OpenAIAccountRecord): void;
+  createAttempt(input: Pick<CreateSetupAttemptInput, "provider" | "method">): SetupAttempt;
+  flush(deadlineMs: number): Promise<void>;
+}
+
+export interface OpenAIDeviceAccountSetupDependencies {
+  collectAccountId(): Promise<string>;
+  login(options: LoginOpenAIWithDeviceCodeOptions): Promise<OpenAIAccountRecord>;
+  onDeviceCode(code: OpenAIDeviceCode): void;
+  persist(record: OpenAIAccountRecord): void;
+  createAttempt(input: Pick<CreateSetupAttemptInput, "provider" | "method">): SetupAttempt;
+  flush(deadlineMs: number): Promise<void>;
+}
+
+function printSetupException(error: unknown, diagnosticId: string): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  console.error(chalk.red(`\n✗ ${detail}`));
+  console.error(chalk.gray(`  Diagnostic ID: ${diagnosticId}`));
+}
+
+async function collectOpenAIManualInput(): Promise<CreateOpenAIAccountRecordInput> {
+  const { input, password } = await import("@inquirer/prompts");
+  const id = await input({
+    message: "OpenAI account ID:",
+    default: `openai-account-${loadOpenAIAccounts().length + 1}`,
+    validate: value => /^[a-zA-Z0-9_-]+$/.test(value) || "Only letters, numbers, _ and - allowed",
+  });
+  const accessToken = await password({
+    message: "OpenAI access token:",
+    mask: "*",
+    validate: value => value.trim().length > 0 || "Access token is required",
+  });
+  const refreshToken = await password({
+    message: "OpenAI refresh token:",
+    mask: "*",
+    validate: value => value.trim().length > 0 || "Refresh token is required",
+  });
+  const expiresAt = await input({
+    message: "Access token expiry (Unix ms):",
+    default: String(Date.now() + 60 * 60 * 1000),
+    validate: value => Number.isFinite(Number(value)) && Number(value) > 0
+      || "Enter a positive Unix timestamp in milliseconds",
+  });
+  const scopes = await input({
+    message: "Scopes:",
+    default: "openid profile email offline_access",
+  });
+  return { id, accessToken, refreshToken, expiresAt, scopes };
+}
+
+const defaultOpenAIManualDependencies: OpenAIManualAccountSetupDependencies = {
+  collectInput: collectOpenAIManualInput,
+  persist: upsertAccountRecord,
+  createAttempt: createSetupAttempt,
+  flush: flushTelemetryWithin,
+};
+
+export async function runOpenAIManualAccountSetup(
+  dependencies: OpenAIManualAccountSetupDependencies = defaultOpenAIManualDependencies,
+): Promise<OpenAIAccountRecord | null> {
+  const attempt = dependencies.createAttempt({ provider: "openai", method: "manual_token" });
+  attempt.stageCompleted("credential_source_selection");
+  return withSetupTelemetryFlush(async () => {
+    let record: OpenAIAccountRecord;
+    try {
+      const collected = await dependencies.collectInput();
+      attempt.stageCompleted("credential_read");
+      record = createOpenAIAccountRecord(collected);
+      attempt.stageCompleted("credential_parse");
+      attempt.stageCompleted("token_validation");
+    } catch (error) {
+      if (isPromptCancellation(error)) {
+        attempt.cancelled();
+        return null;
+      }
+      const outcome = attempt.failed(error, "credential_parse");
+      if (outcome.unexpected) printSetupException(error, outcome.diagnosticId);
+      throw error;
+    }
+
+    try {
+      await persistSetupAttempts([attempt], () => dependencies.persist(record));
+    } catch (error) {
+      printSetupException(error, attempt.diagnosticId);
+      throw error;
+    }
+    return record;
+  }, dependencies.flush);
+}
+
+async function collectOpenAIDeviceAccountId(): Promise<string> {
+  const { input } = await import("@inquirer/prompts");
+  return input({
+    message: "OpenAI account ID:",
+    default: `openai-account-${loadOpenAIAccounts().length + 1}`,
+    validate: value => /^[a-zA-Z0-9_-]+$/.test(value) || "Only letters, numbers, _ and - allowed",
+  });
+}
+
+function printOpenAIDeviceCode(code: OpenAIDeviceCode): void {
+  console.log(chalk.bold("1. Open this URL:"));
+  console.log(`   ${chalk.cyan(code.verificationUrl)}`);
+  console.log(chalk.bold("2. Enter this code:"));
+  console.log(`   ${chalk.cyan(code.userCode)}\n`);
+  console.log(chalk.gray("Waiting for authorization..."));
+}
+
+const defaultOpenAIDeviceDependencies: OpenAIDeviceAccountSetupDependencies = {
+  collectAccountId: collectOpenAIDeviceAccountId,
+  login: loginOpenAIWithDeviceCode,
+  onDeviceCode: printOpenAIDeviceCode,
+  persist: upsertAccountRecord,
+  createAttempt: createSetupAttempt,
+  flush: flushTelemetryWithin,
+};
+
+export async function runOpenAIDeviceAccountSetup(
+  dependencies: OpenAIDeviceAccountSetupDependencies = defaultOpenAIDeviceDependencies,
+): Promise<OpenAIAccountRecord | null> {
+  const attempt = dependencies.createAttempt({ provider: "openai", method: "device_oauth" });
+  attempt.stageCompleted("credential_source_selection");
+  return withSetupTelemetryFlush(async () => {
+    let record: OpenAIAccountRecord;
+    try {
+      const accountId = await dependencies.collectAccountId();
+      record = await dependencies.login({
+        accountId,
+        onDeviceCode: dependencies.onDeviceCode,
+        onStageCompleted: stage => attempt.stageCompleted(stage),
+      });
+    } catch (error) {
+      if (isPromptCancellation(error)) {
+        attempt.cancelled();
+        return null;
+      }
+      const outcome = attempt.failed(error, "failure");
+      if (outcome.unexpected) printSetupException(error, outcome.diagnosticId);
+      throw error;
+    }
+
+    try {
+      await persistSetupAttempts([attempt], () => dependencies.persist(record));
+    } catch (error) {
+      printSetupException(error, attempt.diagnosticId);
+      throw error;
+    }
+    return record;
+  }, dependencies.flush);
+}
 
 export function registerAccounts(program: Command): void {
   const accounts = program
@@ -99,25 +268,33 @@ export function registerAccounts(program: Command): void {
     .command("add")
     .description("Add a new Claude Max account interactively")
     .action(async () => {
-      const { setupSingleAccount } = await import("./cmd-setup.js");
+      await withSetupTelemetryFlush(async () => {
+        const { setupSingleAccountDetailed } = await import("./cmd-setup.js");
 
-      const existing = accountsFileExists() ? loadAccounts() : [];
-      const account = await setupSingleAccount(existing.length + 1);
+        const existing = accountsFileExists() ? loadAccounts() : [];
+        const setup = await setupSingleAccountDetailed(existing.length + 1);
+        const account = setup.account;
 
-      if (!account) {
-        console.log(chalk.yellow("\nNo account added.\n"));
-        return;
-      }
+        if (!account) {
+          console.log(chalk.yellow("\nNo account added.\n"));
+          return;
+        }
 
-      // Merge: replace by ID if already exists, otherwise append
-      const merged = [
-        ...existing.filter(a => a.id !== account.id),
-        account,
-      ];
+        // Merge: replace by ID if already exists, otherwise append
+        const merged = [
+          ...existing.filter(a => a.id !== account.id),
+          account,
+        ];
 
-      saveAccounts(merged);
-      console.log(chalk.green(`\n✓ Account "${account.id}" added (${merged.length} total).\n`));
-      console.log(chalk.gray("  Restart the proxy to load the new account: cc-router start\n"));
+        try {
+          await persistSetupAttempts([setup.attempt], () => saveAccounts(merged));
+        } catch (error) {
+          printSetupException(error, setup.attempt.diagnosticId);
+          throw error;
+        }
+        console.log(chalk.green(`\n✓ Account "${account.id}" added (${merged.length} total).\n`));
+        console.log(chalk.gray("  Restart the proxy to load the new account: cc-router start\n"));
+      });
     });
 
   // ── accounts add-openai ──────────────────────────────────────────────────
@@ -125,41 +302,8 @@ export function registerAccounts(program: Command): void {
     .command("add-openai")
     .description("Add an OpenAI ChatGPT/Codex subscription account manually")
     .action(async () => {
-      const { input, password } = await import("@inquirer/prompts");
-
-      const id = await input({
-        message: "OpenAI account ID:",
-        default: `openai-account-${loadOpenAIAccounts().length + 1}`,
-        validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-      });
-      const accessToken = await password({
-        message: "OpenAI access token:",
-        mask: "*",
-        validate: (v) => v.trim().length > 0 || "Access token is required",
-      });
-      const refreshToken = await password({
-        message: "OpenAI refresh token:",
-        mask: "*",
-        validate: (v) => v.trim().length > 0 || "Refresh token is required",
-      });
-      const expiresAt = await input({
-        message: "Access token expiry (Unix ms):",
-        default: String(Date.now() + 60 * 60 * 1000),
-        validate: (v) => Number.isFinite(Number(v)) && Number(v) > 0 || "Enter a positive Unix timestamp in milliseconds",
-      });
-      const scopes = await input({
-        message: "Scopes:",
-        default: "openid profile email offline_access",
-      });
-
-      const record = createOpenAIAccountRecord({
-        id,
-        accessToken,
-        refreshToken,
-        expiresAt,
-        scopes,
-      });
-      upsertAccountRecord(record);
+      const record = await runOpenAIManualAccountSetup();
+      if (!record) return;
 
       console.log(chalk.green(`\n✓ OpenAI account "${record.id}" saved.\n`));
       console.log(chalk.gray("  Restart the proxy to load the new account: cc-router start\n"));
@@ -171,28 +315,10 @@ export function registerAccounts(program: Command): void {
     .command("login-openai")
     .description("Sign in to an OpenAI ChatGPT/Codex subscription account with device code")
     .action(async () => {
-      const { input } = await import("@inquirer/prompts");
-      const accountId = await input({
-        message: "OpenAI account ID:",
-        default: `openai-account-${loadOpenAIAccounts().length + 1}`,
-        validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-      });
-
       console.log(chalk.cyan("\nOpenAI Codex device login"));
       console.log(chalk.gray("This will open no local callback server. You will approve the login in your browser.\n"));
-
-      const record = await loginOpenAIWithDeviceCode({
-        accountId,
-        onDeviceCode: (code) => {
-          console.log(chalk.bold("1. Open this URL:"));
-          console.log(`   ${chalk.cyan(code.verificationUrl)}`);
-          console.log(chalk.bold("2. Enter this code:"));
-          console.log(`   ${chalk.cyan(code.userCode)}\n`);
-          console.log(chalk.gray("Waiting for authorization..."));
-        },
-      });
-
-      upsertAccountRecord(record);
+      const record = await runOpenAIDeviceAccountSetup();
+      if (!record) return;
 
       console.log(chalk.green(`\n✓ OpenAI account "${record.id}" saved via device login.\n`));
       console.log(chalk.gray("  Restart the proxy to load the new account: cc-router start\n"));
