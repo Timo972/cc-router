@@ -661,4 +661,82 @@ describe("typed telemetry facade", () => {
     expect(discards).toBe(1);
     expect(runtimeFlushes).toBe(1);
   });
+
+  it("drops an invalid runtime setup result without touching recorders or the client", async () => {
+    const { createTelemetryFacade } = await import("../telemetry/facade.js");
+    let analyticsCalls = 0;
+    let logCalls = 0;
+    const facade = createTelemetryFacade({
+      getSnapshot: () => snapshot(),
+      claimFirstStart: () => undefined,
+      getAnalytics: () => {
+        analyticsCalls += 1;
+        throw new Error("invalid result must not initialize analytics");
+      },
+      emitLog: () => { logCalls += 1; },
+    });
+
+    facade.recordSetupResult({
+      provider: "openai",
+      method: "device_oauth",
+      result: "bogus",
+      diagnosticId: DIAGNOSTIC_ID,
+    } as never);
+
+    expect(analyticsCalls).toBe(0);
+    expect(logCalls).toBe(0);
+  });
+
+  it.each([
+    ["not_found", undefined],
+    ["permission_denied", undefined],
+    ["malformed_credentials", undefined],
+    ["invalid_token", undefined],
+    ["unauthorized", "upstream_error"],
+    ["forbidden", "upstream_error"],
+    ["rate_limited", "rate_limited"],
+    ["upstream_4xx", "upstream_error"],
+    ["upstream_5xx", "upstream_error"],
+    ["timeout", "timeout"],
+    ["network_failure", undefined],
+    ["unexpected_response_shape", "upstream_error"],
+    ["persistence_failure", undefined],
+    ["user_cancelled", "cancelled"],
+    ["other", "other"],
+  ] as const)("maps expected setup reason %s to truthful outcome %s", async (reason, expectedOutcome) => {
+    const { createTelemetryFacade } = await import("../telemetry/facade.js");
+    const events: Array<{ properties: Record<string, unknown> }> = [];
+    const recordedLogs: Array<{ attributes: Record<string, unknown> }> = [];
+    const facade = createTelemetryFacade({
+      getSnapshot: () => snapshot(),
+      claimFirstStart: () => undefined,
+      getAnalytics: () => ({
+        captureAnalytics: event => { events.push(event); },
+        captureAnalyticsImmediate: async event => { events.push(event); },
+        captureException: () => undefined,
+        captureExceptionImmediate: async () => undefined,
+        flushWithin: async () => undefined,
+        shutdownWithin: async () => undefined,
+        discardPending: () => undefined,
+      }),
+      emitLog: log => { recordedLogs.push(log); },
+    });
+
+    facade.recordExpectedSetupFailure({
+      provider: "anthropic",
+      method: "manual_token",
+      stage: "token_validation",
+      reason,
+      diagnosticId: DIAGNOSTIC_ID,
+    });
+
+    expect(events).toHaveLength(1);
+    expect(recordedLogs).toHaveLength(1);
+    expect(events[0].properties).not.toHaveProperty("outcome");
+    if (expectedOutcome === undefined) {
+      expect(recordedLogs[0].attributes).not.toHaveProperty("outcome");
+    } else {
+      expect(recordedLogs[0].attributes.outcome).toBe(expectedOutcome);
+    }
+  });
 });

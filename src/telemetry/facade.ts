@@ -251,6 +251,32 @@ function isRandomUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+function expectedSetupFailureOutcome(reason: SetupReason): Outcome | undefined {
+  switch (reason) {
+    case "unauthorized":
+    case "forbidden":
+    case "upstream_4xx":
+    case "upstream_5xx":
+    case "unexpected_response_shape":
+      return "upstream_error";
+    case "rate_limited":
+      return "rate_limited";
+    case "timeout":
+      return "timeout";
+    case "user_cancelled":
+      return "cancelled";
+    case "other":
+      return "other";
+    case "not_found":
+    case "permission_denied":
+    case "malformed_credentials":
+    case "invalid_token":
+    case "network_failure":
+    case "persistence_failure":
+      return undefined;
+  }
+}
+
 function ignoreRejection(operation: Promise<void>): void {
   void operation.catch(() => undefined);
 }
@@ -414,6 +440,7 @@ export function createTelemetryFacade(
     },
 
     recordSetupResult(input): void {
+      if (input.result !== "succeeded" && input.result !== "cancelled") return;
       const snapshot = enabledSnapshot();
       if (!snapshot) return;
       const cancelled = input.result === "cancelled";
@@ -434,7 +461,11 @@ export function createTelemetryFacade(
 
     recordExpectedSetupFailure(input): void {
       const snapshot = enabledSnapshot();
-      const properties = snapshot && setupProperties(input, { outcome: "upstream_error" });
+      const outcome = expectedSetupFailureOutcome(input.reason);
+      const properties = snapshot && setupProperties(
+        input,
+        outcome === undefined ? {} : { outcome },
+      );
       if (!snapshot || !properties) return;
       emitLog(snapshot, "account.setup.diagnostic", "warn", properties, input.diagnosticId);
       captureAnalytics(snapshot, "account_setup.failed", properties, input.diagnosticId, true);
