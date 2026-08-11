@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { PostHog, type PostHogOptions } from "posthog-node";
 import { getTelemetrySnapshot, type TelemetrySnapshot } from "../config/telemetry.js";
 import {
@@ -55,6 +56,7 @@ type SdkEvent = Parameters<PostHog["capture"]>[0];
 type PersistedKey = Parameters<PostHog["setPersistedProperty"]>[0];
 
 const CAPTURE_GENERATION_PROPERTY = "__cc_router_capture_generation";
+const CAPTURE_ID_PROPERTY = "__cc_router_capture_id";
 const QUEUE_KEYS = ["queue", "ai_queue", "logs_queue"] as const;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -163,7 +165,7 @@ function reconstructExceptionList(input: unknown, reason: string): UnknownRecord
   }];
 }
 
-function reconstructExceptionEvent(event: SdkEvent, installationId: string): SdkEvent | null {
+function reconstructExceptionEvent(event: SdkEvent, installationId: string, captureId: string): SdkEvent | null {
   if (event.event !== "$exception" || !isRecord(event.properties)) return null;
   const properties = event.properties;
   const category = own(properties, "category");
@@ -219,6 +221,7 @@ function reconstructExceptionEvent(event: SdkEvent, installationId: string): Sdk
     event: "$exception",
     distinctId: installationId,
     disableGeoip: true,
+    uuid: captureId,
     properties: safeProperties,
   };
 }
@@ -268,7 +271,11 @@ async function settleWithin(operation: () => Promise<void> | void, deadlineMs: n
   }
 }
 
-function exceptionProperties(exception: SafeExceptionContract, generation: number): Record<string, unknown> {
+function exceptionProperties(
+  exception: SafeExceptionContract,
+  generation: number,
+  captureId: string,
+): Record<string, unknown> {
   const properties: Record<string, unknown> = {
     $exception_fingerprint: exception.fingerprint,
     category: exception.category,
@@ -278,6 +285,7 @@ function exceptionProperties(exception: SafeExceptionContract, generation: numbe
     $process_person_profile: false,
     $geoip_disable: true,
     [CAPTURE_GENERATION_PROPERTY]: generation,
+    [CAPTURE_ID_PROPERTY]: captureId,
   };
   if (exception.systemErrorCode !== undefined) properties.systemErrorCode = exception.systemErrorCode;
   if (exception.httpStatusCode !== undefined) properties.httpStatusCode = exception.httpStatusCode;
@@ -298,17 +306,24 @@ export function createPostHogTelemetryClient(
   let initializationFailed = false;
   let shutdownStarted = false;
   let captureGeneration = 0;
+  const preparedCaptureGenerations = new Map<string, number>();
 
   const beforeSend = (event: SdkEvent | null): SdkEvent | null => {
     try {
       if (!event || !isRecord(event.properties)) return null;
       const snapshot = safeSnapshot(getSnapshot);
       if (!snapshot) return null;
-      if (own(event.properties, CAPTURE_GENERATION_PROPERTY) !== captureGeneration) return null;
+      const eventGeneration = own(event.properties, CAPTURE_GENERATION_PROPERTY);
+      const captureId = uuid(own(event.properties, CAPTURE_ID_PROPERTY));
+      if (!Number.isSafeInteger(eventGeneration) || eventGeneration !== captureGeneration || !captureId) return null;
       const installationId = uuid(snapshot.state.installId);
       if (!installationId) return null;
 
-      if (event.event === "$exception") return reconstructExceptionEvent(event, installationId);
+      if (event.event === "$exception") {
+        const safe = reconstructExceptionEvent(event, installationId, captureId);
+        if (safe) preparedCaptureGenerations.set(captureId, eventGeneration as number);
+        return safe;
+      }
       const diagnosticId = own(event.properties, "diagnosticId");
       const safe = reconstructAnalyticsEvent({
         event: event.event,
@@ -318,10 +333,12 @@ export function createPostHogTelemetryClient(
         ...(typeof diagnosticId === "string" ? { diagnosticId } : {}),
       });
       if (!safe) return null;
+      preparedCaptureGenerations.set(captureId, eventGeneration as number);
       return {
         event: safe.event,
         distinctId: safe.distinctId,
         disableGeoip: true,
+        uuid: captureId,
         properties: {
           ...safe.properties,
           $process_person_profile: false,
@@ -334,8 +351,43 @@ export function createPostHogTelemetryClient(
   };
 
   const gatedFetch: PostHogTransport = async (url, fetchOptions) => {
-    if (!safeSnapshot(getSnapshot)) return noOpResponse();
-    return transport(url, fetchOptions);
+    try {
+      if (typeof fetchOptions.body !== "string") return noOpResponse();
+      const payload: unknown = JSON.parse(fetchOptions.body);
+      if (!isRecord(payload)) return noOpResponse();
+      const batch = own(payload, "batch");
+      if (!Array.isArray(batch)) return noOpResponse();
+
+      const captureIds: string[] = [];
+      const activeBatch: unknown[] = [];
+      for (const candidate of batch) {
+        if (!isRecord(candidate)) continue;
+        const captureId = uuid(own(candidate, "uuid"));
+        if (!captureId) continue;
+        captureIds.push(captureId);
+        if (preparedCaptureGenerations.get(captureId) === captureGeneration) {
+          activeBatch.push(candidate);
+        }
+      }
+
+      if (!safeSnapshot(getSnapshot) || activeBatch.length === 0) {
+        for (const captureId of captureIds) preparedCaptureGenerations.delete(captureId);
+        return noOpResponse();
+      }
+
+      const response = await transport(url, {
+        ...fetchOptions,
+        body: JSON.stringify({ ...payload, batch: activeBatch }),
+      });
+      const path = new URL(url).pathname;
+      const accepted = response.status >= 200 && (path === "/batch/" ? response.status < 400 : response.status < 300);
+      if (accepted) {
+        for (const captureId of captureIds) preparedCaptureGenerations.delete(captureId);
+      }
+      return response;
+    } catch {
+      throw new Error("PostHog transport failed");
+    }
   };
 
   const getClient = (): { client: PostHogSdkClient; installationId: string } | undefined => {
@@ -373,6 +425,7 @@ export function createPostHogTelemetryClient(
       try {
         const active = getClient();
         if (!active) return;
+        const captureId = randomUUID();
         active.client.capture({
           event: event.event,
           distinctId: active.installationId,
@@ -382,6 +435,7 @@ export function createPostHogTelemetryClient(
             $process_person_profile: false,
             $geoip_disable: true,
             [CAPTURE_GENERATION_PROPERTY]: captureGeneration,
+            [CAPTURE_ID_PROPERTY]: captureId,
           },
         });
       } catch {
@@ -392,6 +446,7 @@ export function createPostHogTelemetryClient(
       try {
         const active = getClient();
         if (!active) return;
+        const captureId = randomUUID();
         await active.client.captureImmediate({
           event: event.event,
           distinctId: active.installationId,
@@ -401,6 +456,7 @@ export function createPostHogTelemetryClient(
             $process_person_profile: false,
             $geoip_disable: true,
             [CAPTURE_GENERATION_PROPERTY]: captureGeneration,
+            [CAPTURE_ID_PROPERTY]: captureId,
           },
         });
       } catch {
@@ -411,10 +467,11 @@ export function createPostHogTelemetryClient(
       try {
         const active = getClient();
         if (!active) return;
+        const captureId = randomUUID();
         active.client.captureException(
           exception.error,
           active.installationId,
-          exceptionProperties(exception, captureGeneration),
+          exceptionProperties(exception, captureGeneration, captureId),
         );
       } catch {
         // Capture is best effort only.
@@ -424,10 +481,11 @@ export function createPostHogTelemetryClient(
       try {
         const active = getClient();
         if (!active) return;
+        const captureId = randomUUID();
         await active.client.captureExceptionImmediate(
           exception.error,
           active.installationId,
-          exceptionProperties(exception, captureGeneration),
+          exceptionProperties(exception, captureGeneration, captureId),
         );
       } catch {
         // Immediate CLI capture must not change command behavior.
@@ -447,6 +505,9 @@ export function createPostHogTelemetryClient(
     },
     discardPending() {
       captureGeneration += 1;
+      for (const [captureId, generation] of preparedCaptureGenerations) {
+        if (generation !== captureGeneration) preparedCaptureGenerations.delete(captureId);
+      }
       const client = sdkClient;
       if (!client) return;
       for (const key of QUEUE_KEYS) {

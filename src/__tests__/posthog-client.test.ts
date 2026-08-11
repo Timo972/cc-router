@@ -310,7 +310,7 @@ describe("gated PostHog EU client", () => {
     await client.shutdownWithin(100);
   });
 
-  it("turns a queued event into a successful no-op when telemetry is disabled before flush", async () => {
+  it("cancels analytics still preparing when opt-out and discard happen immediately", async () => {
     let currentSnapshot = snapshot(true);
     const requests: CapturedRequest[] = [];
     const client = createPostHogTelemetryClient({
@@ -319,13 +319,29 @@ describe("gated PostHog EU client", () => {
     });
 
     client.captureAnalytics(analyticsEvent());
-    await waitForImmediate();
     currentSnapshot = snapshot(false);
+    client.discardPending();
+    currentSnapshot = snapshot(true);
     await client.flushWithin(100);
 
     expect(requests).toHaveLength(0);
+    await client.shutdownWithin(100);
+  });
+
+  it("cancels exceptions still preparing when opt-out and discard happen immediately", async () => {
+    let currentSnapshot = snapshot(true);
+    const requests: CapturedRequest[] = [];
+    const client = createPostHogTelemetryClient({
+      getSnapshot: () => currentSnapshot,
+      transport: captureTransport(requests),
+    });
+
+    client.captureException(exceptionContract());
+    currentSnapshot = snapshot(false);
+    client.discardPending();
     currentSnapshot = snapshot(true);
     await client.flushWithin(100);
+
     expect(requests).toHaveLength(0);
     await client.shutdownWithin(100);
   });
