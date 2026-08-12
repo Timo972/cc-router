@@ -36,7 +36,7 @@ export function createAnthropicProxy(options: AnthropicProxyOptions): RequestHan
           request.socket.setTimeout(0);
         });
         configuredProxyRequest?.(proxyRequest, request, response, proxyOptions);
-        stripPropagationHeaders();
+        if (!proxyRequest.headersSent) stripPropagationHeaders();
       },
     },
   });

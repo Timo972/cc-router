@@ -319,9 +319,9 @@ async function startForeground(opts: {
   litellm?: string | boolean;
   accounts: string;
 }): Promise<void> {
-  const litellmUrl = opts.litellm
+  const litellmUrl = (opts.litellm
     ? (typeof opts.litellm === "string" ? opts.litellm : `http://localhost:${LITELLM_PORT}`)
-    : undefined;
+    : undefined) ?? process.env["LITELLM_URL"];
 
   if (opts.litellm && typeof opts.litellm !== "string") {
     await ensureLiteLLMRunning();

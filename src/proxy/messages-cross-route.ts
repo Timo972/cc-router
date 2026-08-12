@@ -341,7 +341,7 @@ export function mountMessagesCrossProviderRoute(
         return;
       }
 
-      let failurePhase: "prepare" | "forward" | "delivery" = "prepare";
+      let failurePhase: "prepare" | "route" | "forward" | "delivery" = "prepare";
       try {
         const ready = await prepareOpenAIAccount(account);
         if (!ready) {
@@ -371,6 +371,7 @@ export function mountMessagesCrossProviderRoute(
           return;
         }
 
+        failurePhase = "route";
         const body = anthropicToOpenAIResponses(req.body, opts.modelRouting);
         failurePhase = "forward";
         const upstream = await forwardOpenAI({

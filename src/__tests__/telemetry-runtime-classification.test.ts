@@ -44,6 +44,12 @@ describe("runtime automatic span classification", () => {
       "POST",
       "explicit-proxy.internal",
     )?.operation).toBe("provider.inference");
+    expect(classifyOutgoingTelemetryOperation(
+      "decoy.invalid",
+      "/v1/messages",
+      "POST",
+      "explicit-proxy.internal",
+    )).toBeUndefined();
   });
 
   it("allows literal loopback provider targets only in tests", async () => {

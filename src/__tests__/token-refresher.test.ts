@@ -371,4 +371,74 @@ describe("refreshAccountToken", () => {
 
     expect(persistedRefreshTokens).toEqual(["sk-ant-ort01-SHUTDOWN"]);
   });
+
+  it("drains and persists a deferred request-triggered rotation before stopping", async () => {
+    const account = makeAccount(Date.now() + 60_000);
+    const pool = new TokenPool([account]);
+    const response = deferred<Response>();
+    vi.mocked(fetch).mockImplementation(() => response.promise);
+    const persistedRefreshTokens: string[] = [];
+    const persist = (accounts: Account[]) => {
+      persistedRefreshTokens.push(accounts[0].tokens.refreshToken);
+    };
+    const stop = startRefreshLoop([], { persist });
+    const refreshing = refreshAccountIfCurrent(account, pool, { persist });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+
+    let stopped = false;
+    const stopping = stop(100).then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+
+    response.resolve(successfulRefreshResponse("REQUEST-SHUTDOWN"));
+    await expect(refreshing).resolves.toBe(true);
+    await stopping;
+
+    expect(persistedRefreshTokens).toEqual(["sk-ant-ort01-REQUEST-SHUTDOWN"]);
+    const later = makeAccount(Date.now() + 60_000);
+    await expect(refreshAccountIfCurrent(later, new TokenPool([later]), { persist })).resolves.toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("serializes same-ID account incarnations until the active loop persists rotation", async () => {
+    const first = makeAccount(Date.now() + 60_000);
+    first.id = "anthropic-lifecycle-account";
+    const replacement = makeAccount(Date.now() + 60_000);
+    replacement.id = first.id;
+    const response = deferred<Response>();
+    vi.mocked(fetch).mockImplementation(() => response.promise);
+    const persist = vi.fn();
+    const stopOlder = startRefreshLoop([first], { persist });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    expect(() => startRefreshLoop([replacement])).toThrow("already running");
+
+    response.resolve(successfulRefreshResponse("SERIALIZED-LIFECYCLE"));
+    await stopOlder();
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(persist).toHaveBeenCalledWith([first]);
+    expect(first.tokens.refreshToken).toBe("sk-ant-ort01-SERIALIZED-LIFECYCLE");
+
+    const stopNewer = startRefreshLoop([replacement]);
+    await stopNewer();
+  });
+
+  it("aborts a hung request-owned refresh within the shutdown deadline", async () => {
+    const account = makeAccount(Date.now() + 60_000);
+    const pool = new TokenPool([account]);
+    let observedSignal: AbortSignal | undefined;
+    vi.mocked(fetch).mockImplementation((_input, init) => {
+      observedSignal = init?.signal ?? undefined;
+      return new Promise<Response>(() => undefined);
+    });
+    const stop = startRefreshLoop([]);
+    void refreshAccountIfCurrent(account, pool);
+    await vi.waitFor(() => expect(observedSignal).toBeInstanceOf(AbortSignal));
+
+    const startedAt = Date.now();
+    await stop(10);
+
+    expect(Date.now() - startedAt).toBeLessThan(250);
+    expect(observedSignal?.aborted).toBe(true);
+  });
 });

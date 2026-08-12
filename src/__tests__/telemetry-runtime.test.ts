@@ -983,6 +983,67 @@ describe("proxy runtime sampling and propagation", () => {
     }
   });
 
+  it("records one route-owned exception when Messages translation throws after preparation", async () => {
+    const express = (await import("express")).default;
+    const { createServer } = await import("node:http");
+    const { mountMessagesCrossProviderRoute } = await import("../proxy/messages-cross-route.js");
+    const { flushTelemetryWithin } = await import("../telemetry/facade.js");
+    const app = express();
+    mountMessagesCrossProviderRoute(app, {
+      getOpenAIAccount: () => ({
+        id: TELEMETRY_CANARY.accountId,
+        provider: "openai_subscription",
+        accessToken: TELEMETRY_CANARY.bearerToken,
+        refreshToken: "private-refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+      prepareOpenAIAccount: async () => true,
+      prepareOpenAIAccountOwnsDiagnostics: true,
+      forwardOpenAI: async () => {
+        throw new Error("forwarding should not be reached");
+      },
+    });
+    app.use((_error: unknown, _req: unknown, res: { status: (code: number) => { end: () => void } }, _next: unknown) => {
+      res.status(500).end();
+    });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("translation app did not bind");
+    const transportStarted = capture.requests.length;
+    const sdkStarted = posthogBodies.length;
+
+    try {
+      const response = await originalFetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5-codex",
+          messages: [{ role: "user", content: { private: TELEMETRY_CANARY.prompt } }],
+        }),
+      });
+      expect(response.status).toBe(500);
+      await response.arrayBuffer();
+      await flushTelemetryWithin(500);
+      await vi.waitFor(() => expect(countOccurrences(
+        posthogBodies.slice(sdkStarted).join("\n"),
+        '"event":"$exception"',
+      )).toBe(1));
+
+      const exceptionWire = posthogBodies.slice(sdkStarted).join("\n");
+      expect(exceptionWire).not.toContain(TELEMETRY_CANARY.prompt);
+      expect(exceptionWire).not.toContain(TELEMETRY_CANARY.accountId);
+      expect(countOccurrences(
+        wireFor(capture, "/i/v1/logs", transportStarted).toString("utf8"),
+        "runtime.failure",
+      )).toBe(0);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      server.closeAllConnections();
+    }
+  });
+
   it("discards queued runtime telemetry without transport calls when shutdown observes opt-out", async () => {
     const { recordSafeLog, withTelemetrySpan } = await import("../telemetry/facade.js");
     const runtime = await import("../telemetry/runtime.js");

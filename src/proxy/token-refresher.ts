@@ -33,6 +33,15 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const rawRefreshLocks = new Map<Account, Promise<boolean>>();
 const rawRefreshControllers = new Map<Account, AbortController>();
 const ownedRefreshLocks = new Map<Account, Promise<boolean>>();
+const rawRefreshOwners = new Map<Account, RefreshLifecycle | undefined>();
+const ownedRefreshOwners = new Map<Account, RefreshLifecycle | undefined>();
+
+interface RefreshLifecycle {
+  stopping: boolean;
+  settled: boolean;
+}
+
+let activeRefreshLifecycle: RefreshLifecycle | undefined;
 
 /** A count is required because concurrent deletion attempts may reserve the same object. */
 const deletionReservations = new Map<Account, number>();
@@ -54,6 +63,7 @@ export async function refreshAccountToken(account: Account, signal?: AbortSignal
   // A deletion reservation rejects every new caller, including callers that
   // would otherwise attach themselves to already-running raw refresh work.
   if (isReservedForDeletion(account)) return false;
+  if (activeRefreshLifecycle?.stopping) return false;
 
   // Deduplicate concurrent refresh calls for the same account
   const existing = rawRefreshLocks.get(account);
@@ -67,15 +77,18 @@ export async function refreshAccountToken(account: Account, signal?: AbortSignal
   }
 
   const controller = new AbortController();
+  const owner = activeRefreshLifecycle;
   const unlink = linkAbortSignal(signal, controller);
   const promise = withTelemetrySpan("oauth.refresh", { provider: "anthropic" }, () => _doRefresh(account, controller.signal));
   rawRefreshLocks.set(account, promise);
   rawRefreshControllers.set(account, controller);
+  rawRefreshOwners.set(account, owner);
   try {
     return await promise;
   } finally {
     if (rawRefreshLocks.get(account) === promise) rawRefreshLocks.delete(account);
     if (rawRefreshControllers.get(account) === controller) rawRefreshControllers.delete(account);
+    if (rawRefreshOwners.get(account) === owner) rawRefreshOwners.delete(account);
     unlink();
   }
 }
@@ -123,6 +136,7 @@ export interface AccountOwnershipView {
 export interface RefreshAccountIfCurrentOptions {
   refresh?: (account: Account) => Promise<boolean>;
   persist?: (accounts: Account[]) => void;
+  isCurrent?: () => boolean;
 }
 
 async function performOwnedRefresh(
@@ -131,6 +145,7 @@ async function performOwnedRefresh(
   options: RefreshAccountIfCurrentOptions,
 ): Promise<boolean> {
   if (pool.findById(account.id) !== account) return false;
+  if (options.isCurrent && !options.isCurrent()) return false;
 
   if (pendingDurability.has(account)) {
     (options.persist ?? saveAccounts)(pool.getAll());
@@ -139,11 +154,12 @@ async function performOwnedRefresh(
   }
 
   const ok = await (options.refresh ?? refreshAccountToken)(account);
-  if (!ok || pool.findById(account.id) !== account) return false;
+  if (!ok) return false;
+  pendingDurability.add(account);
+  if (pool.findById(account.id) !== account || (options.isCurrent && !options.isCurrent())) return false;
   try {
     (options.persist ?? saveAccounts)(pool.getAll());
   } catch (error) {
-    pendingDurability.add(account);
     throw error;
   }
   pendingDurability.delete(account);
@@ -160,10 +176,12 @@ export function refreshAccountIfCurrent(
   options: RefreshAccountIfCurrentOptions = {},
 ): Promise<boolean> {
   if (isReservedForDeletion(account)) return Promise.resolve(false);
+  if (activeRefreshLifecycle?.stopping) return Promise.resolve(false);
 
   const existing = ownedRefreshLocks.get(account);
   if (existing) return existing;
 
+  const owner = activeRefreshLifecycle;
   let operation!: Promise<boolean>;
   operation = (async () => {
     try {
@@ -171,10 +189,12 @@ export function refreshAccountIfCurrent(
     } finally {
       if (ownedRefreshLocks.get(account) === operation) {
         ownedRefreshLocks.delete(account);
+        ownedRefreshOwners.delete(account);
       }
     }
   })();
   ownedRefreshLocks.set(account, operation);
+  ownedRefreshOwners.set(account, owner);
   return operation;
 }
 
@@ -310,6 +330,8 @@ export interface RefreshAccountsOnceOptions {
   persist?: (accounts: Account[]) => void;
   onError?: (error: unknown) => void;
   signal?: AbortSignal;
+  isCurrent?: () => boolean;
+  shouldContinue?: () => boolean;
 }
 
 /** Run one ownership-aware scheduled refresh pass. */
@@ -323,12 +345,13 @@ export async function refreshAccountsOnce(
   };
 
   for (const account of [...accounts]) {
-    if (options.signal?.aborted) return;
+    if (options.signal?.aborted || (options.shouldContinue && !options.shouldContinue())) return;
     if (!needsRefresh(account)) continue;
     try {
       await refreshAccountIfCurrent(account, ownershipView, {
         persist: options.persist,
         refresh: current => refreshAccountToken(current, options.signal),
+        isCurrent: options.isCurrent,
       });
     } catch (error) {
       (options.onError ?? console.error)(error);
@@ -346,15 +369,25 @@ export function startRefreshLoop(
   accounts: Account[],
   options: RefreshLoopOptions = {},
 ): (deadlineMs?: number) => Promise<void> {
+  if (activeRefreshLifecycle && !activeRefreshLifecycle.settled) {
+    throw new Error("Anthropic refresh loop is already running");
+  }
+  const lifecycle: RefreshLifecycle = { stopping: false, settled: false };
+  activeRefreshLifecycle = lifecycle;
   let stopped = false;
   let activePass: Promise<void> | undefined;
   let activeController: AbortController | undefined;
   const startPass = (): void => {
-    if (stopped || activePass) return;
+    if (stopped || activePass || activeRefreshLifecycle !== lifecycle) return;
     const controller = new AbortController();
     activeController = controller;
     let operation!: Promise<void>;
-    operation = refreshAccountsOnce(accounts, { ...options, signal: controller.signal })
+    operation = refreshAccountsOnce(accounts, {
+      ...options,
+      signal: controller.signal,
+      isCurrent: () => activeRefreshLifecycle === lifecycle,
+      shouldContinue: () => !stopped && activeRefreshLifecycle === lifecycle,
+    })
       .finally(() => {
         if (activePass === operation) activePass = undefined;
         if (activeController === controller) activeController = undefined;
@@ -366,12 +399,39 @@ export function startRefreshLoop(
   startPass();
 
   const timer = setInterval(startPass, CHECK_INTERVAL_MS);
-  return async (deadlineMs = 500) => {
-    stopped = true;
-    clearInterval(timer);
-    const active = activePass;
-    if (!active) return;
-    await drainRefreshPassWithin(active, deadlineMs, () => activeController?.abort());
+  let stopPromise: Promise<void> | undefined;
+  return (deadlineMs = 500) => {
+    if (stopPromise) return stopPromise;
+    stopPromise = (async () => {
+      stopped = true;
+      lifecycle.stopping = true;
+      clearInterval(timer);
+      const active = Promise.allSettled([
+        ...(activePass ? [activePass] : []),
+        ...[...rawRefreshLocks].filter(([account]) => rawRefreshOwners.get(account) === lifecycle).map(([, promise]) => promise),
+        ...[...ownedRefreshLocks].filter(([account]) => ownedRefreshOwners.get(account) === lifecycle).map(([, promise]) => promise),
+      ]).then(() => undefined);
+      try {
+        await drainRefreshPassWithin(active, deadlineMs, () => {
+          activeController?.abort();
+          for (const [account, controller] of rawRefreshControllers) {
+            if (rawRefreshOwners.get(account) !== lifecycle) continue;
+            controller.abort();
+            rawRefreshLocks.delete(account);
+            rawRefreshControllers.delete(account);
+            rawRefreshOwners.delete(account);
+          }
+          for (const [account] of ownedRefreshLocks) {
+            if (ownedRefreshOwners.get(account) !== lifecycle) continue;
+            ownedRefreshLocks.delete(account);
+            ownedRefreshOwners.delete(account);
+          }
+        });
+      } finally {
+        lifecycle.settled = true;
+      }
+    })();
+    return stopPromise;
   };
 }
 

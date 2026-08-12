@@ -54,6 +54,7 @@ import {
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
 import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
+import { saveProviderAccountsOnShutdown } from "./shutdown-persistence.js";
 
 const TELEMETRY_SHUTDOWN_DEADLINE_MS = 500;
 const REFRESH_SHUTDOWN_DEADLINE_MS = 500;
@@ -1299,10 +1300,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   }));
 
   // ─── Graceful shutdown ────────────────────────────────────────────────────
+  let listener: ReturnType<typeof app.listen> | undefined;
   let shutdownStarted = false;
   const shutdown = () => {
     if (shutdownStarted) return;
     shutdownStarted = true;
+    listener?.close();
     console.log(chalk.yellow("\nShutting down — saving tokens..."));
     usageRefresher.stop();
     if (process.env["CC_ROUTER_DAEMON"] === "1") {
@@ -1317,12 +1320,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       } catch {
         // Refresh drainage is bounded and never changes the proxy exit path.
       }
-      try {
-        saveAccounts(pool.getAll());
-        saveOpenAIAccounts(openAIAccounts);
-      } catch {
-        // Preserve the historical exit behavior after a best-effort final save.
-      }
+      saveProviderAccountsOnShutdown(pool.getAll(), openAIAccounts, {
+        saveAnthropic: saveAccounts,
+        saveOpenAI: saveOpenAIAccounts,
+      });
       try {
         await shutdownTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS);
       } catch {
@@ -1397,7 +1398,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  app.listen(port, host, () => {
+  listener = app.listen(port, host, () => {
     // Write PID for daemon/service process management
     if (process.env["CC_ROUTER_DAEMON"] === "1") {
       writePid(process.pid);

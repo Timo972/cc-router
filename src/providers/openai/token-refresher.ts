@@ -13,6 +13,17 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 const refreshLocks = new Map<string, Promise<boolean>>();
 const refreshControllers = new Map<string, AbortController>();
+const ownedRefreshLocks = new Set<Promise<boolean>>();
+const rawRefreshOwners = new Map<string, RefreshLifecycle | undefined>();
+const ownedRefreshOwners = new Map<Promise<boolean>, RefreshLifecycle | undefined>();
+const pendingDurability = new WeakSet<object>();
+
+interface RefreshLifecycle {
+  stopping: boolean;
+  settled: boolean;
+}
+
+let activeRefreshLifecycle: RefreshLifecycle | undefined;
 
 interface OpenAIRefreshResponse {
   access_token: string;
@@ -43,13 +54,15 @@ export type OpenAISubscriptionAccount = ProviderAccount & {
 };
 
 export function needsOpenAIRefresh(account: Pick<OpenAISubscriptionAccount, "expiresAt">): boolean {
-  return account.expiresAt - Date.now() < REFRESH_BUFFER_MS;
+  return pendingDurability.has(account) || account.expiresAt - Date.now() < REFRESH_BUFFER_MS;
 }
 
 export async function refreshOpenAISubscriptionToken(
   account: OpenAISubscriptionAccount,
   signal?: AbortSignal,
 ): Promise<boolean> {
+  if (activeRefreshLifecycle?.stopping) return false;
+
   const existing = refreshLocks.get(account.id);
   if (existing) {
     const unlink = linkAbortSignal(signal, refreshControllers.get(account.id));
@@ -61,15 +74,18 @@ export async function refreshOpenAISubscriptionToken(
   }
 
   const controller = new AbortController();
+  const owner = activeRefreshLifecycle;
   const unlink = linkAbortSignal(signal, controller);
   const promise = withTelemetrySpan("oauth.refresh", { provider: "openai" }, () => doRefresh(account, controller.signal));
   refreshLocks.set(account.id, promise);
   refreshControllers.set(account.id, controller);
+  rawRefreshOwners.set(account.id, owner);
   try {
     return await promise;
   } finally {
-    refreshLocks.delete(account.id);
-    refreshControllers.delete(account.id);
+    if (refreshLocks.get(account.id) === promise) refreshLocks.delete(account.id);
+    if (refreshControllers.get(account.id) === controller) refreshControllers.delete(account.id);
+    if (rawRefreshOwners.get(account.id) === owner) rawRefreshOwners.delete(account.id);
     unlink();
   }
 }
@@ -80,30 +96,67 @@ export async function prepareOpenAIAccountForRequest(
   saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
 ): Promise<boolean> {
   if (!needsOpenAIRefresh(account)) return true;
+  if (activeRefreshLifecycle?.stopping) return false;
 
-  const ok = await refreshOpenAISubscriptionToken(account);
-  if (ok) saveAccounts(allAccounts);
-  return ok;
+  const owner = activeRefreshLifecycle;
+  let operation!: Promise<boolean>;
+  operation = (async () => {
+    try {
+      if (pendingDurability.has(account)) {
+        saveAccounts(allAccounts);
+        pendingDurability.delete(account);
+        return true;
+      }
+      const ok = await refreshOpenAISubscriptionToken(account);
+      if (ok) {
+        pendingDurability.add(account);
+        saveAccounts(allAccounts);
+        pendingDurability.delete(account);
+      }
+      return ok;
+    } finally {
+      ownedRefreshLocks.delete(operation);
+      ownedRefreshOwners.delete(operation);
+    }
+  })();
+  ownedRefreshLocks.add(operation);
+  ownedRefreshOwners.set(operation, owner);
+  return operation;
 }
 
 export function startOpenAIRefreshLoop(
   accounts: OpenAISubscriptionAccount[],
   saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
 ): (deadlineMs?: number) => Promise<void> {
+  if (activeRefreshLifecycle && !activeRefreshLifecycle.settled) {
+    throw new Error("OpenAI refresh loop is already running");
+  }
+  const lifecycle: RefreshLifecycle = { stopping: false, settled: false };
+  activeRefreshLifecycle = lifecycle;
   let stopped = false;
   let activePass: Promise<void> | undefined;
   let activeController: AbortController | undefined;
   const check = async (signal: AbortSignal) => {
     for (const account of accounts) {
-      if (stopped || signal.aborted) return;
+      if (stopped || signal.aborted || activeRefreshLifecycle !== lifecycle) return;
       if (!needsOpenAIRefresh(account)) continue;
+      if (pendingDurability.has(account)) {
+        saveAccounts(accounts);
+        pendingDurability.delete(account);
+        continue;
+      }
       const ok = await refreshOpenAISubscriptionToken(account, signal);
-      if (ok) saveAccounts(accounts);
+      if (ok) {
+        pendingDurability.add(account);
+        if (activeRefreshLifecycle !== lifecycle) return;
+        saveAccounts(accounts);
+        pendingDurability.delete(account);
+      }
     }
   };
 
   const startPass = (): void => {
-    if (stopped || activePass) return;
+    if (stopped || activePass || activeRefreshLifecycle !== lifecycle) return;
     const controller = new AbortController();
     activeController = controller;
     let operation!: Promise<void>;
@@ -121,12 +174,39 @@ export function startOpenAIRefreshLoop(
   const timer = setInterval(startPass, CHECK_INTERVAL_MS);
   queueMicrotask(startPass);
 
-  return async (deadlineMs = 500) => {
-    stopped = true;
-    clearInterval(timer);
-    const active = activePass;
-    if (!active) return;
-    await drainRefreshPassWithin(active, deadlineMs, () => activeController?.abort());
+  let stopPromise: Promise<void> | undefined;
+  return (deadlineMs = 500) => {
+    if (stopPromise) return stopPromise;
+    stopPromise = (async () => {
+      stopped = true;
+      lifecycle.stopping = true;
+      clearInterval(timer);
+      const active = Promise.allSettled([
+        ...(activePass ? [activePass] : []),
+        ...[...refreshLocks].filter(([id]) => rawRefreshOwners.get(id) === lifecycle).map(([, promise]) => promise),
+        ...[...ownedRefreshLocks].filter(promise => ownedRefreshOwners.get(promise) === lifecycle),
+      ]).then(() => undefined);
+      try {
+        await drainRefreshPassWithin(active, deadlineMs, () => {
+          activeController?.abort();
+          for (const [id, controller] of refreshControllers) {
+            if (rawRefreshOwners.get(id) !== lifecycle) continue;
+            controller.abort();
+            refreshLocks.delete(id);
+            refreshControllers.delete(id);
+            rawRefreshOwners.delete(id);
+          }
+          for (const operation of ownedRefreshLocks) {
+            if (ownedRefreshOwners.get(operation) !== lifecycle) continue;
+            ownedRefreshLocks.delete(operation);
+            ownedRefreshOwners.delete(operation);
+          }
+        });
+      } finally {
+        lifecycle.settled = true;
+      }
+    })();
+    return stopPromise;
   };
 }
 

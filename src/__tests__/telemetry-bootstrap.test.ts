@@ -50,6 +50,10 @@ async function waitUntil(
   throw new Error(failure());
 }
 
+function countOccurrences(value: string, needle: string): number {
+  return value.split(needle).length - 1;
+}
+
 async function startBuiltPackage(options: {
   telemetryEnabled: boolean;
   proxyPort: number;
@@ -57,6 +61,8 @@ async function startBuiltPackage(options: {
   telemetryCaptureOrigin: string;
   testTraceUrl?: string;
   testLogUrl?: string;
+  accounts?: object[];
+  environment?: Record<string, string>;
 }): Promise<RunningPackage> {
   const testHome = mkdtempSync(join(tmpdir(), "cc-router-bootstrap-"));
   const accountsPath = join(testHome, "accounts.json");
@@ -68,7 +74,7 @@ async function startBuiltPackage(options: {
   };
   const binary = join(PROJECT_ROOT, packageJson.bin["cc-router"]);
 
-  writeFileSync(accountsPath, JSON.stringify([{
+  writeFileSync(accountsPath, JSON.stringify(options.accounts ?? [{
     id: "bootstrap-openai",
     provider: "openai_subscription",
     accessToken: "test-access-token",
@@ -112,6 +118,7 @@ globalThis.fetch = async (input, init) => {
     cwd: PROJECT_ROOT,
     env: {
       ...process.env,
+      ...options.environment,
       HOME: testHome,
       ACCOUNTS_PATH: accountsPath,
       CONFIG_PATH: configPath,
@@ -300,6 +307,85 @@ export async function resolve(specifier, context, nextResolve) {
     expect(targetHeaders.at(-1)).not.toHaveProperty("traceparent");
     expect(targetHeaders.at(-1)).not.toHaveProperty("tracestate");
     expect(targetHeaders.at(-1)).not.toHaveProperty("baggage");
+  }, 20_000);
+
+  it("uses an environment LiteLLM target for both forwarding and outgoing span trust", async () => {
+    const before = telemetry.requests.length;
+    const environmentTargetPaths: string[] = [];
+    const environmentTargetServer = createServer((request, response) => {
+      environmentTargetPaths.push(request.url ?? "");
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ id: "env_target_response" }));
+    });
+    const environmentTargetPort = await new Promise<number>((resolvePort, reject) => {
+      environmentTargetServer.once("error", reject);
+      environmentTargetServer.listen(0, "localhost", () => {
+        environmentTargetServer.off("error", reject);
+        const address = environmentTargetServer.address();
+        if (!address || typeof address === "string") {
+          reject(new Error("environment target did not expose a TCP port"));
+          return;
+        }
+        resolvePort(address.port);
+      });
+    });
+    const probe = createServer();
+    const proxyPort = await listen(probe);
+    await close(probe);
+    const environmentTarget = `http://localhost:${environmentTargetPort}`;
+    const running = await startBuiltPackage({
+      telemetryEnabled: true,
+      proxyPort,
+      targetOrigin,
+      telemetryCaptureOrigin: telemetry.origin,
+      environment: { LITELLM_URL: environmentTarget },
+      accounts: [{
+        id: "bootstrap-anthropic",
+        provider: "anthropic_subscription",
+        accessToken: "test-anthropic-access-token",
+        refreshToken: "test-anthropic-refresh-token",
+        expiresAt: Date.now() + 3_600_000,
+        scopes: ["user:inference"],
+        enabled: true,
+      }],
+    });
+    children.push(running);
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-5",
+          messages: [{ role: "user", content: "PRIVATE_ENV_TARGET_PROMPT" }],
+          max_tokens: 32,
+        }),
+      }).catch(error => {
+        throw new Error(`environment LiteLLM proxy request failed\n${running.output()}`, { cause: error });
+      });
+      expect(response.status).toBe(200);
+      await response.arrayBuffer();
+
+      await waitUntil(
+        () => telemetry.requests.slice(before).some(request => request.url === "/i/v1/traces"),
+        8_000,
+        () => `environment LiteLLM target exported no trace\n${running.output()}`,
+      );
+      const wire = Buffer.concat(
+        telemetry.requests
+          .slice(before)
+          .filter(request => request.url === "/i/v1/traces")
+          .map(request => request.rawBody),
+      ).toString("utf8");
+      expect(environmentTargetPaths).toContain("/v1/messages");
+      expect(countOccurrences(wire, "proxy.request")).toBeGreaterThanOrEqual(2);
+      expect(wire).toContain("provider.inference");
+      expect(countOccurrences(wire, "@opentelemetry/instrumentation-http")).toBeGreaterThanOrEqual(2);
+      expect(wire).not.toContain("PRIVATE_ENV_TARGET_PROMPT");
+      expect(wire).not.toContain("test-anthropic-access-token");
+    } finally {
+      await close(environmentTargetServer);
+    }
   }, 20_000);
 
   it("does not initialize or export from the compiled package when persisted telemetry is off", async () => {
