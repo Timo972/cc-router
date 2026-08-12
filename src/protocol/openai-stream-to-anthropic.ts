@@ -1,3 +1,5 @@
+import { anthropicStopReasonForResponse } from "./openai-response-to-anthropic.js";
+
 interface OpenAIStreamEvent {
   type?: string;
   delta?: string;
@@ -12,19 +14,6 @@ interface OpenAIStreamEvent {
   };
 }
 
-/**
- * Anthropic stop reason for a terminal Responses event. `response.incomplete`
- * ends the turn just as `response.completed` does — it is how the Responses API
- * reports a result that stopped early — and the output-token ceiling maps
- * directly onto Anthropic's own `max_tokens`. Any other incomplete reason still
- * delivered content, so `end_turn` stays the honest default.
- */
-function anthropicStopReason(event: OpenAIStreamEvent): string {
-  if (event.type !== "response.incomplete") return "end_turn";
-  return event.response?.incomplete_details?.reason === "max_output_tokens"
-    ? "max_tokens"
-    : "end_turn";
-}
 
 type AnthropicStreamEvent = Record<string, unknown>;
 
@@ -99,7 +88,9 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
           ...prefix,
           {
             type: "message_delta",
-            delta: { stop_reason: anthropicStopReason(event), stop_sequence: null },
+            // Same helper the collected-response translator uses, so an
+            // incomplete turn reports the same stop reason on both paths.
+            delta: { stop_reason: anthropicStopReasonForResponse(event.response), stop_sequence: null },
             usage: { output_tokens: usage.output_tokens ?? 0 },
           },
           { type: "message_stop" },

@@ -74,8 +74,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answer into a `502 upstream_error`. A streamed `/v1/messages` turn that ends
   incomplete now closes properly too — the Anthropic translation emitted no
   `message_stop` for it, leaving the client waiting on a turn that was already
-  over — and reports `max_tokens` as the stop reason when the output-token
-  ceiling was the cause.
+  over. Both `/v1/messages` paths, streamed or collected, now report
+  `max_tokens` as the stop reason when the output-token ceiling was the cause,
+  instead of an `end_turn` that made a truncated answer look deliberate.
 
 ---
 

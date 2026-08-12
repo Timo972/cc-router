@@ -64,6 +64,10 @@ export interface OpenAIResponseCompleted {
   id: string;
   model?: string;
   output?: OpenAIResponseOutputMessage[];
+  /** `"completed"` | `"incomplete"` | `"failed"` | `"in_progress"`. */
+  status?: string;
+  /** Present when `status` is `"incomplete"` — e.g. `"max_output_tokens"`. */
+  incomplete_details?: { reason?: string };
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
