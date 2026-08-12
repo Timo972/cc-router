@@ -107,7 +107,13 @@ function parseResetAtSeconds(
   const absolute = headerNumber(headers, `${prefix}-${kind}-reset-at`);
   if (absolute !== undefined && absolute > 0) {
     const seconds = absolute > MS_TIMESTAMP_THRESHOLD ? Math.floor(absolute / 1000) : Math.floor(absolute);
-    return seconds > nowSec && seconds <= horizonSec ? seconds : 0;
+    if (seconds > nowSec && seconds <= horizonSec) return seconds;
+    // The absolute value is unusable (already past, or implausibly far out), so
+    // fall through to the relative header rather than reporting "no reset
+    // known". Giving up here would leave an exhausted window with no
+    // trustworthy expiry — an indefinite block the pool can only clear via the
+    // multi-hour staleness sweep — while the upstream had just advertised a
+    // reset seconds or minutes away.
   }
   const relative = headerNumber(headers, `${prefix}-${kind}-reset-after-seconds`);
   if (relative !== undefined && relative > 0) {

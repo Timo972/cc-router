@@ -24,6 +24,7 @@ import { sendAnthropicNoEligibleResponse } from "./anthropic-routing.js";
 import type { OpenAIAccount } from "../providers/openai/account-state.js";
 import type { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import {
+  mirrorUpstreamHeaders,
   runOpenAIIngress,
   type ForwardOpenAI,
   type OpenAIIngressEnvelope,
@@ -113,6 +114,15 @@ async function sendOpenAIAsAnthropic(
   // never a synthesized 502.
   if (!upstream.ok) {
     const bodyText = await upstream.text();
+    // Mirror the safe upstream headers so a client can honor the server's
+    // backoff: without Retry-After a 429 tells the caller to slow down but not
+    // for how long. content-type is skipped for the same reason as the
+    // /v1/responses collected path — res.json() below only sets it when unset,
+    // so a mirrored value would silently win over the JSON envelope's own.
+    mirrorUpstreamHeaders(upstream.headers, (key, value) => {
+      if (key.toLowerCase() === "content-type") return;
+      res.setHeader(key, value);
+    });
     res.status(upstream.status).json({
       type: "error",
       error: {

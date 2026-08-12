@@ -40,10 +40,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   event-stream response with no body — was translated into an empty Anthropic
   message with HTTP 200; each now surfaces as an error response, so a rate
   limit reads as a rate limit instead of an empty assistant turn. A non-2xx
-  upstream response (401, 429, 5xx) is now relayed with its real status and
-  error message instead of being parsed as an event stream and reported as a
-  success or a generic failure; non-2xx Codex responses also keep their real
-  content type instead of being rewritten to `text/event-stream`.
+  upstream response (401, 429, 5xx) is now relayed with its real status, error
+  message, and safe headers — `Retry-After` included, so a client can honor the
+  backoff the server asked for — instead of being parsed as an event stream and
+  reported as a success or a generic failure; non-2xx Codex responses also keep
+  their real content type instead of being rewritten to `text/event-stream`.
 - A single malformed SSE frame no longer truncates a `/v1/messages` stream.
   Parsing a chunk was all-or-nothing, so one bad frame discarded the valid
   events beside it and ended the response as a clean `200` the client could

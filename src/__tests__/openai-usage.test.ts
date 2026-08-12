@@ -70,6 +70,34 @@ describe("parseCodexRateLimits", () => {
     expect(update.buckets[0]?.primary?.resetAt).toBe(NOW_SEC + 120);
   });
 
+  it("falls back to reset-after-seconds when reset-at is unusable", () => {
+    // A past absolute reset must not mask a valid relative one: reporting "no
+    // reset known" for an exhausted window turns an advertised 2-minute wait
+    // into an indefinite block the pool clears only via the staleness sweep.
+    const stale = parseCodexRateLimits({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(NOW_SEC - 100),
+      "x-codex-primary-reset-after-seconds": "120",
+    }, NOW_MS);
+    expect(stale.buckets[0]?.primary?.resetAt).toBe(NOW_SEC + 120);
+
+    // Same when the absolute value is implausibly far beyond the trust horizon.
+    const distant = parseCodexRateLimits({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(NOW_SEC + 365 * 24 * 3600),
+      "x-codex-primary-reset-after-seconds": "300",
+    }, NOW_MS);
+    expect(distant.buckets[0]?.primary?.resetAt).toBe(NOW_SEC + 300);
+
+    // Both unusable still means unknown.
+    const neither = parseCodexRateLimits({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(NOW_SEC - 100),
+      "x-codex-primary-reset-after-seconds": String(365 * 24 * 3600),
+    }, NOW_MS);
+    expect(neither.buckets[0]?.primary?.resetAt).toBe(0);
+  });
+
   it("ignores past reset-at values and treats millisecond timestamps as seconds", () => {
     const update = parseCodexRateLimits({
       "x-codex-primary-used-percent": "50",

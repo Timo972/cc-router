@@ -670,13 +670,29 @@ describe("mountMessagesCrossProviderRoute P1: real transport error relay", () =>
   it("relays a real upstream 429 JSON failure through the actual Codex transport, not a synthesized 502", async () => {
     mockCodexUpstream(new Response(
       JSON.stringify({ error: { message: "rate limit reached" } }),
-      { status: 429, headers: { "content-type": "application/json" } },
+      {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "120",
+          "x-codex-primary-used-percent": "100",
+          // Must not survive the relay: hop-by-hop, and an upstream cookie.
+          "connection": "keep-alive",
+          "set-cookie": "session=leak",
+        },
+      },
     ));
     const { app } = mountWithRealTransport(makeRuntimeAccount("openai-victor"));
 
     await withServer(app, async baseUrl => {
       const res = await postMessages(baseUrl, {});
       expect(res.status).toBe(429);
+      // Without Retry-After a 429 tells the caller to back off but not for how long.
+      expect(res.headers.get("retry-after")).toBe("120");
+      expect(res.headers.get("x-codex-primary-used-percent")).toBe("100");
+      expect(res.headers.get("set-cookie")).toBeNull();
+      // The JSON envelope still owns the content type.
+      expect(res.headers.get("content-type")).toContain("application/json");
       expect(await res.json()).toEqual({
         type: "error",
         error: { type: "rate_limit_error", message: "rate limit reached" },
