@@ -4,11 +4,26 @@ interface OpenAIStreamEvent {
   response?: {
     id?: string;
     model?: string;
+    incomplete_details?: { reason?: string };
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
     };
   };
+}
+
+/**
+ * Anthropic stop reason for a terminal Responses event. `response.incomplete`
+ * ends the turn just as `response.completed` does — it is how the Responses API
+ * reports a result that stopped early — and the output-token ceiling maps
+ * directly onto Anthropic's own `max_tokens`. Any other incomplete reason still
+ * delivered content, so `end_turn` stays the honest default.
+ */
+function anthropicStopReason(event: OpenAIStreamEvent): string {
+  if (event.type !== "response.incomplete") return "end_turn";
+  return event.response?.incomplete_details?.reason === "max_output_tokens"
+    ? "max_tokens"
+    : "end_turn";
 }
 
 type AnthropicStreamEvent = Record<string, unknown>;
@@ -70,7 +85,11 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
         ];
       }
 
-      if (event.type === "response.completed") {
+      // Both terminal Responses events must close the Anthropic message.
+      // Emitting nothing for `response.incomplete` would end the HTTP stream
+      // without `message_stop`, leaving the client waiting on a turn that is
+      // already over.
+      if (event.type === "response.completed" || event.type === "response.incomplete") {
         const usage = event.response?.usage ?? {};
         const prefix = textBlockStarted
           ? [{ type: "content_block_stop", index: 0 }]
@@ -80,7 +99,7 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
           ...prefix,
           {
             type: "message_delta",
-            delta: { stop_reason: "end_turn", stop_sequence: null },
+            delta: { stop_reason: anthropicStopReason(event), stop_sequence: null },
             usage: { output_tokens: usage.output_tokens ?? 0 },
           },
           { type: "message_stop" },

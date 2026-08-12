@@ -71,7 +71,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   usage instead of being discarded. `/v1/responses` treated only
   `response.completed` as a terminal event, so `response.incomplete` looked
   identical to a stream that stopped mid-flight and turned a usable partial
-  answer into a `502 upstream_error`.
+  answer into a `502 upstream_error`. A streamed `/v1/messages` turn that ends
+  incomplete now closes properly too — the Anthropic translation emitted no
+  `message_stop` for it, leaving the client waiting on a turn that was already
+  over — and reports `max_tokens` as the stop reason when the output-token
+  ceiling was the cause.
 
 ---
 

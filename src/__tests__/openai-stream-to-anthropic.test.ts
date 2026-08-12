@@ -70,6 +70,48 @@ describe("openAIStreamEventToAnthropicEvents", () => {
     ]);
   });
 
+  it("closes the message on response.incomplete, mapping the token ceiling to max_tokens", () => {
+    const normalizer = createOpenAIStreamToAnthropicNormalizer();
+    normalizer.convert({ type: "response.created", response: { id: "resp_1", model: "gpt-5.6-luna" } });
+    normalizer.convert({ type: "response.output_text.delta", delta: "Par" });
+
+    // Without terminating the message the client is left waiting on a stream
+    // that has already ended.
+    expect(normalizer.convert({
+      type: "response.incomplete",
+      response: {
+        id: "resp_1",
+        incomplete_details: { reason: "max_output_tokens" },
+        usage: { output_tokens: 7 },
+      },
+    })).toEqual([
+      { type: "content_block_stop", index: 0 },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "max_tokens", stop_sequence: null },
+        usage: { output_tokens: 7 },
+      },
+      { type: "message_stop" },
+    ]);
+  });
+
+  it("falls back to end_turn for an incomplete response with another reason", () => {
+    const normalizer = createOpenAIStreamToAnthropicNormalizer();
+    normalizer.convert({ type: "response.created", response: { id: "resp_1" } });
+
+    expect(normalizer.convert({
+      type: "response.incomplete",
+      response: { id: "resp_1", incomplete_details: { reason: "content_filter" }, usage: {} },
+    })).toEqual([
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: 0 },
+      },
+      { type: "message_stop" },
+    ]);
+  });
+
   it("keeps text block state isolated per normalizer instance", () => {
     const first = createOpenAIStreamToAnthropicNormalizer();
     const second = createOpenAIStreamToAnthropicNormalizer();
