@@ -31,6 +31,7 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 /** Exact-object locks prevent stale account incarnations from sharing work. */
 const rawRefreshLocks = new Map<Account, Promise<boolean>>();
+const rawRefreshControllers = new Map<Account, AbortController>();
 const ownedRefreshLocks = new Map<Account, Promise<boolean>>();
 
 /** A count is required because concurrent deletion attempts may reserve the same object. */
@@ -49,21 +50,33 @@ export function needsRefresh(account: Account): boolean {
     (account.tokens.expiresAt - Date.now()) < REFRESH_BUFFER_MS;
 }
 
-export async function refreshAccountToken(account: Account): Promise<boolean> {
+export async function refreshAccountToken(account: Account, signal?: AbortSignal): Promise<boolean> {
   // A deletion reservation rejects every new caller, including callers that
   // would otherwise attach themselves to already-running raw refresh work.
   if (isReservedForDeletion(account)) return false;
 
   // Deduplicate concurrent refresh calls for the same account
   const existing = rawRefreshLocks.get(account);
-  if (existing) return existing;
+  if (existing) {
+    const unlink = linkAbortSignal(signal, rawRefreshControllers.get(account));
+    try {
+      return await existing;
+    } finally {
+      unlink();
+    }
+  }
 
-  const promise = withTelemetrySpan("oauth.refresh", { provider: "anthropic" }, () => _doRefresh(account));
+  const controller = new AbortController();
+  const unlink = linkAbortSignal(signal, controller);
+  const promise = withTelemetrySpan("oauth.refresh", { provider: "anthropic" }, () => _doRefresh(account, controller.signal));
   rawRefreshLocks.set(account, promise);
+  rawRefreshControllers.set(account, controller);
   try {
     return await promise;
   } finally {
     if (rawRefreshLocks.get(account) === promise) rawRefreshLocks.delete(account);
+    if (rawRefreshControllers.get(account) === controller) rawRefreshControllers.delete(account);
+    unlink();
   }
 }
 
@@ -165,7 +178,7 @@ export function refreshAccountIfCurrent(
   return operation;
 }
 
-async function _doRefresh(account: Account): Promise<boolean> {
+async function _doRefresh(account: Account, signal?: AbortSignal): Promise<boolean> {
   const startedAt = Date.now();
   let receivedSuccessfulResponse = false;
   try {
@@ -179,7 +192,9 @@ async function _doRefresh(account: Account): Promise<boolean> {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
+      signal,
     });
+    signal?.throwIfAborted();
 
     if (!res.ok) {
       const body = await res.text();
@@ -207,6 +222,7 @@ async function _doRefresh(account: Account): Promise<boolean> {
 
     receivedSuccessfulResponse = true;
     const data: RefreshResponse = await res.json() as RefreshResponse;
+    signal?.throwIfAborted();
 
     // CRITICAL: refresh_token ROTATES — save the new one immediately or lose access permanently
     account.tokens.accessToken = data.access_token;
@@ -228,6 +244,7 @@ async function _doRefresh(account: Account): Promise<boolean> {
     logRefresh(account.id, true, expiresInMin);
     return true;
   } catch (err) {
+    if (signal?.aborted) return false;
     const expectedReason = classifyExpectedRuntimeFailure(err);
     const reason = expectedReason ?? (receivedSuccessfulResponse ? "unexpected_response_shape" : "other");
     const outcome = reason === "timeout" ? "timeout" : "upstream_error";
@@ -259,6 +276,20 @@ async function _doRefresh(account: Account): Promise<boolean> {
   }
 }
 
+function linkAbortSignal(
+  signal: AbortSignal | undefined,
+  controller: AbortController | undefined,
+): () => void {
+  if (!signal || !controller) return () => undefined;
+  if (signal.aborted) {
+    controller.abort();
+    return () => undefined;
+  }
+  const abort = () => controller.abort();
+  signal.addEventListener("abort", abort, { once: true });
+  return () => signal.removeEventListener("abort", abort);
+}
+
 function refreshHttpReason(status: number): "unauthorized" | "forbidden" | "rate_limited" | "upstream_4xx" | "upstream_5xx" {
   if (status === 401) return "unauthorized";
   if (status === 403) return "forbidden";
@@ -278,6 +309,7 @@ export function saveAccounts(accounts: Account[]): void {
 export interface RefreshAccountsOnceOptions {
   persist?: (accounts: Account[]) => void;
   onError?: (error: unknown) => void;
+  signal?: AbortSignal;
 }
 
 /** Run one ownership-aware scheduled refresh pass. */
@@ -291,10 +323,12 @@ export async function refreshAccountsOnce(
   };
 
   for (const account of [...accounts]) {
+    if (options.signal?.aborted) return;
     if (!needsRefresh(account)) continue;
     try {
       await refreshAccountIfCurrent(account, ownershipView, {
         persist: options.persist,
+        refresh: current => refreshAccountToken(current, options.signal),
       });
     } catch (error) {
       (options.onError ?? console.error)(error);
@@ -306,12 +340,59 @@ export async function refreshAccountsOnce(
  * Background refresh loop: checks every 5 minutes and refreshes any
  * token expiring within the REFRESH_BUFFER_MS window.
  */
-export function startRefreshLoop(accounts: Account[]): () => void {
-  const check = () => refreshAccountsOnce(accounts);
+export interface RefreshLoopOptions extends RefreshAccountsOnceOptions {}
+
+export function startRefreshLoop(
+  accounts: Account[],
+  options: RefreshLoopOptions = {},
+): (deadlineMs?: number) => Promise<void> {
+  let stopped = false;
+  let activePass: Promise<void> | undefined;
+  let activeController: AbortController | undefined;
+  const startPass = (): void => {
+    if (stopped || activePass) return;
+    const controller = new AbortController();
+    activeController = controller;
+    let operation!: Promise<void>;
+    operation = refreshAccountsOnce(accounts, { ...options, signal: controller.signal })
+      .finally(() => {
+        if (activePass === operation) activePass = undefined;
+        if (activeController === controller) activeController = undefined;
+      });
+    activePass = operation;
+  };
 
   // Run immediately on startup (catches already-expired tokens)
-  check().catch(console.error);
+  startPass();
 
-  const timer = setInterval(() => { check().catch(console.error); }, CHECK_INTERVAL_MS);
-  return () => clearInterval(timer);
+  const timer = setInterval(startPass, CHECK_INTERVAL_MS);
+  return async (deadlineMs = 500) => {
+    stopped = true;
+    clearInterval(timer);
+    const active = activePass;
+    if (!active) return;
+    await drainRefreshPassWithin(active, deadlineMs, () => activeController?.abort());
+  };
+}
+
+async function drainRefreshPassWithin(
+  active: Promise<void>,
+  deadlineMs: number,
+  abort: () => void,
+): Promise<void> {
+  const bounded = Number.isFinite(deadlineMs) ? Math.max(0, Math.min(10_000, Math.floor(deadlineMs))) : 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = await Promise.race([
+    active.then(() => false, () => false),
+    new Promise<true>(resolve => { timer = setTimeout(() => resolve(true), bounded); }),
+  ]);
+  if (!timedOut) {
+    clearTimeout(timer);
+    return;
+  }
+  abort();
+  await Promise.race([
+    active.then(() => undefined, () => undefined),
+    new Promise<void>(resolve => setTimeout(resolve, Math.min(25, bounded))),
+  ]);
 }

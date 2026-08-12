@@ -56,6 +56,7 @@ import {
 import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
 
 const TELEMETRY_SHUTDOWN_DEADLINE_MS = 500;
+const REFRESH_SHUTDOWN_DEADLINE_MS = 500;
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
@@ -906,12 +907,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   mountResponsesRoutes(app, {
     getOpenAIAccount: pickOpenAIAccount,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
+    prepareOpenAIAccountOwnsDiagnostics: true,
     modelRouting,
   });
 
   mountMessagesCrossProviderRoute(app, {
     getOpenAIAccount: pickOpenAIAccount,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
+    prepareOpenAIAccountOwnsDiagnostics: true,
     modelRouting,
   });
 
@@ -1248,14 +1251,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     onRefreshFailure: (account) => {
       stats.totalErrors++;
       logError(account.id, 401, "Token refresh failed");
-      recordSafeLog({
-        operation: "oauth.refresh",
-        provider: "anthropic",
-        reason: "unauthorized",
-        outcome: "upstream_error",
-        httpStatusCode: 401,
-        severity: "warn",
-      });
     },
   }), (req, _res, next) => {
     const route = req._ccRoute!;
@@ -1309,18 +1304,29 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     if (shutdownStarted) return;
     shutdownStarted = true;
     console.log(chalk.yellow("\nShutting down — saving tokens..."));
-    stopAnthropicRefreshLoop();
-    stopOpenAIRefreshLoop();
     usageRefresher.stop();
-    saveAccounts(pool.getAll());
     if (process.env["CC_ROUTER_DAEMON"] === "1") {
       removePid();
     }
     void (async () => {
       try {
+        await Promise.all([
+          stopAnthropicRefreshLoop(REFRESH_SHUTDOWN_DEADLINE_MS),
+          stopOpenAIRefreshLoop(REFRESH_SHUTDOWN_DEADLINE_MS),
+        ]);
+      } catch {
+        // Refresh drainage is bounded and never changes the proxy exit path.
+      }
+      try {
+        saveAccounts(pool.getAll());
+        saveOpenAIAccounts(openAIAccounts);
+      } catch {
+        // Preserve the historical exit behavior after a best-effort final save.
+      }
+      try {
         await shutdownTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS);
       } catch {
-        // Telemetry shutdown is never allowed to change proxy exit behavior.
+        // Telemetry shutdown never changes proxy exit behavior.
       } finally {
         process.exit(0);
       }

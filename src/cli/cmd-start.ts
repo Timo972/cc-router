@@ -338,7 +338,7 @@ async function startForeground(opts: {
     : process.env["CC_ROUTER_DAEMON"] === "1"
       ? "daemon"
       : "foreground";
-  startProxyTelemetry(runtimeMode);
+  startProxyTelemetry(runtimeMode, { trustedProviderTarget: litellmUrl });
   const { startServer } = await import("../proxy/server.js");
   await startServer({
     port: parseInt(opts.port, 10),

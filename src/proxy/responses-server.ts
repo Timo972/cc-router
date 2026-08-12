@@ -19,6 +19,7 @@ export interface ResponsesRoutesOptions {
   prepareOpenAIAccount?: (account: OpenAISubscriptionAccount) => Promise<boolean>;
   forwardOpenAI?: ForwardOpenAI;
   modelRouting?: ModelRoutingConfig;
+  prepareOpenAIAccountOwnsDiagnostics?: boolean;
 }
 
 function isResponsesRequest(value: unknown): value is OpenAIResponsesRequest {
@@ -85,6 +86,8 @@ function responseReason(status: number): "unauthorized" | "forbidden" | "rate_li
 
 export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions): void {
   const forwardOpenAI = opts.forwardOpenAI ?? forwardOpenAICodexResponse;
+  const forwardOwnsDiagnostics = opts.forwardOpenAI === undefined;
+  const prepareOwnsDiagnostics = opts.prepareOpenAIAccountOwnsDiagnostics === true;
   const prepareOpenAIAccount = opts.prepareOpenAIAccount ?? (async () => true);
 
   app.post("/v1/responses", express.json({ limit: "10mb" }), async (
@@ -163,6 +166,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       return;
     }
 
+    let failurePhase: "prepare" | "forward" | "delivery" = "prepare";
     try {
       const ready = await prepareOpenAIAccount(account);
       if (!ready) {
@@ -171,15 +175,17 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
           outcome: "upstream_error",
           operationDurationMs: Date.now() - startedAt,
         });
-        recordSafeLog({
-          operation: "oauth.refresh",
-          provider: "openai",
-          reason: "unauthorized",
-          outcome: "upstream_error",
-          httpStatusCode: 401,
-          operationDurationMs: Date.now() - startedAt,
-          severity: "warn",
-        });
+        if (!prepareOwnsDiagnostics) {
+          recordSafeLog({
+            operation: "oauth.refresh",
+            provider: "openai",
+            reason: "unauthorized",
+            outcome: "upstream_error",
+            httpStatusCode: 401,
+            operationDurationMs: Date.now() - startedAt,
+            severity: "warn",
+          });
+        }
         res.status(401).json({
           error: {
             type: "authentication_error",
@@ -193,19 +199,21 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         ...req.body,
         model: route.upstreamModel,
       };
+      failurePhase = "forward";
       const upstream = await forwardOpenAI({
         account,
         body,
         stream: body.stream === true,
       });
+      failurePhase = "delivery";
       const outcome = responseOutcome(upstream.status);
       annotateActiveSpan("proxy.request", {
         httpStatusCode: upstream.status,
         outcome,
         operationDurationMs: Date.now() - startedAt,
       });
-      if (upstream.status === 401 || upstream.status === 403
-        || upstream.status === 429 || upstream.status === 529) {
+      if (!forwardOwnsDiagnostics && (upstream.status === 401 || upstream.status === 403
+        || upstream.status === 429 || upstream.status === 529)) {
         recordSafeLog({
           operation: "provider.inference",
           provider: "openai",
@@ -228,7 +236,12 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         streamOutcome: reason === "timeout" ? "timeout" : "upstream_error",
         operationDurationMs: Date.now() - startedAt,
       });
-      if (reason) {
+      const leafOwnsFailure = failurePhase === "prepare"
+        ? prepareOwnsDiagnostics
+        : failurePhase === "forward"
+          ? forwardOwnsDiagnostics
+          : false;
+      if (!leafOwnsFailure && reason) {
         recordSafeLog({
           operation: "provider.inference",
           provider: "openai",
@@ -237,7 +250,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
           operationDurationMs: Date.now() - startedAt,
           severity: "error",
         });
-      } else {
+      } else if (!leafOwnsFailure) {
         recordUnexpectedException(error, {
           category: "runtime",
           reason: "other",

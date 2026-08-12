@@ -7,6 +7,7 @@ import {
   TraceFlags,
   trace,
   type Attributes,
+  type Span,
 } from "@opentelemetry/api";
 import { logs, SeverityNumber, type LogAttributes } from "@opentelemetry/api-logs";
 import {
@@ -319,21 +320,17 @@ export function withTelemetrySpan<T>(
             && (typeof result === "object" || typeof result === "function")
             && typeof (result as unknown as PromiseLike<unknown>).then === "function") {
             return Promise.resolve(result).then(value => {
-              span.setStatus({ code: SpanStatusCode.OK });
-              span.end();
+              finalizeSpanBestEffort(span, SpanStatusCode.OK);
               return value;
             }, error => {
-              span.setStatus({ code: SpanStatusCode.ERROR });
-              span.end();
+              finalizeSpanBestEffort(span, SpanStatusCode.ERROR);
               throw error;
             }) as T;
           }
-          span.setStatus({ code: SpanStatusCode.OK });
-          span.end();
+          finalizeSpanBestEffort(span, SpanStatusCode.OK);
           return result;
         } catch (error) {
-          span.setStatus({ code: SpanStatusCode.ERROR });
-          span.end();
+          finalizeSpanBestEffort(span, SpanStatusCode.ERROR);
           throw error;
         }
       },
@@ -341,6 +338,19 @@ export function withTelemetrySpan<T>(
   } catch (error) {
     if (callbackStarted) throw error;
     return callback();
+  }
+}
+
+function finalizeSpanBestEffort(span: Span, status: SpanStatusCode): void {
+  try {
+    span.setStatus({ code: status });
+  } catch {
+    // Telemetry finalization never changes application behavior.
+  }
+  try {
+    span.end();
+  } catch {
+    // A broken tracer must not replace the callback value or error identity.
   }
 }
 

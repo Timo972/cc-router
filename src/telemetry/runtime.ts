@@ -126,6 +126,42 @@ function httpHostname(request: RequestOptions): string | undefined {
   return undefined;
 }
 
+function normalizedHostname(hostname: string | undefined): string | undefined {
+  if (!hostname) return undefined;
+  const candidate = hostname.trim().toLowerCase();
+  if (candidate.startsWith("[")) {
+    const closingBracket = candidate.indexOf("]");
+    if (closingBracket === -1) return undefined;
+    const address = candidate.slice(1, closingBracket);
+    return isIP(address) !== 0 ? address : undefined;
+  }
+  if (isIP(candidate) !== 0) return candidate;
+  if (!candidate.includes(":")) return candidate;
+  try {
+    return new URL(`http://${candidate}`).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  } catch {
+    return undefined;
+  }
+}
+
+function trustedTargetHostname(candidate: string | undefined): string | undefined {
+  if (!candidate) return undefined;
+  try {
+    const url = new URL(candidate);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    return normalizedHostname(url.hostname);
+  } catch {
+    return undefined;
+  }
+}
+
+function isTestLoopbackHostname(hostname: string | undefined): boolean {
+  if (process.env["NODE_ENV"] !== "test") return false;
+  const address = normalizedHostname(hostname);
+  if (!address) return false;
+  return isIP(address) === 4 ? address.startsWith("127.") : address === "::1";
+}
+
 interface AutomaticSpanClassification {
   operation: "proxy.request" | "provider.inference" | "oauth.refresh" | "provider.usage_refresh" | "model.discovery";
   provider?: "anthropic" | "openai";
@@ -138,40 +174,54 @@ function incomingClassification(path: string): AutomaticSpanClassification | und
   return undefined;
 }
 
-function outgoingClassification(
+export function classifyOutgoingTelemetryOperation(
   hostname: string | undefined,
   path: string,
   method: string | undefined,
+  trustedProviderHostname?: string,
 ): AutomaticSpanClassification | undefined {
+  const host = normalizedHostname(hostname);
+  const trusted = normalizedHostname(trustedProviderHostname);
+  const testLoopback = isTestLoopbackHostname(host);
   const normalizedMethod = method?.toUpperCase();
-  if (normalizedMethod === "POST" && path === "/v1/messages") {
+  if (normalizedMethod === "POST" && path === "/v1/messages"
+    && (host === "api.anthropic.com" || (trusted !== undefined && host === trusted) || testLoopback)) {
     return { operation: "provider.inference", provider: "anthropic", route: "messages" };
   }
-  if (normalizedMethod === "POST" && (
-    path === "/v1/responses"
-    || path === "/backend-api/codex/responses"
-  )) {
+  if (normalizedMethod === "POST" && path === "/v1/responses"
+    && (host === "api.openai.com" || (trusted !== undefined && host === trusted) || testLoopback)) {
+    return { operation: "provider.inference", provider: "openai", route: "responses" };
+  }
+  if (normalizedMethod === "POST" && path === "/backend-api/codex/responses"
+    && (host === "chatgpt.com" || testLoopback)) {
     return { operation: "provider.inference", provider: "openai", route: "responses" };
   }
   if (normalizedMethod === "POST" && (
-    (hostname === "claude.ai" && path === "/v1/oauth/token")
-    || (hostname === "auth.openai.com" && path === "/oauth/token")
+    (host === "claude.ai" && path === "/v1/oauth/token")
+    || (host === "auth.openai.com" && path === "/oauth/token")
+    || (testLoopback && (path === "/v1/oauth/token" || path === "/oauth/token"))
   )) {
     return {
       operation: "oauth.refresh",
-      provider: hostname === "claude.ai" ? "anthropic" : "openai",
+      provider: path === "/v1/oauth/token" ? "anthropic" : "openai",
     };
   }
-  if (normalizedMethod === "GET" && hostname === "api.anthropic.com" && path === "/api/oauth/usage") {
+  if (normalizedMethod === "GET" && (host === "api.anthropic.com" || testLoopback)
+    && path === "/api/oauth/usage") {
     return { operation: "provider.usage_refresh", provider: "anthropic" };
   }
-  if (normalizedMethod === "GET" && (
-    (hostname === "api.anthropic.com" && path === "/v1/models")
-    || path === "/backend-api/codex/models"
-  )) {
+  if (normalizedMethod === "GET" && (host === "api.anthropic.com" || testLoopback)
+    && path === "/v1/models") {
     return {
       operation: "model.discovery",
-      provider: hostname === "api.anthropic.com" ? "anthropic" : "openai",
+      provider: "anthropic",
+    };
+  }
+  if (normalizedMethod === "GET" && path === "/backend-api/codex/models"
+    && (host === "chatgpt.com" || testLoopback)) {
+    return {
+      operation: "model.discovery",
+      provider: "openai",
     };
   }
   return undefined;
@@ -200,7 +250,7 @@ function testIdGenerator(): IdGenerator | undefined {
   };
 }
 
-function createInstrumentations(runtimeMode: RuntimeMode): [
+function createInstrumentations(runtimeMode: RuntimeMode, trustedProviderHostname?: string): [
   HttpInstrumentation,
   ExpressInstrumentation,
   UndiciInstrumentation,
@@ -214,7 +264,7 @@ function createInstrumentations(runtimeMode: RuntimeMode): [
         const hostname = httpHostname(request);
         const path = requestPath(request.path ?? undefined);
         return isTelemetryEndpoint(hostname, path)
-          || outgoingClassification(hostname, path, request.method) === undefined;
+          || classifyOutgoingTelemetryOperation(hostname, path, request.method, trustedProviderHostname) === undefined;
       },
       requireParentforOutgoingSpans: true,
       startIncomingSpanHook(request) {
@@ -222,20 +272,22 @@ function createInstrumentations(runtimeMode: RuntimeMode): [
         return classification ? classificationAttributes(classification, runtimeMode) : {};
       },
       startOutgoingSpanHook(request) {
-        const classification = outgoingClassification(
+        const classification = classifyOutgoingTelemetryOperation(
           httpHostname(request),
           requestPath(request.path ?? undefined),
           request.method,
+          trustedProviderHostname,
         );
         return classification ? classificationAttributes(classification, runtimeMode) : {};
       },
       requestHook(span, request) {
         const classification = request instanceof IncomingMessage
           ? incomingClassification(requestPath(request.url))
-          : outgoingClassification(
+          : classifyOutgoingTelemetryOperation(
             (request as ClientRequest).host,
             requestPath((request as ClientRequest).path),
             (request as ClientRequest).method,
+            trustedProviderHostname,
           );
         if (classification) span.setAttributes(classificationAttributes(classification, runtimeMode));
       },
@@ -257,7 +309,7 @@ function createInstrumentations(runtimeMode: RuntimeMode): [
         }
         const path = requestPath(request.path);
         return isTelemetryEndpoint(hostname, path)
-          || outgoingClassification(hostname, path, request.method) === undefined;
+          || classifyOutgoingTelemetryOperation(hostname, path, request.method, trustedProviderHostname) === undefined;
       },
       startSpanHook(request) {
         let hostname: string | undefined;
@@ -266,7 +318,12 @@ function createInstrumentations(runtimeMode: RuntimeMode): [
         } catch {
           return {};
         }
-        const classification = outgoingClassification(hostname, requestPath(request.path), request.method);
+        const classification = classifyOutgoingTelemetryOperation(
+          hostname,
+          requestPath(request.path),
+          request.method,
+          trustedProviderHostname,
+        );
         return classification ? classificationAttributes(classification, runtimeMode) : {};
       },
     }),
@@ -285,7 +342,14 @@ function settleWithin(operation: () => Promise<void>, deadlineMs: number): Promi
   ]).then(() => undefined).catch(() => undefined).finally(() => clearTimeout(timer));
 }
 
-export function startProxyTelemetry(runtimeMode: RuntimeMode): boolean {
+export interface StartProxyTelemetryOptions {
+  trustedProviderTarget?: string;
+}
+
+export function startProxyTelemetry(
+  runtimeMode: RuntimeMode,
+  options: StartProxyTelemetryOptions = {},
+): boolean {
   if (activeRuntime) return true;
   try {
     const snapshot = getTelemetrySnapshot();
@@ -325,7 +389,10 @@ export function startProxyTelemetry(runtimeMode: RuntimeMode): boolean {
       sampler: createProxyTraceSampler(),
       textMapPropagator: proxyNetworkPropagator,
       ...(idGenerator === undefined ? {} : { idGenerator }),
-      instrumentations: createInstrumentations(runtimeMode),
+      instrumentations: createInstrumentations(
+        runtimeMode,
+        trustedTargetHostname(options.trustedProviderTarget),
+      ),
       spanProcessors: [spanProcessor],
       logRecordProcessors: [logProcessor],
       metricReaders: [],

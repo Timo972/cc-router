@@ -84,7 +84,11 @@ async function fetchModels(
         });
         return [];
       }
-      return normalizeModelIds(await res.json());
+      const payload: unknown = await res.json();
+      if (!isModelDiscoveryPayload(payload)) {
+        throw new TypeError("Unexpected model discovery response shape");
+      }
+      return normalizeModelIds(payload);
     } catch (error) {
       const expectedReason = init.signal?.aborted === true
         ? "timeout"
@@ -114,6 +118,18 @@ async function fetchModels(
       return [];
     }
   });
+}
+
+export function isModelDiscoveryPayload(payload: unknown): boolean {
+  if (Array.isArray(payload)) return payload.every(value => getModelId(value) !== undefined);
+  if (!payload || typeof payload !== "object") return false;
+  const record = payload as Record<string, unknown>;
+  const values = Array.isArray(record.data)
+    ? record.data
+    : Array.isArray(record.models)
+      ? record.models
+      : undefined;
+  return values !== undefined && values.every(value => getModelId(value) !== undefined);
 }
 
 function discoveryHttpReason(status: number): "unauthorized" | "forbidden" | "rate_limited" | "upstream_4xx" | "upstream_5xx" {

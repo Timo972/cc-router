@@ -34,6 +34,7 @@ export interface MessagesCrossProviderRouteOptions {
   prepareOpenAIAccount?: (account: OpenAISubscriptionAccount) => Promise<boolean>;
   forwardOpenAI?: ForwardOpenAI;
   modelRouting?: ModelRoutingConfig;
+  prepareOpenAIAccountOwnsDiagnostics?: boolean;
 }
 
 function isAnthropicMessagesRequest(value: unknown): value is AnthropicMessagesRequest {
@@ -261,6 +262,8 @@ export function mountMessagesCrossProviderRoute(
   opts: MessagesCrossProviderRouteOptions,
 ): void {
   const forwardOpenAI = opts.forwardOpenAI ?? forwardOpenAICodexResponse;
+  const forwardOwnsDiagnostics = opts.forwardOpenAI === undefined;
+  const prepareOwnsDiagnostics = opts.prepareOpenAIAccountOwnsDiagnostics === true;
   const prepareOpenAIAccount = opts.prepareOpenAIAccount ?? (async () => true);
 
   app.post(
@@ -338,6 +341,7 @@ export function mountMessagesCrossProviderRoute(
         return;
       }
 
+      let failurePhase: "prepare" | "forward" | "delivery" = "prepare";
       try {
         const ready = await prepareOpenAIAccount(account);
         if (!ready) {
@@ -346,15 +350,17 @@ export function mountMessagesCrossProviderRoute(
             outcome: "upstream_error",
             operationDurationMs: Date.now() - startedAt,
           });
-          recordSafeLog({
-            operation: "oauth.refresh",
-            provider: "openai",
-            reason: "unauthorized",
-            outcome: "upstream_error",
-            httpStatusCode: 401,
-            operationDurationMs: Date.now() - startedAt,
-            severity: "warn",
-          });
+          if (!prepareOwnsDiagnostics) {
+            recordSafeLog({
+              operation: "oauth.refresh",
+              provider: "openai",
+              reason: "unauthorized",
+              outcome: "upstream_error",
+              httpStatusCode: 401,
+              operationDurationMs: Date.now() - startedAt,
+              severity: "warn",
+            });
+          }
           res.status(401).json({
             type: "error",
             error: {
@@ -366,19 +372,21 @@ export function mountMessagesCrossProviderRoute(
         }
 
         const body = anthropicToOpenAIResponses(req.body, opts.modelRouting);
+        failurePhase = "forward";
         const upstream = await forwardOpenAI({
           account,
           body,
           stream: body.stream === true,
         });
+        failurePhase = "delivery";
         const outcome = responseOutcome(upstream.status);
         annotateActiveSpan("proxy.request", {
           httpStatusCode: upstream.status,
           outcome,
           operationDurationMs: Date.now() - startedAt,
         });
-        if (upstream.status === 401 || upstream.status === 403
-          || upstream.status === 429 || upstream.status === 529) {
+        if (!forwardOwnsDiagnostics && (upstream.status === 401 || upstream.status === 403
+          || upstream.status === 429 || upstream.status === 529)) {
           recordSafeLog({
             operation: "provider.inference",
             provider: "openai",
@@ -403,7 +411,12 @@ export function mountMessagesCrossProviderRoute(
           streamOutcome: streaming ? reason === "timeout" ? "timeout" : "upstream_error" : undefined,
           operationDurationMs: Date.now() - startedAt,
         });
-        if (reason) {
+        const leafOwnsFailure = failurePhase === "prepare"
+          ? prepareOwnsDiagnostics
+          : failurePhase === "forward"
+            ? forwardOwnsDiagnostics
+            : false;
+        if (!leafOwnsFailure && reason) {
           recordSafeLog({
             operation: "provider.inference",
             provider: "openai",
@@ -412,7 +425,7 @@ export function mountMessagesCrossProviderRoute(
             operationDurationMs: Date.now() - startedAt,
             severity: "error",
           });
-        } else {
+        } else if (!leafOwnsFailure) {
           recordUnexpectedException(error, {
             category: "runtime",
             reason: "other",

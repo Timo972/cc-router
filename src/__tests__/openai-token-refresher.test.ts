@@ -114,4 +114,93 @@ describe("OpenAI subscription token refresher", () => {
     expect(account.accessToken).toBe("new-access");
     vi.useRealTimers();
   });
+
+  it("drains a deferred startup refresh before the stopper resolves", async () => {
+    let resolveJson!: (value: object) => void;
+    const json = new Promise<object>(resolve => { resolveJson = resolve; });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => json,
+    } as Response);
+    const account = {
+      id: "openai-deferred",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    };
+    const persistedRefreshTokens: string[] = [];
+    const stop = startOpenAIRefreshLoop([account], accounts => {
+      persistedRefreshTokens.push(accounts[0].refreshToken);
+    });
+    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1));
+
+    let stopped = false;
+    const stopping = Promise.resolve(stop(100)).then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+
+    resolveJson({
+      access_token: "new-access",
+      refresh_token: "new-refresh",
+      expires_in: 3600,
+      token_type: "Bearer",
+    });
+    await stopping;
+
+    expect(persistedRefreshTokens).toEqual(["new-refresh"]);
+  });
+
+  it("aborts a hung startup refresh within the stopper deadline", async () => {
+    let observedSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) => {
+      observedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        observedSignal?.addEventListener("abort", () => {
+          reject(Object.assign(new Error("PRIVATE_ABORT"), { name: "AbortError" }));
+        }, { once: true });
+      });
+    });
+    const account = {
+      id: "openai-hung",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    };
+    const stop = startOpenAIRefreshLoop([account], vi.fn());
+    await vi.waitFor(() => expect(observedSignal).toBeInstanceOf(AbortSignal));
+
+    const startedAt = Date.now();
+    await Promise.resolve(stop(10));
+
+    expect(Date.now() - startedAt).toBeLessThan(250);
+    expect(observedSignal?.aborted).toBe(true);
+  });
+
+  it("rejects a successful HTTP response with an invalid token schema without mutation", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({}),
+    } as Response);
+    const account = {
+      id: "openai-invalid-schema",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: 12345,
+      enabled: true,
+    };
+
+    await expect(refreshOpenAISubscriptionToken(account)).rejects.toBeInstanceOf(TypeError);
+    expect(account).toEqual(expect.objectContaining({
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: 12345,
+    }));
+  });
 });

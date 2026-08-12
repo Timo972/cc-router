@@ -42,6 +42,10 @@ function wireContainsTraceId(wire: Buffer, traceId: string): boolean {
   return wire.includes(Buffer.from(traceId, "hex")) || wire.toString("utf8").includes(traceId);
 }
 
+function countOccurrences(value: string, needle: string): number {
+  return value.split(needle).length - 1;
+}
+
 async function waitForRequest(
   capture: TransportCaptureServer,
   path: string,
@@ -59,6 +63,9 @@ describe("proxy runtime sampling and propagation", () => {
   let originalFetch: typeof globalThis.fetch;
   const posthogBodies: string[] = [];
   let returnMalformedOpenAIRefresh = false;
+  let returnInvalidOpenAIRefresh = false;
+  let codexStatus = 200;
+  let codexUnexpected = false;
   const originalEnv: Record<string, string | undefined> = {};
 
   beforeAll(async () => {
@@ -103,6 +110,21 @@ describe("proxy runtime sampling and propagation", () => {
         return new Response("PRIVATE_MALFORMED_REFRESH_BODY", {
           status: 200,
           headers: { "content-type": "application/json" },
+        });
+      }
+      if (returnInvalidOpenAIRefresh
+        && url.hostname === "auth.openai.com"
+        && url.pathname === "/oauth/token") {
+        return new Response(JSON.stringify({ private: TELEMETRY_CANARY.prompt }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.hostname === "chatgpt.com" && url.pathname === "/backend-api/codex/responses") {
+        if (codexUnexpected) throw new TypeError("PRIVATE_CODEX_FAILURE");
+        return new Response("private codex response", {
+          status: codexStatus,
+          headers: { "content-type": "text/plain" },
         });
       }
       return responseFor(url);
@@ -721,6 +743,243 @@ describe("proxy runtime sampling and propagation", () => {
       expect(remoteWire).not.toContain(TELEMETRY_CANARY.bearerToken);
     } finally {
       returnMalformedOpenAIRefresh = false;
+    }
+  });
+
+  it("emits one rate-limit diagnostic when the Codex leaf and route observe the same response", async () => {
+    const express = (await import("express")).default;
+    const { createServer } = await import("node:http");
+    const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
+    const { flushTelemetryWithin } = await import("../telemetry/facade.js");
+    const app = express();
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: TELEMETRY_CANARY.accountId,
+        provider: "openai_subscription",
+        accessToken: TELEMETRY_CANARY.bearerToken,
+        refreshToken: "private-refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+    });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("exact-count app did not bind");
+    const started = capture.requests.length;
+    codexStatus = 429;
+
+    try {
+      const response = await originalFetch(`http://127.0.0.1:${address.port}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5-codex", input: [] }),
+      });
+      expect(response.status).toBe(429);
+      await response.arrayBuffer();
+      await flushTelemetryWithin(500);
+      await waitForRequest(capture, "/i/v1/logs", started);
+
+      const logWire = wireFor(capture, "/i/v1/logs", started).toString("utf8");
+      expect(countOccurrences(logWire, "runtime.failure")).toBe(1);
+      expect(logWire).toContain("rate_limited");
+      expect(logWire).not.toContain("private codex response");
+    } finally {
+      codexStatus = 200;
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      server.closeAllConnections();
+    }
+  });
+
+  it("keeps the leaf refresh reason without adding a contradictory route diagnostic", async () => {
+    const express = (await import("express")).default;
+    const { createServer } = await import("node:http");
+    const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
+    const { prepareOpenAIAccountForRequest } = await import("../providers/openai/token-refresher.js");
+    const { flushTelemetryWithin } = await import("../telemetry/facade.js");
+    const account = {
+      id: TELEMETRY_CANARY.accountId,
+      provider: "openai_subscription" as const,
+      accessToken: TELEMETRY_CANARY.bearerToken,
+      refreshToken: "private-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    };
+    const app = express();
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => account,
+      prepareOpenAIAccount: candidate => prepareOpenAIAccountForRequest(candidate, [account], () => undefined),
+      prepareOpenAIAccountOwnsDiagnostics: true,
+    });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("refresh-count app did not bind");
+    const started = capture.requests.length;
+
+    try {
+      const response = await originalFetch(`http://127.0.0.1:${address.port}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5-codex", input: [] }),
+      });
+      expect(response.status).toBe(401);
+      await response.arrayBuffer();
+      await flushTelemetryWithin(500);
+      await waitForRequest(capture, "/i/v1/logs", started);
+
+      const logWire = wireFor(capture, "/i/v1/logs", started).toString("utf8");
+      expect(countOccurrences(logWire, "runtime.failure")).toBe(1);
+      expect(logWire).toContain("rate_limited");
+      expect(logWire).not.toContain("unauthorized");
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      server.closeAllConnections();
+    }
+  });
+
+  it("emits one sanitized exception when the Codex leaf and route observe the same throw", async () => {
+    const express = (await import("express")).default;
+    const { createServer } = await import("node:http");
+    const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
+    const { flushTelemetryWithin } = await import("../telemetry/facade.js");
+    const app = express();
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: TELEMETRY_CANARY.accountId,
+        provider: "openai_subscription",
+        accessToken: TELEMETRY_CANARY.bearerToken,
+        refreshToken: "private-refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+    });
+    app.use((_error: unknown, _req: unknown, res: { status: (code: number) => { end: () => void } }, _next: unknown) => {
+      res.status(500).end();
+    });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("exception-count app did not bind");
+    const sdkStarted = posthogBodies.length;
+    codexUnexpected = true;
+
+    try {
+      const response = await originalFetch(`http://127.0.0.1:${address.port}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5-codex", input: [] }),
+      });
+      expect(response.status).toBe(500);
+      await response.arrayBuffer();
+      await flushTelemetryWithin(500);
+      await vi.waitFor(() => expect(posthogBodies.length).toBeGreaterThan(sdkStarted));
+
+      const exceptionWire = posthogBodies.slice(sdkStarted).join("\n");
+      expect(countOccurrences(exceptionWire, '"event":"$exception"')).toBe(1);
+      expect(exceptionWire).not.toContain("PRIVATE_CODEX_FAILURE");
+      expect(exceptionWire).not.toContain(TELEMETRY_CANARY.accountId);
+    } finally {
+      codexUnexpected = false;
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      server.closeAllConnections();
+    }
+  });
+
+  it("reports invalid structured success payloads without retaining their content", async () => {
+    const { refreshOpenAISubscriptionToken } = await import("../providers/openai/token-refresher.js");
+    const { fetchAnthropicModels } = await import("../providers/model-discovery.js");
+    const { flushTelemetryWithin } = await import("../telemetry/facade.js");
+    const openAIAccount = {
+      id: TELEMETRY_CANARY.accountId,
+      provider: "openai_subscription" as const,
+      accessToken: TELEMETRY_CANARY.bearerToken,
+      refreshToken: "private-refresh",
+      expiresAt: 12345,
+      enabled: true,
+    };
+    const anthropicAccount = {
+      id: TELEMETRY_CANARY.accountId,
+      tokens: {
+        accessToken: TELEMETRY_CANARY.bearerToken,
+        refreshToken: "private-anthropic-refresh",
+        expiresAt: Date.now() + 60_000,
+        scopes: ["private:scope"],
+      },
+      healthy: true,
+      busy: false,
+      requestCount: 0,
+      errorCount: 0,
+      lastUsed: 0,
+      lastRefresh: 0,
+      consecutiveErrors: 0,
+      rateLimits: {
+        status: "unknown" as const,
+        fiveHourUtil: 0,
+        fiveHourReset: 0,
+        sevenDayUtil: 0,
+        sevenDayReset: 0,
+        claim: "",
+        plan: "",
+        requestsLimit: 0,
+        lastUpdated: 0,
+      },
+      enabled: true,
+      sessionLimitPercent: 100,
+      weeklyLimitPercent: 100,
+    };
+    const transportStarted = capture.requests.length;
+    const sdkStarted = posthogBodies.length;
+    returnInvalidOpenAIRefresh = true;
+
+    try {
+      await expect(refreshOpenAISubscriptionToken(openAIAccount)).rejects.toBeInstanceOf(TypeError);
+      expect(openAIAccount).toEqual(expect.objectContaining({
+        accessToken: TELEMETRY_CANARY.bearerToken,
+        refreshToken: "private-refresh",
+        expiresAt: 12345,
+      }));
+      await expect(fetchAnthropicModels(anthropicAccount, async () => new Response(JSON.stringify({
+        private: TELEMETRY_CANARY.prompt,
+      }), { status: 200, headers: { "content-type": "application/json" } }))).resolves.toEqual([]);
+      await flushTelemetryWithin(500);
+      await waitForRequest(capture, "/i/v1/logs", transportStarted);
+      await vi.waitFor(() => expect(countOccurrences(
+        posthogBodies.slice(sdkStarted).join("\n"),
+        '"event":"$exception"',
+      )).toBeGreaterThanOrEqual(2));
+
+      const remoteWire = wireFor(capture, "/i/v1/logs", transportStarted).toString("utf8")
+        + posthogBodies.slice(sdkStarted).join("\n");
+      expect(countOccurrences(remoteWire, "unexpected_response_shape")).toBeGreaterThanOrEqual(2);
+      expect(remoteWire).not.toContain(TELEMETRY_CANARY.prompt);
+      expect(remoteWire).not.toContain(TELEMETRY_CANARY.accountId);
+      expect(remoteWire).not.toContain(TELEMETRY_CANARY.bearerToken);
+    } finally {
+      returnInvalidOpenAIRefresh = false;
+    }
+  });
+
+  it("preserves callback outcomes when span finalization throws", async () => {
+    const { withTelemetrySpan } = await import("../telemetry/facade.js");
+    const applicationError = new Error("application identity");
+    const finalizationError = new Error("telemetry finalization");
+    const getTracer = vi.spyOn(trace, "getTracer").mockReturnValue({
+      startActiveSpan: (_name: string, _options: object, callback: (span: object) => unknown) => callback({
+        setStatus: () => { throw finalizationError; },
+        end: () => { throw finalizationError; },
+      }),
+    } as ReturnType<typeof trace.getTracer>);
+
+    try {
+      expect(withTelemetrySpan("model.discovery", { provider: "openai" }, () => 42)).toBe(42);
+      await expect(withTelemetrySpan(
+        "model.discovery",
+        { provider: "openai" },
+        async () => { throw applicationError; },
+      )).rejects.toBe(applicationError);
+    } finally {
+      getTracer.mockRestore();
     }
   });
 

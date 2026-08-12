@@ -5,6 +5,7 @@ import {
   refreshAccountIfCurrent,
   refreshAccountToken,
   reserveAccountForDeletion,
+  startRefreshLoop,
 } from "../proxy/token-refresher.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
@@ -348,5 +349,26 @@ describe("refreshAccountToken", () => {
     releaseSecond();
     expect(await refreshAccountToken(account)).toBe(true);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("drains and persists a deferred startup rotation before stopping", async () => {
+    const account = makeAccount(Date.now() + 60_000);
+    const response = deferred<Response>();
+    vi.mocked(fetch).mockImplementation(() => response.promise);
+    const persistedRefreshTokens: string[] = [];
+    const stop = startRefreshLoop([account], {
+      persist: accounts => persistedRefreshTokens.push(accounts[0].tokens.refreshToken),
+    });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+
+    let stopped = false;
+    const stopping = Promise.resolve(stop(100)).then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+
+    response.resolve(successfulRefreshResponse("SHUTDOWN"));
+    await stopping;
+
+    expect(persistedRefreshTokens).toEqual(["sk-ant-ort01-SHUTDOWN"]);
   });
 });
