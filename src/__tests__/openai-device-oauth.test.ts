@@ -224,6 +224,7 @@ describe("OpenAI device OAuth", () => {
       stage: "access_token_parse",
       reason: "unexpected_response_shape",
       expected: false,
+      httpStatusCode: 200,
     });
     expect(JSON.stringify(error.classification)).not.toContain("PRIVATE");
   });
@@ -278,6 +279,7 @@ describe("OpenAI device OAuth", () => {
       stage: "device_code_request",
       reason: "unexpected_response_shape",
       expected: true,
+      httpStatusCode: 200,
     });
   });
 
@@ -303,7 +305,152 @@ describe("OpenAI device OAuth", () => {
       stage: "authorization_polling",
       reason: "unexpected_response_shape",
       expected: true,
+      httpStatusCode: 200,
     });
     expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["device JSON", "device_code_request", async () => requestOpenAIDeviceCode({
+      fetchImpl: vi.fn().mockResolvedValue(new Response("{PRIVATE", { status: 207 })),
+    })],
+    ["device shape", "device_code_request", async () => requestOpenAIDeviceCode({
+      fetchImpl: vi.fn().mockResolvedValue(new Response(JSON.stringify({ user_code: "PRIVATE" }), {
+        status: 207,
+        headers: { "content-type": "application/json" },
+      })),
+    })],
+    ["device null", "device_code_request", async () => requestOpenAIDeviceCode({
+      fetchImpl: vi.fn().mockResolvedValue(new Response("null", {
+        status: 207,
+        headers: { "content-type": "application/json" },
+      })),
+    })],
+    ["authorization JSON", "authorization_polling", async () => exchangeOpenAIDeviceCodeForTokens({
+      fetchImpl: vi.fn().mockResolvedValue(new Response("{PRIVATE", { status: 207 })),
+      sleep: async () => undefined,
+      deviceCode: {
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "PRIVATE",
+        deviceAuthId: "PRIVATE",
+        intervalSeconds: 1,
+      },
+    })],
+    ["authorization shape", "authorization_polling", async () => exchangeOpenAIDeviceCodeForTokens({
+      fetchImpl: vi.fn().mockResolvedValue(new Response(JSON.stringify({
+        authorization_code: "PRIVATE",
+      }), { status: 207, headers: { "content-type": "application/json" } })),
+      sleep: async () => undefined,
+      deviceCode: {
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "PRIVATE",
+        deviceAuthId: "PRIVATE",
+        intervalSeconds: 1,
+      },
+    })],
+    ["token JSON", "token_exchange", async () => exchangeOpenAIDeviceCodeForTokens({
+      fetchImpl: vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          authorization_code: "PRIVATE",
+          code_challenge: "PRIVATE",
+          code_verifier: "PRIVATE",
+        }), { status: 200, headers: { "content-type": "application/json" } }))
+        .mockResolvedValueOnce(new Response("{PRIVATE", { status: 207 })),
+      sleep: async () => undefined,
+      deviceCode: {
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "PRIVATE",
+        deviceAuthId: "PRIVATE",
+        intervalSeconds: 1,
+      },
+    })],
+    ["token shape", "token_exchange", async () => exchangeOpenAIDeviceCodeForTokens({
+      fetchImpl: vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          authorization_code: "PRIVATE",
+          code_challenge: "PRIVATE",
+          code_verifier: "PRIVATE",
+        }), { status: 200, headers: { "content-type": "application/json" } }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "PRIVATE" }), {
+          status: 207,
+          headers: { "content-type": "application/json" },
+        })),
+      sleep: async () => undefined,
+      deviceCode: {
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "PRIVATE",
+        deviceAuthId: "PRIVATE",
+        intervalSeconds: 1,
+      },
+    })],
+    ["token null", "token_exchange", async () => exchangeOpenAIDeviceCodeForTokens({
+      fetchImpl: vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          authorization_code: "PRIVATE",
+          code_challenge: "PRIVATE",
+          code_verifier: "PRIVATE",
+        }), { status: 200, headers: { "content-type": "application/json" } }))
+        .mockResolvedValueOnce(new Response("null", {
+          status: 207,
+          headers: { "content-type": "application/json" },
+        })),
+      sleep: async () => undefined,
+      deviceCode: {
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "PRIVATE",
+        deviceAuthId: "PRIVATE",
+        intervalSeconds: 1,
+      },
+    })],
+    ["access-token parse", "access_token_parse", async () => exchangeOpenAIDeviceCodeForTokens({
+      fetchImpl: vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          authorization_code: "PRIVATE",
+          code_challenge: "PRIVATE",
+          code_verifier: "PRIVATE",
+        }), { status: 200, headers: { "content-type": "application/json" } }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          id_token: "PRIVATE",
+          access_token: "not-a-jwt",
+          refresh_token: "PRIVATE",
+        }), { status: 207, headers: { "content-type": "application/json" } })),
+      sleep: async () => undefined,
+      deviceCode: {
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "PRIVATE",
+        deviceAuthId: "PRIVATE",
+        intervalSeconds: 1,
+      },
+    })],
+    ["access-token null claims", "access_token_parse", async () => exchangeOpenAIDeviceCodeForTokens({
+      fetchImpl: vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          authorization_code: "PRIVATE",
+          code_challenge: "PRIVATE",
+          code_verifier: "PRIVATE",
+        }), { status: 200, headers: { "content-type": "application/json" } }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          id_token: "PRIVATE",
+          access_token: `header.${Buffer.from("null").toString("base64url")}.signature`,
+          refresh_token: "PRIVATE",
+        }), { status: 207, headers: { "content-type": "application/json" } })),
+      sleep: async () => undefined,
+      deviceCode: {
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "PRIVATE",
+        deviceAuthId: "PRIVATE",
+        intervalSeconds: 1,
+      },
+    })],
+  ] as const)("carries the successful HTTP status through malformed %s", async (_label, stage, operation) => {
+    const error = await operation().catch(value => value);
+
+    expect(error).toBeInstanceOf(SetupDiagnosticError);
+    expect(error.classification).toEqual(expect.objectContaining({
+      stage,
+      reason: "unexpected_response_shape",
+      httpStatusCode: 207,
+    }));
+    expect(JSON.stringify(error.classification)).not.toContain("PRIVATE");
   });
 });

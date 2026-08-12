@@ -11,6 +11,7 @@ import {
   recordExpectedSetupFailure,
   recordSetupResult,
   recordSetupStage,
+  recordSetupStageFailure,
   recordUnexpectedException,
   type ExpectedSetupFailureInput,
   type SetupResultInput,
@@ -70,10 +71,43 @@ export function classifyHttpSetupFailure(
 
 function ownStringProperty(input: unknown, property: "code" | "name"): string | undefined {
   if ((typeof input !== "object" && typeof input !== "function") || input === null) return undefined;
-  const descriptor = Object.getOwnPropertyDescriptor(input, property);
-  return descriptor && "value" in descriptor && typeof descriptor.value === "string"
-    ? descriptor.value
-    : undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(input, property);
+    return descriptor && "value" in descriptor && typeof descriptor.value === "string"
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function ownCause(input: unknown): unknown {
+  if ((typeof input !== "object" && typeof input !== "function") || input === null) return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(input, "cause");
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeBuiltInErrorName(input: unknown): "AbortError" | "TimeoutError" | undefined {
+  const ownName = ownStringProperty(input, "name");
+  if (ownName === "AbortError" || ownName === "TimeoutError") return ownName;
+  if (typeof DOMException === "undefined") return undefined;
+  try {
+    if (!(input instanceof DOMException)) return undefined;
+  } catch {
+    return undefined;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(DOMException.prototype, "name");
+  if (!descriptor || typeof descriptor.get !== "function") return undefined;
+  try {
+    const name = descriptor.get.call(input) as unknown;
+    return name === "AbortError" || name === "TimeoutError" ? name : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 const NETWORK_CODES = new Set([
@@ -91,8 +125,19 @@ export function classifyNetworkSetupFailure(
   cause: unknown,
   localMessage = cause instanceof Error ? cause.message : String(cause),
 ): SetupDiagnosticError {
-  const name = ownStringProperty(cause, "name");
-  const code = ownStringProperty(cause, "code");
+  const name = safeBuiltInErrorName(cause);
+  let code: string | undefined;
+  let current: unknown = cause;
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth <= 2 && current !== undefined && !seen.has(current); depth++) {
+    seen.add(current);
+    const candidate = ownStringProperty(current, "code");
+    if (candidate && NETWORK_CODES.has(candidate)) {
+      code = candidate;
+      break;
+    }
+    current = ownCause(current);
+  }
   const reason: SetupReason = name === "AbortError" || name === "TimeoutError" || code === "ETIMEDOUT"
     ? "timeout"
     : code && NETWORK_CODES.has(code)
@@ -105,8 +150,24 @@ export function classifyNetworkSetupFailure(
   }, { cause });
 }
 
+export function classifyAccountStateReadFailure(
+  error: { kind: "malformed_json" | "invalid_shape" | "permission_denied" | "read_failure"; message: string },
+): SetupDiagnosticError {
+  const reason: SetupReason = error.kind === "malformed_json" || error.kind === "invalid_shape"
+    ? "malformed_credentials"
+    : error.kind === "permission_denied"
+      ? "permission_denied"
+      : "other";
+  return new SetupDiagnosticError(error.message, {
+    stage: "persistence",
+    reason,
+    expected: false,
+  }, { cause: error });
+}
+
 export interface SetupDiagnosticRecorder {
   recordSetupStage(input: SetupStageInput): void;
+  recordSetupStageFailure(input: ExpectedSetupFailureInput): void;
   recordSetupResult(input: SetupResultInput): void;
   recordExpectedSetupFailure(input: ExpectedSetupFailureInput): void;
   recordUnexpectedException(
@@ -119,6 +180,7 @@ export interface SetupDiagnosticRecorder {
 
 const defaultRecorder: SetupDiagnosticRecorder = {
   recordSetupStage,
+  recordSetupStageFailure,
   recordSetupResult,
   recordExpectedSetupFailure,
   recordUnexpectedException,
@@ -143,6 +205,7 @@ export interface SetupAttempt {
   readonly method: SetupMethod;
   readonly diagnosticId: string;
   stageCompleted(stage: SetupStage): void;
+  stageFailed(error: unknown, fallbackStage: SetupStage): SetupFailureOutcome;
   failed(error: unknown, fallbackStage: SetupStage): SetupFailureOutcome;
   cancelled(): void;
   succeeded(): void;
@@ -178,40 +241,63 @@ export function createSetupAttempt(input: CreateSetupAttemptInput): SetupAttempt
 
   recorder.recordSetupStage({ ...withDuration(), stage: "attempt_start" });
 
+  let terminal = false;
+  const classify = (error: unknown, fallbackStage: SetupStage): SetupFailureClassification =>
+    error instanceof SetupDiagnosticError
+      ? error.classification
+      : { stage: fallbackStage, reason: "other", expected: false };
+  const failureInput = (classification: SetupFailureClassification): ExpectedSetupFailureInput => ({
+    ...withDuration(),
+    stage: classification.stage,
+    reason: classification.reason,
+    ...(classification.httpStatusCode === undefined
+      ? {}
+      : { httpStatusCode: classification.httpStatusCode }),
+  });
+  const recordException = (error: unknown, classification: SetupFailureClassification): void => {
+    if (classification.expected) return;
+    const exceptionCause = error instanceof SetupDiagnosticError && error.cause !== undefined
+      ? error.cause
+      : error;
+    recorder.recordUnexpectedException(exceptionCause, {
+      category: "setup",
+      provider: input.provider,
+      setupStage: classification.stage,
+      reason: classification.reason,
+    }, diagnosticId);
+  };
+
   return {
     ...base,
     stageCompleted(stage): void {
+      if (terminal) return;
       recorder.recordSetupStage({ ...withDuration(), stage });
     },
+    stageFailed(error, fallbackStage): SetupFailureOutcome {
+      const classification = classify(error, fallbackStage);
+      if (!terminal) {
+        recorder.recordSetupStageFailure(failureInput(classification));
+        recordException(error, classification);
+      }
+      return { diagnosticId, unexpected: !classification.expected };
+    },
     failed(error, fallbackStage): SetupFailureOutcome {
-      const classification = error instanceof SetupDiagnosticError
-        ? error.classification
-        : { stage: fallbackStage, reason: "other" as const, expected: false };
-      recorder.recordExpectedSetupFailure({
-        ...withDuration(),
-        stage: classification.stage,
-        reason: classification.reason,
-        ...(classification.httpStatusCode === undefined
-          ? {}
-          : { httpStatusCode: classification.httpStatusCode }),
-      });
-      if (!classification.expected) {
-        const exceptionCause = error instanceof SetupDiagnosticError && error.cause !== undefined
-          ? error.cause
-          : error;
-        recorder.recordUnexpectedException(exceptionCause, {
-          category: "setup",
-          provider: input.provider,
-          setupStage: classification.stage,
-          reason: classification.reason,
-        }, diagnosticId);
+      const classification = classify(error, fallbackStage);
+      if (!terminal) {
+        terminal = true;
+        recorder.recordExpectedSetupFailure(failureInput(classification));
+        recordException(error, classification);
       }
       return { diagnosticId, unexpected: !classification.expected };
     },
     cancelled(): void {
+      if (terminal) return;
+      terminal = true;
       recorder.recordSetupResult({ ...withDuration(), result: "cancelled" });
     },
     succeeded(): void {
+      if (terminal) return;
+      terminal = true;
       recorder.recordSetupResult({ ...withDuration(), result: "succeeded" });
     },
   };
@@ -248,7 +334,19 @@ export async function withSetupTelemetryFlush<T>(
   try {
     return await operation();
   } finally {
-    await flush(SETUP_TELEMETRY_FLUSH_DEADLINE_MS).catch(() => undefined);
+    await new Promise<void>(resolve => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, SETUP_TELEMETRY_FLUSH_DEADLINE_MS);
+      void Promise.resolve()
+        .then(() => flush(SETUP_TELEMETRY_FLUSH_DEADLINE_MS))
+        .then(finish, finish);
+    });
   }
 }
 

@@ -248,6 +248,7 @@ describe("typed telemetry facade", () => {
       "recordSafeLog",
       "recordSetupResult",
       "recordSetupStage",
+      "recordSetupStageFailure",
       "recordUnexpectedException",
       "shutdownTelemetryWithin",
       "startProxyHeartbeat",
@@ -293,6 +294,13 @@ describe("typed telemetry facade", () => {
       provider: "openai",
       method: "device_oauth",
       result: "succeeded",
+      diagnosticId: DIAGNOSTIC_ID,
+    })).toBeUndefined();
+    expect(facade.recordSetupStageFailure({
+      provider: "openai",
+      method: "device_oauth",
+      stage: "token_exchange",
+      reason: "unexpected_response_shape",
       diagnosticId: DIAGNOSTIC_ID,
     })).toBeUndefined();
     expect(facade.recordExpectedSetupFailure({
@@ -738,5 +746,45 @@ describe("typed telemetry facade", () => {
     } else {
       expect(recordedLogs[0].attributes.outcome).toBe(expectedOutcome);
     }
+  });
+
+  it("keeps a recoverable stage failure out of the terminal failure funnel", async () => {
+    const { createTelemetryFacade } = await import("../telemetry/facade.js");
+    const events: unknown[] = [];
+    const logs: Array<{ severity: string; attributes: Record<string, unknown> }> = [];
+    const facade = createTelemetryFacade({
+      getSnapshot: () => snapshot(),
+      claimFirstStart: () => undefined,
+      getAnalytics: () => ({
+        captureAnalytics: event => { events.push(event); },
+        captureAnalyticsImmediate: async event => { events.push(event); },
+        captureException: () => undefined,
+        captureExceptionImmediate: async () => undefined,
+        flushWithin: async () => undefined,
+        shutdownWithin: async () => undefined,
+        discardPending: () => undefined,
+      }),
+      emitLog: log => { logs.push(log); },
+    });
+
+    facade.recordSetupStageFailure({
+      provider: "anthropic",
+      method: "manual_token",
+      stage: "token_validation",
+      reason: "invalid_token",
+      diagnosticId: DIAGNOSTIC_ID,
+    });
+
+    expect(events).toEqual([]);
+    expect(logs).toEqual([
+      expect.objectContaining({
+        severity: "warn",
+        attributes: expect.objectContaining({
+          stage: "token_validation",
+          reason: "invalid_token",
+          diagnosticId: DIAGNOSTIC_ID,
+        }),
+      }),
+    ]);
   });
 });

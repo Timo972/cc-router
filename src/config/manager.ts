@@ -36,13 +36,89 @@ export function readAccountsRaw(): unknown[] {
   return readRawFromPath(ACCOUNTS_PATH);
 }
 
-function readRawFromPath(path: string): unknown[] {
-  if (!existsSync(path)) return [];
-  try {
-    return JSON.parse(readFileSync(path, "utf-8"));
-  } catch {
-    return [];
+export type AccountStateReadFailureKind = "malformed_json" | "invalid_shape" | "permission_denied" | "read_failure";
+
+export class AccountStateReadError extends Error {
+  readonly kind: AccountStateReadFailureKind;
+
+  constructor(kind: AccountStateReadFailureKind, path: string, cause?: unknown) {
+    super(`Could not read account state at ${path} (${kind})`, cause === undefined ? undefined : { cause });
+    this.name = "AccountStateReadError";
+    this.kind = kind;
   }
+}
+
+export type AccountStateReadResult =
+  | { ok: true; records: unknown[] }
+  | { ok: false; error: AccountStateReadError };
+
+function isAccountRecordShape(value: unknown): value is AccountRecord {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const provider = record["provider"];
+  const scopes = record["scopes"];
+  return typeof record["id"] === "string"
+    && record["id"].length > 0
+    && (provider === undefined
+      || provider === "anthropic_subscription"
+      || provider === "openai_subscription"
+      || provider === "openai_api_key")
+    && typeof record["accessToken"] === "string"
+    && record["accessToken"].length > 0
+    && typeof record["refreshToken"] === "string"
+    && typeof record["expiresAt"] === "number"
+    && Number.isFinite(record["expiresAt"])
+    && (scopes === undefined || (Array.isArray(scopes) && scopes.every(scope => typeof scope === "string")))
+    && (record["enabled"] === undefined || typeof record["enabled"] === "boolean")
+    && (record["sessionLimitPercent"] === undefined || (typeof record["sessionLimitPercent"] === "number" && Number.isFinite(record["sessionLimitPercent"])))
+    && (record["weeklyLimitPercent"] === undefined || (typeof record["weeklyLimitPercent"] === "number" && Number.isFinite(record["weeklyLimitPercent"])));
+}
+
+function ownSystemCode(cause: unknown): string | undefined {
+  if ((typeof cause !== "object" && typeof cause !== "function") || cause === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(cause, "code");
+  return descriptor && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : undefined;
+}
+
+export function readAccountStateDetailed(path = ACCOUNTS_PATH): AccountStateReadResult {
+  if (!existsSync(path)) return { ok: true, records: [] };
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (cause) {
+    const code = ownSystemCode(cause);
+    return {
+      ok: false,
+      error: new AccountStateReadError(
+        code === "EACCES" || code === "EPERM" ? "permission_denied" : "read_failure",
+        path,
+        cause,
+      ),
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (cause) {
+    return { ok: false, error: new AccountStateReadError("malformed_json", path, cause) };
+  }
+  if (!Array.isArray(parsed) || !parsed.every(isAccountRecordShape)) {
+    return { ok: false, error: new AccountStateReadError("invalid_shape", path) };
+  }
+  return { ok: true, records: parsed };
+}
+
+function readAccountStateOrThrow(path = ACCOUNTS_PATH): unknown[] {
+  const result = readAccountStateDetailed(path);
+  if (!result.ok) throw result.error;
+  return result.records;
+}
+
+function readRawFromPath(path: string): unknown[] {
+  const result = readAccountStateDetailed(path);
+  return result.ok ? result.records : [];
 }
 
 /** Deserialize Account[] from an explicit file path */
@@ -63,7 +139,7 @@ function writeAccountsAtomicToPath(path: string, data: unknown[]): void {
 
 export function writeAnthropicAccountsPreservingOtherProviders(data: AccountRecord[]): void {
   ensureConfigDir();
-  const existing = readAccountsRaw() as AccountRecord[];
+  const existing = readAccountStateOrThrow() as AccountRecord[];
   const nonAnthropic = existing.filter(a =>
     a.provider !== undefined && a.provider !== "anthropic_subscription"
   );
@@ -72,7 +148,7 @@ export function writeAnthropicAccountsPreservingOtherProviders(data: AccountReco
 
 export function upsertAccountRecord(record: AccountRecord): void {
   ensureConfigDir();
-  const existing = readAccountsRaw() as AccountRecord[];
+  const existing = readAccountStateOrThrow() as AccountRecord[];
   const next = [
     ...existing.filter(a => !(a.id === record.id && a.provider === record.provider)),
     record,
@@ -148,7 +224,7 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
 
 export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void {
   ensureConfigDir();
-  const existing = readAccountsRaw() as AccountRecord[];
+  const existing = readAccountStateOrThrow() as AccountRecord[];
   const nonOpenAI = existing.filter(a => a.provider !== "openai_subscription");
   const records: AccountRecord[] = accounts.map(a => ({
     id: a.id,

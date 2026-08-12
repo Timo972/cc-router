@@ -115,6 +115,7 @@ export interface TelemetryFacade {
   startProxyHeartbeat(accountCount: number): void;
   recordSafeLog(input: SafeRuntimeLogInput): void;
   recordSetupStage(input: SetupStageInput): void;
+  recordSetupStageFailure(input: ExpectedSetupFailureInput): void;
   recordSetupResult(input: SetupResultInput): void;
   recordExpectedSetupFailure(input: ExpectedSetupFailureInput): void;
   recordUnexpectedException(
@@ -443,6 +444,17 @@ export function createTelemetryFacade(
       );
     },
 
+    recordSetupStageFailure(input): void {
+      const snapshot = enabledSnapshot();
+      const outcome = expectedSetupFailureOutcome(input.reason);
+      const properties = snapshot && setupProperties(
+        input,
+        outcome === undefined ? {} : { outcome },
+      );
+      if (!snapshot || !properties) return;
+      emitLog(snapshot, "account.setup.diagnostic", "warn", properties, input.diagnosticId);
+    },
+
     recordSetupResult(input): void {
       if (input.result !== "succeeded" && input.result !== "cancelled") return;
       const snapshot = enabledSnapshot();
@@ -568,6 +580,7 @@ export const recordProxyStarted = telemetry.recordProxyStarted;
 export const startProxyHeartbeat = telemetry.startProxyHeartbeat;
 export const recordSafeLog = telemetry.recordSafeLog;
 export const recordSetupStage = telemetry.recordSetupStage;
+export const recordSetupStageFailure = telemetry.recordSetupStageFailure;
 export const recordSetupResult = telemetry.recordSetupResult;
 export const recordExpectedSetupFailure = telemetry.recordExpectedSetupFailure;
 export const recordUnexpectedException = telemetry.recordUnexpectedException;

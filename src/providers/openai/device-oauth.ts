@@ -52,6 +52,10 @@ interface TokenResponse {
   refresh_token: string;
 }
 
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export interface ExchangeOpenAIDeviceCodeOptions extends OpenAIDeviceOAuthOptions {
   deviceCode: OpenAIDeviceCode;
   sleep?: (ms: number) => Promise<void>;
@@ -85,33 +89,36 @@ function fetchOf(opts: OpenAIDeviceOAuthOptions): FetchImpl {
   return opts.fetchImpl ?? fetch;
 }
 
-function parseAccessTokenExpiry(accessToken: string): number {
+function parseAccessTokenExpiry(accessToken: string, httpStatusCode: number): number {
   const [, payload] = accessToken.split(".");
   if (!payload) {
     throw new SetupDiagnosticError("OpenAI access token is not a JWT", {
       stage: "access_token_parse",
       reason: "unexpected_response_shape",
       expected: false,
+      httpStatusCode,
     });
   }
-  let claims: { exp?: unknown };
+  let claims: unknown;
   try {
-    claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8")) as { exp?: unknown };
+    claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8"));
   } catch (error) {
     throw new SetupDiagnosticError(`OpenAI access token JWT could not be parsed: ${(error as Error).message}`, {
       stage: "access_token_parse",
       reason: "unexpected_response_shape",
       expected: false,
+      httpStatusCode,
     }, { cause: error });
   }
-  if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp)) {
+  if (!isObjectRecord(claims) || typeof claims["exp"] !== "number" || !Number.isFinite(claims["exp"])) {
     throw new SetupDiagnosticError("OpenAI access token JWT does not contain a numeric exp claim", {
       stage: "access_token_parse",
       reason: "unexpected_response_shape",
       expected: true,
+      httpStatusCode,
     });
   }
-  return claims.exp * 1000;
+  return claims["exp"] * 1000;
 }
 
 async function readError(res: Response): Promise<string> {
@@ -144,20 +151,22 @@ export async function requestOpenAIDeviceCode(opts: OpenAIDeviceOAuthOptions = {
     );
   }
 
-  let body: RequestDeviceCodeResponse;
+  let body: unknown;
   try {
-    body = await res.json() as RequestDeviceCodeResponse;
+    body = await res.json();
   } catch (error) {
     throw new SetupDiagnosticError(`OpenAI device code response could not be parsed: ${(error as Error).message}`, {
       stage: "device_code_request",
       reason: "unexpected_response_shape",
       expected: false,
+      httpStatusCode: res.status,
     }, { cause: error });
   }
-  const userCode = body.user_code ?? body.usercode;
-  const intervalSeconds = Number(body.interval ?? 5);
-  if (typeof body.device_auth_id !== "string"
-    || body.device_auth_id.length === 0
+  const userCode = isObjectRecord(body) ? body["user_code"] ?? body["usercode"] : undefined;
+  const intervalSeconds = Number(isObjectRecord(body) ? body["interval"] ?? 5 : Number.NaN);
+  const deviceAuthId = isObjectRecord(body) ? body["device_auth_id"] : undefined;
+  if (typeof deviceAuthId !== "string"
+    || deviceAuthId.length === 0
     || typeof userCode !== "string"
     || userCode.length === 0
     || !Number.isFinite(intervalSeconds)
@@ -166,13 +175,14 @@ export async function requestOpenAIDeviceCode(opts: OpenAIDeviceOAuthOptions = {
       stage: "device_code_request",
       reason: "unexpected_response_shape",
       expected: true,
+      httpStatusCode: res.status,
     });
   }
 
   return {
     verificationUrl: `${issuer}/codex/device`,
     userCode,
-    deviceAuthId: body.device_auth_id,
+    deviceAuthId,
     intervalSeconds,
   };
 }
@@ -212,6 +222,7 @@ async function pollAuthorizationCode(opts: ExchangeOpenAIDeviceCodeOptions): Pro
             stage: "authorization_polling",
             reason: "unexpected_response_shape",
             expected: true,
+            httpStatusCode: res.status,
           });
         }
         return body;
@@ -221,6 +232,7 @@ async function pollAuthorizationCode(opts: ExchangeOpenAIDeviceCodeOptions): Pro
           stage: "authorization_polling",
           reason: "unexpected_response_shape",
           expected: false,
+          httpStatusCode: res.status,
         }, { cause: error });
       }
     }
@@ -277,32 +289,37 @@ export async function exchangeOpenAIDeviceCodeForTokens(
     );
   }
 
-  let tokens: TokenResponse;
+  let tokens: unknown;
   try {
-    tokens = await res.json() as TokenResponse;
+    tokens = await res.json();
   } catch (error) {
     throw new SetupDiagnosticError(`OpenAI token response could not be parsed: ${(error as Error).message}`, {
       stage: "token_exchange",
       reason: "unexpected_response_shape",
       expected: false,
+      httpStatusCode: res.status,
     }, { cause: error });
   }
-  if (typeof tokens.id_token !== "string" || tokens.id_token.length === 0
-    || typeof tokens.access_token !== "string" || tokens.access_token.length === 0
-    || typeof tokens.refresh_token !== "string" || tokens.refresh_token.length === 0) {
+  const idToken = isObjectRecord(tokens) ? tokens["id_token"] : undefined;
+  const accessToken = isObjectRecord(tokens) ? tokens["access_token"] : undefined;
+  const refreshToken = isObjectRecord(tokens) ? tokens["refresh_token"] : undefined;
+  if (typeof idToken !== "string" || idToken.length === 0
+    || typeof accessToken !== "string" || accessToken.length === 0
+    || typeof refreshToken !== "string" || refreshToken.length === 0) {
     throw new SetupDiagnosticError("OpenAI token response is missing required token fields", {
       stage: "token_exchange",
       reason: "unexpected_response_shape",
       expected: true,
+      httpStatusCode: res.status,
     });
   }
   opts.onStageCompleted?.("token_exchange");
-  const expiresAt = parseAccessTokenExpiry(tokens.access_token);
+  const expiresAt = parseAccessTokenExpiry(accessToken, res.status);
   opts.onStageCompleted?.("access_token_parse");
   return {
-    idToken: tokens.id_token,
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token,
+    idToken,
+    accessToken,
+    refreshToken,
     expiresAt,
   };
 }

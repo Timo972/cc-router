@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTelemetryFacade } from "../telemetry/facade.js";
 import {
   SetupDiagnosticError,
+  classifyAccountStateReadFailure,
   classifyHttpSetupFailure,
   classifyNetworkSetupFailure,
   createSetupAttempt,
@@ -31,11 +32,13 @@ afterEach(() => {
 
 function recorder() {
   const stages: unknown[] = [];
+  const stageFailures: unknown[] = [];
   const results: unknown[] = [];
   const failures: unknown[] = [];
   const exceptions: Array<{ error: unknown; context: unknown; diagnosticId?: string }> = [];
   const value: SetupDiagnosticRecorder = {
     recordSetupStage: input => { stages.push(input); },
+    recordSetupStageFailure: input => { stageFailures.push(input); },
     recordSetupResult: input => { results.push(input); },
     recordExpectedSetupFailure: input => { failures.push(input); },
     recordUnexpectedException: (error, context, diagnosticId) => {
@@ -44,7 +47,7 @@ function recorder() {
     },
     flushTelemetryWithin: async () => undefined,
   };
-  return { value, stages, results, failures, exceptions };
+  return { value, stages, stageFailures, results, failures, exceptions };
 }
 
 describe("setup diagnostic stage matrix", () => {
@@ -208,9 +211,94 @@ describe("setup diagnostic stage matrix", () => {
     ]);
     expect(recorded.exceptions).toEqual([]);
   });
+
+  it.each([
+    ["cancelled", "cancelled"],
+    ["succeeded", "succeeded"],
+    ["failed", "failed"],
+  ] as const)("emits exactly one %s terminal and ignores every later terminal", (_label, terminal) => {
+    const recorded = recorder();
+    const attempt = createSetupAttempt({
+      provider: "anthropic",
+      method: "manual_token",
+      recorder: recorded.value,
+      randomUUID: () => DIAGNOSTIC_ID,
+      now: () => 1_000,
+    });
+    const failure = new SetupDiagnosticError("PRIVATE invalid token", {
+      stage: "token_validation",
+      reason: "invalid_token",
+      expected: true,
+    });
+
+    if (terminal === "cancelled") attempt.cancelled();
+    else if (terminal === "succeeded") attempt.succeeded();
+    else attempt.failed(failure, "token_validation");
+
+    attempt.cancelled();
+    attempt.succeeded();
+    attempt.failed(failure, "token_validation");
+    attempt.stageCompleted("persistence");
+
+    expect(recorded.results).toHaveLength(terminal === "failed" ? 0 : 1);
+    expect(recorded.failures).toHaveLength(terminal === "failed" ? 1 : 0);
+    expect(recorded.results.length + recorded.failures.length).toBe(1);
+    expect(recorded.stages).toHaveLength(1);
+  });
+
+  it("keeps a recoverable stage failure nonterminal until the attempt succeeds", () => {
+    const recorded = recorder();
+    const attempt = createSetupAttempt({
+      provider: "anthropic",
+      method: "manual_token",
+      recorder: recorded.value,
+      randomUUID: () => DIAGNOSTIC_ID,
+      now: () => 1_000,
+    });
+    const failure = new SetupDiagnosticError("PRIVATE invalid token", {
+      stage: "token_validation",
+      reason: "invalid_token",
+      expected: true,
+    });
+
+    attempt.stageFailed(failure, "token_validation");
+    attempt.stageCompleted("persistence");
+    attempt.succeeded();
+
+    expect(recorded.stageFailures).toEqual([
+      expect.objectContaining({
+        stage: "token_validation",
+        reason: "invalid_token",
+        diagnosticId: DIAGNOSTIC_ID,
+      }),
+    ]);
+    expect(recorded.failures).toEqual([]);
+    expect(recorded.results).toEqual([
+      expect.objectContaining({ result: "succeeded", diagnosticId: DIAGNOSTIC_ID }),
+    ]);
+  });
 });
 
 describe("typed failure classification", () => {
+  it.each([
+    ["malformed_json", "malformed_credentials"],
+    ["invalid_shape", "malformed_credentials"],
+    ["permission_denied", "permission_denied"],
+    ["read_failure", "other"],
+  ] as const)("classifies typed account-state %s failures without local detail", (kind, reason) => {
+    const error = classifyAccountStateReadFailure({
+      kind,
+      message: "PRIVATE /Users/local/.cc-router/accounts.json",
+    });
+
+    expect(error.classification).toEqual({
+      stage: "persistence",
+      reason,
+      expected: false,
+    });
+    expect(JSON.stringify(error.classification)).not.toContain("PRIVATE");
+  });
+
   it.each([
     [401, "unauthorized"],
     [403, "forbidden"],
@@ -281,6 +369,56 @@ describe("typed failure classification", () => {
       reason: "other",
       expected: false,
     });
+  });
+
+  it.each([
+    [new DOMException("PRIVATE aborted request", "AbortError"), "timeout"],
+    [new DOMException("PRIVATE timed out request", "TimeoutError"), "timeout"],
+  ] as const)("classifies inherited built-in %s names without exporting their messages", (error, reason) => {
+    expect(Object.hasOwn(error, "name")).toBe(false);
+
+    const classified = classifyNetworkSetupFailure("device_code_request", error);
+
+    expect(classified.classification).toEqual({
+      stage: "device_code_request",
+      reason,
+      expected: true,
+    });
+    expect(JSON.stringify(classified.classification)).not.toContain("PRIVATE");
+  });
+
+  it("finds an allowlisted system code through a bounded own cause chain", () => {
+    const deepest = Object.assign(new Error("PRIVATE socket detail"), { code: "ECONNREFUSED" });
+    const nested = Object.assign(new TypeError("PRIVATE fetch failed"), {
+      cause: Object.assign(new Error("PRIVATE wrapper"), { cause: deepest }),
+    });
+
+    expect(classifyNetworkSetupFailure("device_code_request", nested).classification).toEqual({
+      stage: "device_code_request",
+      reason: "network_failure",
+      expected: true,
+    });
+  });
+
+  it("does not traverse an unbounded cause chain or read cause accessors", () => {
+    let getterCalls = 0;
+    const accessor = Object.defineProperty(new Error("PRIVATE"), "cause", {
+      get() {
+        getterCalls += 1;
+        return Object.assign(new Error("PRIVATE"), { code: "ECONNREFUSED" });
+      },
+    });
+    const tooDeep = Object.assign(new Error("PRIVATE level 0"), {
+      cause: Object.assign(new Error("PRIVATE level 1"), {
+        cause: Object.assign(new Error("PRIVATE level 2"), {
+          cause: Object.assign(new Error("PRIVATE level 3"), { code: "ECONNREFUSED" }),
+        }),
+      }),
+    });
+
+    expect(classifyNetworkSetupFailure("device_code_request", accessor).classification.reason).toBe("other");
+    expect(getterCalls).toBe(0);
+    expect(classifyNetworkSetupFailure("device_code_request", tooDeep).classification.reason).toBe("other");
   });
 });
 

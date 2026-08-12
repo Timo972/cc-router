@@ -1,6 +1,15 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { loadAccounts, loadOpenAIAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById, readConfig } from "../config/manager.js";
+import {
+  loadAccounts,
+  loadOpenAIAccounts,
+  accountsFileExists,
+  readAccountStateDetailed,
+  upsertAccountRecord,
+  removeAccountRecordById,
+  readConfig,
+  type AccountStateReadResult,
+} from "../config/manager.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
 import { formatExpiry, redactToken } from "../utils/token-extractor.js";
 import { PROXY_PORT } from "../config/paths.js";
@@ -18,6 +27,7 @@ import type { Account, AccountRecord } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import {
   createSetupAttempt,
+  classifyAccountStateReadFailure,
   isPromptCancellation,
   persistSetupAttempts,
   type CreateSetupAttemptInput,
@@ -29,6 +39,7 @@ import { flushTelemetryWithin } from "../telemetry/facade.js";
 export interface OpenAIManualAccountSetupDependencies {
   collectInput(): Promise<CreateOpenAIAccountRecordInput>;
   persist(record: OpenAIAccountRecord): void;
+  readAccountState(): AccountStateReadResult;
   createAttempt(input: Pick<CreateSetupAttemptInput, "provider" | "method">): SetupAttempt;
   flush(deadlineMs: number): Promise<void>;
 }
@@ -38,6 +49,7 @@ export interface OpenAIDeviceAccountSetupDependencies {
   login(options: LoginOpenAIWithDeviceCodeOptions): Promise<OpenAIAccountRecord>;
   onDeviceCode(code: OpenAIDeviceCode): void;
   persist(record: OpenAIAccountRecord): void;
+  readAccountState(): AccountStateReadResult;
   createAttempt(input: Pick<CreateSetupAttemptInput, "provider" | "method">): SetupAttempt;
   flush(deadlineMs: number): Promise<void>;
 }
@@ -81,6 +93,7 @@ async function collectOpenAIManualInput(): Promise<CreateOpenAIAccountRecordInpu
 const defaultOpenAIManualDependencies: OpenAIManualAccountSetupDependencies = {
   collectInput: collectOpenAIManualInput,
   persist: upsertAccountRecord,
+  readAccountState: readAccountStateDetailed,
   createAttempt: createSetupAttempt,
   flush: flushTelemetryWithin,
 };
@@ -93,6 +106,8 @@ export async function runOpenAIManualAccountSetup(
   return withSetupTelemetryFlush(async () => {
     let record: OpenAIAccountRecord;
     try {
+      const state = dependencies.readAccountState();
+      if (!state.ok) throw classifyAccountStateReadFailure(state.error);
       const collected = await dependencies.collectInput();
       attempt.stageCompleted("credential_read");
       record = createOpenAIAccountRecord(collected);
@@ -140,6 +155,7 @@ const defaultOpenAIDeviceDependencies: OpenAIDeviceAccountSetupDependencies = {
   login: loginOpenAIWithDeviceCode,
   onDeviceCode: printOpenAIDeviceCode,
   persist: upsertAccountRecord,
+  readAccountState: readAccountStateDetailed,
   createAttempt: createSetupAttempt,
   flush: flushTelemetryWithin,
 };
@@ -152,6 +168,8 @@ export async function runOpenAIDeviceAccountSetup(
   return withSetupTelemetryFlush(async () => {
     let record: OpenAIAccountRecord;
     try {
+      const state = dependencies.readAccountState();
+      if (!state.ok) throw classifyAccountStateReadFailure(state.error);
       const accountId = await dependencies.collectAccountId();
       record = await dependencies.login({
         accountId,

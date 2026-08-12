@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OAuthTokens } from "../proxy/types.js";
+import { AccountStateReadError } from "../config/manager.js";
 import {
   SetupDiagnosticError,
   type SetupDiagnosticRecorder,
 } from "../telemetry/setup-diagnostics.js";
 import {
+  parseManualTokenExpiry,
+  runClientSetupFromWizard,
+  runSetupCommand,
   setupSingleAccountDetailed,
   type SetupSingleAccountDependencies,
 } from "../cli/cmd-setup.js";
@@ -32,18 +36,22 @@ function tokens(): OAuthTokens {
 
 function recorder() {
   const safe: unknown[] = [];
+  const stageFailures: unknown[] = [];
+  const terminalFailures: unknown[] = [];
+  const results: unknown[] = [];
   const exceptions: Array<{ context: unknown; diagnosticId?: string }> = [];
   const value: SetupDiagnosticRecorder = {
     recordSetupStage: input => { safe.push(input); },
-    recordSetupResult: input => { safe.push(input); },
-    recordExpectedSetupFailure: input => { safe.push(input); },
+    recordSetupStageFailure: input => { safe.push(input); stageFailures.push(input); },
+    recordSetupResult: input => { safe.push(input); results.push(input); },
+    recordExpectedSetupFailure: input => { safe.push(input); terminalFailures.push(input); },
     recordUnexpectedException: (_error, context, diagnosticId) => {
       exceptions.push({ context, diagnosticId });
       return diagnosticId as never;
     },
     flushTelemetryWithin: async () => undefined,
   };
-  return { value, safe, exceptions };
+  return { value, safe, stageFailures, terminalFailures, results, exceptions };
 }
 
 function dependencies(
@@ -67,6 +75,7 @@ function dependencies(
     confirmRetry: async () => false,
     confirmSaveInvalid: async () => false,
     validateToken: async () => ({ valid: true }),
+    readAccountState: () => ({ ok: true, records: [] }),
     createAttempt: input => (awaitImportAttempt())({
       ...input,
       recorder: recorded.value,
@@ -147,8 +156,134 @@ describe("Anthropic account-add methods", () => {
       expect.objectContaining({ result: "cancelled", diagnosticId: DIAGNOSTIC_ID }),
     ]));
     expect(recorded.exceptions).toEqual([]);
+    expect(recorded.stageFailures).toHaveLength(1);
+    expect(recorded.terminalFailures).toEqual([]);
+    expect(recorded.results).toEqual([
+      expect.objectContaining({ result: "cancelled", diagnosticId: DIAGNOSTIC_ID }),
+    ]);
     expect(JSON.stringify(recorded.safe)).not.toContain("PRIVATE");
   });
+
+  it("closes a failed extraction attempt before retrying with a fresh attempt", async () => {
+    const recorded = recorder();
+    const deps = dependencies("keychain", recorded);
+    const methods = ["keychain", "manual"] as const;
+    const diagnosticIds = [
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+    ];
+    deps.chooseMethod = async () => methods.shift() ?? "manual";
+    deps.extractKeychain = async () => ({
+      ok: false,
+      error: new SetupDiagnosticError("PRIVATE Keychain output", {
+        stage: "credential_read",
+        reason: "not_found",
+        expected: true,
+      }),
+    });
+    deps.confirmRetry = async () => true;
+    deps.createAttempt = input => createSetupAttempt({
+      ...input,
+      recorder: recorded.value,
+      randomUUID: () => diagnosticIds.shift() ?? DIAGNOSTIC_ID,
+      now: () => 1_000,
+    });
+
+    const setup = await setupSingleAccountDetailed(1, deps);
+    expect(setup.account).not.toBeNull();
+    await import("../telemetry/setup-diagnostics.js").then(({ persistSetupAttempts }) =>
+      persistSetupAttempts([setup.attempt], () => undefined));
+
+    expect(recorded.stageFailures).toEqual([]);
+    expect(recorded.terminalFailures).toEqual([
+      expect.objectContaining({
+        reason: "not_found",
+        diagnosticId: "22222222-2222-4222-8222-222222222222",
+      }),
+    ]);
+    expect(recorded.results).toEqual([
+      expect.objectContaining({
+        result: "succeeded",
+        diagnosticId: "33333333-3333-4333-8333-333333333333",
+      }),
+    ]);
+  });
+
+  it.each([
+    [false, "cancelled"],
+    [true, "succeeded"],
+  ] as const)("keeps invalid-token failure nonterminal when save-anyway is %s", async (keepAnyway, terminal) => {
+    const recorded = recorder();
+    const deps = dependencies("manual", recorded);
+    deps.validateToken = async () => ({
+      valid: false,
+      reason: "PRIVATE rejected token",
+      diagnostic: new SetupDiagnosticError("PRIVATE rejected token", {
+        stage: "token_validation",
+        reason: "invalid_token",
+        expected: true,
+      }),
+    });
+    deps.confirmSaveInvalid = async () => keepAnyway;
+
+    const setup = await setupSingleAccountDetailed(1, deps);
+    if (setup.account) {
+      await import("../telemetry/setup-diagnostics.js").then(({ persistSetupAttempts }) =>
+        persistSetupAttempts([setup.attempt], () => undefined));
+    }
+
+    expect(recorded.stageFailures).toEqual([
+      expect.objectContaining({ stage: "token_validation", reason: "invalid_token" }),
+    ]);
+    expect(recorded.terminalFailures).toEqual([]);
+    expect(recorded.results).toEqual([
+      expect.objectContaining({ result: terminal }),
+    ]);
+  });
+
+  it.each([
+    ["2033-05-18", 1_999_987_200_000],
+    ["2033-05-18T03:33:20.000Z", 2_000_000_000_000],
+    ["2000000000000", 2_000_000_000_000],
+  ])("parses explicit ISO and numeric-millisecond manual expiries", (input, expected) => {
+    expect(parseManualTokenExpiry(input)).toBe(expected);
+  });
+
+  it.each(["", "0", "-1", "Infinity", "not-a-date", "2000000000000ms", "999999999999999999"])(
+    "rejects invalid manual expiry %j before an account can be returned",
+    async expiry => {
+      expect(() => parseManualTokenExpiry(expiry)).toThrowError(SetupDiagnosticError);
+      try {
+        parseManualTokenExpiry(expiry);
+      } catch (error) {
+        expect((error as SetupDiagnosticError).classification).toEqual({
+          stage: "credential_parse",
+          reason: "malformed_credentials",
+          expected: true,
+        });
+      }
+
+      const recorded = recorder();
+      const deps = dependencies("manual", recorded);
+      deps.promptManualTokens = async () => {
+        parseManualTokenExpiry(expiry);
+        return tokens();
+      };
+      const promptAccountId = vi.fn(async () => PRIVATE_ACCOUNT);
+      deps.promptAccountId = promptAccountId;
+
+      await expect(setupSingleAccountDetailed(1, deps)).rejects.toBeInstanceOf(SetupDiagnosticError);
+      expect(promptAccountId).not.toHaveBeenCalled();
+      expect(recorded.terminalFailures).toEqual([
+        expect.objectContaining({
+          stage: "credential_parse",
+          reason: "malformed_credentials",
+        }),
+      ]);
+      expect(recorded.exceptions).toEqual([]);
+      expect(vi.mocked(console.error).mock.calls.flat().join(" ")).not.toContain("Unexpected setup failure");
+    },
+  );
 
   it("captures an unexpected validation fault and prints the same local correlation ID", async () => {
     const recorded = recorder();
@@ -190,6 +325,42 @@ describe("Anthropic account-add methods", () => {
       expect.objectContaining({ diagnosticId: DIAGNOSTIC_ID }),
     ]);
     expect(vi.mocked(console.error).mock.calls.flat().join(" ")).toContain(DIAGNOSTIC_ID);
+  });
+});
+
+describe("setup command lifecycle", () => {
+  it("flushes before preserving client connection exit 1 when flushing times out", async () => {
+    vi.useFakeTimers();
+    const previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    const flush = vi.fn(() => new Promise<void>(() => undefined));
+    const fetchImpl = vi.fn(async () => {
+      throw new DOMException("PRIVATE timed out", "TimeoutError");
+    });
+
+    try {
+      const operation = runSetupCommand({ addMode: false }, {
+        runWizard: async () => runClientSetupFromWizard({
+          promptServerUrl: async () => "127.0.0.1:3456",
+          promptSecret: async () => "PRIVATE-secret",
+          fetchImpl,
+        }),
+        flush,
+      });
+      await vi.advanceTimersByTimeAsync(1_500);
+      await operation;
+
+      expect(fetchImpl).toHaveBeenCalledWith(
+        "http://127.0.0.1:3456/cc-router/health",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      expect(flush).toHaveBeenCalledOnce();
+      expect(flush).toHaveBeenCalledWith(1_500);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -250,6 +421,7 @@ describe("OpenAI account-add methods", () => {
         scopes: record.scopes,
       }),
       persist,
+      readAccountState: () => ({ ok: true, records: [] }),
       createAttempt: input => createSetupAttempt({
         ...input,
         recorder: recorded.value,
@@ -289,6 +461,7 @@ describe("OpenAI account-add methods", () => {
       },
       onDeviceCode: () => undefined,
       persist: vi.fn(),
+      readAccountState: () => ({ ok: true, records: [] }),
       createAttempt: input => createSetupAttempt({
         ...input,
         recorder: recorded.value,
@@ -327,6 +500,7 @@ describe("OpenAI account-add methods", () => {
       login: async () => { throw failure; },
       onDeviceCode: () => undefined,
       persist: vi.fn(),
+      readAccountState: () => ({ ok: true, records: [] }),
       createAttempt: input => createSetupAttempt({
         ...input,
         recorder: recorded.value,
@@ -348,4 +522,74 @@ describe("OpenAI account-add methods", () => {
     expect(recorded.exceptions).toEqual([]);
     expect(flush).toHaveBeenCalledOnce();
   });
+
+  it.each(["anthropic", "openai_manual", "openai_device"] as const)(
+    "correlates malformed stored state before the %s add path can prompt or persist",
+    async flow => {
+      const recorded = recorder();
+      const stateError = new AccountStateReadError(
+        "malformed_json",
+        "/Users/PRIVATE/.cc-router/accounts.json",
+        new SyntaxError("PRIVATE raw JSON fragment"),
+      );
+      const collect = vi.fn(async () => ({
+        id: PRIVATE_ACCOUNT,
+        accessToken: "PRIVATE-openai-access",
+        refreshToken: "PRIVATE-openai-refresh",
+        expiresAt: 2_000_000_000_000,
+        scopes: ["PRIVATE-scope"],
+      }));
+      const persist = vi.fn();
+      const createAttemptForTest = (input: Parameters<typeof createSetupAttempt>[0]) => createSetupAttempt({
+        ...input,
+        recorder: recorded.value,
+        randomUUID: () => DIAGNOSTIC_ID,
+        now: () => 1_000,
+      });
+
+      let operation: Promise<unknown>;
+      if (flow === "anthropic") {
+        const deps = dependencies("manual", recorded);
+        deps.readAccountState = () => ({ ok: false, error: stateError });
+        deps.promptManualTokens = collect as never;
+        operation = setupSingleAccountDetailed(1, deps);
+      } else if (flow === "openai_manual") {
+        operation = runOpenAIManualAccountSetup({
+          collectInput: collect,
+          persist,
+          readAccountState: () => ({ ok: false, error: stateError }),
+          createAttempt: createAttemptForTest,
+          flush: async () => undefined,
+        });
+      } else {
+        operation = runOpenAIDeviceAccountSetup({
+          collectAccountId: collect as never,
+          login: vi.fn(),
+          onDeviceCode: () => undefined,
+          persist,
+          readAccountState: () => ({ ok: false, error: stateError }),
+          createAttempt: createAttemptForTest,
+          flush: async () => undefined,
+        });
+      }
+
+      const error = await operation.catch(value => value);
+      expect(error).toBeInstanceOf(SetupDiagnosticError);
+      expect((error as SetupDiagnosticError).cause).toBe(stateError);
+      expect(collect).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
+      expect(recorded.terminalFailures).toEqual([
+        expect.objectContaining({
+          stage: "persistence",
+          reason: "malformed_credentials",
+          diagnosticId: DIAGNOSTIC_ID,
+        }),
+      ]);
+      expect(recorded.exceptions).toEqual([
+        expect.objectContaining({ diagnosticId: DIAGNOSTIC_ID }),
+      ]);
+      expect(vi.mocked(console.error).mock.calls.flat().join(" ")).toContain(DIAGNOSTIC_ID);
+      expect(JSON.stringify(recorded.safe)).not.toContain("PRIVATE");
+    },
+  );
 });

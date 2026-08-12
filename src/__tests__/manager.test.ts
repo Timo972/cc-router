@@ -20,6 +20,8 @@ vi.mock("../config/paths.js", () => ({
 import {
   ensureConfigDir,
   accountsFileExists,
+  AccountStateReadError,
+  readAccountStateDetailed,
   writeAccountsAtomic,
   writeAnthropicAccountsPreservingOtherProviders,
   upsertAccountRecord,
@@ -80,6 +82,62 @@ describe("accountsFileExists", () => {
     expect(accountsFileExists(customPath)).toBe(false);
     fs.writeFileSync(customPath, "[]");
     expect(accountsFileExists(customPath)).toBe(true);
+  });
+});
+
+describe("detailed account-state reads", () => {
+  it("distinguishes malformed JSON while compatibility reads remain empty", () => {
+    fs.writeFileSync(accountsPath(), "{PRIVATE malformed json");
+
+    const result = readAccountStateDetailed();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(AccountStateReadError);
+      expect(result.error.kind).toBe("malformed_json");
+      expect(result.error.cause).toBeInstanceOf(SyntaxError);
+    }
+    expect(loadAccounts()).toEqual([]);
+  });
+
+  it("distinguishes a non-array account-state shape", () => {
+    fs.writeFileSync(accountsPath(), JSON.stringify({ PRIVATE: "not-an-array" }));
+
+    const result = readAccountStateDetailed();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("invalid_shape");
+  });
+
+  it("distinguishes malformed entries inside an account-state array", () => {
+    fs.writeFileSync(accountsPath(), JSON.stringify([sampleRecord, {}]));
+
+    const result = readAccountStateDetailed();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("invalid_shape");
+    expect(loadAccounts()).toEqual([]);
+  });
+
+  it("does not overwrite malformed state during account upsert", () => {
+    const corrupted = "{PRIVATE malformed json";
+    fs.writeFileSync(accountsPath(), corrupted);
+
+    expect(() => upsertAccountRecord({
+      ...sampleRecord,
+      provider: "anthropic_subscription",
+    })).toThrowError(AccountStateReadError);
+    expect(fs.readFileSync(accountsPath(), "utf-8")).toBe(corrupted);
+  });
+
+  it("returns a typed unreadable-state failure", () => {
+    fs.rmSync(accountsPath(), { force: true });
+    fs.mkdirSync(accountsPath());
+
+    const result = readAccountStateDetailed();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("read_failure");
   });
 });
 

@@ -12,7 +12,16 @@ import {
 import { validateToken, type ValidationResult } from "../utils/token-validator.js";
 import { writeClaudeSettings, readClaudeProxySettings } from "../utils/claude-config.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
-import { loadAccounts, accountsFileExists, readConfig, writeConfig, generateProxySecret, type ClientConfig } from "../config/manager.js";
+import {
+  loadAccounts,
+  accountsFileExists,
+  readAccountStateDetailed,
+  readConfig,
+  writeConfig,
+  generateProxySecret,
+  type AccountStateReadResult,
+  type ClientConfig,
+} from "../config/manager.js";
 import { PROXY_PORT } from "../config/paths.js";
 import type { Account, OAuthTokens } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS } from "../proxy/types.js";
@@ -28,6 +37,8 @@ import {
 } from "../interceptor/mitmproxy-manager.js";
 import { printDesktopSupportExplainer, printNetworkExtensionInstructions } from "./cmd-client.js";
 import {
+  SetupDiagnosticError,
+  classifyAccountStateReadFailure,
   createSetupAttempt,
   isPromptCancellation,
   persistSetupAttempts,
@@ -35,8 +46,30 @@ import {
   type SetupAttempt,
   withSetupTelemetryFlush,
 } from "../telemetry/setup-diagnostics.js";
+import { flushTelemetryWithin } from "../telemetry/facade.js";
 
 // ─── Public registration ──────────────────────────────────────────────────────
+
+export interface SetupCommandDependencies {
+  runWizard(options: { addMode: boolean }): Promise<number | undefined>;
+  flush(deadlineMs: number): Promise<void>;
+}
+
+const defaultSetupCommandDependencies: SetupCommandDependencies = {
+  runWizard: runSetupWizard,
+  flush: flushTelemetryWithin,
+};
+
+export async function runSetupCommand(
+  options: { addMode: boolean },
+  dependencies: SetupCommandDependencies = defaultSetupCommandDependencies,
+): Promise<void> {
+  const exitCode = await withSetupTelemetryFlush(
+    () => dependencies.runWizard(options),
+    dependencies.flush,
+  );
+  if (exitCode !== undefined && exitCode !== 0) process.exitCode = exitCode;
+}
 
 export function registerSetup(program: Command): void {
   program
@@ -44,7 +77,7 @@ export function registerSetup(program: Command): void {
     .description("Interactive wizard: extract tokens and configure Claude Code automatically")
     .option("--add", "Add a new account to an existing configuration (skip intro questions)")
     .action(async (opts: { add?: boolean }) => {
-      await withSetupTelemetryFlush(() => runSetupWizard({ addMode: opts.add ?? false }));
+      await runSetupCommand({ addMode: opts.add ?? false });
     });
 }
 
@@ -61,6 +94,7 @@ export interface SetupSingleAccountDependencies {
   confirmRetry(kind: "keychain" | "credentials"): Promise<boolean>;
   confirmSaveInvalid(result: Extract<ValidationResult, { valid: false }>): Promise<boolean>;
   validateToken(accessToken: string): Promise<ValidationResult>;
+  readAccountState(): AccountStateReadResult;
   createAttempt(input: Pick<CreateSetupAttemptInput, "provider" | "method">): SetupAttempt;
 }
 
@@ -98,6 +132,7 @@ const defaultSetupSingleAccountDependencies: SetupSingleAccountDependencies = {
   }),
   confirmSaveInvalid: () => confirm({ message: "Save this account anyway?", default: false }),
   validateToken,
+  readAccountState: readAccountStateDetailed,
   createAttempt: createSetupAttempt,
 };
 
@@ -125,20 +160,25 @@ export async function setupSingleAccountDetailed(
   let tokens: OAuthTokens | null = null;
 
   try {
+    const state = dependencies.readAccountState();
+    if (!state.ok) throw classifyAccountStateReadFailure(state.error);
+
     if (method === "keychain") {
       process.stdout.write(chalk.gray("  Extracting from Keychain... "));
       const extraction = await dependencies.extractKeychain();
       if (!extraction.ok) {
         console.log(chalk.red("✗"));
         console.log(chalk.yellow("  Could not read usable credentials from Keychain."));
-        const outcome = attempt.failed(extraction.error, extraction.error.classification.stage);
-        if (outcome.unexpected) printUnexpectedSetupFailure(extraction.error, outcome.diagnosticId);
         const retry = await dependencies.confirmRetry("keychain");
-        if (!retry) {
-          attempt.cancelled();
-          return { account: null, attempt };
+        if (retry) {
+          const outcome = attempt.failed(extraction.error, extraction.error.classification.stage);
+          if (outcome.unexpected) printUnexpectedSetupFailure(extraction.error, outcome.diagnosticId);
+          return setupSingleAccountDetailed(index, dependencies);
         }
-        return setupSingleAccountDetailed(index, dependencies);
+        const outcome = attempt.stageFailed(extraction.error, extraction.error.classification.stage);
+        if (outcome.unexpected) printUnexpectedSetupFailure(extraction.error, outcome.diagnosticId);
+        attempt.cancelled();
+        return { account: null, attempt };
       }
       tokens = extraction.tokens;
       for (const stage of extraction.completedStages) attempt.stageCompleted(stage);
@@ -149,17 +189,19 @@ export async function setupSingleAccountDetailed(
       const extraction = dependencies.extractCredentials();
       if (!extraction.ok) {
         console.log(chalk.red("  ✗ ~/.claude/.credentials.json not found or unreadable."));
-        const outcome = attempt.failed(extraction.error, extraction.error.classification.stage);
-        if (outcome.unexpected) printUnexpectedSetupFailure(extraction.error, outcome.diagnosticId);
         const retry = await dependencies.confirmRetry("credentials");
-        if (!retry) {
-          attempt.cancelled();
-          return { account: null, attempt };
+        if (retry) {
+          const outcome = attempt.failed(extraction.error, extraction.error.classification.stage);
+          if (outcome.unexpected) printUnexpectedSetupFailure(extraction.error, outcome.diagnosticId);
+          return setupSingleAccountDetailed(index, {
+            ...dependencies,
+            chooseMethod: async () => "manual",
+          });
         }
-        return setupSingleAccountDetailed(index, {
-          ...dependencies,
-          chooseMethod: async () => "manual",
-        });
+        const outcome = attempt.stageFailed(extraction.error, extraction.error.classification.stage);
+        if (outcome.unexpected) printUnexpectedSetupFailure(extraction.error, outcome.diagnosticId);
+        attempt.cancelled();
+        return { account: null, attempt };
       }
       tokens = extraction.tokens;
       for (const stage of extraction.completedStages) attempt.stageCompleted(stage);
@@ -186,7 +228,7 @@ export async function setupSingleAccountDetailed(
     } else {
       console.log(chalk.red("✗ Invalid"));
       console.log(chalk.yellow(`  Reason: ${validation.reason}`));
-      const outcome = attempt.failed(validation.diagnostic, "token_validation");
+      const outcome = attempt.stageFailed(validation.diagnostic, "token_validation");
       if (outcome.unexpected) printUnexpectedSetupFailure(validation.diagnostic, outcome.diagnosticId);
       console.log(chalk.gray("  The token will be saved but may not work until refreshed."));
       const keepAnyway = await dependencies.confirmSaveInvalid(validation);
@@ -218,7 +260,7 @@ export async function setupSingleAccountDetailed(
       return { account: null, attempt };
     }
     const outcome = attempt.failed(error, "failure");
-    printUnexpectedSetupFailure(error, outcome.diagnosticId);
+    if (outcome.unexpected) printUnexpectedSetupFailure(error, outcome.diagnosticId);
     throw error;
   }
 }
@@ -229,7 +271,7 @@ export async function setupSingleAccount(index: number): Promise<Account | null>
 
 // ─── Full wizard ──────────────────────────────────────────────────────────────
 
-export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise<void> {
+export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise<number | undefined> {
   const platform = detectPlatform();
   const hasExisting = accountsFileExists();
   const existingClient = readConfig().client;
@@ -257,8 +299,7 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
     });
 
     if (mode === "client") {
-      await runClientSetupFromWizard();
-      return;
+      return runClientSetupFromWizard();
     }
   }
 
@@ -468,11 +509,29 @@ function printDone(accountCount: number): void {
 
 // ─── Manual token input ───────────────────────────────────────────────────────
 
+export function parseManualTokenExpiry(raw: string): number {
+  const value = raw.trim();
+  const expiresAt = /^\d+$/.test(value)
+    ? Number(value)
+    : /^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(value)
+      ? Date.parse(value)
+      : Number.NaN;
+  if (!Number.isFinite(expiresAt) || expiresAt <= 0 || Number.isNaN(new Date(expiresAt).getTime())) {
+    throw new SetupDiagnosticError("expiresAt must be a valid ISO date or positive Unix millisecond timestamp", {
+      stage: "credential_parse",
+      reason: "malformed_credentials",
+      expected: true,
+    });
+  }
+  return expiresAt;
+}
+
 async function promptManualTokens(): Promise<OAuthTokens | null> {
   console.log(chalk.gray(
     "\n  You can find your tokens by running:\n" +
     "    macOS:         security find-generic-password -s 'Claude Code-credentials' -w\n" +
-    "    Linux/Windows: cat ~/.claude/.credentials.json\n"
+    "    Linux/Windows: cat ~/.claude/.credentials.json\n" +
+    "    Missing or stale credentials: claude login\n"
   ));
 
   const accessToken = await password({
@@ -500,7 +559,7 @@ async function promptManualTokens(): Promise<OAuthTokens | null> {
 
   const expiresAt = useDefaultExpiry
     ? Date.now() + 8 * 60 * 60 * 1000
-    : new Date(await input({ message: "Paste expiresAt (ISO date or ms timestamp):" })).getTime();
+    : parseManualTokenExpiry(await input({ message: "Paste expiresAt (ISO date or ms timestamp):" }));
 
   return {
     accessToken,
@@ -512,20 +571,33 @@ async function promptManualTokens(): Promise<OAuthTokens | null> {
 
 // ─── Client-mode setup (from wizard) ─────────────────────────────────────────
 
-async function runClientSetupFromWizard(): Promise<void> {
+export interface ClientSetupDependencies {
+  promptServerUrl(): Promise<string>;
+  promptSecret(): Promise<string>;
+  fetchImpl: typeof fetch;
+}
+
+const defaultClientSetupDependencies: ClientSetupDependencies = {
+  promptServerUrl: () => input({
+    message: "CC-Router server URL (e.g. 192.168.1.50:3456):",
+  }),
+  promptSecret: () => input({
+    message: "Proxy secret (leave empty if none):",
+    transformer: (v) => (v ? "•".repeat(v.length) : ""),
+  }),
+  fetchImpl: (request, init) => fetch(request, init),
+};
+
+export async function runClientSetupFromWizard(
+  dependencies: ClientSetupDependencies = defaultClientSetupDependencies,
+): Promise<number | undefined> {
   console.log(chalk.bold("\n🔗 Client Mode — Connect to a CC-Router server\n"));
 
-  const rawUrl = await input({
-    message: "CC-Router server URL (e.g. 192.168.1.50:3456):",
-  });
+  const rawUrl = await dependencies.promptServerUrl();
   let url = rawUrl.trim().replace(/\/+$/, "");
   if (!url.startsWith("http://") && !url.startsWith("https://")) url = `http://${url}`;
 
-  const secret =
-    (await input({
-      message: "Proxy secret (leave empty if none):",
-      transformer: (v) => (v ? "•".repeat(v.length) : ""),
-    })) || undefined;
+  const secret = (await dependencies.promptSecret()) || undefined;
 
   // Test connection
   console.log(chalk.gray(`\nTesting connection to ${url}...`));
@@ -533,7 +605,7 @@ async function runClientSetupFromWizard(): Promise<void> {
   try {
     const headers: Record<string, string> = {};
     if (secret) headers["authorization"] = `Bearer ${secret}`;
-    const res = await fetch(`${url}/cc-router/health`, {
+    const res = await dependencies.fetchImpl(`${url}/cc-router/health`, {
       headers,
       signal: AbortSignal.timeout(8_000),
     });
@@ -545,7 +617,7 @@ async function runClientSetupFromWizard(): Promise<void> {
     console.error(chalk.red(`\n✗ Cannot reach CC-Router at ${url}`));
     console.error(chalk.yellow(`  Error: ${(e as Error).message}`));
     console.error(chalk.gray("  Make sure the server is running and the URL is correct.\n"));
-    process.exit(1);
+    return 1;
   }
 
   // Save config
