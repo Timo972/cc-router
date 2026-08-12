@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { RequestOptions } from "node:http";
+import { IncomingMessage, type ClientRequest, type RequestOptions } from "node:http";
 import { isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 import type { Context, TextMapPropagator } from "@opentelemetry/api";
@@ -9,7 +9,10 @@ import { NodeSDK } from "@opentelemetry/sdk-node";
 import {
   BatchSpanProcessor,
   ParentBasedSampler,
+  RandomIdGenerator,
   TraceIdRatioBasedSampler,
+  type IdGenerator,
+  type Sampler,
 } from "@opentelemetry/sdk-trace-base";
 import { ExpressInstrumentation } from "@opentelemetry/instrumentation-express";
 import { HttpInstrumentation } from "@opentelemetry/instrumentation-http";
@@ -28,7 +31,7 @@ const EXPORT_DELAY_MS = 500;
 const EXPORT_TIMEOUT_MS = 2_000;
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
-const NOOP_NETWORK_PROPAGATOR: TextMapPropagator = {
+export const proxyNetworkPropagator: TextMapPropagator = {
   inject(): void {},
   extract(context: Context): Context {
     return context;
@@ -37,6 +40,10 @@ const NOOP_NETWORK_PROPAGATOR: TextMapPropagator = {
     return [];
   },
 };
+
+export function createProxyTraceSampler(): Sampler {
+  return new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(TRACE_SAMPLE_RATIO) });
+}
 
 interface ActiveRuntime {
   sdk: NodeSDK;
@@ -119,6 +126,80 @@ function httpHostname(request: RequestOptions): string | undefined {
   return undefined;
 }
 
+interface AutomaticSpanClassification {
+  operation: "proxy.request" | "provider.inference" | "oauth.refresh" | "provider.usage_refresh" | "model.discovery";
+  provider?: "anthropic" | "openai";
+  route?: "messages" | "responses";
+}
+
+function incomingClassification(path: string): AutomaticSpanClassification | undefined {
+  if (path === "/v1/messages") return { operation: "proxy.request", route: "messages" };
+  if (path === "/v1/responses") return { operation: "proxy.request", route: "responses" };
+  return undefined;
+}
+
+function outgoingClassification(
+  hostname: string | undefined,
+  path: string,
+  method: string | undefined,
+): AutomaticSpanClassification | undefined {
+  const normalizedMethod = method?.toUpperCase();
+  if (normalizedMethod === "POST" && path === "/v1/messages") {
+    return { operation: "provider.inference", provider: "anthropic", route: "messages" };
+  }
+  if (normalizedMethod === "POST" && (
+    path === "/v1/responses"
+    || path === "/backend-api/codex/responses"
+  )) {
+    return { operation: "provider.inference", provider: "openai", route: "responses" };
+  }
+  if (normalizedMethod === "POST" && (
+    (hostname === "claude.ai" && path === "/v1/oauth/token")
+    || (hostname === "auth.openai.com" && path === "/oauth/token")
+  )) {
+    return {
+      operation: "oauth.refresh",
+      provider: hostname === "claude.ai" ? "anthropic" : "openai",
+    };
+  }
+  if (normalizedMethod === "GET" && hostname === "api.anthropic.com" && path === "/api/oauth/usage") {
+    return { operation: "provider.usage_refresh", provider: "anthropic" };
+  }
+  if (normalizedMethod === "GET" && (
+    (hostname === "api.anthropic.com" && path === "/v1/models")
+    || path === "/backend-api/codex/models"
+  )) {
+    return {
+      operation: "model.discovery",
+      provider: hostname === "api.anthropic.com" ? "anthropic" : "openai",
+    };
+  }
+  return undefined;
+}
+
+function classificationAttributes(
+  classification: AutomaticSpanClassification,
+  runtimeMode: RuntimeMode,
+): Record<string, string> {
+  return {
+    "cc_router.operation": classification.operation,
+    "cc_router.runtime_mode": runtimeMode,
+    ...(classification.provider === undefined ? {} : { "cc_router.provider": classification.provider }),
+    ...(classification.route === undefined ? {} : { "cc_router.route": classification.route }),
+  };
+}
+
+function testIdGenerator(): IdGenerator | undefined {
+  if (process.env["NODE_ENV"] !== "test") return undefined;
+  const traceId = process.env["CC_ROUTER_TEST_TRACE_ID"]?.toLowerCase();
+  if (!traceId || !/^[0-9a-f]{32}$/.test(traceId) || /^0+$/.test(traceId)) return undefined;
+  const random = new RandomIdGenerator();
+  return {
+    generateTraceId: () => traceId,
+    generateSpanId: () => random.generateSpanId(),
+  };
+}
+
 function createInstrumentations(runtimeMode: RuntimeMode): [
   HttpInstrumentation,
   ExpressInstrumentation,
@@ -130,19 +211,39 @@ function createInstrumentations(runtimeMode: RuntimeMode): [
         return !isProxyInferencePath(requestPath(request.url));
       },
       ignoreOutgoingRequestHook(request) {
-        return isTelemetryEndpoint(httpHostname(request), requestPath(request.path ?? undefined));
+        const hostname = httpHostname(request);
+        const path = requestPath(request.path ?? undefined);
+        return isTelemetryEndpoint(hostname, path)
+          || outgoingClassification(hostname, path, request.method) === undefined;
       },
       requireParentforOutgoingSpans: true,
+      startIncomingSpanHook(request) {
+        const classification = incomingClassification(requestPath(request.url));
+        return classification ? classificationAttributes(classification, runtimeMode) : {};
+      },
+      startOutgoingSpanHook(request) {
+        const classification = outgoingClassification(
+          httpHostname(request),
+          requestPath(request.path ?? undefined),
+          request.method,
+        );
+        return classification ? classificationAttributes(classification, runtimeMode) : {};
+      },
       requestHook(span, request) {
-        const incoming = "url" in request && typeof request.url === "string";
-        span.setAttribute("cc_router.operation", incoming ? "proxy.request" : "provider.inference");
-        span.setAttribute("cc_router.runtime_mode", runtimeMode);
+        const classification = request instanceof IncomingMessage
+          ? incomingClassification(requestPath(request.url))
+          : outgoingClassification(
+            (request as ClientRequest).host,
+            requestPath((request as ClientRequest).path),
+            (request as ClientRequest).method,
+          );
+        if (classification) span.setAttributes(classificationAttributes(classification, runtimeMode));
       },
     }),
     new ExpressInstrumentation({
-      requestHook(span) {
-        span.setAttribute("cc_router.operation", "proxy.request");
-        span.setAttribute("cc_router.runtime_mode", runtimeMode);
+      requestHook(span, info) {
+        const classification = incomingClassification(requestPath(info.request.path));
+        if (classification) span.setAttributes(classificationAttributes(classification, runtimeMode));
       },
     }),
     new UndiciInstrumentation({
@@ -154,11 +255,19 @@ function createInstrumentations(runtimeMode: RuntimeMode): [
         } catch {
           return true;
         }
-        return isTelemetryEndpoint(hostname, requestPath(request.path));
+        const path = requestPath(request.path);
+        return isTelemetryEndpoint(hostname, path)
+          || outgoingClassification(hostname, path, request.method) === undefined;
       },
-      requestHook(span) {
-        span.setAttribute("cc_router.operation", "provider.inference");
-        span.setAttribute("cc_router.runtime_mode", runtimeMode);
+      startSpanHook(request) {
+        let hostname: string | undefined;
+        try {
+          hostname = new URL(request.origin).hostname;
+        } catch {
+          return {};
+        }
+        const classification = outgoingClassification(hostname, requestPath(request.path), request.method);
+        return classification ? classificationAttributes(classification, runtimeMode) : {};
       },
     }),
   ];
@@ -200,6 +309,7 @@ export function startProxyTelemetry(runtimeMode: RuntimeMode): boolean {
       scheduledDelayMillis: EXPORT_DELAY_MS,
       exportTimeoutMillis: EXPORT_TIMEOUT_MS,
     });
+    const idGenerator = testIdGenerator();
     const sdk = new NodeSDK({
       autoDetectResources: false,
       resourceDetectors: [],
@@ -212,8 +322,9 @@ export function startProxyTelemetry(runtimeMode: RuntimeMode): boolean {
         "host.arch": cpuArchitecture(),
         "cc_router.runtime_mode": runtimeMode,
       }),
-      sampler: new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(TRACE_SAMPLE_RATIO) }),
-      textMapPropagator: NOOP_NETWORK_PROPAGATOR,
+      sampler: createProxyTraceSampler(),
+      textMapPropagator: proxyNetworkPropagator,
+      ...(idGenerator === undefined ? {} : { idGenerator }),
       instrumentations: createInstrumentations(runtimeMode),
       spanProcessors: [spanProcessor],
       logRecordProcessors: [logProcessor],

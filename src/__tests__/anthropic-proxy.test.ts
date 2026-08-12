@@ -349,6 +349,40 @@ describe("createAnthropicProxy", () => {
     }
   });
 
+  it("keeps trace and baggage headers stripped after application proxy hooks run", async () => {
+    let upstreamHeaders: Record<string, string | string[] | undefined> = {};
+    const upstream = createServer((req, res) => {
+      upstreamHeaders = { ...req.headers };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+    const upstreamPort = await listen(upstream);
+    const app = express();
+    app.use("/v1", createAnthropicProxy({
+      target: `http://127.0.0.1:${upstreamPort}`,
+      timeoutMs: 2_000,
+      on: {
+        proxyReq: proxyRequest => {
+          proxyRequest.setHeader("traceparent", "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01");
+          proxyRequest.setHeader("tracestate", "private=value");
+          proxyRequest.setHeader("baggage", "private=value");
+        },
+      },
+    }));
+    const downstream = createServer(app);
+    const downstreamPort = await listen(downstream);
+
+    try {
+      expect((await collect(new URL(`http://127.0.0.1:${downstreamPort}/v1/messages`))).status).toBe(200);
+      expect(upstreamHeaders).not.toHaveProperty("traceparent");
+      expect(upstreamHeaders).not.toHaveProperty("tracestate");
+      expect(upstreamHeaders).not.toHaveProperty("baggage");
+    } finally {
+      await close(downstream);
+      await close(upstream);
+    }
+  });
+
   it("keeps concurrent SSE responses open until each upstream stream terminates", async () => {
     const gates = new Map([
       ["/v1/one", deferred()],

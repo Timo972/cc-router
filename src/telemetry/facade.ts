@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { trace, type Attributes } from "@opentelemetry/api";
+import {
+  context,
+  ROOT_CONTEXT,
+  SpanStatusCode,
+  TraceFlags,
+  trace,
+  type Attributes,
+} from "@opentelemetry/api";
 import { logs, SeverityNumber, type LogAttributes } from "@opentelemetry/api-logs";
 import {
   claimTelemetryFirstStart,
@@ -61,6 +68,37 @@ export interface SafeRuntimeLogInput {
   concurrency?: number;
   operationDurationMs?: number;
   diagnosticId?: string;
+}
+
+function runtimeErrorProperty(error: unknown, key: "cause" | "code"): unknown {
+  if (typeof error !== "object" || error === null) return undefined;
+  try {
+    return Object.getOwnPropertyDescriptor(error, key)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Classify only explicit, allowlisted transport failures without parsing text. */
+export function classifyExpectedRuntimeFailure(
+  error: unknown,
+): "timeout" | "network_failure" | undefined {
+  const directCode = runtimeErrorProperty(error, "code");
+  const causeCode = runtimeErrorProperty(runtimeErrorProperty(error, "cause"), "code");
+  const code = typeof directCode === "string" ? directCode : causeCode;
+  if (code === "ETIMEDOUT") return "timeout";
+  if (["EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ENETUNREACH", "ENOTFOUND", "EPIPE"]
+    .includes(String(code))) {
+    return "network_failure";
+  }
+  try {
+    if (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) {
+      return "timeout";
+    }
+  } catch {
+    // Exotic thrown values remain unexpected.
+  }
+  return undefined;
 }
 
 interface SetupOperationBase {
@@ -189,13 +227,18 @@ function logAttributes(
 }
 
 function defaultEmitLog(log: SafeLog): void {
-  logs.getLogger("cc-router").emit({
-    body: log.body,
-    severityNumber: severityNumber(log.severity),
-    severityText: log.severity.toUpperCase(),
-    timestamp: log.timestampMs,
-    attributes: logAttributes(log.attributes),
-  });
+  const emit = (): void => {
+    logs.getLogger("cc-router").emit({
+      body: log.body,
+      severityNumber: severityNumber(log.severity),
+      severityText: log.severity.toUpperCase(),
+      timestamp: log.timestampMs,
+      attributes: logAttributes(log.attributes),
+    });
+  };
+  const active = trace.getActiveSpan()?.spanContext();
+  if (active && (active.traceFlags & TraceFlags.SAMPLED) !== 0) emit();
+  else context.with(ROOT_CONTEXT, emit);
 }
 
 const SPAN_ATTRIBUTE_NAMES: Readonly<Record<keyof SafeSpanAttributes, string>> = {
@@ -221,11 +264,84 @@ function defaultAnnotateSpan(operation: Operation, attributes: SafeSpanAttribute
   const span = trace.getActiveSpan();
   if (!span) return;
   span.setAttribute("cc_router.operation", operation);
+  span.setAttributes(otelSpanAttributes(attributes));
+}
+
+function otelSpanAttributes(attributes: SafeSpanAttributes): Attributes {
   const safeAttributes: Attributes = {};
   for (const [key, value] of Object.entries(attributes) as Array<[keyof SafeSpanAttributes, unknown]>) {
     if (value !== undefined) safeAttributes[SPAN_ATTRIBUTE_NAMES[key]] = value as string | number | boolean;
   }
-  span.setAttributes(safeAttributes);
+  return safeAttributes;
+}
+
+function reconstructedSpan(
+  operation: Operation,
+  attributes: SafeSpanAttributes,
+): { operation: Operation; attributes: SafeSpanAttributes } | undefined {
+  const safe = reconstructSpan({
+    scope: "cc-router",
+    operation,
+    traceId: "1".repeat(32),
+    spanId: "2".repeat(16),
+    kind: "internal",
+    startTimeMs: 0,
+    durationMs: 0,
+    statusCode: "unset",
+    attributes,
+  });
+  return safe ? { operation: safe.name, attributes: safe.attributes } : undefined;
+}
+
+/**
+ * Run one closed runtime operation in the active OTel context. The callback is
+ * invoked exactly once even if telemetry is disabled or the OTel API fails.
+ */
+export function withTelemetrySpan<T>(
+  operation: Operation,
+  attributes: SafeSpanAttributes,
+  callback: () => T,
+): T {
+  let callbackStarted = false;
+  try {
+    if (!getTelemetrySnapshot().enabled) return callback();
+    const safe = reconstructedSpan(operation, attributes);
+    if (!safe) return callback();
+
+    return trace.getTracer("cc-router").startActiveSpan(
+      safe.operation,
+      { attributes: otelSpanAttributes(safe.attributes) },
+      span => {
+        callbackStarted = true;
+        try {
+          const result = callback();
+          if (result !== null
+            && (typeof result === "object" || typeof result === "function")
+            && typeof (result as unknown as PromiseLike<unknown>).then === "function") {
+            return Promise.resolve(result).then(value => {
+              span.setStatus({ code: SpanStatusCode.OK });
+              span.end();
+              return value;
+            }, error => {
+              span.setStatus({ code: SpanStatusCode.ERROR });
+              span.end();
+              throw error;
+            }) as T;
+          }
+          span.setStatus({ code: SpanStatusCode.OK });
+          span.end();
+          return result;
+        } catch (error) {
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          span.end();
+          throw error;
+        }
+      },
+    );
+  } catch (error) {
+    if (callbackStarted) throw error;
+    return callback();
+  }
 }
 
 function defaultDependencies(): TelemetryFacadeDependencies {
@@ -522,18 +638,8 @@ export function createTelemetryFacade(
     annotateActiveSpan(operation, attributes): void {
       if (!enabledSnapshot()) return;
       try {
-        const safe = reconstructSpan({
-          scope: "cc-router",
-          operation,
-          traceId: "1".repeat(32),
-          spanId: "2".repeat(16),
-          kind: "internal",
-          startTimeMs: 0,
-          durationMs: 0,
-          statusCode: "unset",
-          attributes,
-        });
-        if (safe) dependencies.annotateSpan(safe.name, safe.attributes);
+        const safe = reconstructedSpan(operation, attributes);
+        if (safe) dependencies.annotateSpan(safe.operation, safe.attributes);
       } catch {
         // Span enrichment is optional.
       }

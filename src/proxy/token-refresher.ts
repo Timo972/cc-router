@@ -2,6 +2,13 @@ import type { Account, RefreshResponse } from "./types.js";
 import { writeAnthropicAccountsPreservingOtherProviders, serialize } from "../config/manager.js";
 import { logRefresh } from "./logger.js";
 import { stats } from "./stats.js";
+import {
+  annotateActiveSpan,
+  classifyExpectedRuntimeFailure,
+  recordSafeLog,
+  recordUnexpectedException,
+  withTelemetrySpan,
+} from "../telemetry/facade.js";
 
 /**
  * Official Claude Code CLI client_id for the OAuth PKCE flow.
@@ -51,7 +58,7 @@ export async function refreshAccountToken(account: Account): Promise<boolean> {
   const existing = rawRefreshLocks.get(account);
   if (existing) return existing;
 
-  const promise = _doRefresh(account);
+  const promise = withTelemetrySpan("oauth.refresh", { provider: "anthropic" }, () => _doRefresh(account));
   rawRefreshLocks.set(account, promise);
   try {
     return await promise;
@@ -159,6 +166,8 @@ export function refreshAccountIfCurrent(
 }
 
 async function _doRefresh(account: Account): Promise<boolean> {
+  const startedAt = Date.now();
+  let receivedSuccessfulResponse = false;
   try {
     const body = new URLSearchParams({
       grant_type: "refresh_token",
@@ -174,6 +183,21 @@ async function _doRefresh(account: Account): Promise<boolean> {
 
     if (!res.ok) {
       const body = await res.text();
+      const outcome = res.status === 429 ? "rate_limited" : "upstream_error";
+      annotateActiveSpan("oauth.refresh", {
+        httpStatusCode: res.status,
+        outcome,
+        operationDurationMs: Date.now() - startedAt,
+      });
+      recordSafeLog({
+        operation: "oauth.refresh",
+        provider: "anthropic",
+        reason: refreshHttpReason(res.status),
+        outcome,
+        httpStatusCode: res.status,
+        operationDurationMs: Date.now() - startedAt,
+        severity: "warn",
+      });
       logRefresh(account.id, false);
       console.error(`  Status: ${res.status} — ${body}`);
       account.consecutiveErrors++;
@@ -181,6 +205,7 @@ async function _doRefresh(account: Account): Promise<boolean> {
       return false;
     }
 
+    receivedSuccessfulResponse = true;
     const data: RefreshResponse = await res.json() as RefreshResponse;
 
     // CRITICAL: refresh_token ROTATES — save the new one immediately or lose access permanently
@@ -191,6 +216,10 @@ async function _doRefresh(account: Account): Promise<boolean> {
     account.healthy = true;
     account.consecutiveErrors = 0;
     account.lastRefresh = Date.now();
+    annotateActiveSpan("oauth.refresh", {
+      outcome: "complete",
+      operationDurationMs: Date.now() - startedAt,
+    });
 
     stats.totalRefreshes++;
     stats.addLog({ ts: Date.now(), accountId: account.id, model: "-", type: "refresh" });
@@ -199,12 +228,42 @@ async function _doRefresh(account: Account): Promise<boolean> {
     logRefresh(account.id, true, expiresInMin);
     return true;
   } catch (err) {
+    const expectedReason = classifyExpectedRuntimeFailure(err);
+    const reason = expectedReason ?? (receivedSuccessfulResponse ? "unexpected_response_shape" : "other");
+    const outcome = reason === "timeout" ? "timeout" : "upstream_error";
+    recordSafeLog({
+      operation: "oauth.refresh",
+      provider: "anthropic",
+      reason,
+      outcome,
+      operationDurationMs: Date.now() - startedAt,
+      severity: "error",
+    });
+    annotateActiveSpan("oauth.refresh", {
+      outcome,
+      operationDurationMs: Date.now() - startedAt,
+    });
+    if (!expectedReason) {
+      recordUnexpectedException(err, {
+        category: "runtime",
+        reason: "other",
+        operation: "oauth.refresh",
+        provider: "anthropic",
+      });
+    }
     logRefresh(account.id, false);
     console.error(`  Error:`, err);
     account.consecutiveErrors++;
     account.healthy = false;
     return false;
   }
+}
+
+function refreshHttpReason(status: number): "unauthorized" | "forbidden" | "rate_limited" | "upstream_4xx" | "upstream_5xx" {
+  if (status === 401) return "unauthorized";
+  if (status === 403) return "forbidden";
+  if (status === 429) return "rate_limited";
+  return status >= 500 ? "upstream_5xx" : "upstream_4xx";
 }
 
 /**
@@ -247,11 +306,12 @@ export async function refreshAccountsOnce(
  * Background refresh loop: checks every 5 minutes and refreshes any
  * token expiring within the REFRESH_BUFFER_MS window.
  */
-export function startRefreshLoop(accounts: Account[]): void {
+export function startRefreshLoop(accounts: Account[]): () => void {
   const check = () => refreshAccountsOnce(accounts);
 
   // Run immediately on startup (catches already-expired tokens)
   check().catch(console.error);
 
-  setInterval(() => { check().catch(console.error); }, CHECK_INTERVAL_MS);
+  const timer = setInterval(() => { check().catch(console.error); }, CHECK_INTERVAL_MS);
+  return () => clearInterval(timer);
 }

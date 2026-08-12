@@ -79,4 +79,47 @@ describe("createStreamLifecycleTracker", () => {
     expect(tracker.state.downstreamFinish).toBe(true);
     expect(tracker.state.bodyDurationMs).toBe(1_100);
   });
+
+  it("reports one safe terminal outcome without exposing inspected SSE content", () => {
+    let current = 6_000;
+    const outcomes: Array<{ outcome: string; durationMs: number }> = [];
+    const tracker = createStreamLifecycleTracker(5_000, true, () => current, terminal => {
+      outcomes.push(terminal);
+    });
+    const upstream = new EventEmitter();
+    const downstream = new EventEmitter();
+    tracker.attach(upstream, downstream);
+    tracker.observeChunk(Buffer.from('data: {"type":"message_stop","private":"never retain"}\n'));
+    upstream.emit("end");
+    current = 6_250;
+    downstream.emit("finish");
+    downstream.emit("close");
+
+    expect(outcomes).toEqual([{ outcome: "complete", durationMs: 1_250 }]);
+    expect(JSON.stringify(outcomes)).not.toContain("never retain");
+  });
+
+  it("classifies an upstream abort and a premature downstream close", () => {
+    const aborted: string[] = [];
+    const abortTracker = createStreamLifecycleTracker(1_000, false, () => 1_100, terminal => {
+      aborted.push(terminal.outcome);
+    });
+    const abortUpstream = new EventEmitter();
+    const abortDownstream = new EventEmitter();
+    abortTracker.attach(abortUpstream, abortDownstream);
+    abortUpstream.emit("aborted");
+    abortDownstream.emit("close");
+    expect(aborted).toEqual(["upstream_error"]);
+
+    const cancelled: string[] = [];
+    const cancelTracker = createStreamLifecycleTracker(1_000, false, () => 1_200, terminal => {
+      cancelled.push(terminal.outcome);
+    });
+    const cancelUpstream = new EventEmitter();
+    const cancelDownstream = new EventEmitter();
+    cancelTracker.attach(cancelUpstream, cancelDownstream);
+    cancelDownstream.emit("close");
+    cancelUpstream.emit("close");
+    expect(cancelled).toEqual(["cancelled"]);
+  });
 });

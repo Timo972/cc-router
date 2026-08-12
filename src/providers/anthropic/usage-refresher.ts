@@ -1,4 +1,10 @@
 import type { Account, AccountUsageSnapshot } from "../../proxy/types.js";
+import {
+  annotateActiveSpan,
+  recordSafeLog,
+  recordUnexpectedException,
+  withTelemetrySpan,
+} from "../../telemetry/facade.js";
 import { fetchAnthropicUsage, type UsageFetchResult } from "./usage.js";
 
 const SUCCESS_REFRESH_MS = 5 * 60_000;
@@ -169,12 +175,60 @@ export class AnthropicUsageRefresher {
       return;
     }
     void (async () => {
-      let result: UsageFetchResult;
-      try {
-        result = await this.fetchUsage(account);
-      } catch {
-        result = { ok: false, reason: "network" };
-      }
+      const startedAt = this.now();
+      const result = await withTelemetrySpan("provider.usage_refresh", {
+        provider: "anthropic",
+        accountPoolSize: this.pool.getAll().length,
+        concurrency: this.active,
+      }, async (): Promise<UsageFetchResult> => {
+        try {
+          const fetched = await this.fetchUsage(account);
+          const duration = Math.max(0, this.now() - startedAt);
+          const outcome = usageOutcome(fetched);
+          annotateActiveSpan("provider.usage_refresh", {
+            outcome,
+            httpStatusCode: fetched.ok ? undefined : fetched.status,
+            operationDurationMs: duration,
+          });
+          if (!fetched.ok) {
+            recordSafeLog({
+              operation: "provider.usage_refresh",
+              provider: "anthropic",
+              reason: usageReason(fetched),
+              outcome,
+              httpStatusCode: fetched.status,
+              accountPoolSize: this.pool.getAll().length,
+              concurrency: this.active,
+              operationDurationMs: duration,
+              severity: "warn",
+            });
+          }
+          return fetched;
+        } catch (error) {
+          const duration = Math.max(0, this.now() - startedAt);
+          annotateActiveSpan("provider.usage_refresh", {
+            outcome: "upstream_error",
+            operationDurationMs: duration,
+          });
+          recordSafeLog({
+            operation: "provider.usage_refresh",
+            provider: "anthropic",
+            reason: "other",
+            outcome: "upstream_error",
+            accountPoolSize: this.pool.getAll().length,
+            concurrency: this.active,
+            operationDurationMs: duration,
+            severity: "error",
+          });
+          recordUnexpectedException(error, {
+            category: "runtime",
+            reason: "other",
+            operation: "provider.usage_refresh",
+            provider: "anthropic",
+          });
+          return { ok: false, reason: "network" };
+        }
+      });
 
       if (this.pool.findById(account.id) === account) {
         this.apply(account, result);
@@ -209,4 +263,23 @@ export class AnthropicUsageRefresher {
     const failures = this.failures.get(account) ?? 1;
     return FAILURE_BACKOFF_MS[Math.min(failures - 1, FAILURE_BACKOFF_MS.length - 1)];
   }
+}
+
+function usageOutcome(result: UsageFetchResult): "complete" | "rate_limited" | "timeout" | "upstream_error" {
+  if (result.ok) return "complete";
+  if (result.reason === "timeout") return "timeout";
+  if (result.reason === "http" && result.status === 429) return "rate_limited";
+  return "upstream_error";
+}
+
+function usageReason(result: Exclude<UsageFetchResult, { ok: true }>): "unauthorized" | "forbidden" | "rate_limited" | "upstream_4xx" | "upstream_5xx" | "timeout" | "network_failure" | "unexpected_response_shape" {
+  if (result.reason === "timeout") return "timeout";
+  if (result.reason === "network") return "network_failure";
+  if (result.reason === "invalid_json" || result.reason === "invalid_schema") {
+    return "unexpected_response_shape";
+  }
+  if (result.status === 401) return "unauthorized";
+  if (result.status === 403) return "forbidden";
+  if (result.status === 429) return "rate_limited";
+  return (result.status ?? 500) >= 500 ? "upstream_5xx" : "upstream_4xx";
 }
