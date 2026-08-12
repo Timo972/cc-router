@@ -66,6 +66,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   capped without toggling the whole provider. `POST /cc-router/accounts` now
   rejects an out-of-range percentage cap the same way `PATCH` does, rather
   than silently coercing it.
+- A Codex response that ends as `response.incomplete` — e.g. hitting the
+  output-token ceiling — is now delivered with its partial content and token
+  usage instead of being discarded. `/v1/responses` treated only
+  `response.completed` as a terminal event, so `response.incomplete` looked
+  identical to a stream that stopped mid-flight and turned a usable partial
+  answer into a `502 upstream_error`.
 
 ---
 

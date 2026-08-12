@@ -42,6 +42,28 @@ describe("collectCodexResponseStream", () => {
     });
   });
 
+  it("returns the verbatim response.incomplete object as JSON, not a 502", async () => {
+    const upstream = sseResponse([
+      'data: {"type":"response.created","response":{"id":"resp_1"}}\n\n',
+      'data: {"type":"response.output_text.delta","delta":"partial answer"}\n\n',
+      'data: {"type":"response.incomplete","response":{"id":"resp_1","model":"gpt-5.5","output":[{"type":"message"}],"usage":{"input_tokens":10,"output_tokens":5},"incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+    ]);
+
+    const result = await collectCodexResponseStream(upstream);
+
+    expect(result).toEqual({
+      kind: "json",
+      status: 200,
+      body: {
+        id: "resp_1",
+        model: "gpt-5.5",
+        output: [{ type: "message" }],
+        usage: { input_tokens: 10, output_tokens: 5 },
+        incomplete_details: { reason: "max_output_tokens" },
+      },
+    });
+  });
+
   it("passes a genuine application/json 200 body straight through", async () => {
     const upstream = new Response(JSON.stringify({ id: "resp_json" }), {
       status: 200,
@@ -75,7 +97,7 @@ describe("collectCodexResponseStream", () => {
     expect(result).toEqual({
       kind: "json",
       status: 502,
-      body: { error: { type: "upstream_error", message: "Stream ended before response.completed" } },
+      body: { error: { type: "upstream_error", message: "Stream ended before any terminal response event" } },
     });
   });
 
@@ -182,6 +204,20 @@ describe("createCodexUsageObserver", () => {
     expect(observer.finish()).toEqual({ inputTokens: 100, cachedInputTokens: 60, outputTokens: 25 });
   });
 
+  it("captures usage from a response.incomplete event and reports no failure", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode(`data: ${JSON.stringify({
+      type: "response.incomplete",
+      response: {
+        id: "resp_1",
+        usage: { input_tokens: 200, output_tokens: 50, input_tokens_details: { cached_tokens: 20 } },
+        incomplete_details: { reason: "max_output_tokens" },
+      },
+    })}\n\n`));
+    expect(observer.finish()).toEqual({ inputTokens: 200, cachedInputTokens: 20, outputTokens: 50 });
+    expect(observer.failure()).toBeUndefined();
+  });
+
   it("returns undefined when no completed event arrives", () => {
     const observer = createCodexUsageObserver();
     observer.push(encoder.encode("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"));
@@ -217,7 +253,7 @@ describe("createCodexUsageObserver", () => {
     const observer = createCodexUsageObserver();
     observer.push(encoder.encode('data: {"type":"response.output_text.delta","delta":"partial"}\n\n'));
     observer.finish();
-    expect(observer.failure()).toBe("Upstream stream ended before response.completed");
+    expect(observer.failure()).toBe("Upstream stream ended before any terminal response event");
   });
 
   it("reports a synthetic failure when the terminal response.completed frame is malformed", () => {
@@ -226,7 +262,7 @@ describe("createCodexUsageObserver", () => {
     // without a completion check this would look identical to a clean 200.
     observer.push(encoder.encode('data: {"type":"response.completed","response":{"id":\n\n'));
     observer.finish();
-    expect(observer.failure()).toBe("Upstream stream ended before response.completed");
+    expect(observer.failure()).toBe("Upstream stream ended before any terminal response event");
   });
 
   it("records a failure message from a response.failed event without altering usage extraction", () => {

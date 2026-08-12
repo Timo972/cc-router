@@ -9,7 +9,8 @@ import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.
 import type { AnthropicMessagesRequest } from "../protocol/anthropic-types.js";
 import type { OpenAIResponseCompleted } from "../protocol/openai-responses-types.js";
 import {
-  usageFromCompletedEvent,
+  terminalResponsePayload,
+  usageFromTerminalEvent,
   usageFromResponseBody,
   type CodexUsageTotals,
 } from "../protocol/openai-responses-collect.js";
@@ -178,8 +179,9 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
 }> {
   const reader = upstream.body?.getReader();
   if (!reader) {
-    // An event-stream response with no body cannot have completed. Reporting
-    // it as a failure keeps the caller from fabricating an empty 200.
+    // An event-stream response with no body cannot have reached a terminal
+    // event. Reporting it as a failure keeps the caller from fabricating an
+    // empty 200.
     return {
       message: openAIResponseToAnthropicMessage({ id: "", model: "", output: [], usage: {} }),
       usage: undefined,
@@ -231,7 +233,7 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
       return;
     }
 
-    if (openAIEvent.type === "response.completed") {
+    if (terminalResponsePayload(event) !== undefined) {
       id = openAIEvent.response?.id ?? id;
       model = openAIEvent.response?.model ?? model;
       usage = openAIEvent.response?.usage ?? usage;
@@ -267,13 +269,14 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
     usage: usageFromResponseBody({ usage }),
     // Tolerant parsing skips a malformed frame rather than aborting the read,
     // which keeps a bad nonterminal frame from truncating the stream — but it
-    // also means a malformed *terminal* `response.completed` frame would
-    // silently vanish. Without an observed completion there is no answer to
-    // return, so a stream that ends without one (dropped terminal frame, or
-    // an upstream that simply stopped mid-flight) is a failure rather than an
-    // empty success. An explicit `response.failed`/`error` message wins,
-    // since it says more about what went wrong.
-    failure: failure ?? (completed ? undefined : "Upstream stream ended without a completion event"),
+    // also means a malformed *terminal* frame (`response.completed` or
+    // `response.incomplete`) would silently vanish. Without an observed
+    // terminal event there is no answer to return, so a stream that ends
+    // without one (dropped terminal frame, or an upstream that simply stopped
+    // mid-flight) is a failure rather than an empty success. An explicit
+    // `response.failed`/`error` message wins, since it says more about what
+    // went wrong.
+    failure: failure ?? (completed ? undefined : "Upstream stream ended without a terminal response event"),
   };
 }
 
@@ -292,31 +295,31 @@ async function sendOpenAIStreamAsAnthropic(
   const reader = upstream.body?.getReader();
   if (!reader) {
     res.end();
-    // No body means no `response.completed` was ever possible either — mirror
-    // collectOpenAIStreamAsAnthropicMessage's `!reader` case below rather than
-    // reporting an empty stream as a success.
+    // No body means no terminal response event was ever possible either —
+    // mirror collectOpenAIStreamAsAnthropicMessage's `!reader` case below
+    // rather than reporting an empty stream as a success.
     return "Upstream response had no body";
   }
 
   const decoder = new TextDecoder();
   let remainder = "";
   // Usage is applied once, after the stream ends: `applyCodexUsage`
-  // accumulates into the process-wide totals, so calling it per
-  // `response.completed` event would double-count a stream that carried more
-  // than one. Mirrors `createCodexUsageObserver`'s finish()-once contract.
+  // accumulates into the process-wide totals, so calling it per terminal event
+  // would double-count a stream that carried more than one. Mirrors
+  // `createCodexUsageObserver`'s finish()-once contract.
   let totals: CodexUsageTotals | undefined;
   let failure: string | undefined;
   let completed = false;
 
   const inspect = (event: unknown): void => {
-    totals = usageFromCompletedEvent(event) ?? totals;
+    totals = usageFromTerminalEvent(event) ?? totals;
     if (typeof event !== "object" || event === null) return;
     const typed = event as { type?: unknown; error?: { message?: string }; response?: { error?: { message?: string } } };
     if (typed.type === "response.failed") {
       failure = typed.response?.error?.message ?? "Response failed";
     } else if (typed.type === "error") {
       failure = typed.error?.message ?? "Upstream error event";
-    } else if (typed.type === "response.completed") {
+    } else if (terminalResponsePayload(event) !== undefined) {
       completed = true;
     }
   };
@@ -353,13 +356,13 @@ async function sendOpenAIStreamAsAnthropic(
   }
   // Mirrors collectOpenAIStreamAsAnthropicMessage: tolerant parsing skips a
   // malformed frame rather than aborting the relay, which also means a
-  // malformed *terminal* response.completed frame would silently vanish.
-  // Without an observed completion the client received a partial answer, not
-  // a finished one, so it is reported as a failure (bytes already relayed to
-  // the client are unaffected — only the status used for stats/activity
-  // changes). An explicit response.failed/error message wins, since it says
-  // more about what went wrong.
-  return failure ?? (completed ? undefined : "Upstream stream ended without a completion event");
+  // malformed *terminal* frame (`response.completed` or `response.incomplete`)
+  // would silently vanish. Without an observed terminal event the client
+  // received a partial answer, not a finished one, so it is reported as a
+  // failure (bytes already relayed to the client are unaffected — only the
+  // status used for stats/activity changes). An explicit response.failed/error
+  // message wins, since it says more about what went wrong.
+  return failure ?? (completed ? undefined : "Upstream stream ended without a terminal response event");
 }
 
 export function mountMessagesCrossProviderRoute(

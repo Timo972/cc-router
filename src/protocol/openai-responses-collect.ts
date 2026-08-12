@@ -15,10 +15,50 @@ function upstreamError(message: string): CollectedCodexResponse {
 }
 
 /**
+ * SSE event types that represent a Responses stream reaching a terminal
+ * *result*, as opposed to a transport/backend failure.
+ *
+ * `response.completed` is the ordinary success terminal event.
+ * `response.incomplete` is also terminal: Codex/OpenAI emit it when
+ * generation stops without completing — most commonly hitting
+ * `max_output_tokens`, or a content filter — but the event still carries a
+ * full response object with `usage` and `incomplete_details.reason`. It is a
+ * *result* to relay, not an error, so it belongs here rather than alongside
+ * `response.failed`.
+ *
+ * `response.failed` and the bare `error` event are failures, not results:
+ * they carry no usable response body and are handled separately by every
+ * caller below.
+ */
+const TERMINAL_RESPONSE_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "response.completed",
+  "response.incomplete",
+]);
+
+/**
+ * Returns the `.response` payload carried by a terminal Responses SSE event
+ * (`response.completed` or `response.incomplete`), or `undefined` for any
+ * other event — including `response.failed`/`error`, which are failures and
+ * carry no usable response to return. Shared by every ingress that needs to
+ * recognize "the stream produced a result", so that notion cannot drift
+ * apart between the `/v1/responses` and `/v1/messages` paths.
+ */
+export function terminalResponsePayload(event: unknown): unknown {
+  if (typeof event !== "object" || event === null) return undefined;
+  const typed = event as { type?: unknown; response?: unknown };
+  if (typeof typed.type !== "string" || !TERMINAL_RESPONSE_EVENT_TYPES.has(typed.type)) {
+    return undefined;
+  }
+  return typed.response;
+}
+
+/**
  * Collapse the Codex backend's forced SSE stream into a single Responses
  * object for callers that did not ask to stream. The backend's terminal
- * `response.completed` payload is returned verbatim, preserving tool calls,
- * reasoning, and usage.
+ * `response.completed` or `response.incomplete` payload is returned
+ * verbatim, preserving tool calls, reasoning, and usage — including for a
+ * response that stopped early (e.g. hitting the output-token ceiling), which
+ * is a usable partial answer, not a transport failure.
  */
 export async function collectCodexResponseStream(
   upstream: globalThis.Response,
@@ -42,15 +82,18 @@ export async function collectCodexResponseStream(
 
   const decoder = new TextDecoder();
   let remainder = "";
-  let completed: unknown;
+  let terminalResponse: unknown;
   let failure: string | undefined;
 
   const applyEvent = (event: unknown): void => {
+    const payload = terminalResponsePayload(event);
+    if (payload !== undefined) {
+      terminalResponse = payload;
+      return;
+    }
     if (typeof event !== "object" || event === null) return;
     const e = event as CodexStreamEvent;
-    if (e.type === "response.completed") {
-      completed = e.response;
-    } else if (e.type === "response.failed") {
+    if (e.type === "response.failed") {
       const err = (e.response as { error?: { message?: string } } | undefined)?.error;
       failure = err?.message ?? "Response failed";
     } else if (e.type === "error") {
@@ -75,8 +118,8 @@ export async function collectCodexResponseStream(
   }
 
   if (failure !== undefined) return upstreamError(failure);
-  if (completed === undefined) return upstreamError("Stream ended before response.completed");
-  return { kind: "json", status: upstream.status, body: completed };
+  if (terminalResponse === undefined) return upstreamError("Stream ended before any terminal response event");
+  return { kind: "json", status: upstream.status, body: terminalResponse };
 }
 
 export interface CodexUsageTotals {
@@ -91,9 +134,10 @@ function usageNumber(value: unknown): number {
 
 /**
  * Extract usage totals from a response-shaped object (i.e. something with a
- * `.usage` field directly — the Responses `response.completed` payload, or
- * an object wrapping one). Shared by every ingress that needs to report
- * Codex token usage from a fully-materialized body.
+ * `.usage` field directly — the Responses `response.completed`/
+ * `response.incomplete` payload, or an object wrapping one). Shared by every
+ * ingress that needs to report Codex token usage from a fully-materialized
+ * body.
  */
 export function usageFromResponseBody(body: unknown): CodexUsageTotals | undefined {
   if (typeof body !== "object" || body === null) return undefined;
@@ -107,16 +151,15 @@ export function usageFromResponseBody(body: unknown): CodexUsageTotals | undefin
 }
 
 /**
- * Extract usage totals from a `response.completed` SSE event, or `undefined`
- * for any other event. Single definition shared by every streaming ingress so
+ * Extract usage totals from a terminal Responses SSE event —
+ * `response.completed` or `response.incomplete`, see
+ * `TERMINAL_RESPONSE_EVENT_TYPES` above — or `undefined` for any other
+ * event. Single definition shared by every streaming ingress so
  * `/v1/responses` and `/v1/messages` can never report different token totals
  * for the same stream.
  */
-export function usageFromCompletedEvent(event: unknown): CodexUsageTotals | undefined {
-  if (typeof event !== "object" || event === null) return undefined;
-  const typed = event as { type?: unknown; response?: unknown };
-  if (typed.type !== "response.completed") return undefined;
-  return usageFromResponseBody(typed.response);
+export function usageFromTerminalEvent(event: unknown): CodexUsageTotals | undefined {
+  return usageFromResponseBody(terminalResponsePayload(event));
 }
 
 /**
@@ -133,8 +176,9 @@ export function createCodexUsageObserver(): {
   finish(): CodexUsageTotals | undefined;
   /** The failure message observed via `response.failed`/`error`, or a
    *  synthetic one if the stream ended without ever observing a valid
-   *  `response.completed`. Only meaningful after `finish()` has been called —
-   *  earlier chunks may not yet have carried the terminal event. */
+   *  terminal response event (`response.completed`/`response.incomplete`).
+   *  Only meaningful after `finish()` has been called — earlier chunks may
+   *  not yet have carried the terminal event. */
   failure(): string | undefined;
 } {
   const decoder = new TextDecoder();
@@ -144,7 +188,7 @@ export function createCodexUsageObserver(): {
   let completed = false;
 
   const applyEvent = (event: unknown): void => {
-    totals = usageFromCompletedEvent(event) ?? totals;
+    totals = usageFromTerminalEvent(event) ?? totals;
     if (typeof event !== "object" || event === null) return;
     const e = event as CodexStreamEvent;
     if (e.type === "response.failed") {
@@ -152,7 +196,7 @@ export function createCodexUsageObserver(): {
       failure = err?.message ?? "Response failed";
     } else if (e.type === "error") {
       failure = e.error?.message ?? "Upstream error event";
-    } else if (e.type === "response.completed") {
+    } else if (terminalResponsePayload(event) !== undefined) {
       completed = true;
     }
   };
@@ -186,12 +230,13 @@ export function createCodexUsageObserver(): {
     },
     failure(): string | undefined {
       // Tolerant parsing drops a malformed frame instead of aborting, which
-      // also means a malformed *terminal* response.completed frame vanishes
-      // silently. Without an observed completion the stream never actually
-      // finished, so — mirroring collectCodexResponseStream's non-streaming
-      // check — that is reported as a failure too, unless an explicit
+      // also means a malformed *terminal* response event (`response.completed`
+      // or `response.incomplete`) frame vanishes silently. Without an
+      // observed terminal event the stream never actually produced a result,
+      // so — mirroring collectCodexResponseStream's non-streaming check —
+      // that is reported as a failure too, unless an explicit
       // response.failed/error already said more about what went wrong.
-      return failure ?? (completed ? undefined : "Upstream stream ended before response.completed");
+      return failure ?? (completed ? undefined : "Upstream stream ended before any terminal response event");
     },
   };
 }

@@ -395,6 +395,48 @@ describe("mountResponsesRoutes", () => {
     });
   });
 
+  it("reconciles a non-streaming request whose terminal event is response.incomplete into a 200 JSON body, not a 502", async () => {
+    // response.incomplete fires when generation stops without completing
+    // (e.g. hitting max_output_tokens) but still carries a full response with
+    // usage — a usable partial answer, not a transport failure.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'));
+          controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"partial"}\n\n'));
+          controller.enqueue(encoder.encode('data: {"type":"response.incomplete","response":{"id":"resp_1","model":"gpt-5.5","output":[{"type":"message"}],"usage":{"input_tokens":40,"output_tokens":10},"incomplete_details":{"reason":"max_output_tokens"}}}\n\n'));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [] }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({
+        id: "resp_1",
+        model: "gpt-5.5",
+        output: [{ type: "message" }],
+        usage: { input_tokens: 40, output_tokens: 10 },
+        incomplete_details: { reason: "max_output_tokens" },
+      });
+    });
+
+    expect(activity.some(e => e.type === "error")).toBe(false);
+    const entry = activity.find(e => e.type === "route");
+    expect(entry?.inputTokens).toBe(40);
+    expect(entry?.outputTokens).toBe(10);
+  });
+
   it("passes a non-2xx upstream through as text on the non-streaming path", async () => {
     const errorBody = JSON.stringify({ error: { message: "upstream boom" } });
     const forward: ForwardOpenAI = async () => new Response(errorBody, {
@@ -982,6 +1024,20 @@ const SSE_BODY = `event: response.completed\ndata: ${JSON.stringify({
   response: { id: "resp_1", model: "gpt-5.6-luna", usage: { input_tokens: 100, output_tokens: 25, input_tokens_details: { cached_tokens: 60 } } },
 })}\n\n`;
 
+// response.incomplete is also a terminal Responses event — generation
+// stopped without completing (e.g. hitting max_output_tokens), but the frame
+// still carries a full response with usage. It must relay and account like
+// any other successful route, not like response.failed/error.
+const INCOMPLETE_SSE_BODY = `event: response.incomplete\ndata: ${JSON.stringify({
+  type: "response.incomplete",
+  response: {
+    id: "resp_2",
+    model: "gpt-5.6-luna",
+    usage: { input_tokens: 40, output_tokens: 10, input_tokens_details: { cached_tokens: 5 } },
+    incomplete_details: { reason: "max_output_tokens" },
+  },
+})}\n\n`;
+
 function sseResponse(headers: Record<string, string> = {}): Response {
   return new Response(SSE_BODY, {
     status: 200,
@@ -1159,6 +1215,28 @@ describe("mountResponsesRoutes sticky routing", () => {
     expect(entry?.inputTokens).toBe(100);
     expect(entry?.outputTokens).toBe(25);
     expect(entry?.cacheReadTokens).toBe(60);
+  });
+
+  it("streams a response.incomplete terminal event byte-for-byte and records it as a successful route with usage, not a 502", async () => {
+    const account = makeRuntimeAccount("openai-a");
+    const forwardOpenAI = vi.fn(async () => new Response(INCOMPLETE_SSE_BODY, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }));
+    const { app, activity } = mountWithPool([account], forwardOpenAI);
+
+    await withServer(app, async baseUrl => {
+      const response = await post(baseUrl, {});
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe(INCOMPLETE_SSE_BODY); // byte-identical relay
+    });
+
+    expect(activity.some(e => e.type === "error")).toBe(false);
+    const entry = activity.find(e => e.type === "route");
+    expect(entry).toBeDefined();
+    expect(entry?.inputTokens).toBe(40);
+    expect(entry?.outputTokens).toBe(10);
+    expect(entry?.cacheReadTokens).toBe(5);
   });
 
   it("relays a stream byte-for-byte and still records activity when a malformed SSE data line precedes a valid frame", async () => {

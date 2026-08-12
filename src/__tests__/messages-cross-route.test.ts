@@ -297,6 +297,58 @@ describe("mountMessagesCrossProviderRoute", () => {
     });
   });
 
+  it("collapses OpenAI Responses SSE ending in response.incomplete into Anthropic-shaped JSON with its usage, not a 502", async () => {
+    // response.incomplete fires when generation stops without completing
+    // (e.g. hitting max_output_tokens), but still carries a full response
+    // with usage — a usable partial answer, not a transport failure.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2},\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.4-mini",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({
+        id: "resp_1",
+        type: "message",
+        role: "assistant",
+        model: "gpt-5.4-mini",
+        content: [{ type: "text", text: "Par" }],
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: { input_tokens: 4, output_tokens: 2 },
+      });
+    });
+
+    expect(activity.some(entry => entry.type === "error")).toBe(false);
+    const routeEntry = activity.find(entry => entry.type === "route");
+    expect(routeEntry).toEqual(expect.objectContaining({ statusCode: 200 }));
+  });
+
   it("reports a 502 when a non-stream collect never sees a completion event", async () => {
     // The terminal frame is malformed JSON: tolerant parsing drops it rather
     // than aborting the read, so without a completion check the collector
@@ -404,6 +456,47 @@ describe("mountMessagesCrossProviderRoute", () => {
       expect(text).toContain("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}");
       expect(text).toContain("data: {\"type\":\"message_stop\"}");
     });
+  });
+
+  it("streams OpenAI Responses SSE ending in response.incomplete as Anthropic Messages SSE, recording the upstream 200 rather than a 502", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1},\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+      const text = await res.text();
+      expect(text).toContain("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Par\"}}");
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(false);
+    const routeEntry = activity.find(entry => entry.type === "route");
+    expect(routeEntry).toEqual(expect.objectContaining({ statusCode: 200 }));
   });
 
   it("passes non-openai models to later Anthropic proxy middleware with route context and replayable raw body", async () => {
