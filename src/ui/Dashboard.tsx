@@ -76,6 +76,7 @@ interface AccountStat {
   globalCooldownUntilMs?: number;
   modelCooldowns?: Array<{ modelFamily: string; untilMs: number }>;
   codexRateLimits?: CodexRateLimitsView;
+  credentialsPendingWrite?: boolean;
 }
 
 const EMPTY_RL: AccountRateLimitsView = {
@@ -1102,6 +1103,11 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
         <Text color="gray">{formatAgo(a.lastUsedMs)}</Text>
         <Text color="gray">  {a.activeSessions ?? 0} active / {a.inFlightRequests ?? 0} streams</Text>
         {capsHint && <Text color="yellow">{capsHint}</Text>}
+        {a.credentialsPendingWrite && (
+          // The account still works — its rotated token is live in memory — but a
+          // restart before the pending write lands would need a re-login.
+          <Text color="yellow">{"  creds unsaved"}</Text>
+        )}
       </Box>
       {(rl.lastUpdated > 0 || usage) && (
         <Box paddingLeft={4}>

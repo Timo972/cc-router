@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   applyRateLimitHeaders,
   createHealthAccountViews,
@@ -10,6 +10,7 @@ import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import { applyCodexRateLimits, createOpenAIAccount } from "../providers/openai/account-state.js";
+import { prepareOpenAIAccountForRequest } from "../providers/openai/token-refresher.js";
 import { parseCodexRateLimits } from "../providers/openai/usage.js";
 
 function makeAnthropicAccount(): Account {
@@ -245,6 +246,44 @@ describe("createHealthAccountViews", () => {
     expect(codex.credits?.balance).toBe("12[31mX");
     const serialized = JSON.stringify(views[0]);
     expect(serialized).not.toContain("\x1b");
+  });
+
+  it("flags an OpenAI account whose rotated credentials have not reached disk", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-a",
+      provider: "openai_subscription",
+      accessToken: "header.e30.sig",
+      refreshToken: "rt",
+      // Already expiring, so preparation refreshes and then tries to persist.
+      expiresAt: Date.now() + 1_000,
+      enabled: true,
+    });
+
+    expect(createHealthAccountViews([], [account])[0]?.credentialsPendingWrite).toBeUndefined();
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        access_token: "new-access",
+        refresh_token: "rotated-refresh",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }),
+    } as Response);
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const ready = await prepareOpenAIAccountForRequest(account, [account], () => {
+        throw new Error("disk full");
+      });
+      // The token works, so the request proceeds — but the operator needs to
+      // see that a restart would lose the rotation.
+      expect(ready).toBe(true);
+    } finally {
+      fetchSpy.mockRestore();
+      consoleSpy.mockRestore();
+    }
+
+    expect(createHealthAccountViews([], [account])[0]?.credentialsPendingWrite).toBe(true);
   });
 
   it("never exposes tokens or raw header values in the OpenAI health view", () => {

@@ -19,6 +19,7 @@ import { writePid, removePid } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
 import {
+  hasPendingCredentialWrite,
   prepareOpenAIAccountForRequest,
   refreshAndPersistOpenAIAccount,
   startOpenAIRefreshLoop,
@@ -97,6 +98,12 @@ export interface HealthAccountView {
   globalCooldownUntilMs?: number;
   modelCooldowns?: PublicModelCooldown[];
   codexRateLimits?: PublicCodexRateLimits;
+  /** True while an OpenAI account's rotated credentials are live in memory but
+   *  not yet on disk, because a save failed and is still being retried. The
+   *  account keeps serving traffic — the token works — but a restart before
+   *  the write lands would fall back to the old refresh token, which the
+   *  provider already invalidated, and require re-authentication. */
+  credentialsPendingWrite?: boolean;
 }
 
 export interface PublicCodexWindow {
@@ -419,6 +426,7 @@ function publicOpenAIAccountView(
     lastUsedMs: a.lastUsed,
     lastRefreshMs: a.lastRefresh,
     codexRateLimits: publicCodexRateLimits(a, routing.cooldowns),
+    ...(hasPendingCredentialWrite(a) ? { credentialsPendingWrite: true } : {}),
   };
 }
 
