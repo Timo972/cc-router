@@ -217,6 +217,35 @@ export function bucketForModel(
 }
 
 /**
+ * Give a reset-less exhausted window the retry time the upstream just
+ * advertised. A 429 reporting 100% utilization with a `Retry-After` but no
+ * reset header leaves `resetAt: 0`, which the pool can only read as "blocked
+ * indefinitely": it suppresses the `retryAtMs` the client would otherwise be
+ * told, and it outlives the cooldown derived from that very `Retry-After`,
+ * keeping the account unroutable until the multi-hour staleness sweep.
+ *
+ * The cooldown expiry is the best reset available — it is literally when the
+ * upstream said to come back — so recording it bounds recovery by what was
+ * advertised rather than by a fallback measured in hours. A later response
+ * carrying a real reset overwrites it.
+ */
+export function boundResetlessExhaustedWindows(
+  account: Pick<OpenAIAccount, "rateLimits">,
+  limitId: string,
+  expiryMs: number,
+): void {
+  const bucket = account.rateLimits.buckets.get(limitId);
+  if (!bucket) return;
+  const resetAt = Math.ceil(expiryMs / 1000);
+  if (!Number.isFinite(resetAt) || resetAt <= 0) return;
+  for (const window of [bucket.primary, bucket.secondary]) {
+    if (window !== undefined && window.utilization >= 1 && window.resetAt === 0) {
+      window.resetAt = resetAt;
+    }
+  }
+}
+
+/**
  * A window that's fully exhausted (utilization >= 1) but reports resetAt === 0
  * (untrustworthy — past, absent, or malformed, per parseResetAtSeconds) has no
  * trustworthy expiry to wait out. Treat it as expired once the snapshot behind

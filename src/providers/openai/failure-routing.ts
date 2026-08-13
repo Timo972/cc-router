@@ -5,7 +5,7 @@ import {
   type BindingInvalidator,
   type FailureRoute,
 } from "../../proxy/lease-lifecycle.js";
-import { learnModelBucket, type OpenAIAccount } from "./account-state.js";
+import { boundResetlessExhaustedWindows, learnModelBucket, type OpenAIAccount } from "./account-state.js";
 import { DEFAULT_CODEX_LIMIT_ID, resolveActiveLimit } from "./usage.js";
 
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60_000;
@@ -143,10 +143,12 @@ export function applyCodexFailureRouting(
       learnModelBucket(route.account, requestedModel, activeLimit);
       const durationMs = rateLimitCooldownMs(failureHeaders, route.account, activeLimit, nowMs);
       pool.setBucketCooldownForAccount(route.account, activeLimit, durationMs);
+      boundResetlessExhaustedWindows(route.account, activeLimit, nowMs + durationMs);
       return { cooldownSeconds: durationMs / 1_000, limitingScope: `bucket:${activeLimit}` };
     }
     const durationMs = rateLimitCooldownMs(failureHeaders, route.account, DEFAULT_CODEX_LIMIT_ID, nowMs);
     pool.setGlobalCooldownForAccount(route.account, durationMs);
+    boundResetlessExhaustedWindows(route.account, DEFAULT_CODEX_LIMIT_ID, nowMs + durationMs);
     route.account.rateLimits.status = "rate_limited";
     return { cooldownSeconds: durationMs / 1_000, limitingScope: "global" };
   }

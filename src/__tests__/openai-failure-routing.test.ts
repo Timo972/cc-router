@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { applyCodexFailureRouting } from "../providers/openai/failure-routing.js";
 import { applyCodexRateLimits, createOpenAIAccount } from "../providers/openai/account-state.js";
+import { OpenAITokenPool } from "../providers/openai/token-pool.js";
+import { NoEligibleAccountError } from "../proxy/account-pool.js";
 import { parseCodexRateLimits } from "../providers/openai/usage.js";
 
 const NOW_MS = 1_754_000_000_000;
@@ -175,5 +177,71 @@ describe("applyCodexFailureRouting", () => {
     expect(pool.setGlobalCooldownForAccount).not.toHaveBeenCalled();
     expect(pool.setBucketCooldownForAccount).not.toHaveBeenCalled();
     expect(router.invalidate).not.toHaveBeenCalled();
+  });
+});
+
+describe("applyCodexFailureRouting over a real pool", () => {
+  it("recovers when the cooldown expires even though the 429 carried no reset header", () => {
+    // The upstream says "100% used, come back in 120s" but never says when the
+    // window itself resets. Left as resetAt 0 that exhausted window reads as an
+    // indefinite blocker: it suppresses the retry time clients are given, and
+    // it outlives the very cooldown it came with.
+    let now = NOW_MS;
+    const account = makeAccount();
+    const pool = new OpenAITokenPool([account], { now: () => now });
+    const router = { invalidate: vi.fn().mockReturnValue(true) };
+
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "100",
+    }, now), now);
+
+    applyCodexFailureRouting(
+      429,
+      { "retry-after": "120" },
+      { account },
+      undefined,
+      router,
+      pool,
+      () => now,
+    );
+
+    // Blocked, and the client is told exactly when to retry.
+    try {
+      pool.acquireBest(new Map());
+      expect.unreachable("account should be blocked while cooling");
+    } catch (error) {
+      expect(error).toBeInstanceOf(NoEligibleAccountError);
+      expect((error as NoEligibleAccountError).retryAtMs).toBe(NOW_MS + 120_000);
+    }
+
+    // Once that advertised window passes the account routes again, rather than
+    // waiting out the multi-hour staleness sweep.
+    now += 121_000;
+    expect(pool.acquireBest(new Map()).account.id).toBe("openai-a");
+  });
+
+  it("leaves a window that already carries a trustworthy reset alone", () => {
+    const now = NOW_MS;
+    const account = makeAccount();
+    const pool = new OpenAITokenPool([account], { now: () => now });
+
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(NOW_SEC + 3_600),
+    }, now), now);
+
+    applyCodexFailureRouting(
+      429,
+      { "retry-after": "120" },
+      { account },
+      undefined,
+      { invalidate: vi.fn() },
+      pool,
+      () => now,
+    );
+
+    // The upstream's own reset still governs; it is not overwritten by the
+    // shorter Retry-After-derived expiry.
+    expect(account.rateLimits.buckets.get("codex")?.primary?.resetAt).toBe(NOW_SEC + 3_600);
   });
 });
