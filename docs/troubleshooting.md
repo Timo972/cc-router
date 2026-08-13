@@ -152,12 +152,12 @@ If the Keychain entry is locked, the `security` command will prompt for your mac
 
 ---
 
-## Reporting an unknown telemetry-diagnosed failure
+## Reporting an unknown setup failure
 
-Unexpected setup or runtime failures may print a random diagnostic ID in the
-detailed local log. The same ID accompanies the sanitized remote exception; it
-is separate from the stable installation pseudonym and is not reused for an
-unrelated failure.
+Unexpected account-setup failures print a random diagnostic ID beside the local
+error. The same ID accompanies the sanitized remote setup exception; it is
+separate from the stable installation pseudonym and is not reused for another
+setup attempt.
 
 When opening an issue, quote the diagnostic ID and attach only the relevant
 local log lines after reviewing them for tokens, account details, paths, or
@@ -165,6 +165,13 @@ other private data. Do not post `accounts.json`, OAuth responses, credentials,
 prompts, or full unreviewed logs. A maintainer can use the ID to locate the safe
 remote record while your reviewed local excerpt supplies details that telemetry
 deliberately omits.
+
+Runtime exceptions also receive an internal per-occurrence diagnostic ID in the
+remote record, but current runtime callers do not print or retain that ID in a
+local log. Do not claim a runtime diagnostic-ID correlation when reporting a
+failure. Runtime issues remain anonymously grouped by their safe fingerprint
+and stable installation pseudonym; share only a reviewed local excerpt and the
+approximate occurrence time.
 
 Check effective telemetry state with:
 

@@ -8,7 +8,8 @@
     "cc-router": "dist/cli/bootstrap.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/clean-dist.mjs && tsc",
+    "prepack": "pnpm build",
     "dev": "tsx src/cli/bootstrap.ts",
     "start": "node dist/cli/bootstrap.js",
     "test": "vitest run",
@@ -45,6 +46,9 @@
     "accounts.example.json",
     "README.md",
     "CHANGELOG.md",
+    "docs/telemetry.md",
+    "docs/security.md",
+    "docs/troubleshooting.md",
     "LICENSE"
   ],
   "dependencies": {

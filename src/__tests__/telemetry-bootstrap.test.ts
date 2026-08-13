@@ -400,7 +400,14 @@ describe("compiled ESM telemetry bootstrap", () => {
   const auxiliaryServers: Server[] = [];
 
   beforeAll(async () => {
+    mkdirSync(join(PROJECT_ROOT, "dist"), { recursive: true });
+    writeFileSync(
+      join(PROJECT_ROOT, "dist", "__stale-build-output.js"),
+      "throw new Error('stale compiler output must not ship');\n",
+    );
     execFileSync("pnpm", ["build"], { cwd: PROJECT_ROOT, stdio: "pipe" });
+    expect(existsSync(join(PROJECT_ROOT, "dist", "__stale-build-output.js"))).toBe(false);
+    expect(existsSync(join(PROJECT_ROOT, "dist", "utils", "telemetry.js"))).toBe(false);
     target = createServer((request, response) => {
       const chunks: Buffer[] = [];
       request.on("data", chunk => chunks.push(Buffer.from(chunk)));
@@ -494,6 +501,10 @@ describe("compiled ESM telemetry bootstrap", () => {
     installedCwd = join(packedPackageRoot, "prefix");
     mkdirSync(packDirectory, { recursive: true });
     mkdirSync(installedCwd, { recursive: true });
+    writeFileSync(
+      join(PROJECT_ROOT, "dist", "__stale-prepack-output.js"),
+      "throw new Error('stale prepack output must not ship');\n",
+    );
     execFileSync("pnpm", ["pack", "--pack-destination", packDirectory], {
       cwd: PROJECT_ROOT,
       stdio: "pipe",
@@ -521,6 +532,9 @@ describe("compiled ESM telemetry bootstrap", () => {
       "dist/telemetry/posthog-client.js",
       "README.md",
       "CHANGELOG.md",
+      "docs/telemetry.md",
+      "docs/security.md",
+      "docs/troubleshooting.md",
       "LICENSE",
       "package.json",
     ]) {
@@ -531,6 +545,18 @@ describe("compiled ESM telemetry bootstrap", () => {
     ) as { bin?: Record<string, string> };
     expect(installedManifest.bin?.["cc-router"]).toBe("dist/cli/bootstrap.js");
     expect(existsSync(installedBinary)).toBe(true);
+    expect(existsSync(join(installedPackage, "dist", "__stale-build-output.js"))).toBe(false);
+    expect(existsSync(join(installedPackage, "dist", "__stale-prepack-output.js"))).toBe(false);
+    expect(existsSync(join(installedPackage, "dist", "utils", "telemetry.js"))).toBe(false);
+    const packagedJavaScript = readdirSync(join(installedPackage, "dist"), {
+      recursive: true,
+      encoding: "utf8",
+    })
+      .filter(path => path.endsWith(".js"))
+      .map(path => readFileSync(join(installedPackage, "dist", path), "utf8"))
+      .join("\n");
+    expect(packagedJavaScript).not.toContain("eu.aptabase.com");
+    expect(packagedJavaScript).not.toContain("APTABASE_");
   }, 30_000);
 
   afterAll(async () => {

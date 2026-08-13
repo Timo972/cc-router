@@ -177,9 +177,13 @@ is created.
 
 The complete resource is:
 
-- `service.name` (always `cc-router`), application version, stable random
-  `service.instance.id`, Node version, OS family (`macos`, `linux`, `windows`,
-  or `other`), CPU architecture (`arm64`, `x64`, or `other`), and runtime mode.
+- `service.name` (always `cc-router`);
+- `service.version` (semantic application version, at most 64 characters);
+- `service.instance.id` (stable random installation UUID);
+- `process.runtime.version` (semantic Node version, at most 64 characters);
+- `os.type` (`macos`, `linux`, `windows`, or `other`);
+- `host.arch` (`arm64`, `x64`, or `other`);
+- `cc_router.runtime_mode` (`foreground`, `daemon`, or `service`).
 
 Default resource detection is disabled. Host, process, cloud, container, and
 environment metadata is not exported.
@@ -188,6 +192,7 @@ Numeric categories are bounded before export:
 
 | Category | Accepted range |
 |---|---:|
+| application/Node version | semantic version string, 1-64 characters |
 | attempt | integer 0-100 |
 | account-pool size | integer 0-10,000 |
 | concurrency | integer 0-10,000 |
@@ -220,11 +225,71 @@ closed records are dropped. Telemetry failures are swallowed at the telemetry
 boundary and never alter proxy responses, streamed bytes, retry behavior, exit
 codes, or crash semantics.
 
-## Reporting a diagnostic ID
+## Reporting setup diagnostic IDs
 
-A diagnostic ID correlates one setup attempt or exception with a detailed local
-log. It is not the installation pseudonym and is never reused across unrelated
-attempts or occurrences. When reporting an unknown failure, quote the diagnostic
-ID and include only the smallest reviewed local-log excerpt needed to explain
-the problem. Remove tokens, account details, paths, prompts, and any other
-private content first; never publish `accounts.json` or a full unreviewed log.
+A setup diagnostic ID correlates one account-setup attempt with the ID printed
+beside its detailed local error. It is not the installation pseudonym and is
+never reused across attempts. When reporting an unknown setup failure, quote
+that ID and include only the smallest reviewed local-log excerpt needed to
+explain the problem. Remove tokens, account details, paths, prompts, and any
+other private content first; never publish `accounts.json` or a full unreviewed
+log.
+
+Sanitized runtime exceptions also carry a fresh internal diagnostic ID, but
+current runtime callers discard the return value and do not write it to local
+logs. Runtime failures therefore cannot currently be reported by diagnostic ID.
+They remain anonymously correlated in the maintainer's project by safe
+fingerprint and the random installation pseudonym. A runtime report should
+include only a reviewed local excerpt and approximate occurrence time.
+
+## Live EU release-validation harness
+
+The repository-only `scripts/validate-telemetry-eu.mjs` harness validates the
+exact `.tgz` selected for release. It is not included in the npm package and
+defaults to a dry-run plan:
+
+```bash
+node scripts/validate-telemetry-eu.mjs
+```
+
+Before live mode, an operator with read/config access to the personal EU
+`cc-router` project must enable Logs ingestion PII scrubbing, confirm that
+profile/GeoIP settings do not override the event-level safeguards, record the
+Person count, and compute the SHA-256 digest of that project's public token.
+The digest is compared with the public token compiled into the packed artifact;
+the raw token is never printed or written to evidence.
+
+```bash
+CC_ROUTER_EU_LIVE_VALIDATION=I_UNDERSTAND_SYNTHETIC_TELEMETRY_WILL_BE_SENT \
+CC_ROUTER_EU_PROJECT_CONFIGURED=personal-eu-cc-router \
+CC_ROUTER_EU_PROJECT_TOKEN_SHA256=<sha256-of-public-project-token> \
+node scripts/validate-telemetry-eu.mjs --live \
+  --tarball /absolute/path/to/timo972-cc-router-<version>.tgz
+```
+
+Live mode installs that tarball into a temporary prefix using pnpm's offline
+store. It uses only generated synthetic accounts, credentials, content, and
+canaries. The packaged ESM bootstrap handles a deterministic sampled request;
+the provider request is intercepted and redirected to a literal `127.0.0.1`
+fixture. A preload permits only literal-loopback traffic and these three remote
+paths:
+
+- `https://eu.i.posthog.com/batch/`;
+- `https://eu.i.posthog.com/i/v1/traces`;
+- `https://eu.i.posthog.com/i/v1/logs`.
+
+All other fetch, HTTP(S), and socket targets are blocked. The harness emits a
+sampled proxy/provider waterfall with a correlated `runtime.failure` log, safe
+success/failure funnels for all five provider/method combinations, lifecycle
+events, and two sanitized exceptions with different raw messages but identical
+safe context and fingerprint. It leaves a mode-`0600` evidence file containing
+only generated canaries, the validation window, anonymous IDs, safe
+fingerprints, and the network-target summary; the temporary installed package
+and synthetic account files are removed.
+
+Using the evidence file, search every generated canary independently in Traces,
+Logs, Events/Activity, and Error Tracking. Verify the packaged Express/Undici
+waterfall and log correlation, every setup method/stage/reason funnel, repeated
+exception grouping, `$process_person_profile: false`, `$geoip_disable: true`,
+and no new Person. Any canary match, missing packaged automatic span, unexpected
+network target, wrong-project ingestion, or Person creation blocks release.

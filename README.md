@@ -598,9 +598,9 @@ raw errors, URLs, headers, hostnames, and absolute paths are forbidden from the
 payload. Existing console output and detailed local logs are never forwarded.
 
 See [docs/telemetry.md](docs/telemetry.md) for the complete closed inventory,
-privacy boundary, EU endpoints, sampling, bounded counters, and diagnostic-ID
-reporting workflow. The contracts are implemented in
-[`src/telemetry/`](src/telemetry/).
+privacy boundary, EU endpoints, sampling, bounded counters, setup diagnostic-ID
+reporting, and the guarded live-validation workflow. The contracts are
+implemented in [`src/telemetry/`](src/telemetry/).
 
 **Disable it** — three ways, any one works:
 
