@@ -5,7 +5,9 @@ import {
   existsSync as nativeExistsSync,
   fsyncSync,
   linkSync as nativeLinkSync,
+  lstatSync,
   mkdirSync,
+  opendirSync,
   openSync as nativeOpenSync,
   readFileSync as nativeReadFileSync,
   readdirSync,
@@ -20,7 +22,9 @@ export {
   chmodSync,
   closeSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
+  opendirSync,
   readdirSync,
   rmdirSync,
   writeFileSync,
@@ -85,7 +89,7 @@ export function readFileSync(path, ...args) {
   if (!enabled()) return value;
   if (String(path) === lockPath) {
     authoritativeLockReads += 1;
-    if (authoritativeLockReads === 2) {
+    if (authoritativeLockReads === 2 && worker !== "reclaimer") {
       pauseAfterStaleValidation();
     }
   } else if (String(path) === telemetryPath && worker === "first" && !heldFirstStateRead) {
@@ -115,7 +119,15 @@ export function renameSync(oldPath, newPath) {
     enabled()
     && String(oldPath) === lockPath
     && String(newPath).includes(`${lockPath}.reclaim.`)
-  ) pauseAfterStaleValidation();
+  ) {
+    if (worker !== "reclaimer") pauseAfterStaleValidation();
+    const result = nativeRenameSync(oldPath, newPath);
+    if (worker === "reclaimer") {
+      signal("renamed-quarantine");
+      waitFor("release-reclaimer");
+    }
+    return result;
+  }
   return nativeRenameSync(oldPath, newPath);
 }
 

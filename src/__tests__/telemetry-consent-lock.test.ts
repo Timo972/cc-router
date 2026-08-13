@@ -1,15 +1,20 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 const PROJECT_ROOT = resolve(import.meta.dirname, "..", "..");
@@ -168,7 +173,7 @@ function startRaceWorker(
   home: string,
   telemetryPath: string,
   barrier: string,
-  worker: "first" | "second",
+  worker: "first" | "second" | "reclaimer",
   enabled: boolean,
 ): { child: ChildProcess; result: Promise<WorkerResult> } {
   const child = spawn(process.execPath, [
@@ -233,6 +238,21 @@ async function waitForEitherPath(paths: string[]): Promise<string> {
   }
 }
 
+function reclaimArtifacts(telemetryPath: string): string[] {
+  const prefix = `${basename(telemetryPath)}.lock.reclaim.`;
+  return readdirSync(dirname(telemetryPath)).filter(name => name.startsWith(prefix)).sort();
+}
+
+function quarantineName(
+  telemetryPath: string,
+  reclaimer: { token: string; pid: number; createdAt: number },
+  owner: { token: string; pid: number; createdAt: number },
+): string {
+  return `${basename(telemetryPath)}.lock.reclaim.v1.${String(reclaimer.pid)}.${
+    String(reclaimer.createdAt)
+  }.${reclaimer.token}.${String(owner.pid)}.${String(owner.createdAt)}.${owner.token}`;
+}
+
 afterEach(async () => {
   await Promise.all(children.splice(0).map(stopChild));
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
@@ -273,6 +293,62 @@ describe("telemetry consent lock ownership", () => {
     expect(existsSync(`${telemetryPath}.lock`)).toBe(false);
   });
 
+  it("rejects a symlink contender queue without touching its external target", async () => {
+    const { home, telemetryPath } = createState(true, 8);
+    const external = join(home, "external-queue-target");
+    mkdirSync(external, { mode: 0o700 });
+    const queuePath = `${telemetryPath}.lock.queue`;
+    symlinkSync(external, queuePath, process.platform === "win32" ? "junction" : "dir");
+
+    const result = await runWorker(home, telemetryPath, "update", "false");
+
+    expect(result.ok).toBe(false);
+    expect(lstatSync(queuePath).isSymbolicLink()).toBe(true);
+    expect(readdirSync(external)).toEqual([]);
+    expect(JSON.parse(readFileSync(telemetryPath, "utf8"))).toEqual({
+      enabled: true,
+      installId: INSTALL_ID,
+      firstRunAt: FIRST_RUN_AT,
+      revision: 8,
+    });
+  });
+
+  it("rejects a regular-file contender queue without replacing or changing it", async () => {
+    const { home, telemetryPath } = createState(true, 9);
+    const queuePath = `${telemetryPath}.lock.queue`;
+    writeFileSync(queuePath, "foreign queue file", { mode: 0o600 });
+
+    const result = await runWorker(home, telemetryPath, "update", "false");
+
+    expect(result.ok).toBe(false);
+    expect(lstatSync(queuePath).isFile()).toBe(true);
+    expect(readFileSync(queuePath, "utf8")).toBe("foreign queue file");
+    expect(JSON.parse(readFileSync(telemetryPath, "utf8"))).toEqual({
+      enabled: true,
+      installId: INSTALL_ID,
+      firstRunAt: FIRST_RUN_AT,
+      revision: 9,
+    });
+  });
+
+  it("tightens an existing contender queue to owner-only directory permissions", async () => {
+    const { home, telemetryPath } = createState(true, 10);
+    const queuePath = `${telemetryPath}.lock.queue`;
+    mkdirSync(queuePath, { mode: 0o700 });
+    chmodSync(queuePath, 0o777);
+
+    const result = await runWorker(home, telemetryPath, "update", "false");
+
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      state: { enabled: false, installId: INSTALL_ID, firstRunAt: FIRST_RUN_AT, revision: 11 },
+    }));
+    const status = statSync(queuePath);
+    expect(status.isDirectory()).toBe(true);
+    expect(lstatSync(queuePath).isSymbolicLink()).toBe(false);
+    if (process.platform !== "win32") expect(status.mode & 0o777).toBe(0o700);
+  });
+
   it("recovers both immutable contender and write lock after an elected updater is killed", async () => {
     const { home, telemetryPath } = createState(true, 20);
     const barrier = join(home, "killed-elected-updater");
@@ -294,6 +370,85 @@ describe("telemetry consent lock ownership", () => {
     expect(result.elapsedMs).toBeLessThan(1_000);
     expect(readdirSync(`${telemetryPath}.lock.queue`)).toHaveLength(0);
     expect(existsSync(`${telemetryPath}.lock`)).toBe(false);
+  });
+
+  it("reclaims an exact crash-window quarantine without accumulating killed artifacts", async () => {
+    const { home, telemetryPath } = createState(true, 0);
+
+    for (let round = 1; round <= 3; round += 1) {
+      const holder = await startLockHolder(home, telemetryPath);
+      await stopChild(holder.child);
+      await new Promise(resolveWait => setTimeout(resolveWait, 300));
+      const barrier = join(home, `killed-reclaimer-${String(round)}`);
+      mkdirSync(barrier, { mode: 0o700 });
+      const killed = startRaceWorker(home, telemetryPath, barrier, "reclaimer", false);
+      const ignoredKilledResult = killed.result.catch(() => undefined);
+      await waitForPath(join(barrier, "reclaimer.renamed-quarantine"));
+
+      expect(existsSync(`${telemetryPath}.lock`)).toBe(false);
+      expect(reclaimArtifacts(telemetryPath)).toHaveLength(1);
+      await stopChild(killed.child);
+      await ignoredKilledResult;
+
+      const recovered = await runWorker(home, telemetryPath, "update", String(round % 2 === 0));
+      expect(recovered).toEqual(expect.objectContaining({
+        ok: true,
+        state: expect.objectContaining({ revision: round }),
+      }));
+      expect(reclaimArtifacts(telemetryPath)).toEqual([]);
+    }
+  });
+
+  it("preserves live, malformed, and symlinked quarantine artifacts without following them", async () => {
+    const { home, telemetryPath } = createState(true, 4);
+    const holder = await startLockHolder(home, telemetryPath);
+    await stopChild(holder.child);
+    await new Promise(resolveWait => setTimeout(resolveWait, 300));
+    const configDir = dirname(telemetryPath);
+    const liveReclaimer = {
+      token: "123e4567-e89b-42d3-a456-426614174081",
+      pid: process.pid,
+      createdAt: Date.now() - 1_000,
+    };
+    const liveName = quarantineName(telemetryPath, liveReclaimer, holder.owner);
+    const livePath = join(configDir, liveName);
+    mkdirSync(livePath, { mode: 0o700 });
+    renameSync(`${telemetryPath}.lock`, join(livePath, "owner"));
+
+    const deadReclaimer = {
+      token: "123e4567-e89b-42d3-a456-426614174082",
+      pid: holder.owner.pid,
+      createdAt: holder.owner.createdAt,
+    };
+    const malformedName = quarantineName(telemetryPath, deadReclaimer, {
+      ...holder.owner,
+      token: "123e4567-e89b-42d3-a456-426614174083",
+    });
+    const malformedPath = join(configDir, malformedName);
+    mkdirSync(malformedPath, { mode: 0o700 });
+    writeFileSync(join(malformedPath, "owner"), "not-json", { mode: 0o600 });
+
+    const external = join(home, "external-quarantine-target");
+    mkdirSync(external, { mode: 0o700 });
+    writeFileSync(join(external, "owner"), JSON.stringify(holder.owner), { mode: 0o600 });
+    const symlinkName = quarantineName(telemetryPath, {
+      ...deadReclaimer,
+      token: "123e4567-e89b-42d3-a456-426614174084",
+    }, holder.owner);
+    const symlinkPath = join(configDir, symlinkName);
+    symlinkSync(external, symlinkPath, process.platform === "win32" ? "junction" : "dir");
+
+    const result = await runWorker(home, telemetryPath, "update", "false");
+
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      state: { enabled: false, installId: INSTALL_ID, firstRunAt: FIRST_RUN_AT, revision: 5 },
+    }));
+    expect(reclaimArtifacts(telemetryPath)).toEqual([liveName, malformedName, symlinkName].sort());
+    expect(readFileSync(join(livePath, "owner"), "utf8")).toBe(JSON.stringify(holder.owner));
+    expect(readFileSync(join(malformedPath, "owner"), "utf8")).toBe("not-json");
+    expect(lstatSync(symlinkPath).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(external, "owner"), "utf8")).toBe(JSON.stringify(holder.owner));
   });
 
   it("lets only an atomic stale-generation claimant remove it before concurrent updates", async () => {

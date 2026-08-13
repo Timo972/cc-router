@@ -94,6 +94,7 @@ function withAuthorizedSocket(target, method, operation) {
     method,
     path: target.pathname,
     socket: undefined,
+    acceptedSockets: 0,
   }, operation);
 }
 
@@ -260,6 +261,7 @@ net.Socket.prototype.connect = function guardedConnect(...args) {
   const normalizedHostname = String(hostname ?? "").replace(/^\[|\]$/g, "");
   const previousSocketIsClosed = authorization?.socket?.destroyed === true;
   if (!authorization
+    || authorization.acceptedSockets >= 2
     || (authorization.socket !== undefined && !previousSocketIsClosed)
     || authorization.hostname !== normalizedHostname
     || authorization.port !== String(port)) {
@@ -272,9 +274,10 @@ net.Socket.prototype.connect = function guardedConnect(...args) {
     throw new Error(`blocked external socket: ${String(hostname ?? "unknown")}`);
   }
   // Undici can replace a destroyed transport while settling one authorized
-  // request. Permit only that sequential replacement in the same async request
-  // context; a second live socket, another target, or no provenance still fails.
+  // request. Permit at most that one sequential replacement in the same async
+  // request context; further, live, other-target, or provenance-free sockets fail.
   authorization.socket = this;
+  authorization.acceptedSockets += 1;
   record("approved-socket", {
     protocol: "tcp:",
     hostname: normalizedHostname,

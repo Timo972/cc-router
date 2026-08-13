@@ -3,7 +3,9 @@ import {
   closeSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
+  opendirSync,
   openSync,
   readFileSync,
   readdirSync,
@@ -13,7 +15,7 @@ import {
   writeFileSync,
 } from "fs";
 import { randomUUID } from "crypto";
-import { dirname, join } from "path";
+import { basename, dirname, join } from "path";
 import { ensureConfigDir } from "./directory.js";
 import { TELEMETRY_PATH } from "./paths.js";
 
@@ -154,11 +156,22 @@ interface ConsentQueueEntry extends ConsentQueueOwner {
 
 interface ConsentQueueLock {
   path: string;
+  directory: ConsentQueueDirectory;
+  owner: ConsentQueueOwner;
+}
+
+interface ConsentQueueDirectory {
+  path: string;
+  device: number;
+  inode: number;
 }
 
 const CONSENT_LOCK_TIMEOUT_MS = 750;
 const CONSENT_LOCK_STALE_AFTER_MS = 250;
 const CONSENT_RETRY_MS = 10;
+const CONSENT_QUARANTINE_DIRECTORY_SCAN_LIMIT = 256;
+const CONSENT_QUARANTINE_CANDIDATE_LIMIT = 32;
+const CONSENT_QUARANTINE_OWNER_SIZE_LIMIT = 4_096;
 const consentWaitBuffer = new SharedArrayBuffer(4);
 const consentWaitView = new Int32Array(consentWaitBuffer);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -173,21 +186,24 @@ function errorCode(error: unknown): unknown {
     : undefined;
 }
 
+function validateConsentLockOwner(candidate: Record<string, unknown>): ConsentLockOwner | undefined {
+  if (
+    candidate["version"] !== 1
+    || typeof candidate["token"] !== "string"
+    || !UUID_PATTERN.test(candidate["token"])
+    || typeof candidate["pid"] !== "number"
+    || !Number.isSafeInteger(candidate["pid"])
+    || candidate["pid"] <= 0
+    || typeof candidate["createdAt"] !== "number"
+    || !Number.isSafeInteger(candidate["createdAt"])
+    || candidate["createdAt"] < 0
+  ) return undefined;
+  return candidate as unknown as ConsentLockOwner;
+}
+
 function parseConsentLockOwner(raw: string): ConsentLockOwner | undefined {
   try {
-    const candidate = JSON.parse(raw) as Record<string, unknown>;
-    if (
-      candidate["version"] !== 1
-      || typeof candidate["token"] !== "string"
-      || !UUID_PATTERN.test(candidate["token"])
-      || typeof candidate["pid"] !== "number"
-      || !Number.isSafeInteger(candidate["pid"])
-      || candidate["pid"] <= 0
-      || typeof candidate["createdAt"] !== "number"
-      || !Number.isSafeInteger(candidate["createdAt"])
-      || candidate["createdAt"] < 0
-    ) return undefined;
-    return candidate as unknown as ConsentLockOwner;
+    return validateConsentLockOwner(JSON.parse(raw) as Record<string, unknown>);
   } catch {
     return undefined;
   }
@@ -219,6 +235,11 @@ function processIsDefinitelyDead(pid: number): boolean {
   }
 }
 
+function ownedByCurrentUser(uid: number): boolean {
+  const getuid = Object.getOwnPropertyDescriptor(process, "getuid")?.value as (() => number) | undefined;
+  return getuid === undefined || uid === getuid();
+}
+
 function consentLockBusyError(path: string): NodeJS.ErrnoException {
   const error = new Error(
     `EEXIST: telemetry consent lock is busy, open '${path}'`,
@@ -226,6 +247,52 @@ function consentLockBusyError(path: string): NodeJS.ErrnoException {
   error.code = "EEXIST";
   error.path = path;
   return error;
+}
+
+function consentPathError(code: string, path: string, message: string): NodeJS.ErrnoException {
+  const error = new Error(`${code}: ${message}, '${path}'`) as NodeJS.ErrnoException;
+  error.code = code;
+  error.path = path;
+  return error;
+}
+
+function readConsentQueueDirectory(path: string): ConsentQueueDirectory {
+  const status = lstatSync(path);
+  if (status.isSymbolicLink()) throw consentPathError("ELOOP", path, "refusing symlink consent queue");
+  if (!status.isDirectory()) throw consentPathError("ENOTDIR", path, "consent queue is not a directory");
+  if (!ownedByCurrentUser(status.uid)) {
+    throw consentPathError("EACCES", path, "consent queue is not owned by this user");
+  }
+  if (process.platform !== "win32" && (status.mode & 0o777) !== 0o700) {
+    throw consentPathError("EACCES", path, "consent queue is not owner-only");
+  }
+  return { path, device: status.dev, inode: status.ino };
+}
+
+function assertConsentQueueDirectory(directory: ConsentQueueDirectory): void {
+  const current = readConsentQueueDirectory(directory.path);
+  if (current.device !== directory.device || current.inode !== directory.inode) {
+    throw consentPathError("EAGAIN", directory.path, "consent queue directory changed");
+  }
+}
+
+function ensureConsentQueueDirectory(path: string): ConsentQueueDirectory {
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } catch (error) {
+    if (errorCode(error) !== "EEXIST") throw error;
+    const status = lstatSync(path);
+    if (status.isSymbolicLink()) throw consentPathError("ELOOP", path, "refusing symlink consent queue");
+    if (!status.isDirectory()) throw consentPathError("ENOTDIR", path, "consent queue is not a directory");
+  }
+  try {
+    chmodSync(path, 0o700);
+  } catch (error) {
+    // Windows does not implement POSIX directory modes. Path type and identity
+    // checks remain mandatory there; supported POSIX platforms must enforce 0700.
+    if (process.platform !== "win32") throw error;
+  }
+  return readConsentQueueDirectory(path);
 }
 
 function parseConsentQueueEntry(name: string): ConsentQueueEntry | undefined {
@@ -261,10 +328,12 @@ function queueEntryName(owner: ConsentQueueOwner, phase: "choosing" | "ticket", 
  * process is definitely dead. Unknown entries fail closed so foreign data is
  * never interpreted as ours or removed.
  */
-function listConsentQueueEntries(queuePath: string, now: number): {
+function listConsentQueueEntries(directory: ConsentQueueDirectory, now: number): {
   entries: ConsentQueueEntry[];
   hasForeignEntry: boolean;
 } {
+  assertConsentQueueDirectory(directory);
+  const queuePath = directory.path;
   const entries: ConsentQueueEntry[] = [];
   let hasForeignEntry = false;
   for (const name of readdirSync(queuePath)) {
@@ -278,6 +347,7 @@ function listConsentQueueEntries(queuePath: string, now: number): {
       && processIsDefinitelyDead(entry.pid)
     ) {
       try {
+        assertConsentQueueDirectory(directory);
         unlinkSync(join(queuePath, entry.name));
       } catch (error) {
         if (errorCode(error) !== "ENOENT") throw error;
@@ -304,11 +374,7 @@ function compareConsentQueueEntries(left: ConsentQueueEntry, right: ConsentQueue
 function acquireConsentQueueLock(): ConsentQueueLock {
   ensureConfigDir();
   const queuePath = `${TELEMETRY_PATH}.lock.queue`;
-  try {
-    mkdirSync(queuePath, { mode: 0o700 });
-  } catch (error) {
-    if (errorCode(error) !== "EEXIST") throw error;
-  }
+  const directory = ensureConsentQueueDirectory(queuePath);
 
   const startedAt = Date.now();
   const owner: ConsentQueueOwner = {
@@ -319,6 +385,7 @@ function acquireConsentQueueLock(): ConsentQueueLock {
   let ownPath = join(queuePath, queueEntryName(owner, "choosing"));
   let descriptor: number | undefined;
   try {
+    assertConsentQueueDirectory(directory);
     descriptor = openSync(ownPath, "wx", 0o600);
     fsyncSync(descriptor);
     closeSync(descriptor);
@@ -327,7 +394,7 @@ function acquireConsentQueueLock(): ConsentQueueLock {
     let ticket: number | undefined;
     while (ticket === undefined) {
       const now = Date.now();
-      const snapshot = listConsentQueueEntries(queuePath, now);
+      const snapshot = listConsentQueueEntries(directory, now);
       if (!snapshot.hasForeignEntry) {
         const maximum = snapshot.entries.reduce(
           (current, entry) => entry.phase === "ticket" ? Math.max(current, entry.ticket!) : current,
@@ -336,6 +403,7 @@ function acquireConsentQueueLock(): ConsentQueueLock {
         if (maximum >= Number.MAX_SAFE_INTEGER) throw new Error("Telemetry consent lock ticket exhausted");
         ticket = maximum + 1;
         const ticketPath = join(queuePath, queueEntryName(owner, "ticket", ticket));
+        assertConsentQueueDirectory(directory);
         renameSync(ownPath, ticketPath);
         ownPath = ticketPath;
         break;
@@ -352,7 +420,7 @@ function acquireConsentQueueLock(): ConsentQueueLock {
     };
     while (true) {
       const now = Date.now();
-      const snapshot = listConsentQueueEntries(queuePath, now);
+      const snapshot = listConsentQueueEntries(directory, now);
       const blocked = snapshot.hasForeignEntry || snapshot.entries.some(entry => (
         entry.token !== owner.token
         && (
@@ -360,7 +428,7 @@ function acquireConsentQueueLock(): ConsentQueueLock {
           || compareConsentQueueEntries(entry, ownEntry) < 0
         )
       ));
-      if (!blocked) return { path: ownPath };
+      if (!blocked) return { path: ownPath, directory, owner };
       if (now - startedAt >= CONSENT_LOCK_TIMEOUT_MS) throw consentLockBusyError(queuePath);
       Atomics.wait(consentWaitView, 0, 0, CONSENT_RETRY_MS);
     }
@@ -375,13 +443,134 @@ function acquireConsentQueueLock(): ConsentQueueLock {
 
 function releaseConsentQueueLock(lock: ConsentQueueLock): void {
   try {
+    assertConsentQueueDirectory(lock.directory);
     unlinkSync(lock.path);
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error;
   }
 }
 
-function recoverAbandonedConsentLock(now: number): boolean {
+function consentQuarantineName(reclaimer: ConsentLockOwner, owner: ConsentLockOwner): string {
+  return `${basename(TELEMETRY_PATH)}.lock.reclaim.v1.${String(reclaimer.pid)}.${
+    String(reclaimer.createdAt)
+  }.${reclaimer.token}.${String(owner.pid)}.${String(owner.createdAt)}.${owner.token}`;
+}
+
+function parseConsentQuarantineName(name: string): {
+  reclaimer: ConsentLockOwner;
+  owner: ConsentLockOwner;
+} | undefined {
+  const prefix = `${basename(TELEMETRY_PATH)}.lock.reclaim.v1.`;
+  if (!name.startsWith(prefix)) return undefined;
+  const fields = name.slice(prefix.length).split(".");
+  if (fields.length !== 6) return undefined;
+  const reclaimer = validateConsentLockOwner({
+    version: 1,
+    pid: Number(fields[0]),
+    createdAt: Number(fields[1]),
+    token: fields[2],
+  });
+  const owner = validateConsentLockOwner({
+    version: 1,
+    pid: Number(fields[3]),
+    createdAt: Number(fields[4]),
+    token: fields[5],
+  });
+  return reclaimer && owner ? { reclaimer, owner } : undefined;
+}
+
+function directoryContainsOnlyOwner(path: string): boolean {
+  let directory;
+  try {
+    directory = opendirSync(path);
+    const first = directory.readSync();
+    const second = directory.readSync();
+    return first?.name === "owner" && second === null;
+  } catch {
+    return false;
+  } finally {
+    try { directory?.closeSync(); } catch { /* fail closed through false */ }
+  }
+}
+
+function removeAbandonedConsentQuarantine(
+  path: string,
+  expected: { reclaimer: ConsentLockOwner; owner: ConsentLockOwner },
+  now: number,
+): void {
+  try {
+    const directoryStatus = lstatSync(path);
+    if (
+      directoryStatus.isSymbolicLink()
+      || !directoryStatus.isDirectory()
+      || !ownedByCurrentUser(directoryStatus.uid)
+      || (process.platform !== "win32" && (directoryStatus.mode & 0o777) !== 0o700)
+      || now - expected.reclaimer.createdAt < CONSENT_LOCK_STALE_AFTER_MS
+      || !processIsDefinitelyDead(expected.reclaimer.pid)
+      || now - expected.owner.createdAt < CONSENT_LOCK_STALE_AFTER_MS
+      || !processIsDefinitelyDead(expected.owner.pid)
+      || !directoryContainsOnlyOwner(path)
+    ) return;
+
+    const ownerPath = join(path, "owner");
+    const ownerStatus = lstatSync(ownerPath);
+    if (
+      ownerStatus.isSymbolicLink()
+      || !ownerStatus.isFile()
+      || !ownedByCurrentUser(ownerStatus.uid)
+      || ownerStatus.size > CONSENT_QUARANTINE_OWNER_SIZE_LIMIT
+      || (process.platform !== "win32" && (ownerStatus.mode & 0o777) !== 0o600)
+    ) return;
+    const owner = parseConsentLockOwner(readFileSync(ownerPath, "utf8"));
+    if (!owner || !sameConsentLockOwner(owner, expected.owner)) return;
+
+    const currentDirectory = lstatSync(path);
+    const currentOwner = lstatSync(ownerPath);
+    if (
+      currentDirectory.isSymbolicLink()
+      || !currentDirectory.isDirectory()
+      || currentDirectory.dev !== directoryStatus.dev
+      || currentDirectory.ino !== directoryStatus.ino
+      || currentOwner.isSymbolicLink()
+      || !currentOwner.isFile()
+      || currentOwner.dev !== ownerStatus.dev
+      || currentOwner.ino !== ownerStatus.ino
+    ) return;
+    unlinkSync(ownerPath);
+    rmdirSync(path);
+  } catch {
+    // Missing, changing, inaccessible, or foreign artifacts remain untouched.
+  }
+}
+
+function cleanupAbandonedConsentQuarantines(now: number): void {
+  const configDirectory = dirname(TELEMETRY_PATH);
+  const prefix = `${basename(TELEMETRY_PATH)}.lock.reclaim.v1.`;
+  let directory;
+  let scanned = 0;
+  let candidates = 0;
+  try {
+    directory = opendirSync(configDirectory);
+    while (
+      scanned < CONSENT_QUARANTINE_DIRECTORY_SCAN_LIMIT
+      && candidates < CONSENT_QUARANTINE_CANDIDATE_LIMIT
+    ) {
+      const entry = directory.readSync();
+      if (!entry) break;
+      scanned += 1;
+      if (!entry.name.startsWith(prefix)) continue;
+      candidates += 1;
+      const expected = parseConsentQuarantineName(entry.name);
+      if (expected) removeAbandonedConsentQuarantine(join(configDirectory, entry.name), expected, now);
+    }
+  } catch {
+    // Cleanup is conservative hygiene; lock acquisition remains authoritative.
+  } finally {
+    try { directory?.closeSync(); } catch { /* no path is removed on close failure */ }
+  }
+}
+
+function recoverAbandonedConsentLock(now: number, reclaimer: ConsentLockOwner): boolean {
   const owner = readConsentLockOwner();
   if (!owner) return false;
   const age = now - owner.createdAt;
@@ -391,7 +580,7 @@ function recoverAbandonedConsentLock(now: number): boolean {
   // pathname atomically into a freshly created private directory, then validate
   // the exact inode/generation that was moved. A delayed reclaimer cannot move
   // or unlink a subsequently published lock.
-  const claimDirectory = `${TELEMETRY_PATH}.lock.reclaim.${String(process.pid)}.${randomUUID()}`;
+  const claimDirectory = join(dirname(TELEMETRY_PATH), consentQuarantineName(reclaimer, owner));
   mkdirSync(claimDirectory, { mode: 0o700 });
   const claimedPath = join(claimDirectory, "owner");
   try {
@@ -431,8 +620,9 @@ function recoverAbandonedConsentLock(now: number): boolean {
   return true;
 }
 
-function acquireConsentLock(): ConsentLock {
+function acquireConsentLock(reclaimer: ConsentLockOwner): ConsentLock {
   ensureConfigDir();
+  cleanupAbandonedConsentQuarantines(Date.now());
   const lockPath = `${TELEMETRY_PATH}.lock`;
   const startedAt = Date.now();
   while (true) {
@@ -465,7 +655,7 @@ function acquireConsentLock(): ConsentLock {
       try { unlinkSync(candidatePath); } catch { /* absent or retained after process death */ }
       const now = Date.now();
       if (errorCode(error) !== "EEXIST") throw error;
-      if (recoverAbandonedConsentLock(now)) continue;
+      if (recoverAbandonedConsentLock(now, reclaimer)) continue;
       if (now - startedAt >= CONSENT_LOCK_TIMEOUT_MS) throw error;
       Atomics.wait(consentWaitView, 0, 0, CONSENT_RETRY_MS);
     }
@@ -476,7 +666,7 @@ function withConsentLock<T>(operation: () => T): T {
   const lockPath = `${TELEMETRY_PATH}.lock`;
   const queueLock = acquireConsentQueueLock();
   try {
-    const lock = acquireConsentLock();
+    const lock = acquireConsentLock({ version: 1, ...queueLock.owner });
     try {
       return operation();
     } finally {

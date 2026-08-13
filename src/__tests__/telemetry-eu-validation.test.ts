@@ -18,6 +18,20 @@ const NAMED_BEFORE = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network
 const LOOPBACK_ONLY = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network-loopback-only-preload.mjs");
 const ALLOWED_NETWORK_ATTEMPTS = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "allowed-network-attempts.mjs");
 const AUTHORIZED_ABORT = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "guard-authorized-abort.mjs");
+const SOCKET_NO_TRANSPORT = join(
+  PROJECT_ROOT,
+  "src",
+  "__tests__",
+  "fixtures",
+  "guard-socket-no-transport-preload.mjs",
+);
+const SOCKET_CARDINALITY = join(
+  PROJECT_ROOT,
+  "src",
+  "__tests__",
+  "fixtures",
+  "guard-socket-cardinality.mjs",
+);
 
 describe("personal EU telemetry release validator", () => {
   it("defaults to an offline plan with the complete synthetic matrix", () => {
@@ -338,6 +352,65 @@ describe("personal EU telemetry release validator", () => {
         server.close(() => resolveClose());
         server.closeAllConnections();
       });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows one destroyed-socket replacement but blocks every other socket cardinality", () => {
+    const root = mkdtempSync(join(tmpdir(), "cc-router-guard-cardinality-"));
+    const networkLog = join(root, "network.jsonl");
+    const origin = "http://127.0.0.1:43197";
+    try {
+      const result = spawnSync(process.execPath, [
+        "--import", pathToFileURL(SOCKET_NO_TRANSPORT).href,
+        "--import", pathToFileURL(GUARD).href,
+        SOCKET_CARDINALITY,
+      ], {
+        cwd: PROJECT_ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          NODE_ENV: "test",
+          CC_ROUTER_EU_GUARD_MODE: "offline-test",
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: origin,
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: origin,
+          CC_ROUTER_EU_NETWORK_LOG: networkLog,
+        },
+      });
+
+      expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+      expect(JSON.parse(result.stdout.trim())).toEqual({
+        first: "allowed",
+        secondLive: "blocked",
+        mismatch: "blocked",
+        replacement: "allowed",
+        third: "blocked",
+        noProvenance: "blocked",
+      });
+      const entries = readFileSync(networkLog, "utf8")
+        .trim().split("\n").map(line => JSON.parse(line) as {
+          kind: string;
+          method?: string;
+          path: string;
+          hostname: string;
+          port?: string;
+        });
+      expect(entries.filter(entry => entry.kind === "approved-socket")).toEqual([
+        expect.objectContaining({
+          hostname: "127.0.0.1",
+          port: "43197",
+          method: "POST",
+          path: "/batch/",
+        }),
+        expect.objectContaining({
+          hostname: "127.0.0.1",
+          port: "43197",
+          method: "POST",
+          path: "/batch/",
+        }),
+      ]);
+      expect(entries.filter(entry => entry.kind === "blocked-socket")).toHaveLength(4);
+    } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
