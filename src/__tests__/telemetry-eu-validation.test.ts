@@ -17,6 +17,7 @@ const NO_TRANSPORT = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network
 const NAMED_BEFORE = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network-named-import-before-preload.mjs");
 const LOOPBACK_ONLY = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network-loopback-only-preload.mjs");
 const ALLOWED_NETWORK_ATTEMPTS = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "allowed-network-attempts.mjs");
+const AUTHORIZED_ABORT = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "guard-authorized-abort.mjs");
 
 describe("personal EU telemetry release validator", () => {
   it("defaults to an offline plan with the complete synthetic matrix", () => {
@@ -291,6 +292,47 @@ describe("personal EU telemetry release validator", () => {
         },
       });
       expect(audit.status, `${audit.stdout}${audit.stderr}`).toBe(0);
+    } finally {
+      await new Promise<void>(resolveClose => {
+        server.close(() => resolveClose());
+        server.closeAllConnections();
+      });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("contains an authorized held-request abort without misclassifying its transport cleanup", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cc-router-guard-abort-"));
+    const networkLog = join(root, "network.jsonl");
+    const server = createServer((request) => { request.resume(); });
+    await new Promise<void>((resolveListen, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolveListen());
+    });
+    const address = server.address() as AddressInfo;
+    try {
+      const result = spawnSync(process.execPath, [
+        "--import", pathToFileURL(GUARD).href,
+        AUTHORIZED_ABORT,
+      ], {
+        cwd: PROJECT_ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          NODE_ENV: "test",
+          CC_ROUTER_EU_GUARD_MODE: "offline-test",
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: `http://127.0.0.1:${address.port}`,
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: `http://127.0.0.1:${address.port}`,
+          CC_ROUTER_EU_NETWORK_LOG: networkLog,
+        },
+      });
+
+      const networkWire = readFileSync(networkLog, "utf8");
+      expect(result.status, `${result.stdout}${result.stderr}\n${networkWire}`).toBe(0);
+      expect(result.stdout).toContain("authorized request settled");
+      expect(networkWire).toContain('"kind":"offline-posthog-loopback"');
+      expect(networkWire).toContain('"kind":"approved-socket"');
+      expect(networkWire).not.toContain("blocked-");
     } finally {
       await new Promise<void>(resolveClose => {
         server.close(() => resolveClose());

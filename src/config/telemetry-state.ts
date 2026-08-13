@@ -3,14 +3,17 @@ import {
   closeSync,
   fsyncSync,
   linkSync,
+  mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "fs";
 import { randomUUID } from "crypto";
-import { dirname } from "path";
+import { dirname, join } from "path";
 import { ensureConfigDir } from "./directory.js";
 import { TELEMETRY_PATH } from "./paths.js";
 
@@ -137,12 +140,32 @@ interface ConsentLock {
   owner: ConsentLockOwner;
 }
 
+interface ConsentQueueOwner {
+  token: string;
+  pid: number;
+  createdAt: number;
+}
+
+interface ConsentQueueEntry extends ConsentQueueOwner {
+  name: string;
+  phase: "choosing" | "ticket";
+  ticket?: number;
+}
+
+interface ConsentQueueLock {
+  path: string;
+}
+
 const CONSENT_LOCK_TIMEOUT_MS = 750;
 const CONSENT_LOCK_STALE_AFTER_MS = 250;
 const CONSENT_RETRY_MS = 10;
 const consentWaitBuffer = new SharedArrayBuffer(4);
 const consentWaitView = new Int32Array(consentWaitBuffer);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CONSENT_QUEUE_ENTRY_PATTERN = new RegExp(
+  `^v1\\.(\\d+)\\.(\\d+)\\.(${UUID_PATTERN.source.slice(1, -1)})\\.(choosing|ticket\\.(\\d+))$`,
+  "i",
+);
 
 function errorCode(error: unknown): unknown {
   return (typeof error === "object" || typeof error === "function") && error !== null
@@ -196,23 +219,216 @@ function processIsDefinitelyDead(pid: number): boolean {
   }
 }
 
+function consentLockBusyError(path: string): NodeJS.ErrnoException {
+  const error = new Error(
+    `EEXIST: telemetry consent lock is busy, open '${path}'`,
+  ) as NodeJS.ErrnoException;
+  error.code = "EEXIST";
+  error.path = path;
+  return error;
+}
+
+function parseConsentQueueEntry(name: string): ConsentQueueEntry | undefined {
+  const match = CONSENT_QUEUE_ENTRY_PATTERN.exec(name);
+  if (!match) return undefined;
+  const pid = Number(match[1]);
+  const createdAt = Number(match[2]);
+  const ticket = match[5] === undefined ? undefined : Number(match[5]);
+  if (
+    !Number.isSafeInteger(pid)
+    || pid <= 0
+    || !Number.isSafeInteger(createdAt)
+    || createdAt < 0
+    || (ticket !== undefined && (!Number.isSafeInteger(ticket) || ticket <= 0))
+  ) return undefined;
+  return {
+    name,
+    token: match[3]!,
+    pid,
+    createdAt,
+    phase: match[4] === "choosing" ? "choosing" : "ticket",
+    ticket,
+  };
+}
+
+function queueEntryName(owner: ConsentQueueOwner, phase: "choosing" | "ticket", ticket?: number): string {
+  const suffix = phase === "choosing" ? phase : `ticket.${String(ticket)}`;
+  return `v1.${String(owner.pid)}.${String(owner.createdAt)}.${owner.token}.${suffix}`;
+}
+
+/**
+ * List immutable contenders and remove only exact, uniquely named entries whose
+ * process is definitely dead. Unknown entries fail closed so foreign data is
+ * never interpreted as ours or removed.
+ */
+function listConsentQueueEntries(queuePath: string, now: number): {
+  entries: ConsentQueueEntry[];
+  hasForeignEntry: boolean;
+} {
+  const entries: ConsentQueueEntry[] = [];
+  let hasForeignEntry = false;
+  for (const name of readdirSync(queuePath)) {
+    const entry = parseConsentQueueEntry(name);
+    if (!entry) {
+      hasForeignEntry = true;
+      continue;
+    }
+    if (
+      now - entry.createdAt >= CONSENT_LOCK_STALE_AFTER_MS
+      && processIsDefinitelyDead(entry.pid)
+    ) {
+      try {
+        unlinkSync(join(queuePath, entry.name));
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
+      }
+      continue;
+    }
+    entries.push(entry);
+  }
+  return { entries, hasForeignEntry };
+}
+
+function compareConsentQueueEntries(left: ConsentQueueEntry, right: ConsentQueueEntry): number {
+  const ticketDifference = left.ticket! - right.ticket!;
+  if (ticketDifference !== 0) return ticketDifference;
+  return left.token.localeCompare(right.token);
+}
+
+/**
+ * A filesystem form of Lamport's bakery lock. Every contender has an immutable,
+ * token-scoped path; crashed entries can therefore be reclaimed without ever
+ * unlinking a replacement generation. The choosing phase prevents equal-ticket
+ * contenders from entering before the total token ordering is visible.
+ */
+function acquireConsentQueueLock(): ConsentQueueLock {
+  ensureConfigDir();
+  const queuePath = `${TELEMETRY_PATH}.lock.queue`;
+  try {
+    mkdirSync(queuePath, { mode: 0o700 });
+  } catch (error) {
+    if (errorCode(error) !== "EEXIST") throw error;
+  }
+
+  const startedAt = Date.now();
+  const owner: ConsentQueueOwner = {
+    token: randomUUID(),
+    pid: process.pid,
+    createdAt: startedAt,
+  };
+  let ownPath = join(queuePath, queueEntryName(owner, "choosing"));
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(ownPath, "wx", 0o600);
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+
+    let ticket: number | undefined;
+    while (ticket === undefined) {
+      const now = Date.now();
+      const snapshot = listConsentQueueEntries(queuePath, now);
+      if (!snapshot.hasForeignEntry) {
+        const maximum = snapshot.entries.reduce(
+          (current, entry) => entry.phase === "ticket" ? Math.max(current, entry.ticket!) : current,
+          0,
+        );
+        if (maximum >= Number.MAX_SAFE_INTEGER) throw new Error("Telemetry consent lock ticket exhausted");
+        ticket = maximum + 1;
+        const ticketPath = join(queuePath, queueEntryName(owner, "ticket", ticket));
+        renameSync(ownPath, ticketPath);
+        ownPath = ticketPath;
+        break;
+      }
+      if (now - startedAt >= CONSENT_LOCK_TIMEOUT_MS) throw consentLockBusyError(queuePath);
+      Atomics.wait(consentWaitView, 0, 0, CONSENT_RETRY_MS);
+    }
+
+    const ownEntry: ConsentQueueEntry = {
+      ...owner,
+      name: queueEntryName(owner, "ticket", ticket),
+      phase: "ticket",
+      ticket,
+    };
+    while (true) {
+      const now = Date.now();
+      const snapshot = listConsentQueueEntries(queuePath, now);
+      const blocked = snapshot.hasForeignEntry || snapshot.entries.some(entry => (
+        entry.token !== owner.token
+        && (
+          entry.phase === "choosing"
+          || compareConsentQueueEntries(entry, ownEntry) < 0
+        )
+      ));
+      if (!blocked) return { path: ownPath };
+      if (now - startedAt >= CONSENT_LOCK_TIMEOUT_MS) throw consentLockBusyError(queuePath);
+      Atomics.wait(consentWaitView, 0, 0, CONSENT_RETRY_MS);
+    }
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* retain the original error */ }
+    }
+    try { unlinkSync(ownPath); } catch { /* exact contender may already be absent */ }
+    throw error;
+  }
+}
+
+function releaseConsentQueueLock(lock: ConsentQueueLock): void {
+  try {
+    unlinkSync(lock.path);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+  }
+}
+
 function recoverAbandonedConsentLock(now: number): boolean {
   const owner = readConsentLockOwner();
   if (!owner) return false;
   const age = now - owner.createdAt;
   if (age < CONSENT_LOCK_STALE_AFTER_MS || !processIsDefinitelyDead(owner.pid)) return false;
 
-  // Verify the unique token and full ownership record immediately before the
-  // unlink. Malformed, replaced, PID-reused, or foreign locks are never removed.
-  const current = readConsentLockOwner();
-  if (!current || !sameConsentLockOwner(current, owner)) return false;
+  // Only the elected queue owner reaches this point. Move the authoritative
+  // pathname atomically into a freshly created private directory, then validate
+  // the exact inode/generation that was moved. A delayed reclaimer cannot move
+  // or unlink a subsequently published lock.
+  const claimDirectory = `${TELEMETRY_PATH}.lock.reclaim.${String(process.pid)}.${randomUUID()}`;
+  mkdirSync(claimDirectory, { mode: 0o700 });
+  const claimedPath = join(claimDirectory, "owner");
   try {
-    unlinkSync(`${TELEMETRY_PATH}.lock`);
-    return true;
+    renameSync(`${TELEMETRY_PATH}.lock`, claimedPath);
   } catch (error) {
+    try { rmdirSync(claimDirectory); } catch { /* preserve the rename error */ }
     if (errorCode(error) === "ENOENT") return true;
     throw error;
   }
+
+  const claimed = (() => {
+    try {
+      return parseConsentLockOwner(readFileSync(claimedPath, "utf8"));
+    } catch {
+      return undefined;
+    }
+  })();
+  const stillAbandoned = claimed
+    && sameConsentLockOwner(claimed, owner)
+    && Date.now() - claimed.createdAt >= CONSENT_LOCK_STALE_AFTER_MS
+    && processIsDefinitelyDead(claimed.pid);
+  if (!stillAbandoned) {
+    // The pathname changed outside the contender protocol. Restore only with
+    // atomic no-replace publication and retain the claim on any conflict.
+    try {
+      linkSync(claimedPath, `${TELEMETRY_PATH}.lock`);
+      unlinkSync(claimedPath);
+      rmdirSync(claimDirectory);
+    } catch {
+      // Fail closed: do not delete an unverified generation or another owner.
+    }
+    return false;
+  }
+
+  try { unlinkSync(claimedPath); } catch { /* exact stale quarantine is harmless */ }
+  try { rmdirSync(claimDirectory); } catch { /* exact private directory may remain */ }
+  return true;
 }
 
 function acquireConsentLock(): ConsentLock {
@@ -258,18 +474,23 @@ function acquireConsentLock(): ConsentLock {
 
 function withConsentLock<T>(operation: () => T): T {
   const lockPath = `${TELEMETRY_PATH}.lock`;
-  const lock = acquireConsentLock();
+  const queueLock = acquireConsentQueueLock();
   try {
-    return operation();
-  } finally {
-    const current = readConsentLockOwner();
-    if (current && sameConsentLockOwner(current, lock.owner)) {
-      try {
-        unlinkSync(lockPath);
-      } catch (error) {
-        if (errorCode(error) !== "ENOENT") throw error;
+    const lock = acquireConsentLock();
+    try {
+      return operation();
+    } finally {
+      const current = readConsentLockOwner();
+      if (current && sameConsentLockOwner(current, lock.owner)) {
+        try {
+          unlinkSync(lockPath);
+        } catch (error) {
+          if (errorCode(error) !== "ENOENT") throw error;
+        }
       }
     }
+  } finally {
+    releaseConsentQueueLock(queueLock);
   }
 }
 

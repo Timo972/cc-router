@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -13,9 +14,11 @@ import { afterEach, describe, expect, it } from "vitest";
 
 const PROJECT_ROOT = resolve(import.meta.dirname, "..", "..");
 const WORKER = join(import.meta.dirname, "fixtures", "telemetry-consent-worker.mjs");
+const FS_LOADER = join(import.meta.dirname, "fixtures", "telemetry-consent-fs-loader.mjs");
 const INSTALL_ID = "123e4567-e89b-42d3-a456-426614174000";
 const FIRST_RUN_AT = "2026-08-01T00:00:00.000Z";
 const homes: string[] = [];
+const children: ChildProcess[] = [];
 
 interface WorkerResult {
   ok: boolean;
@@ -161,7 +164,77 @@ function stopChild(child: ChildProcess): Promise<void> {
   });
 }
 
-afterEach(() => {
+function startRaceWorker(
+  home: string,
+  telemetryPath: string,
+  barrier: string,
+  worker: "first" | "second",
+  enabled: boolean,
+): { child: ChildProcess; result: Promise<WorkerResult> } {
+  const child = spawn(process.execPath, [
+    "--import", "tsx",
+    "--loader", FS_LOADER,
+    WORKER, "update", String(enabled),
+  ], {
+    cwd: PROJECT_ROOT,
+    env: {
+      ...workerEnvironment(home, telemetryPath),
+      NODE_ENV: "test",
+      CC_ROUTER_TEST_CONSENT_RACE_BARRIER: barrier,
+      CC_ROUTER_TEST_CONSENT_RACE_WORKER: worker,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  children.push(child);
+  const result = new Promise<WorkerResult>((resolveResult, reject) => {
+    let stdout = "";
+    let stderr = "";
+    const deadline = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`race worker ${worker} timed out\n${stdout}\n${stderr}`));
+    }, 10_000);
+    child.stdout?.on("data", chunk => { stdout += String(chunk); });
+    child.stderr?.on("data", chunk => { stderr += String(chunk); });
+    child.once("error", error => {
+      clearTimeout(deadline);
+      reject(error);
+    });
+    child.once("close", code => {
+      clearTimeout(deadline);
+      if (code !== 0) {
+        reject(new Error(`race worker ${worker} exited ${String(code)}\n${stdout}\n${stderr}`));
+        return;
+      }
+      try {
+        resolveResult(JSON.parse(stdout.trim()) as WorkerResult);
+      } catch (error) {
+        reject(new Error(`invalid race worker ${worker} output\n${stdout}\n${stderr}`, { cause: error }));
+      }
+    });
+  });
+  return { child, result };
+}
+
+async function waitForPath(path: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    await new Promise(resolveWait => setTimeout(resolveWait, 10));
+  }
+}
+
+async function waitForEitherPath(paths: string[]): Promise<string> {
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    const existing = paths.find(path => existsSync(path));
+    if (existing) return existing;
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for one of ${paths.join(", ")}`);
+    await new Promise(resolveWait => setTimeout(resolveWait, 10));
+  }
+}
+
+afterEach(async () => {
+  await Promise.all(children.splice(0).map(stopChild));
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
 
@@ -198,6 +271,80 @@ describe("telemetry consent lock ownership", () => {
     }));
     expect(result.elapsedMs).toBeLessThan(1_000);
     expect(existsSync(`${telemetryPath}.lock`)).toBe(false);
+  });
+
+  it("recovers both immutable contender and write lock after an elected updater is killed", async () => {
+    const { home, telemetryPath } = createState(true, 20);
+    const barrier = join(home, "killed-elected-updater");
+    mkdirSync(barrier, { mode: 0o700 });
+    const killed = startRaceWorker(home, telemetryPath, barrier, "first", false);
+    const ignoredKilledResult = killed.result.catch(() => undefined);
+    await waitForPath(join(barrier, "first.read-state"));
+    await stopChild(killed.child);
+    await ignoredKilledResult;
+
+    expect(existsSync(`${telemetryPath}.lock`)).toBe(true);
+    expect(readdirSync(`${telemetryPath}.lock.queue`)).toHaveLength(1);
+    const result = await runWorker(home, telemetryPath, "update", "false");
+
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      state: { enabled: false, installId: INSTALL_ID, firstRunAt: FIRST_RUN_AT, revision: 21 },
+    }));
+    expect(result.elapsedMs).toBeLessThan(1_000);
+    expect(readdirSync(`${telemetryPath}.lock.queue`)).toHaveLength(0);
+    expect(existsSync(`${telemetryPath}.lock`)).toBe(false);
+  });
+
+  it("lets only an atomic stale-generation claimant remove it before concurrent updates", async () => {
+    const { home, telemetryPath } = createState(true, 0);
+    const barrier = join(home, "race");
+    mkdirSync(barrier, { mode: 0o700 });
+    const holder = await startLockHolder(home, telemetryPath);
+    await stopChild(holder.child);
+    await new Promise(resolveWait => setTimeout(resolveWait, 300));
+
+    const first = startRaceWorker(home, telemetryPath, barrier, "first", false);
+    await waitForPath(join(barrier, "first.validated-stale"));
+    const second = startRaceWorker(home, telemetryPath, barrier, "second", true);
+    await waitForEitherPath([
+      join(barrier, "second.validated-stale"),
+      join(barrier, "second.queued"),
+    ]);
+
+    writeFileSync(join(barrier, "first.release-validation"), "", { mode: 0o600 });
+    await waitForPath(join(barrier, "first.read-state"));
+    const firstReplacement = JSON.parse(readFileSync(`${telemetryPath}.lock`, "utf8")) as { token: string };
+    writeFileSync(join(barrier, "second.release-validation"), "", { mode: 0o600 });
+    let secondResult: WorkerResult | undefined;
+    await Promise.race([
+      second.result.then(result => { secondResult = result; }),
+      new Promise(resolveWait => setTimeout(resolveWait, 250)),
+    ]);
+    writeFileSync(join(barrier, "first.release-state"), "", { mode: 0o600 });
+    const firstResult = await first.result;
+    secondResult ??= await second.result;
+
+    expect(firstResult.ok).toBe(true);
+    expect(secondResult.ok, JSON.stringify(secondResult)).toBe(true);
+    expect([firstResult.state?.revision, secondResult.state?.revision].sort()).toEqual([1, 2]);
+    const finalState = JSON.parse(readFileSync(telemetryPath, "utf8")) as TelemetryState;
+    const lastResult = [firstResult, secondResult].find(result => result.state?.revision === 2);
+    expect(finalState).toEqual(lastResult?.state);
+
+    const audit = readFileSync(join(barrier, "lock-audit.jsonl"), "utf8")
+      .trim().split("\n").map(line => JSON.parse(line) as { type: string; worker: string; token?: string });
+    expect(audit).toContainEqual({
+      type: "acquired",
+      worker: "first",
+      token: firstReplacement.token,
+    });
+    const acquiredByWorker = new Map(audit
+      .filter(entry => entry.type === "acquired")
+      .map(entry => [`${entry.worker}:${entry.token}`, true]));
+    for (const entry of audit.filter(candidate => candidate.type === "unlinked-authoritative")) {
+      expect(acquiredByWorker.has(`${entry.worker}:${entry.token}`), JSON.stringify(entry)).toBe(true);
+    }
   });
 
   it("serializes concurrent updater processes into unique monotonic revisions", async () => {
