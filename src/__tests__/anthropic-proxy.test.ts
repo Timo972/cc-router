@@ -12,51 +12,6 @@ import { SessionRouter } from "../proxy/session-router.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
-import { createTelemetryFacade } from "../telemetry/facade.js";
-
-const TELEMETRY_MODES = ["enabled", "disabled", "failing"] as const;
-type TelemetryMode = typeof TELEMETRY_MODES[number];
-
-function observeProxyResponseWithTelemetry(mode: TelemetryMode): () => void {
-  const enabled = mode !== "disabled";
-  const fail = (): void => {
-    if (mode === "failing") throw new Error("telemetry dependency failed");
-  };
-  const telemetry = createTelemetryFacade({
-    getSnapshot: () => ({
-      state: {
-        enabled,
-        installId: "70d8062e-1fa0-4ae4-a115-bf782ecca462",
-        firstRunAt: "2026-08-03T00:00:00.000Z",
-      },
-      environmentDisabled: false,
-      enabled,
-    }),
-    annotateSpan: fail,
-    emitLog: fail,
-    runtimeMetadata: () => ({
-      serviceVersion: "0.8.2",
-      osFamily: "macos",
-      runtimeMode: "foreground",
-    }),
-  });
-  return () => {
-    telemetry.annotateActiveSpan("provider.inference", {
-      provider: "anthropic",
-      route: "messages",
-      streaming: true,
-      streamOutcome: "complete",
-    });
-    telemetry.recordSafeLog({
-      operation: "provider.inference",
-      provider: "anthropic",
-      reason: "rate_limited",
-      outcome: "rate_limited",
-      httpStatusCode: 429,
-      severity: "warn",
-    });
-  };
-}
 
 function makeAccount(id: string): Account {
   return {
@@ -292,9 +247,7 @@ describe("createAnthropicProxy", () => {
     }
   });
 
-  it.each(TELEMETRY_MODES)(
-    "keeps successful and failed SSE byte-transparent with telemetry %s",
-    async telemetryMode => {
+  it("keeps successful and failed SSE byte-transparent through the routing stack", async () => {
     const successBody = Buffer.from(
       "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
       "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
@@ -322,7 +275,7 @@ describe("createAnthropicProxy", () => {
     app.use("/v1", createAnthropicProxy({
       target: `http://127.0.0.1:${upstreamPort}`,
       timeoutMs: 2_000,
-      on: { proxyRes: observeProxyResponseWithTelemetry(telemetryMode) },
+      on: {},
     }));
     const downstream = createServer(app);
     const downstreamPort = await listen(downstream);
@@ -339,12 +292,9 @@ describe("createAnthropicProxy", () => {
       await close(downstream);
       await close(upstream);
     }
-    },
-  );
+  });
 
-  it.each(TELEMETRY_MODES)(
-    "forwards deliberately split SSE bytes without inserting or removing events with telemetry %s",
-    async telemetryMode => {
+  it("forwards deliberately split SSE bytes without inserting or removing events", async () => {
     const chunks = [
       Buffer.from("event: message_start\nda"),
       Buffer.from("ta: {\"type\":\"message_start\"}\n\n"),
@@ -377,7 +327,6 @@ describe("createAnthropicProxy", () => {
       timeoutMs: 2_000,
       on: {
         proxyRes: proxyResponse => {
-          observeProxyResponseWithTelemetry(telemetryMode)();
           proxyResponse.on("data", chunk => observedChunks.push(Buffer.from(chunk)));
         },
       },
@@ -398,8 +347,7 @@ describe("createAnthropicProxy", () => {
       await close(downstream);
       await close(upstream);
     }
-    },
-  );
+  });
 
   it("keeps trace and baggage headers stripped after application proxy hooks run", async () => {
     let upstreamHeaders: Record<string, string | string[] | undefined> = {};
@@ -435,9 +383,7 @@ describe("createAnthropicProxy", () => {
     }
   });
 
-  it.each(TELEMETRY_MODES)(
-    "keeps concurrent SSE responses open until each upstream stream terminates with telemetry %s",
-    async telemetryMode => {
+  it("keeps concurrent SSE responses open until each upstream stream terminates", async () => {
     const gates = new Map([
       ["/v1/one", deferred()],
       ["/v1/two", deferred()],
@@ -464,7 +410,7 @@ describe("createAnthropicProxy", () => {
     app.use("/v1", createAnthropicProxy({
       target: `http://127.0.0.1:${upstreamPort}`,
       timeoutMs: 10_000,
-      on: { proxyRes: observeProxyResponseWithTelemetry(telemetryMode) },
+      on: {},
     }));
     const downstream = createServer(app);
     const downstreamPort = await listen(downstream);
@@ -489,12 +435,9 @@ describe("createAnthropicProxy", () => {
       await close(downstream);
       await close(upstream);
     }
-    },
-  );
+  });
 
-  it.each(TELEMETRY_MODES)(
-    "does not abort a started SSE response after the pre-response timeout with telemetry %s",
-    async telemetryMode => {
+  it("does not abort a started SSE response after the pre-response timeout", async () => {
     // The timeout must elapse during the post-start wait for the assertion to
     // mean anything, but response arrival must not itself be a race: loopback
     // needs single-digit ms, and CI runners (Windows especially) are far slower
@@ -516,7 +459,7 @@ describe("createAnthropicProxy", () => {
     app.use("/v1", createAnthropicProxy({
       target: `http://127.0.0.1:${upstreamPort}`,
       timeoutMs: preResponseTimeoutMs,
-      on: { proxyRes: observeProxyResponseWithTelemetry(telemetryMode) },
+      on: {},
     }));
     const downstream = createServer(app);
     const downstreamPort = await listen(downstream);
@@ -539,12 +482,9 @@ describe("createAnthropicProxy", () => {
       await close(downstream);
       await close(upstream);
     }
-    },
-  );
+  });
 
-  it.each(TELEMETRY_MODES)(
-    "routes concurrent production-stack SSE streams with sticky leases and abort cleanup with telemetry %s",
-    async telemetryMode => {
+  it("routes concurrent production-stack SSE streams with sticky leases and abort cleanup", async () => {
     const gates = new Map([
       ["/v1/one", deferred()],
       ["/v1/two", deferred()],
@@ -579,7 +519,6 @@ describe("createAnthropicProxy", () => {
       target: `http://127.0.0.1:${upstreamPort}`,
       timeoutMs: 10_000,
       on: {
-        proxyRes: observeProxyResponseWithTelemetry(telemetryMode),
         proxyReq: (proxyRequest, req) => {
           const account = (req as express.Request)._ccAccount!;
           proxyRequest.setHeader("authorization", `Bearer ${account.tokens.accessToken}`);
@@ -653,12 +592,9 @@ describe("createAnthropicProxy", () => {
       await close(downstream);
       await close(upstream);
     }
-    },
-  );
+  });
 
-  it.each(TELEMETRY_MODES)(
-    "relays a failed response unchanged and mutates only the next-request routing state with telemetry %s",
-    async telemetryMode => {
+  it("relays a failed response unchanged and mutates only the next-request routing state", async () => {
     const failureBody = Buffer.from("{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}\n");
     let upstreamRequests = 0;
     const upstream = createServer((_req, res) => {
@@ -689,7 +625,6 @@ describe("createAnthropicProxy", () => {
       timeoutMs: 2_000,
       on: {
         proxyRes: proxyResponse => {
-          observeProxyResponseWithTelemetry(telemetryMode)();
           applyUpstreamFailureRouting(
             proxyResponse.statusCode ?? 0,
             proxyResponse.headers,
@@ -722,6 +657,5 @@ describe("createAnthropicProxy", () => {
       await close(downstream);
       await close(upstream);
     }
-    },
-  );
+  });
 });

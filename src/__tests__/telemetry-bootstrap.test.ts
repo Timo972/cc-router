@@ -9,15 +9,18 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createServer, type Server } from "node:http";
+import { createServer, request, type ClientRequest, type Server } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  decodeOtlpProtobuf,
+  semanticStrings,
   startTransportCaptureServer,
   TELEMETRY_CANARY,
+  telemetryWireRepresentations,
   type TransportCaptureServer,
 } from "./telemetry-test-helpers.js";
 
@@ -68,62 +71,59 @@ function countOccurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
 }
 
-function parsedProtobufForPrivacyAudit(input: Buffer): unknown {
-  const readVarint = (buffer: Buffer, offset: number): { value: number; next: number } => {
-    let value = 0;
-    let multiplier = 1;
-    for (let index = offset; index < buffer.length && index < offset + 10; index += 1) {
-      const byte = buffer[index]!;
-      value += (byte & 0x7f) * multiplier;
-      if ((byte & 0x80) === 0) return { value, next: index + 1 };
-      multiplier *= 128;
-    }
-    throw new Error("invalid protobuf varint");
-  };
-  const parseMessage = (message: Buffer): unknown[] => {
-    const fields: unknown[] = [];
-    let offset = 0;
-    while (offset < message.length) {
-      const tag = readVarint(message, offset);
-      offset = tag.next;
-      const field = Math.floor(tag.value / 8);
-      const wireType = tag.value & 7;
-      if (field === 0) throw new Error("invalid protobuf field");
-      if (wireType === 0) {
-        const value = readVarint(message, offset);
-        fields.push({ field, varint: value.value });
-        offset = value.next;
-        continue;
-      }
-      if (wireType === 1 || wireType === 5) {
-        const bytes = wireType === 1 ? 8 : 4;
-        if (offset + bytes > message.length) throw new Error("truncated fixed protobuf field");
-        fields.push({ field, fixed: message.subarray(offset, offset + bytes).toString("hex") });
-        offset += bytes;
-        continue;
-      }
-      if (wireType !== 2) throw new Error(`unsupported protobuf wire type ${wireType}`);
-      const length = readVarint(message, offset);
-      offset = length.next;
-      const end = offset + length.value;
-      if (end > message.length) throw new Error("truncated protobuf field");
-      const bytes = message.subarray(offset, end);
-      let decoded: unknown;
-      try {
-        decoded = parseMessage(bytes);
-      } catch {
-        try {
-          decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-        } catch {
-          decoded = bytes.toString("base64");
-        }
-      }
-      fields.push({ field, value: decoded });
-      offset = end;
-    }
-    return fields;
-  };
-  return parseMessage(input);
+interface HttpObservation {
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+  chunks: Buffer[];
+  body: Buffer;
+}
+
+function startHttpRequest(
+  url: URL,
+  body: Buffer,
+  headers: Record<string, string>,
+): {
+  request: ClientRequest;
+  firstChunk: Promise<void>;
+  completed: Promise<HttpObservation>;
+  chunks: Buffer[];
+} {
+  let firstChunkResolve!: () => void;
+  const firstChunk = new Promise<void>(resolveFirst => { firstChunkResolve = resolveFirst; });
+  let requestHandle!: ClientRequest;
+  const receivedChunks: Buffer[] = [];
+  const completed = new Promise<HttpObservation>((resolveResponse, reject) => {
+    requestHandle = request(url, {
+      method: "POST",
+      headers: {
+        ...headers,
+        "content-length": String(body.length),
+      },
+    }, response => {
+      response.on("data", chunk => {
+        receivedChunks.push(Buffer.from(chunk));
+        if (receivedChunks.length === 1) firstChunkResolve();
+      });
+      response.on("end", () => resolveResponse({
+        status: response.statusCode ?? 0,
+        headers: { ...response.headers },
+        chunks: receivedChunks,
+        body: Buffer.concat(receivedChunks),
+      }));
+      response.on("error", reject);
+    });
+    requestHandle.on("error", reject);
+    requestHandle.end(body);
+  });
+  return { request: requestHandle, firstChunk, completed, chunks: receivedChunks };
+}
+
+async function collectHttpRequest(
+  url: URL,
+  body: Buffer,
+  headers: Record<string, string>,
+): Promise<HttpObservation> {
+  return startHttpRequest(url, body, headers).completed;
 }
 
 async function startBuiltPackage(options: {
@@ -138,6 +138,7 @@ async function startBuiltPackage(options: {
   binary?: string;
   cwd?: string;
   launchBinaryDirectly?: boolean;
+  config?: Record<string, unknown>;
 }): Promise<RunningPackage> {
   const testHome = mkdtempSync(join(tmpdir(), "cc-router-bootstrap-"));
   const accountsPath = join(testHome, "accounts.json");
@@ -163,16 +164,29 @@ async function startBuiltPackage(options: {
     installId: "11111111-1111-4111-8111-111111111111",
     firstRunAt: "2026-08-01T00:00:00.000Z",
   }));
-  writeFileSync(configPath, "{}");
+  writeFileSync(configPath, JSON.stringify(options.config ?? {}));
 
   writeFileSync(preloadPath, `
+import { ServerResponse } from "node:http";
 const realFetch = globalThis.fetch;
 const targetOrigin = ${JSON.stringify(options.targetOrigin)};
 const telemetryOrigin = ${JSON.stringify(options.telemetryCaptureOrigin)};
+const originalWriteHead = ServerResponse.prototype.writeHead;
+ServerResponse.prototype.writeHead = function (...args) {
+  if (!this.hasHeader("date")) this.setHeader("date", "Thu, 01 Jan 1970 00:00:00 GMT");
+  return originalWriteHead.apply(this, args);
+};
 Math.random = () => 0;
 globalThis.fetch = async (input, init) => {
   const original = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
   if (original.hostname === "chatgpt.com" && original.pathname === "/backend-api/codex/responses") {
+    if (String(init?.body ?? "").includes("telemetry_hostile_error")) {
+      const hostile = await realFetch(new URL(original.pathname, targetOrigin), init);
+      await hostile.arrayBuffer();
+      const error = new Error(${JSON.stringify(TELEMETRY_CANARY.exceptionMessage)});
+      error.stack = ${JSON.stringify(`Error: ${TELEMETRY_CANARY.exceptionMessage}\n    at private (${TELEMETRY_CANARY.homePath}/private.js:1:2)`)};
+      throw error;
+    }
     return realFetch(new URL(original.pathname, targetOrigin), init);
   }
   if (original.hostname === "eu.i.posthog.com") {
@@ -288,7 +302,17 @@ describe("compiled ESM telemetry bootstrap", () => {
   let installedCwd: string;
   const targetHeaders: Array<Record<string, string | string[] | undefined>> = [];
   const targetBodies: Buffer[] = [];
+  const targetFlows: Array<{
+    flow: string;
+    headers: Record<string, string | string[] | undefined>;
+    body: Buffer;
+  }> = [];
+  const releaseTargetFlow = new Map<string, () => void>();
+  const closedTargetFlows: string[] = [];
+  const hostileStatusDescriptions: string[] = [];
+  const hostileResponseBodies: Buffer[] = [];
   const children: RunningPackage[] = [];
+  const auxiliaryServers: Server[] = [];
 
   beforeAll(async () => {
     execFileSync("pnpm", ["build"], { cwd: PROJECT_ROOT, stdio: "pipe" });
@@ -296,8 +320,76 @@ describe("compiled ESM telemetry bootstrap", () => {
       const chunks: Buffer[] = [];
       request.on("data", chunk => chunks.push(Buffer.from(chunk)));
       request.on("end", () => {
+        response.sendDate = false;
+        response.setHeader("date", "Thu, 01 Jan 1970 00:00:00 GMT");
         targetHeaders.push({ ...request.headers });
-        targetBodies.push(Buffer.concat(chunks));
+        const body = Buffer.concat(chunks);
+        targetBodies.push(body);
+        const flow = String(request.headers["x-test-flow"] ?? "openai");
+        if (request.url === "/hostile-status" || body.includes("telemetry_hostile_error")) {
+          response.statusMessage = TELEMETRY_CANARY.exceptionMessage;
+          hostileStatusDescriptions.push(response.statusMessage);
+          hostileResponseBodies.push(Buffer.from(TELEMETRY_CANARY.rawProviderBody));
+          response.writeHead(599, {
+            "content-type": "application/json",
+            "x-hostile-path": TELEMETRY_CANARY.homePath,
+          });
+          response.end(TELEMETRY_CANARY.rawProviderBody);
+          return;
+        }
+        if (request.url === "/v1/messages") {
+          targetFlows.push({ flow, headers: { ...request.headers }, body });
+          const ssePrefix = Buffer.from(`event: ping\ndata: {"flow":"${flow}"}\n\n`);
+          const sseSuffix = Buffer.from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+          if (flow === "timeout") {
+            response.once("close", () => closedTargetFlows.push(flow));
+            return;
+          }
+          if (flow === "abort" || flow.startsWith("concurrent-")) {
+            response.writeHead(200, {
+              "content-type": "text/event-stream",
+              "cache-control": "no-cache",
+              "x-upstream-marker": "transparent",
+            });
+            response.write(ssePrefix);
+            response.once("close", () => closedTargetFlows.push(flow));
+            releaseTargetFlow.set(flow, () => {
+              if (!response.destroyed) response.end(sseSuffix);
+            });
+            return;
+          }
+          if (flow === "sse") {
+            response.writeHead(200, {
+              "content-type": "text/event-stream",
+              "cache-control": "no-cache",
+              "x-upstream-marker": "transparent",
+            });
+            response.write(ssePrefix.subarray(0, 11));
+            response.write(ssePrefix.subarray(11));
+            response.end(sseSuffix);
+            return;
+          }
+          if (flow === "failure") {
+            const failureBody = Buffer.from("{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}\n");
+            response.writeHead(429, {
+              "content-type": "application/json",
+              "retry-after": "60",
+              "x-upstream-marker": "transparent",
+            });
+            response.write(failureBody.subarray(0, 13));
+            response.end(failureBody.subarray(13));
+            return;
+          }
+          const nonStreamBody = Buffer.from("{\"type\":\"message\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}\n");
+          response.writeHead(201, {
+            "content-type": "application/json",
+            "content-length": String(nonStreamBody.length),
+            "x-upstream-marker": "transparent",
+          });
+          response.write(nonStreamBody.subarray(0, 9));
+          response.end(nonStreamBody.subarray(9));
+          return;
+        }
         response.writeHead(200, {
           "content-type": "application/json",
           "x-telemetry-canary": TELEMETRY_CANARY.headerValue,
@@ -358,7 +450,7 @@ describe("compiled ESM telemetry bootstrap", () => {
 
   afterAll(async () => {
     await Promise.all(children.map(child => child.stop()));
-    await Promise.all([close(target), telemetry.close()]);
+    await Promise.all([close(target), telemetry.close(), ...auxiliaryServers.map(close)]);
     rmSync(packedPackageRoot, { recursive: true, force: true });
   });
 
@@ -432,36 +524,32 @@ export async function resolve(specifier, context, nextResolve) {
     }
   }, 15_000);
 
-  it("launches the installed tarball through its ESM hook with private carriers and byte-stable kill switches", async () => {
-    const unavailableCapture = await startTransportCaptureServer();
-    const unavailableOrigin = unavailableCapture.origin;
-    await unavailableCapture.close();
-    const observations: Array<{
-      status: number;
-      contentType: string | null;
-      body: Buffer;
-      forwardedBody: Buffer;
-    }> = [];
+  it("launches the installed tarball through its ESM hook with semantic privacy and isolated kill switches", async () => {
+    const observations: Array<{ status: number; headers: Record<string, string>; body: Buffer; forwardedBody: Buffer }> = [];
     const modes = [
-      { name: "enabled", telemetryEnabled: true, environment: {}, capture: telemetry.origin },
-      { name: "persisted opt-out", telemetryEnabled: false, environment: {}, capture: telemetry.origin },
+      {
+        name: "enabled",
+        telemetryEnabled: true,
+        environment: { DO_NOT_TRACK: "0", CC_ROUTER_TELEMETRY: "1" },
+      },
+      {
+        name: "persisted opt-out",
+        telemetryEnabled: false,
+        environment: { DO_NOT_TRACK: "0", CC_ROUTER_TELEMETRY: "1" },
+      },
       {
         name: "DO_NOT_TRACK=1",
         telemetryEnabled: true,
-        environment: { DO_NOT_TRACK: "1" },
-        capture: telemetry.origin,
+        environment: { DO_NOT_TRACK: "1", CC_ROUTER_TELEMETRY: "1" },
       },
       {
         name: "CC_ROUTER_TELEMETRY=0",
         telemetryEnabled: true,
-        environment: { CC_ROUTER_TELEMETRY: "0" },
-        capture: telemetry.origin,
+        environment: { DO_NOT_TRACK: "0", CC_ROUTER_TELEMETRY: "0" },
       },
-      { name: "failing transport", telemetryEnabled: true, environment: {}, capture: unavailableOrigin },
     ] as const;
-
     for (const mode of modes) {
-      const telemetryBefore = telemetry.requests.length;
+      const isolatedCapture = await startTransportCaptureServer();
       const targetBefore = targetBodies.length;
       const probe = createServer();
       const proxyPort = await listen(probe);
@@ -470,100 +558,351 @@ export async function resolve(specifier, context, nextResolve) {
         telemetryEnabled: mode.telemetryEnabled,
         proxyPort,
         targetOrigin,
-        telemetryCaptureOrigin: mode.capture,
+        telemetryCaptureOrigin: isolatedCapture.origin,
         environment: mode.environment,
         binary: installedBinary,
         cwd: installedCwd,
         launchBinaryDirectly: true,
       });
       children.push(running);
-
       try {
         const requestBody = JSON.stringify({
           model: "openai/gpt-5.5",
-          input: [{
-            role: "user",
-            content: [{
-              type: "input_text",
-              text: Object.values(TELEMETRY_CANARY).join("\n"),
-            }],
-          }],
+          input: [{ role: "user", content: [{
+            type: "input_text",
+            text: Object.values(TELEMETRY_CANARY).join("\n"),
+          }] }],
+          metadata: { escaped: JSON.stringify({ privateBody: TELEMETRY_CANARY.rawProviderBody }) },
           stream: false,
         });
-        const response = await fetch(
-          `http://127.0.0.1:${proxyPort}/v1/responses${TELEMETRY_CANARY.queryString}`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              host: TELEMETRY_CANARY.hostname,
-              authorization: TELEMETRY_CANARY.bearerToken,
-              "x-api-key": TELEMETRY_CANARY.headerValue,
-              "x-claude-code-session-id": TELEMETRY_CANARY.accountId,
-              traceparent: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
-              tracestate: "private=value",
-              baggage: "private=value",
-            },
-            body: requestBody,
+        const carrierValues = semanticStrings(JSON.parse(requestBody));
+        for (const canary of Object.values(TELEMETRY_CANARY)) {
+          expect(carrierValues.some(value => value.includes(canary)), canary).toBe(true);
+        }
+        const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses${TELEMETRY_CANARY.queryString}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            host: TELEMETRY_CANARY.hostname,
+            authorization: TELEMETRY_CANARY.bearerToken,
+            "x-api-key": TELEMETRY_CANARY.headerValue,
+            "x-claude-code-session-id": TELEMETRY_CANARY.accountId,
+            traceparent: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+            tracestate: "private=value",
+            baggage: "private=value",
           },
-        );
-        expect(response.status, `${mode.name}\n${running.output()}`).toBe(200);
+          body: requestBody,
+        });
         const responseBody = Buffer.from(await response.arrayBuffer());
+        expect(response.status, `${mode.name}\n${running.output()}`).toBe(200);
         expect(targetBodies).toHaveLength(targetBefore + 1);
         observations.push({
           status: response.status,
-          contentType: response.headers.get("content-type"),
+          headers: Object.fromEntries([...response.headers].sort()),
           body: responseBody,
           forwardedBody: targetBodies.at(-1)!,
         });
-
         if (mode.name === "enabled") {
           await waitUntil(
-            () => telemetry.requests.slice(telemetryBefore).some(request => request.url === "/i/v1/traces"),
+            () => isolatedCapture.requests.some(request => request.url === "/i/v1/traces"),
             8_000,
             () => `installed package exported no traces\n${running.output()}`,
           );
-          const capturedTelemetry = telemetry.requests.slice(telemetryBefore);
-          const wire = Buffer.concat(
-            capturedTelemetry
-              .filter(request => request.url === "/i/v1/traces")
-              .map(request => request.rawBody),
-          ).toString("utf8");
-          expect(wire).toContain("@opentelemetry/instrumentation-express");
-          expect(wire).toContain("@opentelemetry/instrumentation-undici");
-          expect(wire).toContain("proxy.request");
-          expect(wire).toContain("provider.inference");
-          expect(wire).not.toContain("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-          expect(capturedTelemetry.length).toBeGreaterThan(0);
-          expect(new Set(capturedTelemetry.map(request => request.url)))
-            .toEqual(new Set(capturedTelemetry.map(request => request.url).filter(path =>
-              path === "/i/v1/traces" || path === "/i/v1/logs" || path === "/batch/"
-            )));
-          const allWire = Buffer.concat(capturedTelemetry.map(request => request.rawBody)).toString("utf8");
-          const parsedPayloads = capturedTelemetry.map(request =>
-            request.json ?? parsedProtobufForPrivacyAudit(request.rawBody)
-          );
+          const decodedPayloads = isolatedCapture.requests.map(request => request.json
+            ?? decodeOtlpProtobuf(request.rawBody, request.url.endsWith("traces") ? "traces" : "logs"));
+          const decodedValues = semanticStrings(decodedPayloads);
+          const capturedWire = Buffer.concat(isolatedCapture.requests.map(request => request.rawBody));
+          expect(decodedValues).toContain("@opentelemetry/instrumentation-express");
+          expect(decodedValues).toContain("@opentelemetry/instrumentation-undici");
+          expect(decodedValues).toContain("proxy.request");
+          expect(decodedValues).toContain("provider.inference");
           for (const canary of Object.values(TELEMETRY_CANARY)) {
-            expect(allWire).not.toContain(canary);
-            expect(JSON.stringify(parsedPayloads)).not.toContain(canary);
+            expect(decodedValues.some(value => value.includes(canary)), canary).toBe(false);
+            for (const representation of telemetryWireRepresentations(canary)) {
+              expect(capturedWire.includes(Buffer.from(representation)), representation).toBe(false);
+            }
           }
           expect(targetHeaders.at(-1)).not.toHaveProperty("traceparent");
           expect(targetHeaders.at(-1)).not.toHaveProperty("tracestate");
           expect(targetHeaders.at(-1)).not.toHaveProperty("baggage");
-        } else if (mode.name !== "failing transport") {
-          await new Promise(resolveWait => setTimeout(resolveWait, 750));
-          expect(telemetry.requests, `${mode.name} emitted telemetry`).toHaveLength(telemetryBefore);
         }
       } finally {
         await running.stop("SIGTERM");
       }
+      await new Promise(resolveWait => setTimeout(resolveWait, 300));
+      if (mode.name !== "enabled") {
+        expect(isolatedCapture.requests, `${mode.name} emitted during request or shutdown drain`).toEqual([]);
+      }
+      await isolatedCapture.close();
+    }
+    expect(observations).toHaveLength(modes.length);
+    for (const observation of observations.slice(1)) expect(observation).toEqual(observations[0]);
+  }, 60_000);
+
+  it("removes hostile automatic Express, HTTP, and Undici error values from final telemetry", async () => {
+    const capture = await startTransportCaptureServer();
+    const probe = createServer();
+    const proxyPort = await listen(probe);
+    await close(probe);
+    const running = await startBuiltPackage({
+      telemetryEnabled: true,
+      proxyPort,
+      targetOrigin,
+      telemetryCaptureOrigin: capture.origin,
+      environment: { DO_NOT_TRACK: "0", CC_ROUTER_TELEMETRY: "1" },
+      binary: installedBinary,
+      cwd: installedCwd,
+      launchBinaryDirectly: true,
+    });
+    children.push(running);
+    const hostileBefore = hostileStatusDescriptions.length;
+    try {
+      const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses${TELEMETRY_CANARY.queryString}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-hostile-path": TELEMETRY_CANARY.homePath,
+        },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          input: [{ role: "user", content: "telemetry_hostile_error" }],
+          metadata: {
+            nested: JSON.stringify({
+              message: TELEMETRY_CANARY.exceptionMessage,
+              stack: `${TELEMETRY_CANARY.homePath}/private.js:1:2`,
+              providerBody: TELEMETRY_CANARY.rawProviderBody,
+            }),
+          },
+          stream: false,
+        }),
+      });
+      expect(response.status).toBe(500);
+      await response.arrayBuffer();
+      expect(hostileStatusDescriptions.slice(hostileBefore)).toEqual([
+        TELEMETRY_CANARY.exceptionMessage,
+      ]);
+      expect(hostileResponseBodies.at(-1)?.toString("utf8")).toBe(TELEMETRY_CANARY.rawProviderBody);
+      await waitUntil(
+        () => capture.requests.some(request => request.url === "/i/v1/traces"),
+        8_000,
+        () => `automatic error flow exported no trace\n${running.output()}`,
+      );
+    } finally {
+      await running.stop("SIGTERM");
+    }
+    await new Promise(resolveWait => setTimeout(resolveWait, 300));
+    expect(capture.requests.some(request => request.url === "/batch/")).toBe(true);
+    expect(semanticStrings(capture.requests
+      .filter(request => request.url === "/batch/")
+      .map(request => request.json))).toContain("$exception");
+    const decodedPayloads = capture.requests.map(request => request.json
+      ?? decodeOtlpProtobuf(request.rawBody, request.url.endsWith("traces") ? "traces" : "logs"));
+    const decodedValues = semanticStrings(decodedPayloads);
+    const capturedWire = Buffer.concat(capture.requests.map(request => request.rawBody));
+    expect(decodedValues).toContain("@opentelemetry/instrumentation-express");
+    expect(decodedValues).toContain("@opentelemetry/instrumentation-http");
+    expect(decodedValues).toContain("@opentelemetry/instrumentation-undici");
+    for (const canary of [
+      TELEMETRY_CANARY.exceptionMessage,
+      TELEMETRY_CANARY.homePath,
+      TELEMETRY_CANARY.rawProviderBody,
+      TELEMETRY_CANARY.queryString,
+    ]) {
+      expect(decodedValues.some(value => value.includes(canary)), canary).toBe(false);
+      for (const representation of telemetryWireRepresentations(canary)) {
+        expect(capturedWire.includes(Buffer.from(representation)), representation).toBe(false);
+      }
+    }
+    await capture.close();
+  }, 20_000);
+
+  it("keeps the real Anthropic proxy byte-transparent when telemetry is enabled, disabled, or failing", async () => {
+    let failingTransportAttempts = 0;
+    const failingTransport = createServer((request, response) => {
+      failingTransportAttempts++;
+      response.destroy(new Error("intentional loopback telemetry transport failure"));
+      request.socket.destroy();
+    });
+    auxiliaryServers.push(failingTransport);
+    const failingTransportOrigin = `http://127.0.0.1:${await listen(failingTransport)}`;
+    const priorEnvironment = {
+      DO_NOT_TRACK: process.env["DO_NOT_TRACK"],
+      CC_ROUTER_TELEMETRY: process.env["CC_ROUTER_TELEMETRY"],
+    };
+    const modes = [
+      { name: "enabled", telemetryEnabled: true, capture: telemetry.origin },
+      { name: "disabled", telemetryEnabled: false, capture: telemetry.origin },
+      { name: "failing", telemetryEnabled: true, capture: failingTransportOrigin },
+    ] as const;
+    const snapshots: Array<{
+      responses: Record<string, HttpObservation>;
+      forwarded: Array<{ flow: string; headers: Record<string, string | string[] | undefined>; body: Buffer }>;
+      concurrency: string[];
+      abortPrefix: Buffer;
+      abortClosed: boolean;
+      timeoutClosed: boolean;
+    }> = [];
+    const requestBody = (flow: string, stream: boolean): Buffer => Buffer.from(JSON.stringify({
+      model: "claude-sonnet-4-5",
+      messages: [{ role: "user", content: `transparent-${flow}` }],
+      max_tokens: 32,
+      stream,
+    }));
+    const requestHeaders = (flow: string): Record<string, string> => ({
+      "content-type": "application/json",
+      "x-test-flow": flow,
+      "x-claude-code-session-id": `session-${flow}`,
+      "x-forwarded-private": "forwarded-byte-for-byte",
+    });
+
+    for (const mode of modes) {
+      expect(process.env["DO_NOT_TRACK"]).toBe(priorEnvironment.DO_NOT_TRACK);
+      expect(process.env["CC_ROUTER_TELEMETRY"]).toBe(priorEnvironment.CC_ROUTER_TELEMETRY);
+      const flowBefore = targetFlows.length;
+      const closedBefore = closedTargetFlows.length;
+      const telemetryBefore = telemetry.requests.length;
+      const failingAttemptsBefore = failingTransportAttempts;
+      const probe = createServer();
+      const proxyPort = await listen(probe);
+      await close(probe);
+      const running = await startBuiltPackage({
+        telemetryEnabled: mode.telemetryEnabled,
+        proxyPort,
+        targetOrigin,
+        telemetryCaptureOrigin: mode.capture,
+        environment: { DO_NOT_TRACK: "0", CC_ROUTER_TELEMETRY: "1", LITELLM_URL: targetOrigin },
+        config: { proxyRequestTimeoutMs: 150 },
+        accounts: [{
+          id: "transparent-anthropic",
+          provider: "anthropic_subscription",
+          accessToken: "transparent-access-token",
+          refreshToken: "transparent-refresh-token",
+          expiresAt: Date.now() + 3_600_000,
+          scopes: ["user:inference"],
+          enabled: true,
+        }],
+        binary: installedBinary,
+        cwd: installedCwd,
+        launchBinaryDirectly: true,
+      });
+      children.push(running);
+      const base = `http://127.0.0.1:${proxyPort}/v1/messages`;
+      const responses: Record<string, HttpObservation> = {};
+      let abortPrefix = Buffer.alloc(0);
+      try {
+        for (const flow of ["nonstream", "sse"] as const) {
+          responses[flow] = await collectHttpRequest(
+            new URL(base),
+            requestBody(flow, flow === "sse"),
+            requestHeaders(flow),
+          );
+        }
+
+        const concurrentOne = startHttpRequest(
+          new URL(base), requestBody("concurrent-one", true), requestHeaders("concurrent-one"),
+        );
+        const concurrentTwo = startHttpRequest(
+          new URL(base), requestBody("concurrent-two", true), requestHeaders("concurrent-two"),
+        );
+        let oneCompleted = false;
+        let twoCompleted = false;
+        void concurrentOne.completed.then(() => { oneCompleted = true; });
+        void concurrentTwo.completed.then(() => { twoCompleted = true; });
+        await Promise.all([concurrentOne.firstChunk, concurrentTwo.firstChunk]);
+        expect(oneCompleted).toBe(false);
+        expect(twoCompleted).toBe(false);
+        releaseTargetFlow.get("concurrent-one")?.();
+        responses["concurrent-one"] = await concurrentOne.completed;
+        expect(twoCompleted).toBe(false);
+        releaseTargetFlow.get("concurrent-two")?.();
+        responses["concurrent-two"] = await concurrentTwo.completed;
+
+        const abort = startHttpRequest(new URL(base), requestBody("abort", true), requestHeaders("abort"));
+        void abort.completed.catch(() => undefined);
+        await abort.firstChunk;
+        abortPrefix = Buffer.concat(abort.chunks);
+        abort.request.destroy();
+        await waitUntil(
+          () => closedTargetFlows.slice(closedBefore).includes("abort"),
+          2_000,
+          () => `${mode.name} abort did not close upstream`,
+        );
+
+        try {
+          responses.timeout = await collectHttpRequest(
+            new URL(base), requestBody("timeout", false), requestHeaders("timeout"),
+          );
+        } catch (error) {
+          responses.timeout = {
+            status: 0,
+            headers: { "x-client-error": String((error as NodeJS.ErrnoException).code ?? "unknown") },
+            chunks: [],
+            body: Buffer.alloc(0),
+          };
+        }
+        await waitUntil(
+          () => closedTargetFlows.slice(closedBefore).includes("timeout"),
+          2_000,
+          () => `${mode.name} timeout did not close upstream`,
+        );
+        responses.failure = await collectHttpRequest(
+          new URL(base), requestBody("failure", false), requestHeaders("failure"),
+        );
+      } finally {
+        for (const release of releaseTargetFlow.values()) release();
+        releaseTargetFlow.clear();
+        await running.stop("SIGTERM");
+      }
+      await new Promise(resolveWait => setTimeout(resolveWait, 300));
+      if (mode.name === "enabled") expect(telemetry.requests.length).toBeGreaterThan(telemetryBefore);
+      if (mode.name === "disabled") expect(telemetry.requests).toHaveLength(telemetryBefore);
+      if (mode.name === "failing") expect(failingTransportAttempts).toBeGreaterThan(failingAttemptsBefore);
+      expect(process.env["DO_NOT_TRACK"]).toBe(priorEnvironment.DO_NOT_TRACK);
+      expect(process.env["CC_ROUTER_TELEMETRY"]).toBe(priorEnvironment.CC_ROUTER_TELEMETRY);
+      const forwarded = targetFlows.slice(flowBefore)
+        .filter(flow => !flow.flow.startsWith("abort"))
+        .sort((left, right) => left.flow.localeCompare(right.flow));
+      for (const flow of forwarded) {
+        expect(flow.headers["authorization"]).toBe("Bearer transparent-access-token");
+        expect(flow.headers["x-forwarded-private"]).toBe("forwarded-byte-for-byte");
+        expect(flow.body).toEqual(requestBody(flow.flow, flow.flow.startsWith("sse") || flow.flow.startsWith("concurrent-")));
+      }
+      snapshots.push({
+        responses,
+        forwarded,
+        concurrency: ["concurrent-one", "concurrent-two"],
+        abortPrefix,
+        abortClosed: closedTargetFlows.slice(closedBefore).includes("abort"),
+        timeoutClosed: closedTargetFlows.slice(closedBefore).includes("timeout"),
+      });
     }
 
-    expect(observations).toHaveLength(modes.length);
-    for (const observation of observations.slice(1)) {
-      expect(observation).toEqual(observations[0]);
+    expect(snapshots).toHaveLength(3);
+    for (const snapshot of snapshots) {
+      expect(snapshot.responses.nonstream!.status).toBe(201);
+      expect(snapshot.responses.nonstream!.body).toEqual(Buffer.from("{\"type\":\"message\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}\n"));
+      expect(snapshot.responses.failure!.status).toBe(429);
+      expect(snapshot.responses.failure!.headers["retry-after"]).toBe("60");
+      expect(snapshot.responses.failure!.body).toEqual(Buffer.from("{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}\n"));
+      for (const flow of ["sse", "concurrent-one", "concurrent-two"] as const) {
+        const text = snapshot.responses[flow]!.body.toString("utf8");
+        expect(snapshot.responses[flow]!.status).toBe(200);
+        expect(snapshot.responses[flow]!.headers["x-upstream-marker"]).toBe("transparent");
+        expect(text.indexOf("event: ping")).toBeLessThan(text.indexOf("event: message_stop"));
+        expect(text.match(/event: message_stop/g)).toHaveLength(1);
+      }
+      expect(snapshot.responses.timeout).toEqual({
+        status: 0,
+        headers: { "x-client-error": "ECONNRESET" },
+        chunks: [],
+        body: Buffer.alloc(0),
+      });
+      expect(snapshot.abortPrefix).toEqual(Buffer.from("event: ping\ndata: {\"flow\":\"abort\"}\n\n"));
+      expect(snapshot.abortClosed).toBe(true);
+      expect(snapshot.timeoutClosed).toBe(true);
     }
-  }, 45_000);
+    for (const snapshot of snapshots.slice(1)) expect(snapshot).toEqual(snapshots[0]);
+  }, 60_000);
 
   it("uses an environment LiteLLM target for both forwarding and outgoing span trust", async () => {
     const before = telemetry.requests.length;

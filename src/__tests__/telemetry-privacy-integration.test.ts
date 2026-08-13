@@ -8,8 +8,12 @@ import { pathToFileURL } from "node:url";
 import { SpanKind, SpanStatusCode, TraceFlags } from "@opentelemetry/api";
 import { SeverityNumber } from "@opentelemetry/api-logs";
 import { resourceFromAttributes } from "@opentelemetry/resources";
-import type { ReadableLogRecord } from "@opentelemetry/sdk-logs";
-import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import {
+  BatchLogRecordProcessor,
+  type ReadableLogRecord,
+  type SdkLogRecord,
+} from "@opentelemetry/sdk-logs";
+import { BatchSpanProcessor, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { afterEach, describe, expect, it } from "vitest";
 import type { TelemetrySnapshot } from "../config/telemetry.js";
 import { createPostHogOtlpExporters } from "../telemetry/otel-exporters.js";
@@ -19,8 +23,11 @@ import {
 } from "../telemetry/posthog-client.js";
 import { reconstructAnalyticsEvent, sanitizeException } from "../telemetry/privacy.js";
 import {
+  decodeOtlpProtobuf,
+  semanticStrings,
   startTransportCaptureServer,
   TELEMETRY_CANARY,
+  telemetryWireRepresentations,
   type CapturedTransportRequest,
   type TransportCaptureServer,
 } from "./telemetry-test-helpers.js";
@@ -140,6 +147,20 @@ function safeCandidateLog(timestamp: number): ReadableLogRecord {
   };
 }
 
+function sdkCandidateLog(timestamp: number): SdkLogRecord {
+  const readable = safeCandidateLog(timestamp);
+  const record: SdkLogRecord = {
+    ...readable,
+    setAttribute: () => record,
+    setAttributes: () => record,
+    setBody: () => record,
+    setEventName: () => record,
+    setSeverityNumber: () => record,
+    setSeverityText: () => record,
+  };
+  return record;
+}
+
 function exportSpan(
   exporter: ReturnType<typeof createPostHogOtlpExporters>["spanExporter"],
   span: ReadableSpan,
@@ -240,6 +261,15 @@ describe("end-to-end telemetry privacy boundaries", () => {
     }
   });
 
+  it("finds exact canaries inside escaped and nested JSON carriers semantically", () => {
+    const nested = JSON.stringify({
+      escaped: JSON.stringify({ privateBody: TELEMETRY_CANARY.rawProviderBody }),
+    });
+    expect(nested).not.toContain(TELEMETRY_CANARY.rawProviderBody);
+    expect(JSON.stringify(JSON.parse(nested))).not.toContain(TELEMETRY_CANARY.rawProviderBody);
+    expect(semanticStrings(JSON.parse(nested))).toContain(TELEMETRY_CANARY.rawProviderBody);
+  });
+
   it("allows in-flight OTLP requests to finish but starts no queued trace or log request after opt-out", async () => {
     const testHome = mkdtempSync(join(tmpdir(), "cc-router-otlp-opt-out-"));
     temporaryDirectories.push(testHome);
@@ -274,30 +304,80 @@ describe("end-to-end telemetry privacy boundaries", () => {
       requestTimeoutMillis: 1_000,
       exportTimeoutMillis: 1_000,
     });
+    const spanExportCalls: ReadableSpan[][] = [];
+    const logExportCalls: ReadableLogRecord[][] = [];
+    const spanResults: number[] = [];
+    const logResults: number[] = [];
+    const spanProcessor = new BatchSpanProcessor({
+      export: (spans, callback) => {
+        spanExportCalls.push([...spans]);
+        exporters.spanExporter.export(spans, result => {
+          spanResults.push(result.code);
+          callback(result);
+        });
+      },
+      forceFlush: () => exporters.spanExporter.forceFlush(),
+      shutdown: () => exporters.spanExporter.shutdown(),
+    }, {
+      maxQueueSize: 4,
+      maxExportBatchSize: 1,
+      scheduledDelayMillis: 1,
+      exportTimeoutMillis: 1_000,
+    });
+    const logProcessor = new BatchLogRecordProcessor({
+      exporter: {
+        export: (logs, callback) => {
+          logExportCalls.push([...logs]);
+          exporters.logExporter.export(logs, result => {
+            logResults.push(result.code);
+            callback(result);
+          });
+        },
+        forceFlush: () => exporters.logExporter.forceFlush(),
+        shutdown: () => exporters.logExporter.shutdown(),
+      },
+      maxQueueSize: 4,
+      maxExportBatchSize: 1,
+      scheduledDelayMillis: 1,
+      exportTimeoutMillis: 1_000,
+    });
 
-    const inFlight = [
-      exportSpan(exporters.spanExporter, safeCandidateSpan("0123456789abcdef")),
-      exportLog(exporters.logExporter, safeCandidateLog(1_800_000_000)),
-    ];
+    spanProcessor.onEnd(safeCandidateSpan("0123456789abcdef"));
+    logProcessor.onEmit(sdkCandidateLog(1_800_000_000));
     await firstRequests;
-    const queued = [
-      exportSpan(exporters.spanExporter, safeCandidateSpan("fedcba9876543210")),
-      exportLog(exporters.logExporter, safeCandidateLog(1_800_000_001)),
-    ];
+    spanProcessor.onEnd(safeCandidateSpan("fedcba9876543210"));
+    logProcessor.onEmit(sdkCandidateLog(1_800_000_001));
+    await new Promise(resolve => setTimeout(resolve, 25));
+    expect(spanExportCalls).toHaveLength(1);
+    expect(logExportCalls).toHaveLength(1);
+    expect(spanResults).toEqual([]);
+    expect(logResults).toEqual([]);
     const optOutOutput = persistTelemetryOff(testHome, telemetryPath);
     expect(persistedSnapshot(telemetryPath).enabled).toBe(false);
     expect(optOutOutput).toContain("New outbound telemetry stops immediately");
     for (const response of firstResponses.values()) response.end();
 
-    await Promise.all([...inFlight, ...queued]);
+    await Promise.all([spanProcessor.forceFlush(), logProcessor.forceFlush()]);
+    expect(spanExportCalls).toHaveLength(2);
+    expect(logExportCalls).toHaveLength(2);
+    expect(spanExportCalls.flat().map(span => span.spanContext().spanId)).toEqual([
+      "0123456789abcdef",
+      "fedcba9876543210",
+    ]);
+    expect(logExportCalls.flat().map(log => log.hrTime[0])).toEqual([
+      1_800_000_000,
+      1_800_000_001,
+    ]);
+    expect(spanResults).toEqual([0, 0]);
+    expect(logResults).toEqual([0, 0]);
     await new Promise(resolve => setTimeout(resolve, 50));
 
     expect(Object.fromEntries(requestCounts)).toEqual({
       "/i/v1/traces": 1,
       "/i/v1/logs": 1,
     });
-    await exporters.spanExporter.shutdown();
-    await exporters.logExporter.shutdown();
+    await spanProcessor.shutdown();
+    await logProcessor.shutdown();
   });
 
   it("allows one in-flight PostHog request to finish while opt-out silently discards queued events and exceptions", async () => {
@@ -428,18 +508,38 @@ describe("end-to-end telemetry privacy boundaries", () => {
 
       const traceRequests = otlpCapture.requests.filter(request => request.url === "/i/v1/traces");
       expect(traceRequests).toHaveLength(2);
-      expect(traceRequests[0]!.rawBody.toString("utf8")).toContain(INSTALL_ID);
-      expect(traceRequests[0]!.rawBody.toString("utf8")).not.toContain(OTHER_INSTALL_ID);
-      expect(traceRequests[1]!.rawBody.toString("utf8")).toContain(OTHER_INSTALL_ID);
-      expect(traceRequests[1]!.rawBody.toString("utf8")).not.toContain(INSTALL_ID);
+      const decodedTraces = traceRequests.map(request => decodeOtlpProtobuf(request.rawBody, "traces"));
+      const resourceInstallId = (decoded: ReturnType<typeof decodeOtlpProtobuf>): unknown => {
+        expect(decoded.resourceSpans).toHaveLength(1);
+        const resource = (decoded.resourceSpans![0] as {
+          resource: { attributes: Record<string, unknown> };
+        }).resource;
+        return resource.attributes["service.instance.id"];
+      };
+      const resourceInstallIds = decodedTraces.map(resourceInstallId);
+      expect(resourceInstallIds).toEqual([INSTALL_ID, OTHER_INSTALL_ID]);
+      const misplacedIdentity = structuredClone(decodedTraces[0]);
+      const misplacedResourceSpan = misplacedIdentity.resourceSpans![0] as {
+        resource: { attributes: Record<string, unknown> };
+        scopeSpans: Array<{ spans: Array<Record<string, unknown>> }>;
+      };
+      misplacedResourceSpan.resource.attributes["service.instance.id"] = OTHER_INSTALL_ID;
+      misplacedResourceSpan.scopeSpans[0]!.spans[0]!.name = INSTALL_ID;
+      expect(JSON.stringify(misplacedIdentity)).toContain(INSTALL_ID);
+      expect(resourceInstallId(misplacedIdentity)).toBe(OTHER_INSTALL_ID);
 
       const rawPostHog = Buffer.concat(postHogCapture.requests.map(request => request.rawBody)).toString("utf8");
       const rawOtlp = Buffer.concat(otlpCapture.requests.map(request => request.rawBody)).toString("utf8");
-      const parsedPostHog = JSON.stringify(postHogCapture.requests.map(request => request.json));
+      const decodedValues = [
+        ...semanticStrings(postHogCapture.requests.map(request => request.json)),
+        ...semanticStrings(decodedTraces),
+      ];
       for (const canary of Object.values(TELEMETRY_CANARY)) {
-        expect(rawPostHog).not.toContain(canary);
-        expect(rawOtlp).not.toContain(canary);
-        expect(parsedPostHog).not.toContain(canary);
+        for (const representation of telemetryWireRepresentations(canary)) {
+          expect(rawPostHog).not.toContain(representation);
+          expect(rawOtlp).not.toContain(representation);
+        }
+        expect(decodedValues.some(value => value.includes(canary))).toBe(false);
       }
     } finally {
       await firstClient.shutdownWithin(100);

@@ -5,20 +5,6 @@ import { forwardOpenAICodexResponse, toCodexBackendRequest } from "../providers/
 import { mountResponsesRoutes } from "../proxy/responses-server.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
 
-const TELEMETRY_MODES = ["enabled", "disabled"] as const;
-
-async function runWithTelemetryMode<T>(
-  mode: typeof TELEMETRY_MODES[number],
-  operation: () => Promise<T>,
-): Promise<T> {
-  if (mode === "disabled") process.env["DO_NOT_TRACK"] = "1";
-  try {
-    return await operation();
-  } finally {
-    delete process.env["DO_NOT_TRACK"];
-  }
-}
-
 describe("forwardOpenAICodexResponse", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -241,9 +227,7 @@ describe("mountResponsesRoutes", () => {
     }
   });
 
-  it.each(TELEMETRY_MODES)(
-    "streams upstream Responses SSE chunks without waiting for the full body with telemetry %s",
-    async telemetryMode => runWithTelemetryMode(telemetryMode, async () => {
+  it("streams upstream Responses SSE chunks without waiting for the full body", async () => {
     const app = express();
 
     mountResponsesRoutes(app, {
@@ -304,6 +288,5 @@ describe("mountResponsesRoutes", () => {
         server.close(err => err ? reject(err) : resolve());
       });
     }
-    }),
-  );
+  });
 });
