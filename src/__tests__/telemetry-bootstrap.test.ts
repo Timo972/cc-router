@@ -14,7 +14,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi, type MockInstance } from "vitest";
 import {
   decodeOtlpProtobuf,
   semanticStrings,
@@ -217,6 +217,7 @@ async function startBuiltPackage(options: {
   launchBinaryDirectly?: boolean;
   config?: Record<string, unknown>;
   readinessTimeoutMs?: number;
+  waitForStartup?: () => Promise<void>;
 }): Promise<RunningPackage> {
   const testHome = mkdtempSync(join(tmpdir(), "cc-router-bootstrap-"));
   let child: ChildProcess | undefined;
@@ -325,6 +326,7 @@ globalThis.fetch = async (input, init) => {
     child.stdout?.on("data", chunk => { output += chunk.toString(); });
     child.stderr?.on("data", chunk => { output += chunk.toString(); });
 
+    await options.waitForStartup?.();
     await waitUntil(async () => {
       if (startupError) throw startupError;
       if (child!.exitCode !== null) return false;
@@ -824,10 +826,21 @@ export async function resolve(specifier, context, nextResolve) {
         targetOrigin,
         telemetryCaptureOrigin: capture.origin,
         binary: join(import.meta.dirname, "fixtures", "unready-package.mjs"),
-        readinessTimeoutMs: 150,
+        readinessTimeoutMs: 500,
         environment: { CC_ROUTER_TEST_STARTUP_MARKER: markerPath },
+        waitForStartup: async () => {
+          await waitUntil(
+            () => existsSync(markerPath),
+            8_000,
+            () => "unready fixture did not bind and write its startup marker",
+          );
+          resources = JSON.parse(readFileSync(markerPath, "utf8")) as typeof resources;
+          expect(resources).toEqual(expect.objectContaining({ port: proxyPort }));
+          const health = await fetch(`http://127.0.0.1:${proxyPort}/cc-router/health`);
+          expect(health.status).toBe(503);
+          await health.arrayBuffer();
+        },
       })).rejects.toThrow("compiled package did not start");
-      resources = JSON.parse(readFileSync(markerPath, "utf8")) as typeof resources;
       expect(resources).toBeDefined();
       expect(existsSync(resources!.home), "failed startup leaked its temp home").toBe(false);
       expect(() => process.kill(resources!.pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
@@ -1488,34 +1501,118 @@ describe("proxy launch commands", () => {
 });
 
 describe("proxy telemetry runtime lifecycle", () => {
-  it("installs only an uncaughtExceptionMonitor while enabled and removes it during bounded shutdown", async () => {
-    const testHome = mkdtempSync(join(tmpdir(), "cc-router-runtime-"));
-    const telemetryPath = join(testHome, "telemetry.json");
-    const capture = await startTransportCaptureServer();
-    const originalEnv = {
-      nodeEnv: process.env["NODE_ENV"],
-      telemetryPath: process.env["TELEMETRY_PATH"],
-      traceUrl: process.env["CC_ROUTER_TEST_OTLP_TRACE_URL"],
-      logUrl: process.env["CC_ROUTER_TEST_OTLP_LOG_URL"],
-    };
-    writeFileSync(telemetryPath, JSON.stringify({
-      enabled: true,
-      installId: "22222222-2222-4222-8222-222222222222",
-      firstRunAt: "2026-08-01T00:00:00.000Z",
-    }));
-    process.env["NODE_ENV"] = "test";
-    process.env["TELEMETRY_PATH"] = telemetryPath;
-    process.env["CC_ROUTER_TEST_OTLP_TRACE_URL"] = capture.endpoint("/i/v1/traces");
-    process.env["CC_ROUTER_TEST_OTLP_LOG_URL"] = capture.endpoint("/i/v1/logs");
-    vi.resetModules();
+  const runtimeEnvironmentNames = [
+    "NODE_ENV",
+    "TELEMETRY_PATH",
+    "CC_ROUTER_TEST_OTLP_TRACE_URL",
+    "CC_ROUTER_TEST_OTLP_LOG_URL",
+  ] as const;
 
+  type RuntimeEnvironmentName = typeof runtimeEnvironmentNames[number];
+  type RuntimeEnvironment = Record<RuntimeEnvironmentName, string | undefined>;
+  type RuntimeModule = typeof import("../telemetry/runtime.js");
+
+  interface RuntimeLifecycleTestContext {
+    testHome: string;
+    telemetryPath: string;
+    capture: TransportCaptureServer;
+    fetchMock: MockInstance<typeof globalThis.fetch>;
+    runtime: RuntimeModule;
+  }
+
+  function snapshotRuntimeEnvironment(): RuntimeEnvironment {
+    return Object.fromEntries(runtimeEnvironmentNames.map(name => [name, process.env[name]])) as RuntimeEnvironment;
+  }
+
+  function restoreRuntimeEnvironment(environment: RuntimeEnvironment): void {
+    for (const name of runtimeEnvironmentNames) {
+      const value = environment[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+
+  async function withRuntimeLifecycleTestEnvironment<T>(
+    operation: (context: RuntimeLifecycleTestContext) => Promise<T>,
+    setupCheckpoint?: (owned: Pick<RuntimeLifecycleTestContext, "testHome" | "telemetryPath" | "capture">) => void,
+  ): Promise<T> {
+    const originalEnvironment = snapshotRuntimeEnvironment();
+    let testHome: string | undefined;
+    let capture: TransportCaptureServer | undefined;
+    let fetchMock: MockInstance<typeof globalThis.fetch> | undefined;
+    let runtime: RuntimeModule | undefined;
+    let operationFailed = false;
+    try {
+      testHome = mkdtempSync(join(tmpdir(), "cc-router-runtime-"));
+      const telemetryPath = join(testHome, "telemetry.json");
+      capture = await startTransportCaptureServer();
+      writeFileSync(telemetryPath, JSON.stringify({
+        enabled: true,
+        installId: "22222222-2222-4222-8222-222222222222",
+        firstRunAt: "2026-08-01T00:00:00.000Z",
+      }));
+      process.env["NODE_ENV"] = "test";
+      process.env["TELEMETRY_PATH"] = telemetryPath;
+      process.env["CC_ROUTER_TEST_OTLP_TRACE_URL"] = capture.endpoint("/i/v1/traces");
+      process.env["CC_ROUTER_TEST_OTLP_LOG_URL"] = capture.endpoint("/i/v1/logs");
+      vi.resetModules();
+      fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 200 }));
+      setupCheckpoint?.({ testHome, telemetryPath, capture });
+      runtime = await import("../telemetry/runtime.js");
+      return await operation({ testHome, telemetryPath, capture, fetchMock, runtime });
+    } catch (error) {
+      operationFailed = true;
+      throw error;
+    } finally {
+      const cleanupErrors: unknown[] = [];
+      if (runtime) {
+        try {
+          await runtime.shutdownProxyTelemetryWithin(100);
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      try {
+        fetchMock?.mockRestore();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      try {
+        restoreRuntimeEnvironment(originalEnvironment);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      if (capture) {
+        try {
+          await capture.close();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (testHome) {
+        try {
+          rmSync(testHome, { recursive: true, force: true });
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      try {
+        vi.resetModules();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      if (!operationFailed && cleanupErrors.length > 0) {
+        throw new AggregateError(cleanupErrors, "failed to clean runtime lifecycle test environment");
+      }
+    }
+  }
+
+  it("installs only an uncaughtExceptionMonitor while enabled and removes it during bounded shutdown", async () => {
     const monitorBefore = process.listenerCount("uncaughtExceptionMonitor");
     const monitorsBefore = new Set(process.listeners("uncaughtExceptionMonitor"));
     const uncaughtBefore = process.listenerCount("uncaughtException");
     const rejectionBefore = process.listenerCount("unhandledRejection");
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 200 }));
-    try {
-      const runtime = await import("../telemetry/runtime.js");
+    await withRuntimeLifecycleTestEnvironment(async ({ telemetryPath, fetchMock, runtime }) => {
       expect(runtime.startProxyTelemetry("foreground")).toBe(true);
       expect(process.listenerCount("uncaughtExceptionMonitor")).toBe(monitorBefore + 1);
       expect(process.listenerCount("uncaughtException")).toBe(uncaughtBefore);
@@ -1552,18 +1649,54 @@ describe("proxy telemetry runtime lifecycle", () => {
       }));
       expect(runtime.startProxyTelemetry("foreground")).toBe(false);
       expect(process.listenerCount("uncaughtExceptionMonitor")).toBe(monitorBefore);
+    });
+  });
+
+  it("restores every runtime harness owner when setup fails after the fetch spy", async () => {
+    const environmentBeforeTest = snapshotRuntimeEnvironment();
+    const fetchBeforeTest = globalThis.fetch;
+    const sentinelEnvironment: RuntimeEnvironment = {
+      NODE_ENV: "runtime-setup-sentinel",
+      TELEMETRY_PATH: "/runtime/setup/sentinel/telemetry.json",
+      CC_ROUTER_TEST_OTLP_TRACE_URL: "http://127.0.0.1:4318/sentinel-traces",
+      CC_ROUTER_TEST_OTLP_LOG_URL: "http://127.0.0.1:4318/sentinel-logs",
+    };
+    const sentinelFetch: typeof globalThis.fetch = async () => new Response("sentinel", { status: 299 });
+    let failedHome: string | undefined;
+    let failedCapture: TransportCaptureServer | undefined;
+    let operationReached = false;
+    try {
+      restoreRuntimeEnvironment(sentinelEnvironment);
+      globalThis.fetch = sentinelFetch;
+      await expect(withRuntimeLifecycleTestEnvironment(
+        async () => {
+          operationReached = true;
+        },
+        owned => {
+          failedHome = owned.testHome;
+          failedCapture = owned.capture;
+          throw new Error("controlled runtime setup failure");
+        },
+      )).rejects.toThrow("controlled runtime setup failure");
+
+      expect(operationReached).toBe(false);
+      expect(failedHome).toBeTypeOf("string");
+      expect(existsSync(failedHome!), "failed setup leaked its temp home").toBe(false);
+      expect(snapshotRuntimeEnvironment()).toEqual(sentinelEnvironment);
+      expect(globalThis.fetch).toBe(sentinelFetch);
+      await expect(new Promise<void>((resolveProbe, rejectProbe) => {
+        const probe = request(new URL("/i/v1/traces", failedCapture!.origin), { method: "POST" }, response => {
+          response.resume();
+          resolveProbe();
+        });
+        probe.once("error", rejectProbe);
+        probe.end();
+      })).rejects.toThrow();
     } finally {
-      if (originalEnv.nodeEnv === undefined) delete process.env["NODE_ENV"];
-      else process.env["NODE_ENV"] = originalEnv.nodeEnv;
-      if (originalEnv.telemetryPath === undefined) delete process.env["TELEMETRY_PATH"];
-      else process.env["TELEMETRY_PATH"] = originalEnv.telemetryPath;
-      if (originalEnv.traceUrl === undefined) delete process.env["CC_ROUTER_TEST_OTLP_TRACE_URL"];
-      else process.env["CC_ROUTER_TEST_OTLP_TRACE_URL"] = originalEnv.traceUrl;
-      if (originalEnv.logUrl === undefined) delete process.env["CC_ROUTER_TEST_OTLP_LOG_URL"];
-      else process.env["CC_ROUTER_TEST_OTLP_LOG_URL"] = originalEnv.logUrl;
-      fetchMock.mockRestore();
-      await capture.close();
-      rmSync(testHome, { recursive: true, force: true });
+      restoreRuntimeEnvironment(environmentBeforeTest);
+      globalThis.fetch = fetchBeforeTest;
+      if (failedCapture) await failedCapture.close();
+      if (failedHome) rmSync(failedHome, { recursive: true, force: true });
       vi.resetModules();
     }
   });
