@@ -22,6 +22,26 @@ export interface LogEntry {
 
 export type LocalRoutingErrorReason = "rate_limited" | "unavailable";
 
+/**
+ * Longest model identifier retained in an activity entry. Model names arrive
+ * in request bodies the JSON parsers accept up to megabytes, and every entry
+ * stays resident until MAX_LOG_ENTRIES newer ones push it out — and is
+ * re-serialized into each health response meanwhile. Retaining one verbatim
+ * would let a handful of requests pin hundreds of megabytes. Real model names
+ * are far shorter than this; the same 64 that `normalizeModelSlug` and
+ * `normalizeModelFamily` already clamp their identifiers to.
+ */
+const MAX_LOG_MODEL_LENGTH = 64;
+
+/**
+ * Clamp a caller-supplied model identifier to a length that is safe to retain.
+ * Truncation only — an empty model stays empty so routing lookups behave
+ * exactly as they did on the untruncated value.
+ */
+export function boundModelId(model: string): string {
+  return model.length > MAX_LOG_MODEL_LENGTH ? model.slice(0, MAX_LOG_MODEL_LENGTH) : model;
+}
+
 /** Build a bounded diagnostic for a request rejected before account selection. */
 export function createLocalRoutingErrorLog(
   reason: LocalRoutingErrorReason,
@@ -31,7 +51,7 @@ export function createLocalRoutingErrorLog(
   return {
     ts: now,
     accountId: "proxy",
-    model: modelFamily ?? "-",
+    model: modelFamily ? boundModelId(modelFamily) : "-",
     type: "error",
     details: `no-eligible:${reason.replace("_", "-")}`,
     statusCode: reason === "rate_limited" ? 429 : 503,

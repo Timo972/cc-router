@@ -114,6 +114,27 @@ describe("OpenAITokenPool cooldowns", () => {
     expect(view.bucketCooldowns).toEqual([{ limitId: "codex_bengalfox", untilMs: NOW_MS + 60_000 }]);
   });
 
+  it("enforces the active-limit bucket cooldown when two buckets tie on last-seen", () => {
+    const a = makeAccount("a");
+    // Both buckets name the model and arrive in the same response, so they
+    // share a `lastSeenAt`.
+    applyHeaders(a, {
+      "x-codex-bengalfox-primary-used-percent": "50",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+      "x-codex-newfox-primary-used-percent": "50",
+      "x-codex-newfox-limit-name": "gpt-5.6-sol",
+    });
+    const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
+
+    // The 429 named codex_newfox active, so that is the bucket holding the
+    // cooldown — resolving the model to its tied sibling would lose it.
+    learnModelBucket(a, "gpt-5.6-sol", "codex_newfox");
+    pool.setBucketCooldownForAccount(a, "codex_newfox", 60_000);
+
+    expect(() => pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-sol" }))
+      .toThrow(NoEligibleAccountError);
+  });
+
   it("makes room for a new bucket cooldown by dropping expired entries, not live ones", () => {
     let now = NOW_MS;
     const a = makeAccount("a");

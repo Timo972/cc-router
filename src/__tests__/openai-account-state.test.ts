@@ -112,6 +112,28 @@ describe("bucketForModel", () => {
     expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("codex_newfox");
   });
 
+  it("keeps the active-limit mapping when two live buckets tie on last-seen", () => {
+    const account = createOpenAIAccount(record());
+    // One response stamps every bucket it carries with the same `lastSeenAt`,
+    // so recency cannot separate two buckets that name the same model.
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "10",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+      "x-codex-newfox-primary-used-percent": "100",
+      "x-codex-newfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+
+    // A 429's `x-codex-active-limit` is upstream naming the bucket that
+    // actually limited the request — the only authoritative mapping there is.
+    learnModelBucket(account, "gpt-5.6-sol", "codex_newfox");
+
+    // Resolution must keep landing there, not drift back to whichever bucket
+    // happened to be inserted first.
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_newfox");
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_newfox");
+    expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("codex_newfox");
+  });
+
   it("falls back to the cached mapping when no live bucket names the model", () => {
     const account = createOpenAIAccount(record());
     // The header-only 429 path: a mapping exists with no bucket snapshot, and

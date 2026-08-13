@@ -189,11 +189,26 @@ export function bucketIdForModel(
   // would keep consulting a superseded (or already-reaped) bucket, leaving an
   // exhausted replacement eligible until a 429 happened to relearn it. When
   // several buckets name the model, the most recently seen one is current.
+  //
+  // Recency cannot break every tie: one response stamps every bucket it
+  // carries with the same `lastSeenAt`, so two buckets naming the same model
+  // arrive indistinguishable. Falling back to Map insertion order there would
+  // silently outrank the cached mapping — and the cache is where a 429's
+  // `x-codex-active-limit` records which bucket upstream itself said was
+  // limiting. Prefer it on a tie, or a bucket cooldown keyed on the active
+  // limit stops being found and the rate-limited account goes back in rotation.
+  const cached = account.modelBuckets.get(model);
   let live: CodexLimitBucket | undefined;
   for (const bucket of account.rateLimits.buckets.values()) {
     if (bucket.limitId === DEFAULT_CODEX_LIMIT_ID) continue;
     if (bucket.limitName?.trim().toLowerCase() !== model) continue;
-    if (live === undefined || (bucket.lastSeenAt ?? 0) > (live.lastSeenAt ?? 0)) live = bucket;
+    if (live === undefined) {
+      live = bucket;
+      continue;
+    }
+    const seenAt = bucket.lastSeenAt ?? 0;
+    const bestSeenAt = live.lastSeenAt ?? 0;
+    if (seenAt > bestSeenAt || (seenAt === bestSeenAt && bucket.limitId === cached)) live = bucket;
   }
   if (live !== undefined) {
     // Re-learning also refreshes the mapping's LRU recency, so a model that

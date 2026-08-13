@@ -56,7 +56,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unrelated file.
 - OpenAI token refresh survives a malformed token response. A payload missing
   `expires_in` produced a `NaN` expiry that read as "never needs refreshing",
-  so the account kept presenting a stale token indefinitely; a failure to
+  so the account kept presenting a stale token indefinitely — as did a lifetime
+  large enough to overflow into an infinite expiry, while a zero or negative
+  one reported success on a token that was already due for another refresh.
+  Each is now treated as the failed refresh it is; a failure to
   persist rotated credentials no longer fails the request that triggered the
   refresh, and the write is now retried on subsequent requests (and the
   background refresh loop) until it succeeds, so a rotated refresh token

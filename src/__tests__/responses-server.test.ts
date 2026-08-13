@@ -196,6 +196,43 @@ describe("mountResponsesRoutes", () => {
     });
   });
 
+  it("bounds an oversized client model name in every retained activity entry", async () => {
+    // A 10mb body limit means the model string is a client-controlled lever on
+    // how much the 100-entry activity buffer retains, and on how much the
+    // health response re-serializes each time it is read.
+    const oversized = `openai/${"g".repeat(50_000)}`;
+    let forwardedModel: string | undefined;
+    const forward: ForwardOpenAI = async opts => {
+      forwardedModel = opts.body.model;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      // A pre-routing rejection and a fully routed request are separate
+      // activity paths; both retain the model.
+      const warned = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: oversized, input: [], store: true }),
+      });
+      expect(warned.status).toBe(400);
+
+      const routed = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: oversized, input: [] }),
+      });
+      expect(routed.status).toBe(200);
+    });
+
+    expect(activity).toHaveLength(2);
+    for (const entry of activity) expect(entry.model.length).toBeLessThanOrEqual(64);
+    // Bounding is for what we retain — the request forwarded upstream still
+    // carries exactly the model the client asked for.
+    expect(forwardedModel).toBe(oversized.slice("openai/".length));
+  });
+
   it("rejects a non-openai_subscription model with 501", async () => {
     const forward = vi.fn();
     const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);

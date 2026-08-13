@@ -189,11 +189,20 @@ async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
   // "never needs refreshing" in `needsOpenAIRefresh` and permanently strands
   // the account on a broken token.
   if (typeof data?.access_token !== "string" || data.access_token.length === 0) return false;
+  // The lifetime has to be positive and has to still name a finite instant
+  // once converted. A zero or negative `expires_in` would report success on a
+  // token that is already due for another refresh, so every request re-enters
+  // the refresh path; a value big enough to overflow the multiplication would
+  // set `expiresAt` to Infinity, which `needsOpenAIRefresh` can never reach —
+  // the same permanent strand as NaN, from the opposite direction.
   if (typeof data.expires_in !== "number" || !Number.isFinite(data.expires_in)) return false;
+  if (data.expires_in <= 0) return false;
+  const expiresAt = Date.now() + data.expires_in * 1000;
+  if (!Number.isFinite(expiresAt)) return false;
 
   account.accessToken = data.access_token;
   account.refreshToken = data.refresh_token ?? account.refreshToken;
-  account.expiresAt = Date.now() + data.expires_in * 1000;
+  account.expiresAt = expiresAt;
 
   // A successful refresh recovers an account the pool previously excluded for
   // being unhealthy (e.g. after a prior failed refresh). Without this, the pool's

@@ -9,7 +9,7 @@ import {
   usageFromResponseBody,
 } from "../protocol/openai-responses-collect.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
-import { stats, applyCodexUsage } from "./stats.js";
+import { stats, applyCodexUsage, boundModelId } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { logWarn } from "./logger.js";
 import type { SessionRouter } from "./session-router.js";
@@ -103,7 +103,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       recordActivity({
         ts: Date.now(),
         accountId: "-",
-        model: req.body.model,
+        model: boundModelId(req.body.model),
         type: "warn",
         statusCode: 400,
         path: "/v1/responses",
@@ -123,7 +123,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       recordActivity({
         ts: Date.now(),
         accountId: "-",
-        model: req.body.model,
+        model: boundModelId(req.body.model),
         type: "warn",
         path: "/v1/responses",
         details: "max_output_tokens ignored — unsupported by the Codex backend",

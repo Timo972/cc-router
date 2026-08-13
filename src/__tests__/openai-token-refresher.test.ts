@@ -53,6 +53,40 @@ describe("OpenAI subscription token refresher", () => {
     );
   });
 
+  it("fails the refresh when a 200 carries an unusable lifetime", async () => {
+    let lifetime = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => ({
+      ok: true,
+      json: async () => ({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_in: lifetime,
+        token_type: "Bearer",
+      }),
+    } as Response));
+
+    // Zero and negative lifetimes leave the token due for another refresh the
+    // moment it is written; MAX_VALUE overflows to an Infinity expiry that
+    // `needsOpenAIRefresh` can never reach, stranding the account on a token
+    // that does expire.
+    for (lifetime of [0, -60, Number.MAX_VALUE]) {
+      const account = {
+        id: "openai-victor",
+        provider: "openai_subscription" as const,
+        accessToken: "old-access",
+        refreshToken: "old-refresh",
+        expiresAt: Date.now() + 60_000,
+        enabled: true,
+      };
+      const expiresAt = account.expiresAt;
+
+      expect(await refreshOpenAISubscriptionToken(account)).toBe(false);
+      expect(account.accessToken).toBe("old-access");
+      expect(account.expiresAt).toBe(expiresAt);
+      expect(needsOpenAIRefresh(account)).toBe(true);
+    }
+  });
+
   it("refreshes and persists an expiring account before request forwarding", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,

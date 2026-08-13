@@ -6,7 +6,7 @@ import { headersToRecord, parseCodexRateLimits } from "../providers/openai/usage
 import { applyCodexFailureRouting } from "../providers/openai/failure-routing.js";
 import { needsOpenAIRefresh } from "../providers/openai/token-refresher.js";
 import type { OpenAITokenPool } from "../providers/openai/token-pool.js";
-import { stats, createLocalRoutingErrorLog } from "./stats.js";
+import { stats, boundModelId, createLocalRoutingErrorLog } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { logError } from "./logger.js";
 import { EmptyPoolError, NoEligibleAccountError } from "./account-pool.js";
@@ -150,10 +150,16 @@ export interface OpenAIIngressOptions {
  */
 export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void> {
   const {
-    res, sessionKey, requestedModel, path, openAIRouter, openAIPool,
+    res, sessionKey, path, openAIRouter, openAIPool,
     prepareOpenAIAccount, forwardOpenAI, forwardBody, recordActivity, now,
     envelope, relay, onUpstreamAuthFailure,
   } = opts;
+  // The model comes from a client-controlled body and is retained in the
+  // activity ring buffer below. Bound it once, here, so every activity entry,
+  // routing context and bucket lookup on this path carries an identifier that
+  // cannot grow with the request. The body forwarded upstream is untouched —
+  // it still carries whatever model the caller asked for.
+  const requestedModel = boundModelId(opts.requestedModel);
 
   let selected: { route: RoutedAccountLease<OpenAIAccount>; release: () => void; details: string };
   try {
