@@ -5,7 +5,7 @@ import { getTelemetrySnapshot, loadTelemetryState, writeTelemetryState } from ".
 export function registerTelemetry(program: Command): void {
   program
     .command("telemetry [action]")
-    .description("Manage anonymous usage analytics: on, off, status (default: status)")
+    .description("Manage privacy-safe telemetry: on, off, status (default: status; fresh installs: on)")
     .action(async (action?: string) => {
       const resolved = action ?? "status";
 
@@ -57,9 +57,12 @@ function showStatus(): void {
   console.log(`  Install ID: ${chalk.dim(state.installId)}`);
   console.log(`  Since:      ${chalk.dim(state.firstRunAt)}`);
   console.log();
-  console.log(chalk.dim("  What we send:  version, OS, locale, lifecycle events (start, heartbeat)"));
-  console.log(chalk.dim("  What we DON'T: IPs, tokens, prompts, request content, account names"));
+  console.log(chalk.dim("  What we send:  sampled traces, safe diagnostics, lifecycle events, sanitized exceptions"));
+  console.log(chalk.dim("  What we DON'T: tokens, prompts/content, account/session IDs, raw errors, URLs, headers"));
+  console.log(chalk.dim("  Network note:   PostHog EU sees the HTTPS source IP; it is not added to the payload"));
+  console.log(chalk.dim("  Identity:       random install pseudonym; no Person profile or GeoIP enrichment"));
   console.log(chalk.dim("  Source code:   src/telemetry/"));
+  console.log(chalk.dim("  Inventory:     docs/telemetry.md"));
   console.log(chalk.dim("  Default:       on for new installs"));
   console.log();
   console.log(chalk.dim("  Disable:  cc-router telemetry off"));

@@ -152,6 +152,34 @@ If the Keychain entry is locked, the `security` command will prompt for your mac
 
 ---
 
+## Reporting an unknown telemetry-diagnosed failure
+
+Unexpected setup or runtime failures may print a random diagnostic ID in the
+detailed local log. The same ID accompanies the sanitized remote exception; it
+is separate from the stable installation pseudonym and is not reused for an
+unrelated failure.
+
+When opening an issue, quote the diagnostic ID and attach only the relevant
+local log lines after reviewing them for tokens, account details, paths, or
+other private data. Do not post `accounts.json`, OAuth responses, credentials,
+prompts, or full unreviewed logs. A maintainer can use the ID to locate the safe
+remote record while your reviewed local excerpt supplies details that telemetry
+deliberately omits.
+
+Check effective telemetry state with:
+
+```bash
+cc-router telemetry status
+```
+
+Telemetry is on by default for fresh installations. `cc-router telemetry off`,
+`DO_NOT_TRACK=1`, or `CC_ROUTER_TELEMETRY=0` disables it. Turning it off stops
+new capture immediately; enabling a daemon that started disabled requires a
+daemon restart. See [telemetry.md](telemetry.md) for the complete inventory and
+privacy contract.
+
+---
+
 ## Docker: cc-router container exits immediately
 
 Check logs:

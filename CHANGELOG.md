@@ -10,6 +10,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Privacy-safe OpenTelemetry and PostHog EU telemetry: 10% sampled proxy
+  waterfalls, unsampled closed-schema setup/runtime diagnostics, lifecycle
+  analytics, and sanitized Error Tracking with diagnostic IDs. Fresh installs
+  default on; persisted and environment opt-outs gate every signal. See
+  [docs/telemetry.md](docs/telemetry.md) for the exhaustive inventory.
 - **Model-aware Anthropic allowance routing.** Requested Messages models now
   participate in account eligibility and headroom ranking through dynamic
   model-scoped weekly limits. Account-based session affinity is retained while
@@ -20,6 +25,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Aptabase telemetry has been replaced by a reconstructive, closed-schema
+  PostHog EU boundary with no Person profiles, disabled GeoIP enrichment, and
+  immediate late opt-out checks. Existing persisted opt-outs remain disabled.
 - Anthropic cooldowns, upstream quota exhaustion, disabled or unhealthy state,
   and invalid authentication are hard routing exclusions. The only fallback is
   an explicit bypass of configured per-account percentage caps when every

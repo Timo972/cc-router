@@ -570,7 +570,8 @@ When the proxy is running, `models set` updates the live router and persists the
 - The file is excluded by `.gitignore`
 - Writes are atomic (write to `.tmp`, then rename) — no corruption on crash
 - Keychain reads use `execFile` with a fixed argument array — no shell injection
-- Anonymous opt-out telemetry via [Aptabase](https://aptabase.com) (see [Telemetry](#telemetry) below)
+- Privacy-bounded telemetry through PostHog EU, enabled by default and fully
+  disableable (see [Telemetry](#telemetry) below)
 
 See [docs/security.md](docs/security.md) for details.
 
@@ -578,21 +579,28 @@ See [docs/security.md](docs/security.md) for details.
 
 ## Telemetry
 
-CC-Router sends a handful of anonymous lifecycle events to [Aptabase](https://aptabase.com) (privacy-first, open source, EU-hosted). The goal is simple: know how many people use the project, which versions are live, and roughly how many instances are running — so we can prioritize fixes and features.
+CC-Router sends privacy-bounded traces, structured diagnostics, lifecycle
+events, and sanitized exceptions to PostHog's EU ingestion service. Telemetry
+is **on by default for fresh installations**. An existing persisted opt-out
+stays off after upgrade.
 
-**What we send** — the entire payload lives in [`src/utils/telemetry.ts`](src/utils/telemetry.ts), audit it yourself:
+Normal proxy traces are sampled at 10%; safe setup diagnostics, warnings,
+errors, lifecycle analytics, and sanitized exceptions are not sampled. A random
+install UUID stored in `~/.cc-router/telemetry.json` is used as the stable
+PostHog `distinctId` and OpenTelemetry `service.instance.id`. It is not derived
+from a user, account, hostname, IP address, or machine identifier. CC-Router
+does not create PostHog Person profiles and disables GeoIP enrichment.
 
-| Event                | When                                            | Custom props                             |
-| -------------------- | ------------------------------------------------ | ---------------------------------------- |
-| `app_started`        | First proxy start after install                 | `first_run: true`                        |
-| `setup_completed`    | Setup wizard finishes successfully               | `account_count`                          |
-| `proxy_started`      | Each `cc-router start`                           | `account_count`, `mode`                  |
-| `proxy_heartbeat`    | Every hour while the proxy is running              | `uptime_minutes`, `account_count`        |
-| `telemetry_disabled` | When you run `cc-router telemetry off`           | —                                        |
+PostHog necessarily sees the connection's source IP while receiving HTTPS
+requests. CC-Router does not put that IP in the telemetry payload. Prompts,
+responses, request or response bodies, credentials, account/session/user IDs,
+raw errors, URLs, headers, hostnames, and absolute paths are forbidden from the
+payload. Existing console output and detailed local logs are never forwarded.
 
-Plus anonymous system props with every event: `appVersion`, `osName` (macOS/Linux/Windows), `osVersion`, `locale`, `engineVersion` (Node), and an anonymous `installId` (random UUID generated on first run, stored in `~/.cc-router/telemetry.json`).
-
-**What we never send**: IPs, OAuth tokens, account names, request content, prompts, responses, URLs, hostnames, usernames, file paths — nothing that could identify you or your usage patterns.
+See [docs/telemetry.md](docs/telemetry.md) for the complete closed inventory,
+privacy boundary, EU endpoints, sampling, bounded counters, and diagnostic-ID
+reporting workflow. The contracts are implemented in
+[`src/telemetry/`](src/telemetry/).
 
 **Disable it** — three ways, any one works:
 
@@ -608,6 +616,12 @@ export CC_ROUTER_TELEMETRY=0
 ```
 
 Check status anytime: `cc-router telemetry status`.
+
+Turning telemetry off stops new capture immediately and queued records are
+discarded; an HTTPS request already in flight cannot be recalled. Turning it
+back on takes effect for future short-lived commands, but a daemon that started
+while telemetry was disabled must be restarted before its runtime telemetry
+stack is initialized.
 
 ---
 
