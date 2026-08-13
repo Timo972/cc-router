@@ -338,7 +338,11 @@ describe("mountMessagesCrossProviderRoute", () => {
         role: "assistant",
         model: "gpt-5.4-mini",
         content: [{ type: "text", text: "Par" }],
-        stop_reason: "end_turn",
+        // The turn was cut off by the output-token ceiling, so it must not be
+        // reported as a deliberate end_turn — and this reconstructed-response
+        // path, not the JSON branch, is what a non-streaming client gets since
+        // Codex always streams.
+        stop_reason: "max_tokens",
         stop_sequence: null,
         usage: { input_tokens: 4, output_tokens: 2 },
       });

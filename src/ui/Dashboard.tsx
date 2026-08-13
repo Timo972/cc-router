@@ -212,12 +212,20 @@ export function getCodexCapacityRows(
 
     for (const window of windows) {
       const exhausted = window.utilization >= 1;
+      // While cooling, the countdown that matters is the cooldown's own expiry
+      // — it can come from Retry-After and outlast (or replace) the window
+      // reset, and a row labeled "bucket cooldown" showing the window's reset
+      // instant, or no time at all when that reset is unknown, tells the
+      // operator the wrong thing about when routing resumes.
+      const resetAt = cooling
+        ? Math.floor(bucket.cooldownUntilMs / 1000)
+        : window.resetAt;
       rows.push({
         label: `${bucket.label} ${window.label}`,
         state: cooling ? "bucket cooldown" : exhausted ? "exhausted" : "available",
         color: cooling ? "yellow" : exhausted ? "red" : window.utilization >= 0.7 ? "yellow" : "green",
         utilization: window.utilization,
-        ...(window.resetAt > 0 ? { resetAt: window.resetAt } : {}),
+        ...(resetAt > 0 ? { resetAt } : {}),
       });
     }
     if (windows.length === 0 && cooling) {

@@ -197,6 +197,8 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
   let failure: string | undefined;
   let completed = false;
   let usage: OpenAIResponseCompleted["usage"] = {};
+  let status: string | undefined;
+  let incompleteDetails: { reason?: string } | undefined;
 
   const applyEvent = (event: unknown) => {
     if (typeof event !== "object" || event === null) return;
@@ -207,6 +209,8 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
       response?: {
         id?: string;
         model?: string;
+        status?: string;
+        incomplete_details?: { reason?: string };
         error?: { message?: string };
         usage?: OpenAIResponseCompleted["usage"];
       };
@@ -237,6 +241,11 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
       id = openAIEvent.response?.id ?? id;
       model = openAIEvent.response?.model ?? model;
       usage = openAIEvent.response?.usage ?? usage;
+      // How the turn ended has to survive into the reconstructed response
+      // below: it is what tells the translator to report `max_tokens` rather
+      // than an `end_turn` that would make a truncated answer look deliberate.
+      status = openAIEvent.response?.status ?? status;
+      incompleteDetails = openAIEvent.response?.incomplete_details ?? incompleteDetails;
       completed = true;
     }
   };
@@ -265,6 +274,8 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
         content: [{ type: "output_text", text }],
       }] : [],
       usage,
+      ...(status ? { status } : {}),
+      ...(incompleteDetails ? { incomplete_details: incompleteDetails } : {}),
     }),
     usage: usageFromResponseBody({ usage }),
     // Tolerant parsing skips a malformed frame rather than aborting the read,

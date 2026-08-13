@@ -32,6 +32,38 @@ describe("getCodexCapacityRows", () => {
     expect(rows[1]).toMatchObject({ label: "gpt-5.6-sol weekly", state: "exhausted", color: "red" });
   });
 
+  it("counts down to the cooldown expiry, not the window reset, while cooling", () => {
+    const windowReset = Math.floor(NOW / 1000) + 600;
+    const rows = getCodexCapacityRows(codexView({
+      buckets: [{
+        limitId: "codex_bengalfox",
+        label: "gpt-5.6-sol",
+        // A Retry-After-derived cooldown outlasting the window reset: showing
+        // the window reset would tell the operator routing resumes in 10m
+        // when it actually resumes in an hour.
+        cooldownUntilMs: NOW + 60 * 60_000,
+        primary: { utilization: 1, resetAt: windowReset, windowMinutes: 300 },
+      }],
+    }), 0, NOW);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ state: "bucket cooldown" });
+    expect(rows[0]?.resetAt).toBe(Math.floor((NOW + 60 * 60_000) / 1000));
+  });
+
+  it("shows a cooling bucket's expiry even when the window reset is unknown", () => {
+    const rows = getCodexCapacityRows(codexView({
+      buckets: [{
+        limitId: "codex_bengalfox",
+        label: "gpt-5.6-sol",
+        cooldownUntilMs: NOW + 90_000,
+        primary: { utilization: 1, resetAt: 0, windowMinutes: 0 },
+      }],
+    }), 0, NOW);
+
+    expect(rows[0]?.resetAt).toBe(Math.floor((NOW + 90_000) / 1000));
+  });
+
   it("marks cooling buckets and appends the global cooldown row", () => {
     const rows = getCodexCapacityRows(codexView({
       buckets: [{ limitId: "codex_x", label: "gpt-5.6-terra", cooldownUntilMs: NOW + 30_000 }],
