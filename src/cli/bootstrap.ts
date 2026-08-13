@@ -20,6 +20,18 @@ if (proxyTelemetryPrepared) {
   }
 }
 
+let cliTelemetryPrepared = false;
+if (!proxyTelemetryPrepared) {
+  try {
+    const { shouldStartCliTelemetry, startCliTelemetry } = await import("../telemetry/cli-runtime.js");
+    if (shouldStartCliTelemetry(process.argv) && getTelemetrySnapshot().enabled) {
+      cliTelemetryPrepared = startCliTelemetry("foreground");
+    }
+  } catch {
+    // Short-lived command telemetry is strictly best effort.
+  }
+}
+
 try {
   const { runCli } = await import("./index.js");
   await runCli();
@@ -31,6 +43,14 @@ try {
       await flushProxyTelemetryWithin(250);
     } catch {
       // A flush failure must not change the command's exit status.
+    }
+  }
+  if (cliTelemetryPrepared) {
+    try {
+      const { shutdownCliTelemetryWithin } = await import("../telemetry/cli-runtime.js");
+      await shutdownCliTelemetryWithin(500);
+    } catch {
+      // A shutdown failure must not change the command's exit status.
     }
   }
   process.exitCode = commandExitCode;

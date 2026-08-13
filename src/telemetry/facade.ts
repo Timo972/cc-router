@@ -47,6 +47,7 @@ import {
   sanitizeException,
 } from "./privacy.js";
 import { flushProxyTelemetryWithin, shutdownProxyTelemetryWithin } from "./runtime.js";
+import { flushCliTelemetryWithin, shutdownCliTelemetryWithin } from "./cli-runtime.js";
 
 const HEARTBEAT_INTERVAL_MS = 60 * 60 * 1_000;
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -363,8 +364,18 @@ function defaultDependencies(): TelemetryFacadeDependencies {
     emitLog: defaultEmitLog,
     annotateSpan: defaultAnnotateSpan,
     sanitizeException,
-    flushRuntime: flushProxyTelemetryWithin,
-    shutdownRuntime: shutdownProxyTelemetryWithin,
+    flushRuntime: async deadlineMs => {
+      await Promise.all([
+        flushProxyTelemetryWithin(deadlineMs),
+        flushCliTelemetryWithin(deadlineMs),
+      ]);
+    },
+    shutdownRuntime: async deadlineMs => {
+      await Promise.all([
+        shutdownProxyTelemetryWithin(deadlineMs),
+        shutdownCliTelemetryWithin(deadlineMs),
+      ]);
+    },
     runtimeMetadata,
     now: Date.now,
     randomUUID,

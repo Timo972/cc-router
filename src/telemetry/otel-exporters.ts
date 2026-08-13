@@ -50,6 +50,17 @@ export interface PostHogOtlpExporters {
   logExporter: LogRecordExporter;
 }
 
+export type PostHogOtlpLogExporterOptions = Pick<
+  PostHogOtlpExporterOptions,
+  | "getSnapshot"
+  | "getDiagnosticId"
+  | "logUrl"
+  | "requestTimeoutMillis"
+  | "exportTimeoutMillis"
+  | "lifecycleTimeoutMillis"
+  | "maxBatchSize"
+>;
+
 const SUCCESS = { code: 0 } as const;
 const FAILED = { code: 1 } as const;
 const DEFAULT_LIFECYCLE_TIMEOUT_MILLIS = 2_000;
@@ -507,13 +518,6 @@ export function createPostHogOtlpExporters(
     concurrencyLimit: 1,
     keepAlive: false,
   });
-  const logDelegate = new OTLPLogExporter({
-    url: options.logUrl ?? POSTHOG_LOG_URL,
-    headers,
-    timeoutMillis,
-    concurrencyLimit: 1,
-    keepAlive: false,
-  });
   const shared = {
     getSnapshot: options.getSnapshot,
     exportTimeoutMillis: options.exportTimeoutMillis ?? timeoutMillis,
@@ -525,10 +529,27 @@ export function createPostHogOtlpExporters(
       ...shared,
       delegate: traceDelegate,
     }),
-    logExporter: createPrivacySafeLogExporter({
-      ...shared,
-      delegate: logDelegate,
-      getDiagnosticId: options.getDiagnosticId,
-    }),
+    logExporter: createPostHogOtlpLogExporter(options),
   };
+}
+
+export function createPostHogOtlpLogExporter(
+  options: PostHogOtlpLogExporterOptions = {},
+): LogRecordExporter {
+  const timeoutMillis = requestTimeout(options.requestTimeoutMillis);
+  const delegate = new OTLPLogExporter({
+    url: options.logUrl ?? POSTHOG_LOG_URL,
+    headers: { Authorization: `Bearer ${POSTHOG_PROJECT_TOKEN}` },
+    timeoutMillis,
+    concurrencyLimit: 1,
+    keepAlive: false,
+  });
+  return createPrivacySafeLogExporter({
+    delegate,
+    getSnapshot: options.getSnapshot,
+    getDiagnosticId: options.getDiagnosticId,
+    exportTimeoutMillis: options.exportTimeoutMillis ?? timeoutMillis,
+    lifecycleTimeoutMillis: options.lifecycleTimeoutMillis ?? timeoutMillis,
+    maxBatchSize: options.maxBatchSize,
+  });
 }

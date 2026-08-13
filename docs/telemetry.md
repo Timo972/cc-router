@@ -269,7 +269,9 @@ node scripts/validate-telemetry-eu.mjs --live \
 
 Live mode installs that tarball into a temporary prefix using pnpm's offline
 store. It uses only generated synthetic accounts, credentials, content, and
-canaries. The packaged ESM bootstrap handles a deterministic sampled request;
+canaries. Start it from a shell with empty `NODE_OPTIONS`; live mode rejects
+any inherited value and replaces child `NODE_OPTIONS` with only its network
+guard. The packaged ESM bootstrap handles a deterministic sampled request;
 the provider request is intercepted and redirected to a literal `127.0.0.1`
 fixture. A preload permits only literal-loopback traffic and these three remote
 paths:
@@ -278,18 +280,30 @@ paths:
 - `https://eu.i.posthog.com/i/v1/traces`;
 - `https://eu.i.posthog.com/i/v1/logs`.
 
-All other fetch, HTTP(S), and socket targets are blocked. The harness emits a
-sampled proxy/provider waterfall with a correlated `runtime.failure` log, safe
-success/failure funnels for all five provider/method combinations, lifecycle
-events, and two sanitized exceptions with different raw messages but identical
-safe context and fingerprint. It leaves a mode-`0600` evidence file containing
-only generated canaries, the validation window, anonymous IDs, safe
-fingerprints, and the network-target summary; the temporary installed package
-and synthetic account files are removed.
+All other fetch, HTTP(S), and socket attempts are recorded before being blocked;
+the run fails even if application code catches the thrown error. The harness
+emits a sampled proxy/provider waterfall with a correlated `runtime.failure`
+log. Its synthetic child starts the same log-only CLI runtime used by real
+short-lived setup/account/status-add flows and drives `createSetupAttempt`
+through representative success/failure stages for all five provider/method
+combinations. This produces real `account.setup.diagnostic` logs plus the
+closed analytics funnels; two unexpected setup exceptions are sanitized by the
+same facade/PostHog path and must share a safe fingerprint. No prompts,
+credentials, or provider calls are used for setup validation.
+
+By default the harness exclusively creates a fresh mode-`0700` evidence
+directory. `CC_ROUTER_EU_EVIDENCE_DIR` is accepted only when its target does
+not yet exist. `evidence.json` and `network.jsonl` are exclusively created and
+checked as mode `0600` before and after writes. They contain only generated
+canaries, the validation window, anonymous IDs, safe fingerprints, and the
+network-target summary; the temporary installed package and synthetic account
+files are removed.
 
 Using the evidence file, search every generated canary independently in Traces,
 Logs, Events/Activity, and Error Tracking. Verify the packaged Express/Undici
-waterfall and log correlation, every setup method/stage/reason funnel, repeated
+waterfall and log correlation, every real `account.setup.diagnostic` method and
+representative stage, its matching analytics funnel, repeated sanitized setup
 exception grouping, `$process_person_profile: false`, `$geoip_disable: true`,
-and no new Person. Any canary match, missing packaged automatic span, unexpected
-network target, wrong-project ingestion, or Person creation blocks release.
+and no new Person. Any canary match, missing diagnostic/automatic signal,
+recorded blocked attempt, unexpected network target, wrong-project ingestion,
+or Person creation blocks release.

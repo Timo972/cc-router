@@ -65,7 +65,10 @@ globalThis.fetch = async (input, init) => {
     record("offline-posthog-loopback", redirected);
     return originalFetch(redirected, init);
   }
-  if (!approvedUrl(url)) throw new Error(`blocked external fetch: ${url.protocol}//${url.hostname}${url.pathname}`);
+  if (!approvedUrl(url)) {
+    record("blocked-fetch", url);
+    throw new Error(`blocked external fetch: ${url.protocol}//${url.hostname}${url.pathname}`);
+  }
   record("fetch", url);
   return originalFetch(input, init);
 };
@@ -73,7 +76,30 @@ globalThis.fetch = async (input, init) => {
 function guardRequest(original, protocol) {
   return function guardedRequest(...args) {
     const url = requestUrl(args, protocol);
-    if (!approvedUrl(url)) throw new Error(`blocked external request: ${url.protocol}//${url.hostname}${url.pathname}`);
+    if (offlineCaptureOrigin
+      && url.protocol === "https:"
+      && url.hostname === "eu.i.posthog.com"
+      && approvedPostHogPaths.has(url.pathname)) {
+      const redirected = new URL(`${url.pathname}${url.search}`, offlineCaptureOrigin);
+      record("offline-posthog-loopback", redirected);
+      const first = args[0];
+      if (typeof first === "string" || first instanceof URL) {
+        return Reflect.apply(original, this, [redirected, ...args.slice(1)]);
+      }
+      const options = first ?? {};
+      return Reflect.apply(original, this, [{
+        ...options,
+        protocol: redirected.protocol,
+        hostname: redirected.hostname,
+        host: redirected.host,
+        port: redirected.port,
+        path: `${redirected.pathname}${redirected.search}`,
+      }, ...args.slice(1)]);
+    }
+    if (!approvedUrl(url)) {
+      record("blocked-request", url);
+      throw new Error(`blocked external request: ${url.protocol}//${url.hostname}${url.pathname}`);
+    }
     record("request", url);
     return Reflect.apply(original, this, args);
   };
@@ -89,6 +115,7 @@ net.Socket.prototype.connect = function guardedConnect(...args) {
   const options = typeof candidate === "object" && candidate !== null ? candidate : undefined;
   const hostname = options?.host ?? options?.hostname ?? (typeof args[1] === "string" ? args[1] : undefined);
   if (!literalLoopback(hostname) && hostname !== "eu.i.posthog.com") {
+    record("blocked-socket", new URL(`tcp://${String(hostname ?? "unknown")}`));
     throw new Error(`blocked external socket: ${String(hostname ?? "unknown")}`);
   }
   return Reflect.apply(originalConnect, this, args);

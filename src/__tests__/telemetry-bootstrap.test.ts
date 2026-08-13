@@ -1302,6 +1302,138 @@ export async function resolve(specifier, context, nextResolve) {
     }
   });
 
+  it("preserves a compiled setup command failure across bounded log-runtime shutdown", () => {
+    const testHome = mkdtempSync(join(tmpdir(), "cc-router-cli-exit-code-"));
+    const telemetryPath = join(testHome, "telemetry.json");
+    writeFileSync(telemetryPath, JSON.stringify({
+      enabled: true,
+      installId: "77777777-7777-4777-8777-777777777777",
+      firstRunAt: "2026-08-13T00:00:00.000Z",
+    }));
+    const started = Date.now();
+    try {
+      const result = spawnSync(installedBinary, ["setup", "--not-a-real-option"], {
+        cwd: installedCwd,
+        env: {
+          ...process.env,
+          HOME: testHome,
+          TELEMETRY_PATH: telemetryPath,
+          NODE_ENV: "test",
+          CC_ROUTER_TEST_OTLP_LOG_URL: telemetry.endpoint("/i/v1/logs"),
+          CC_ROUTER_EU_GUARD_MODE: "offline-test",
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: telemetry.origin,
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: telemetry.origin,
+          NODE_OPTIONS: `--import=${pathToFileURL(join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs")).href}`,
+          NO_UPDATE_NOTIFIER: "1",
+          CI: "1",
+        },
+        encoding: "utf8",
+        timeout: 3_000,
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("unknown option");
+      expect(Date.now() - started).toBeLessThan(2_500);
+    } finally {
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  });
+
+  it("exports compiled setup diagnostics for every method through the bounded log-only CLI runtime", async () => {
+    const testHome = mkdtempSync(join(tmpdir(), "cc-router-cli-telemetry-"));
+    const telemetryPath = join(testHome, "telemetry.json");
+    const before = telemetry.requests.length;
+    writeFileSync(telemetryPath, JSON.stringify({
+      enabled: true,
+      installId: "55555555-5555-4555-8555-555555555555",
+      firstRunAt: "2026-08-13T00:00:00.000Z",
+    }));
+    const started = Date.now();
+    try {
+      await runNodeFixture(
+        join(PROJECT_ROOT, "src", "__tests__", "fixtures", "cli-setup-telemetry-carrier.mjs"),
+        {
+          HOME: testHome,
+          TELEMETRY_PATH: telemetryPath,
+          NODE_ENV: "test",
+          CC_ROUTER_TEST_OTLP_LOG_URL: telemetry.endpoint("/i/v1/logs"),
+          CC_ROUTER_EU_GUARD_MODE: "offline-test",
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: telemetry.origin,
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: telemetry.origin,
+          NODE_OPTIONS: `--import=${pathToFileURL(join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs")).href}`,
+          CC_ROUTER_COMPILED_PACKAGE_ROOT: installedCwd,
+        },
+      );
+      expect(Date.now() - started).toBeLessThan(2_500);
+
+      const requests = telemetry.requests.slice(before);
+      const decodedLogs = requests
+        .filter(request => request.url === "/i/v1/logs")
+        .map(request => request.json);
+      const logStrings = semanticStrings(decodedLogs);
+      for (const [provider, method, stage] of [
+        ["anthropic", "macos_keychain", "credential_read"],
+        ["anthropic", "claude_credentials_file", "credential_parse"],
+        ["anthropic", "manual_token", "token_validation"],
+        ["openai", "manual_token", "persistence"],
+        ["openai", "device_oauth", "token_exchange"],
+      ]) {
+        expect(logStrings).toEqual(expect.arrayContaining([
+          "account.setup.diagnostic", provider, method, stage,
+        ]));
+      }
+      expect(logStrings).toContain("cc_router.diagnostic_id");
+      expect(logStrings).toContain("service.instance.id");
+      expect(requests.some(request => request.url === "/batch/")).toBe(true);
+      expect(requests.some(request => request.rawBody.includes("CLI_SETUP_PRIVATE_EXCEPTION"))).toBe(false);
+      expect(requests.every(request => request.url === "/i/v1/logs" || request.url === "/batch/")).toBe(true);
+    } finally {
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("keeps the compiled log-only CLI runtime silent when persisted telemetry is disabled", async () => {
+    const testHome = mkdtempSync(join(tmpdir(), "cc-router-cli-telemetry-off-"));
+    const telemetryPath = join(testHome, "telemetry.json");
+    const before = telemetry.requests.length;
+    writeFileSync(telemetryPath, JSON.stringify({
+      enabled: false,
+      installId: "66666666-6666-4666-8666-666666666666",
+      firstRunAt: "2026-08-13T00:00:00.000Z",
+    }));
+    try {
+      await runNodeFixture(
+        join(PROJECT_ROOT, "src", "__tests__", "fixtures", "cli-setup-telemetry-carrier.mjs"),
+        {
+          HOME: testHome,
+          TELEMETRY_PATH: telemetryPath,
+          NODE_ENV: "test",
+          CC_ROUTER_TEST_OTLP_LOG_URL: telemetry.endpoint("/i/v1/logs"),
+          CC_ROUTER_EU_GUARD_MODE: "offline-test",
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: telemetry.origin,
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: telemetry.origin,
+          NODE_OPTIONS: `--import=${pathToFileURL(join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs")).href}`,
+          CC_ROUTER_EXPECT_TELEMETRY_DISABLED: "1",
+          CC_ROUTER_COMPILED_PACKAGE_ROOT: installedCwd,
+        },
+      );
+      await new Promise(resolveWait => setTimeout(resolveWait, 100));
+      expect(telemetry.requests).toHaveLength(before);
+    } finally {
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("starts the log-only runtime only for short-lived setup/account/status-add command paths", async () => {
+    const runtime = await import("../telemetry/cli-runtime.js");
+    expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "setup"])).toBe(true);
+    expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "status"])).toBe(true);
+    expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "accounts", "add"])).toBe(true);
+    expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "accounts", "add-openai"])).toBe(true);
+    expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "accounts", "login-openai"])).toBe(true);
+    expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "accounts", "list"])).toBe(false);
+    expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "start"])).toBe(false);
+  });
+
   it.each(["SIGTERM", "SIGINT"] as const)(
     "flushes completed spans within the bounded %s shutdown before preserving exit 0",
     async signal => {

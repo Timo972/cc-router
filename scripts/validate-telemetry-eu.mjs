@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -45,8 +46,10 @@ Synthetic setup funnels:
   openai/device_oauth
 
 The live run also emits a deterministic sampled packaged-ESM waterfall with a
-correlated safe runtime log, repeated sanitized exceptions, lifecycle events,
-and runtime-generated canaries for absence searches.
+correlated safe runtime log. The packed log-only CLI runtime drives real setup
+attempt helpers for each method, producing account.setup.diagnostic logs,
+closed funnels, repeated sanitized exceptions from setup, and runtime-generated
+canaries for absence searches.
 
 Before live mode, use project read/config access to enable Logs PII scrubbing,
 confirm the personal EU cc-router project, copy its public project token hash,
@@ -151,8 +154,61 @@ function guardEnvironment(providerOrigin, networkLog) {
     CC_ROUTER_EU_GUARD_MODE: "validation",
     CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: providerOrigin,
     CC_ROUTER_EU_NETWORK_LOG: networkLog,
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${pathToFileURL(guardPath).href}`].filter(Boolean).join(" "),
+    NODE_OPTIONS: `--import=${pathToFileURL(guardPath).href}`,
   };
+}
+
+function assertMode(path, expected, kind) {
+  const stat = lstatSync(path);
+  if ((stat.mode & 0o777) !== expected) {
+    throw new Error(`${kind} permissions must be ${expected.toString(8)}`);
+  }
+  if (kind === "evidence directory" ? !stat.isDirectory() : !stat.isFile()) {
+    throw new Error(`${kind} has the wrong filesystem type`);
+  }
+}
+
+function createEvidenceRoot(override) {
+  if (!override) {
+    const created = mkdtempSync(join(tmpdir(), "cc-router-eu-validation-evidence-"));
+    chmodSync(created, 0o700);
+    assertMode(created, 0o700, "evidence directory");
+    return created;
+  }
+  const target = resolve(override);
+  if (existsSync(target)) throw new Error("evidence target must not already exist");
+  mkdirSync(target, { recursive: false, mode: 0o700 });
+  chmodSync(target, 0o700);
+  assertMode(target, 0o700, "evidence directory");
+  return target;
+}
+
+function secureWrite(path, contents, firstWrite = false) {
+  writeFileSync(path, contents, { flag: firstWrite ? "wx" : "w", mode: 0o600 });
+  chmodSync(path, 0o600);
+  assertMode(path, 0o600, "evidence file");
+}
+
+function readNetworkEntries(networkLog) {
+  return existsSync(networkLog)
+    ? readFileSync(networkLog, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line))
+    : [];
+}
+
+function assertNoBlockedAttempts(networkLog) {
+  const entries = readNetworkEntries(networkLog);
+  if (entries.some(entry => String(entry.kind).includes("blocked"))) {
+    throw new Error("network guard recorded a blocked egress attempt");
+  }
+  return entries;
+}
+
+if (process.argv.includes("--test-audit-network-log")) {
+  if (process.env.NODE_ENV !== "test") throw new Error("network-log audit mode is test-only");
+  const path = argument("--network-log");
+  if (!path) throw new Error("test network-log audit requires --network-log");
+  assertNoBlockedAttempts(resolve(path));
+  process.exit(0);
 }
 
 if (!process.argv.includes("--live")) {
@@ -169,6 +225,9 @@ if (process.env.CC_ROUTER_EU_PROJECT_CONFIGURED !== "personal-eu-cc-router") {
 if (!/^[0-9a-f]{64}$/i.test(process.env.CC_ROUTER_EU_PROJECT_TOKEN_SHA256 ?? "")) {
   throw new Error("live mode requires CC_ROUTER_EU_PROJECT_TOKEN_SHA256 for the selected personal project public token");
 }
+if ((process.env.NODE_OPTIONS ?? "").trim() !== "") {
+  throw new Error("live mode rejects non-empty inherited NODE_OPTIONS");
+}
 
 const tarballArgument = argument("--tarball");
 if (!tarballArgument) throw new Error("live mode requires --tarball /absolute/path/to/package.tgz");
@@ -177,11 +236,7 @@ if (!tarballArgument.startsWith("/") || !existsSync(tarball) || !lstatSync(tarba
   throw new Error("--tarball must name an existing absolute .tgz regular file");
 }
 
-const workRoot = mkdtempSync(join(tmpdir(), "cc-router-eu-validation-work-"));
-const evidenceRoot = process.env.CC_ROUTER_EU_EVIDENCE_DIR
-  ? resolve(process.env.CC_ROUTER_EU_EVIDENCE_DIR)
-  : mkdtempSync(join(tmpdir(), "cc-router-eu-validation-evidence-"));
-mkdirSync(evidenceRoot, { recursive: true, mode: 0o700 });
+const evidenceRoot = createEvidenceRoot(process.env.CC_ROUTER_EU_EVIDENCE_DIR);
 const evidencePath = join(evidenceRoot, "evidence.json");
 const networkLog = join(evidenceRoot, "network.jsonl");
 const installationId = randomUUID();
@@ -204,10 +259,12 @@ const evidence = {
     arbitraryProperty: `${canaryPrefix}-arbitrary-property`,
   },
 };
-writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
+secureWrite(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, true);
+secureWrite(networkLog, "", true);
 
 let proxy;
 let provider;
+const workRoot = mkdtempSync(join(tmpdir(), "cc-router-eu-validation-work-"));
 try {
   const installRoot = join(workRoot, "installed");
   mkdirSync(installRoot, { recursive: true });
@@ -220,7 +277,7 @@ try {
   scanPackagedArtifact(packageRoot);
   const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
   evidence.packageVersion = manifest.version;
-  writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
+  secureWrite(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
 
   const constants = await import(pathToFileURL(join(packageRoot, "dist", "telemetry", "constants.js")).href);
   const tokenHash = createHash("sha256").update(constants.POSTHOG_PROJECT_TOKEN).digest("hex");
@@ -310,18 +367,16 @@ try {
     stdio: "pipe",
   });
 
-  const networkEntries = existsSync(networkLog)
-    ? readFileSync(networkLog, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line))
-    : [];
-  if (networkEntries.some(entry => String(entry.kind).includes("blocked"))) {
-    throw new Error("network guard recorded a blocked egress attempt");
-  }
+  const networkEntries = assertNoBlockedAttempts(networkLog);
+  assertMode(evidenceRoot, 0o700, "evidence directory");
+  assertMode(evidencePath, 0o600, "evidence file");
+  assertMode(networkLog, 0o600, "evidence file");
   evidence.networkSummary = networkEntries;
-  writeFileSync(evidencePath, `${JSON.stringify({ ...JSON.parse(readFileSync(evidencePath, "utf8")), networkSummary: networkEntries }, null, 2)}\n`, { mode: 0o600 });
+  secureWrite(evidencePath, `${JSON.stringify({ ...JSON.parse(readFileSync(evidencePath, "utf8")), networkSummary: networkEntries }, null, 2)}\n`);
   process.stdout.write(`Live synthetic emission finished. Evidence: ${evidencePath}\n\n`);
   process.stdout.write(`Use the personal EU project and this exact time window/install ID to verify:\n`);
   process.stdout.write(`1. sampled proxy.request -> provider.inference waterfall and correlated runtime.failure log;\n`);
-  process.stdout.write(`2. all five setup method funnels and their stage/reason events;\n`);
+  process.stdout.write(`2. real account.setup.diagnostic logs and matching funnels for all five setup methods/stages;\n`);
   process.stdout.write(`3. repeated sanitized exceptions share fingerprint/install ID and create no Person;\n`);
   process.stdout.write(`4. every canary in evidence.json has zero matches in Traces, Logs, Events, and Error Tracking.\n`);
 } finally {
