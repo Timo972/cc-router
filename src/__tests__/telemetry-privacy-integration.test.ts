@@ -36,6 +36,14 @@ const INSTALL_ID = "70d8062e-1fa0-4ae4-a115-bf782ecca462";
 const OTHER_INSTALL_ID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
 const PROJECT_ROOT = "/workspace/cc-router";
 const REPOSITORY_ROOT = resolve(import.meta.dirname, "..", "..");
+const CI_DEADLINE_MS = 8_000;
+
+function withinDeadline<T>(promise: Promise<T>, context: string): Promise<T> {
+  return new Promise((resolveWithin, reject) => {
+    const deadline = setTimeout(() => reject(new Error(`${context} after ${CI_DEADLINE_MS}ms`)), CI_DEADLINE_MS);
+    promise.then(resolveWithin, reject).finally(() => clearTimeout(deadline));
+  });
+}
 
 function snapshot(enabled: boolean): TelemetrySnapshot {
   return {
@@ -248,14 +256,9 @@ function proxyStartedEvent(installationId = INSTALL_ID) {
 }
 
 describe("end-to-end telemetry privacy boundaries", () => {
-  const servers: Array<ReturnType<typeof createServer>> = [];
   const temporaryDirectories: string[] = [];
 
-  afterEach(async () => {
-    await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => {
-      server.close(() => resolve());
-      server.closeAllConnections();
-    })));
+  afterEach(() => {
     for (const directory of temporaryDirectories.splice(0)) {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -268,6 +271,23 @@ describe("end-to-end telemetry privacy boundaries", () => {
     expect(nested).not.toContain(TELEMETRY_CANARY.rawProviderBody);
     expect(JSON.stringify(JSON.parse(nested))).not.toContain(TELEMETRY_CANARY.rawProviderBody);
     expect(semanticStrings(JSON.parse(nested))).toContain(TELEMETRY_CANARY.rawProviderBody);
+  });
+
+  it("rejects unapproved telemetry capture methods and endpoints", async () => {
+    const capture = await startTransportCaptureServer({ allowUnapprovedRequests: true });
+    try {
+      const responses = await Promise.all([
+        fetch(capture.endpoint("/decide"), { method: "POST" }),
+        fetch(capture.endpoint("/config"), { method: "POST" }),
+        fetch(capture.endpoint("/batch/"), { method: "GET" }),
+      ]);
+      expect(responses.map(response => response.status)).toEqual([404, 404, 405]);
+      expect(() => capture.assertOnlyApprovedRequests()).toThrow(
+        "unapproved telemetry capture request(s): POST /decide, POST /config, GET /batch/",
+      );
+    } finally {
+      await capture.close();
+    }
   });
 
   it("allows in-flight OTLP requests to finish but starts no queued trace or log request after opt-out", async () => {
@@ -290,7 +310,6 @@ describe("end-to-end telemetry privacy boundaries", () => {
       }
       response.end();
     });
-    servers.push(collector);
     await new Promise<void>((resolve, reject) => {
       collector.once("error", reject);
       collector.listen(0, "127.0.0.1", () => resolve());
@@ -301,8 +320,8 @@ describe("end-to-end telemetry privacy boundaries", () => {
       traceUrl: `${origin}/i/v1/traces`,
       logUrl: `${origin}/i/v1/logs`,
       getSnapshot: () => persistedSnapshot(telemetryPath),
-      requestTimeoutMillis: 1_000,
-      exportTimeoutMillis: 1_000,
+      requestTimeoutMillis: CI_DEADLINE_MS,
+      exportTimeoutMillis: CI_DEADLINE_MS,
     });
     const spanExportCalls: ReadableSpan[][] = [];
     const logExportCalls: ReadableLogRecord[][] = [];
@@ -322,7 +341,7 @@ describe("end-to-end telemetry privacy boundaries", () => {
       maxQueueSize: 4,
       maxExportBatchSize: 1,
       scheduledDelayMillis: 1,
-      exportTimeoutMillis: 1_000,
+      exportTimeoutMillis: CI_DEADLINE_MS,
     });
     const logProcessor = new BatchLogRecordProcessor({
       exporter: {
@@ -339,45 +358,53 @@ describe("end-to-end telemetry privacy boundaries", () => {
       maxQueueSize: 4,
       maxExportBatchSize: 1,
       scheduledDelayMillis: 1,
-      exportTimeoutMillis: 1_000,
+      exportTimeoutMillis: CI_DEADLINE_MS,
     });
+    try {
+      spanProcessor.onEnd(safeCandidateSpan("0123456789abcdef"));
+      logProcessor.onEmit(sdkCandidateLog(1_800_000_000));
+      await withinDeadline(firstRequests, "first OTLP trace and log requests did not become in-flight");
+      spanProcessor.onEnd(safeCandidateSpan("fedcba9876543210"));
+      logProcessor.onEmit(sdkCandidateLog(1_800_000_001));
+      // onEnd/onEmit synchronously accept into the real SDK queues; delegate call
+      // counts remain one until the deliberately blocked exports complete.
+      expect(spanExportCalls).toHaveLength(1);
+      expect(logExportCalls).toHaveLength(1);
+      expect(spanResults).toEqual([]);
+      expect(logResults).toEqual([]);
+      const optOutOutput = persistTelemetryOff(testHome, telemetryPath);
+      expect(persistedSnapshot(telemetryPath).enabled).toBe(false);
+      expect(optOutOutput).toContain("New outbound telemetry stops immediately");
+      for (const response of firstResponses.values()) response.end();
 
-    spanProcessor.onEnd(safeCandidateSpan("0123456789abcdef"));
-    logProcessor.onEmit(sdkCandidateLog(1_800_000_000));
-    await firstRequests;
-    spanProcessor.onEnd(safeCandidateSpan("fedcba9876543210"));
-    logProcessor.onEmit(sdkCandidateLog(1_800_000_001));
-    await new Promise(resolve => setTimeout(resolve, 25));
-    expect(spanExportCalls).toHaveLength(1);
-    expect(logExportCalls).toHaveLength(1);
-    expect(spanResults).toEqual([]);
-    expect(logResults).toEqual([]);
-    const optOutOutput = persistTelemetryOff(testHome, telemetryPath);
-    expect(persistedSnapshot(telemetryPath).enabled).toBe(false);
-    expect(optOutOutput).toContain("New outbound telemetry stops immediately");
-    for (const response of firstResponses.values()) response.end();
-
-    await Promise.all([spanProcessor.forceFlush(), logProcessor.forceFlush()]);
-    expect(spanExportCalls).toHaveLength(2);
-    expect(logExportCalls).toHaveLength(2);
-    expect(spanExportCalls.flat().map(span => span.spanContext().spanId)).toEqual([
-      "0123456789abcdef",
-      "fedcba9876543210",
-    ]);
-    expect(logExportCalls.flat().map(log => log.hrTime[0])).toEqual([
-      1_800_000_000,
-      1_800_000_001,
-    ]);
-    expect(spanResults).toEqual([0, 0]);
-    expect(logResults).toEqual([0, 0]);
-    await new Promise(resolve => setTimeout(resolve, 50));
-
-    expect(Object.fromEntries(requestCounts)).toEqual({
-      "/i/v1/traces": 1,
-      "/i/v1/logs": 1,
-    });
-    await spanProcessor.shutdown();
-    await logProcessor.shutdown();
+      await withinDeadline(
+        Promise.all([spanProcessor.forceFlush(), logProcessor.forceFlush()]).then(() => undefined),
+        "queued OTLP work did not settle",
+      );
+      expect(spanExportCalls).toHaveLength(2);
+      expect(logExportCalls).toHaveLength(2);
+      expect(spanExportCalls.flat().map(span => span.spanContext().spanId)).toEqual([
+        "0123456789abcdef",
+        "fedcba9876543210",
+      ]);
+      expect(logExportCalls.flat().map(log => log.hrTime[0])).toEqual([
+        1_800_000_000,
+        1_800_000_001,
+      ]);
+      expect(spanResults).toEqual([0, 0]);
+      expect(logResults).toEqual([0, 0]);
+      expect(Object.fromEntries(requestCounts)).toEqual({
+        "/i/v1/traces": 1,
+        "/i/v1/logs": 1,
+      });
+    } finally {
+      for (const response of firstResponses.values()) response.end();
+      await Promise.allSettled([spanProcessor.shutdown(), logProcessor.shutdown()]);
+      await new Promise<void>(resolveClose => {
+        collector.close(() => resolveClose());
+        collector.closeAllConnections();
+      });
+    }
   });
 
   it("allows one in-flight PostHog request to finish while opt-out silently discards queued events and exceptions", async () => {
@@ -403,7 +430,6 @@ describe("end-to-end telemetry privacy boundaries", () => {
         response.end();
       });
     });
-    servers.push(collector);
     await new Promise<void>((resolve, reject) => {
       collector.once("error", reject);
       collector.listen(0, "127.0.0.1", () => resolve());
@@ -415,30 +441,36 @@ describe("end-to-end telemetry privacy boundaries", () => {
       transport: async (_url, options) => fetch(endpoint, options as RequestInit),
     });
 
-    const alreadyInFlight = client.captureAnalyticsImmediate(proxyStartedEvent());
-    await requestInFlight;
-    client.captureAnalytics(proxyStartedEvent());
-    client.captureException(sanitizedFailure(
-      INSTALL_ID,
-      "ad94f035-1e08-4e29-8517-fd56bdc83d99",
-      TELEMETRY_CANARY.exceptionMessage,
-    ));
-    const optOutOutput = persistTelemetryOff(testHome, telemetryPath);
-    expect(persistedSnapshot(telemetryPath).enabled).toBe(false);
-    expect(optOutOutput).toContain("New outbound telemetry stops immediately");
-    inFlightResponse?.end();
-    await alreadyInFlight;
+    try {
+      const alreadyInFlight = client.captureAnalyticsImmediate(proxyStartedEvent());
+      await withinDeadline(requestInFlight, "first PostHog request did not become in-flight");
+      client.captureAnalytics(proxyStartedEvent());
+      client.captureException(sanitizedFailure(
+        INSTALL_ID,
+        "ad94f035-1e08-4e29-8517-fd56bdc83d99",
+        TELEMETRY_CANARY.exceptionMessage,
+      ));
+      const optOutOutput = persistTelemetryOff(testHome, telemetryPath);
+      expect(persistedSnapshot(telemetryPath).enabled).toBe(false);
+      expect(optOutOutput).toContain("New outbound telemetry stops immediately");
+      inFlightResponse?.end();
+      await withinDeadline(alreadyInFlight, "in-flight PostHog request did not settle");
 
-    await client.flushWithin(100);
-    writeFileSync(telemetryPath, JSON.stringify(snapshot(true).state));
-    await client.flushWithin(100);
-    await new Promise(resolve => setTimeout(resolve, 25));
-
-    expect(bodies).toHaveLength(1);
-    expect(JSON.parse(bodies[0]!.toString("utf8"))).toEqual(expect.objectContaining({
-      batch: [expect.objectContaining({ event: "proxy.started" })],
-    }));
-    await client.shutdownWithin(100);
+      await client.flushWithin(100);
+      writeFileSync(telemetryPath, JSON.stringify(snapshot(true).state));
+      await client.flushWithin(100);
+      expect(bodies).toHaveLength(1);
+      expect(JSON.parse(bodies[0]!.toString("utf8"))).toEqual(expect.objectContaining({
+        batch: [expect.objectContaining({ event: "proxy.started" })],
+      }));
+    } finally {
+      inFlightResponse?.end();
+      await client.shutdownWithin(100);
+      await new Promise<void>(resolveClose => {
+        collector.close(() => resolveClose());
+        collector.closeAllConnections();
+      });
+    }
   });
 
   it("correlates repeated sanitized failures by installation without profiles or raw canaries", async () => {
@@ -473,6 +505,7 @@ describe("end-to-end telemetry privacy boundaries", () => {
       await firstClient.captureExceptionImmediate(repeated);
       await secondClient.captureExceptionImmediate(otherInstall);
 
+      postHogCapture.assertOnlyApprovedRequests();
       expect(postHogCapture.requests).toHaveLength(3);
       expect(postHogCapture.requests.every(request => request.url === "/batch/")).toBe(true);
       const events = postHogCapture.requests.map(capturedPostHogEvent);
@@ -507,6 +540,7 @@ describe("end-to-end telemetry privacy boundaries", () => {
       }
 
       const traceRequests = otlpCapture.requests.filter(request => request.url === "/i/v1/traces");
+      otlpCapture.assertOnlyApprovedRequests();
       expect(traceRequests).toHaveLength(2);
       const decodedTraces = traceRequests.map(request => decodeOtlpProtobuf(request.rawBody, "traces"));
       const resourceInstallId = (decoded: ReturnType<typeof decodeOtlpProtobuf>): unknown => {

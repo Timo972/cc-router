@@ -67,6 +67,38 @@ async function waitUntil(
   throw new Error(failure());
 }
 
+function runNodeFixture(path: string, environment: Record<string, string>): Promise<void> {
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(process.execPath, [path], {
+      cwd: PROJECT_ROOT,
+      env: { ...process.env, ...environment },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout?.on("data", chunk => { output += String(chunk); });
+    child.stderr?.on("data", chunk => { output += String(chunk); });
+    let timedOut = false;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, 15_000);
+    child.once("error", error => {
+      clearTimeout(deadline);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(deadline);
+      if (!timedOut && code === 0) {
+        resolveRun();
+        return;
+      }
+      reject(new Error(
+        `Node fixture ${timedOut ? "timed out" : `exited ${String(code)} (${String(signal)})`}\n${output}`,
+      ));
+    });
+  });
+}
+
 function countOccurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
 }
@@ -550,6 +582,7 @@ export async function resolve(specifier, context, nextResolve) {
     ] as const;
     for (const mode of modes) {
       const isolatedCapture = await startTransportCaptureServer();
+      try {
       const targetBefore = targetBodies.length;
       const probe = createServer();
       const proxyPort = await listen(probe);
@@ -629,17 +662,84 @@ export async function resolve(specifier, context, nextResolve) {
       } finally {
         await running.stop("SIGTERM");
       }
-      await new Promise(resolveWait => setTimeout(resolveWait, 300));
+      isolatedCapture.assertOnlyApprovedRequests();
       if (mode.name !== "enabled") {
         expect(isolatedCapture.requests, `${mode.name} emitted during request or shutdown drain`).toEqual([]);
       }
-      await isolatedCapture.close();
+      } finally {
+        await isolatedCapture.close();
+      }
     }
     expect(observations).toHaveLength(modes.length);
     for (const observation of observations.slice(1)) expect(observation).toEqual(observations[0]);
   }, 60_000);
 
-  it("removes hostile automatic Express, HTTP, and Undici error values from final telemetry", async () => {
+  it("removes a real automatic Express error message, stack, and status description before OTLP export", async () => {
+    const testHome = mkdtempSync(join(tmpdir(), "cc-router-auto-express-error-"));
+    const candidateMarker = join(testHome, "candidate.json");
+    const telemetryPath = join(testHome, "telemetry.json");
+    writeFileSync(telemetryPath, JSON.stringify({
+      enabled: true,
+      installId: "70d8062e-1fa0-4ae4-a115-bf782ecca462",
+      firstRunAt: "2026-08-03T00:00:00.000Z",
+    }));
+    const capture = await startTransportCaptureServer();
+    try {
+      await runNodeFixture(
+        join(import.meta.dirname, "fixtures", "otel-auto-error-carrier-bootstrap.mjs"),
+        {
+          NODE_ENV: "test",
+          TELEMETRY_PATH: telemetryPath,
+          CC_ROUTER_TEST_TRACE_ID: "00000000000000000000000000000001",
+          CC_ROUTER_TEST_OTLP_TRACE_URL: capture.endpoint("/i/v1/traces"),
+          CC_ROUTER_TEST_OTLP_LOG_URL: capture.endpoint("/i/v1/logs"),
+          CC_ROUTER_TEST_CANDIDATE_MARKER: candidateMarker,
+          CC_ROUTER_TEST_HOSTILE_MESSAGE: TELEMETRY_CANARY.exceptionMessage,
+          CC_ROUTER_TEST_HOSTILE_STACK_PATH: TELEMETRY_CANARY.homePath,
+        },
+      );
+
+      const candidate = JSON.parse(readFileSync(candidateMarker, "utf8")) as {
+        scope: string;
+        status: { code: number; message?: string };
+        events: Array<{ name: string; attributes: Record<string, unknown> }>;
+        attributes: Record<string, unknown>;
+      };
+      expect(candidate.scope).toBe("@opentelemetry/instrumentation-express");
+      expect(candidate.status).toEqual({ code: 2, message: TELEMETRY_CANARY.exceptionMessage });
+      expect(candidate.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          name: "exception",
+          attributes: expect.objectContaining({
+            "exception.message": TELEMETRY_CANARY.exceptionMessage,
+            "exception.stacktrace": expect.stringContaining(TELEMETRY_CANARY.homePath),
+          }),
+        }),
+      ]));
+      expect(candidate.attributes["cc_router.operation"]).toBe("proxy.request");
+
+      expect(capture.requests.map(request => `${request.method} ${request.url}`)).toEqual([
+        "POST /i/v1/traces",
+      ]);
+      capture.assertOnlyApprovedRequests();
+      const decoded = capture.requests.map(request => decodeOtlpProtobuf(request.rawBody, "traces"));
+      const decodedValues = semanticStrings(decoded);
+      const wire = Buffer.concat(capture.requests.map(request => request.rawBody));
+      expect(decodedValues).toContain("@opentelemetry/instrumentation-express");
+      expect(decodedValues).toContain("proxy.request");
+      for (const canary of [TELEMETRY_CANARY.exceptionMessage, TELEMETRY_CANARY.homePath]) {
+        expect(decodedValues.some(value => value.includes(canary)), canary).toBe(false);
+        for (const representation of telemetryWireRepresentations(canary)) {
+          expect(wire.includes(Buffer.from(representation)), representation).toBe(false);
+        }
+      }
+    } finally {
+      await capture.close();
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("sanitizes a production PostHog exception after a hostile provider failure", async () => {
     const capture = await startTransportCaptureServer();
     const probe = createServer();
     const proxyPort = await listen(probe);
@@ -656,6 +756,7 @@ export async function resolve(specifier, context, nextResolve) {
     });
     children.push(running);
     const hostileBefore = hostileStatusDescriptions.length;
+    let stopped = false;
     try {
       const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses${TELEMETRY_CANARY.queryString}`, {
         method: "POST",
@@ -683,56 +784,47 @@ export async function resolve(specifier, context, nextResolve) {
       ]);
       expect(hostileResponseBodies.at(-1)?.toString("utf8")).toBe(TELEMETRY_CANARY.rawProviderBody);
       await waitUntil(
-        () => capture.requests.some(request => request.url === "/i/v1/traces"),
+        () => capture.requests.some(request => request.url === "/i/v1/traces")
+          && capture.requests.some(request => request.url === "/batch/"),
         8_000,
-        () => `automatic error flow exported no trace\n${running.output()}`,
+        () => `hostile provider flow exported no sanitized PostHog exception or trace\n${running.output()}`,
       );
-    } finally {
       await running.stop("SIGTERM");
-    }
-    await new Promise(resolveWait => setTimeout(resolveWait, 300));
-    expect(capture.requests.some(request => request.url === "/batch/")).toBe(true);
-    expect(semanticStrings(capture.requests
-      .filter(request => request.url === "/batch/")
-      .map(request => request.json))).toContain("$exception");
-    const decodedPayloads = capture.requests.map(request => request.json
-      ?? decodeOtlpProtobuf(request.rawBody, request.url.endsWith("traces") ? "traces" : "logs"));
-    const decodedValues = semanticStrings(decodedPayloads);
-    const capturedWire = Buffer.concat(capture.requests.map(request => request.rawBody));
-    expect(decodedValues).toContain("@opentelemetry/instrumentation-express");
-    expect(decodedValues).toContain("@opentelemetry/instrumentation-http");
-    expect(decodedValues).toContain("@opentelemetry/instrumentation-undici");
-    for (const canary of [
-      TELEMETRY_CANARY.exceptionMessage,
-      TELEMETRY_CANARY.homePath,
-      TELEMETRY_CANARY.rawProviderBody,
-      TELEMETRY_CANARY.queryString,
-    ]) {
-      expect(decodedValues.some(value => value.includes(canary)), canary).toBe(false);
-      for (const representation of telemetryWireRepresentations(canary)) {
-        expect(capturedWire.includes(Buffer.from(representation)), representation).toBe(false);
+      stopped = true;
+      capture.assertOnlyApprovedRequests();
+      expect(semanticStrings(capture.requests
+        .filter(request => request.url === "/batch/")
+        .map(request => request.json))).toContain("$exception");
+      const decodedPayloads = capture.requests.map(request => request.json
+        ?? decodeOtlpProtobuf(request.rawBody, request.url.endsWith("traces") ? "traces" : "logs"));
+      const decodedValues = semanticStrings(decodedPayloads);
+      const capturedWire = Buffer.concat(capture.requests.map(request => request.rawBody));
+      for (const canary of [
+        TELEMETRY_CANARY.exceptionMessage,
+        TELEMETRY_CANARY.homePath,
+        TELEMETRY_CANARY.rawProviderBody,
+        TELEMETRY_CANARY.queryString,
+      ]) {
+        expect(decodedValues.some(value => value.includes(canary)), canary).toBe(false);
+        for (const representation of telemetryWireRepresentations(canary)) {
+          expect(capturedWire.includes(Buffer.from(representation)), representation).toBe(false);
+        }
       }
+    } finally {
+      if (!stopped) await running.stop("SIGTERM");
+      await capture.close();
     }
-    await capture.close();
   }, 20_000);
 
   it("keeps the real Anthropic proxy byte-transparent when telemetry is enabled, disabled, or failing", async () => {
-    let failingTransportAttempts = 0;
-    const failingTransport = createServer((request, response) => {
-      failingTransportAttempts++;
-      response.destroy(new Error("intentional loopback telemetry transport failure"));
-      request.socket.destroy();
-    });
-    auxiliaryServers.push(failingTransport);
-    const failingTransportOrigin = `http://127.0.0.1:${await listen(failingTransport)}`;
     const priorEnvironment = {
       DO_NOT_TRACK: process.env["DO_NOT_TRACK"],
       CC_ROUTER_TELEMETRY: process.env["CC_ROUTER_TELEMETRY"],
     };
     const modes = [
-      { name: "enabled", telemetryEnabled: true, capture: telemetry.origin },
-      { name: "disabled", telemetryEnabled: false, capture: telemetry.origin },
-      { name: "failing", telemetryEnabled: true, capture: failingTransportOrigin },
+      { name: "enabled", telemetryEnabled: true, responseMode: "success" },
+      { name: "disabled", telemetryEnabled: false, responseMode: "success" },
+      { name: "failing", telemetryEnabled: true, responseMode: "reset" },
     ] as const;
     const snapshots: Array<{
       responses: Record<string, HttpObservation>;
@@ -756,12 +848,12 @@ export async function resolve(specifier, context, nextResolve) {
     });
 
     for (const mode of modes) {
+      const modeCapture = await startTransportCaptureServer({ responseMode: mode.responseMode });
+      try {
       expect(process.env["DO_NOT_TRACK"]).toBe(priorEnvironment.DO_NOT_TRACK);
       expect(process.env["CC_ROUTER_TELEMETRY"]).toBe(priorEnvironment.CC_ROUTER_TELEMETRY);
       const flowBefore = targetFlows.length;
       const closedBefore = closedTargetFlows.length;
-      const telemetryBefore = telemetry.requests.length;
-      const failingAttemptsBefore = failingTransportAttempts;
       const probe = createServer();
       const proxyPort = await listen(probe);
       await close(probe);
@@ -769,7 +861,7 @@ export async function resolve(specifier, context, nextResolve) {
         telemetryEnabled: mode.telemetryEnabled,
         proxyPort,
         targetOrigin,
-        telemetryCaptureOrigin: mode.capture,
+        telemetryCaptureOrigin: modeCapture.origin,
         environment: { DO_NOT_TRACK: "0", CC_ROUTER_TELEMETRY: "1", LITELLM_URL: targetOrigin },
         config: { proxyRequestTimeoutMs: 150 },
         accounts: [{
@@ -853,12 +945,15 @@ export async function resolve(specifier, context, nextResolve) {
         releaseTargetFlow.clear();
         await running.stop("SIGTERM");
       }
-      await new Promise(resolveWait => setTimeout(resolveWait, 300));
-      if (mode.name === "enabled") expect(telemetry.requests.length).toBeGreaterThan(telemetryBefore);
-      if (mode.name === "disabled") expect(telemetry.requests).toHaveLength(telemetryBefore);
-      if (mode.name === "failing") expect(failingTransportAttempts).toBeGreaterThan(failingAttemptsBefore);
+      modeCapture.assertOnlyApprovedRequests();
+      if (mode.name === "enabled") expect(modeCapture.requests.length).toBeGreaterThan(0);
+      if (mode.name === "disabled") expect(modeCapture.requests).toEqual([]);
+      if (mode.name === "failing") expect(modeCapture.requests.length).toBeGreaterThan(0);
       expect(process.env["DO_NOT_TRACK"]).toBe(priorEnvironment.DO_NOT_TRACK);
       expect(process.env["CC_ROUTER_TELEMETRY"]).toBe(priorEnvironment.CC_ROUTER_TELEMETRY);
+      // A downstream abort can happen before the proxy finishes uploading to or
+      // reading from upstream, so only the observed prefix and upstream close are
+      // meaningful; complete forwarded bytes are asserted for every non-abort flow.
       const forwarded = targetFlows.slice(flowBefore)
         .filter(flow => !flow.flow.startsWith("abort"))
         .sort((left, right) => left.flow.localeCompare(right.flow));
@@ -875,6 +970,9 @@ export async function resolve(specifier, context, nextResolve) {
         abortClosed: closedTargetFlows.slice(closedBefore).includes("abort"),
         timeoutClosed: closedTargetFlows.slice(closedBefore).includes("timeout"),
       });
+      } finally {
+        await modeCapture.close();
+      }
     }
 
     expect(snapshots).toHaveLength(3);

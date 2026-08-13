@@ -12,8 +12,15 @@ export interface CapturedTransportRequest {
 export interface TransportCaptureServer {
   readonly origin: string;
   readonly requests: CapturedTransportRequest[];
+  readonly violations: CapturedTransportRequest[];
   endpoint(path?: string): string;
+  assertOnlyApprovedRequests(): void;
   close(): Promise<void>;
+}
+
+export interface TransportCaptureOptions {
+  responseMode?: "success" | "reset";
+  allowUnapprovedRequests?: boolean;
 }
 
 export const TELEMETRY_CANARY = {
@@ -321,8 +328,17 @@ function listen(server: Server): Promise<void> {
   });
 }
 
-export async function startTransportCaptureServer(): Promise<TransportCaptureServer> {
+const APPROVED_TELEMETRY_REQUESTS = new Set([
+  "POST /batch/",
+  "POST /i/v1/traces",
+  "POST /i/v1/logs",
+]);
+
+export async function startTransportCaptureServer(
+  options: TransportCaptureOptions = {},
+): Promise<TransportCaptureServer> {
   const requests: CapturedTransportRequest[] = [];
+  const violations: CapturedTransportRequest[] = [];
   const server = createServer((request, response) => {
     if (!isLoopbackAddress(request.socket.remoteAddress)) {
       response.statusCode = 403;
@@ -334,13 +350,27 @@ export async function startTransportCaptureServer(): Promise<TransportCaptureSer
     request.on("data", chunk => chunks.push(Buffer.from(chunk)));
     request.on("end", () => {
       const rawBody = Buffer.concat(chunks);
-      requests.push({
+      const captured = {
         method: request.method ?? "GET",
         url: request.url ?? "/",
         headers: request.headers,
         rawBody,
         json: parseJson(rawBody),
-      });
+      };
+      requests.push(captured);
+      const requestKey = `${captured.method} ${captured.url}`;
+      if (!APPROVED_TELEMETRY_REQUESTS.has(requestKey)) {
+        violations.push(captured);
+        const approvedPath = [...APPROVED_TELEMETRY_REQUESTS]
+          .some(approved => approved.endsWith(` ${captured.url}`));
+        response.statusCode = approvedPath ? 405 : 404;
+        response.end();
+        return;
+      }
+      if (options.responseMode === "reset") {
+        request.socket.destroy();
+        return;
+      }
       response.statusCode = 200;
       response.end();
     });
@@ -357,14 +387,27 @@ export async function startTransportCaptureServer(): Promise<TransportCaptureSer
   return {
     origin,
     requests,
+    violations,
     endpoint(path = "/") {
       const endpoint = new URL(path, origin).toString();
       assertLoopbackUrl(endpoint);
       return endpoint;
     },
-    close: () => new Promise((resolve, reject) => {
-      server.close(error => error ? reject(error) : resolve());
-      server.closeAllConnections();
-    }),
+    assertOnlyApprovedRequests() {
+      if (violations.length > 0) {
+        const attempted = violations.map(request => `${request.method} ${request.url}`).join(", ");
+        throw new Error(`unapproved telemetry capture request(s): ${attempted}`);
+      }
+    },
+    async close() {
+      await new Promise<void>((resolve, reject) => {
+        server.close(error => error ? reject(error) : resolve());
+        server.closeAllConnections();
+      });
+      if (!options.allowUnapprovedRequests && violations.length > 0) {
+        const attempted = violations.map(request => `${request.method} ${request.url}`).join(", ");
+        throw new Error(`unapproved telemetry capture request(s): ${attempted}`);
+      }
+    },
   };
 }
