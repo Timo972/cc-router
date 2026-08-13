@@ -29,7 +29,7 @@ import type { RuntimeMode } from "./contracts.js";
 import { createPostHogOtlpExporters } from "./otel-exporters.js";
 import { createPostHogTelemetryClient, type PostHogTelemetryClient } from "./posthog-client.js";
 import { sanitizeException } from "./privacy.js";
-import { reportRuntimeExceptionLocally } from "./local-diagnostics.js";
+import { reportFatalExceptionCorrelationLocally } from "./local-diagnostics.js";
 
 const TRACE_SAMPLE_RATIO = 0.1;
 const QUEUE_SIZE = 100;
@@ -461,7 +461,7 @@ export function startProxyTelemetry(
           projectRoot: PROJECT_ROOT,
         });
         if (exception) {
-          reportRuntimeExceptionLocally(error, exception.diagnosticId);
+          reportFatalExceptionCorrelationLocally(exception.diagnosticId);
           void posthog.captureExceptionImmediate(exception);
         }
       } catch {

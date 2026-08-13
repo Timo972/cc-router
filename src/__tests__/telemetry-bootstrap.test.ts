@@ -2161,8 +2161,8 @@ describe("proxy telemetry runtime lifecycle", () => {
       expect(capturedWire).toContain("other");
       expect(localErrors).toHaveBeenCalledExactlyOnceWith(
         expect.stringMatching(/diagnostic ID: [0-9a-f-]{36}/),
-        fatal,
       );
+      expect(localErrors.mock.calls.flat().join("\n")).not.toContain("PRIVATE_FATAL_MESSAGE");
       const localDiagnosticId = String(localErrors.mock.calls[0]?.[0]).match(/[0-9a-f-]{36}/)?.[0];
       expect(localDiagnosticId).toBeDefined();
       expect(capturedWire).toContain(localDiagnosticId);
