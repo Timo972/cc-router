@@ -769,7 +769,7 @@ export async function resolve(specifier, context, nextResolve) {
         {
           NODE_ENV: "test",
           TELEMETRY_PATH: telemetryPath,
-          CC_ROUTER_TEST_TRACE_ID: "00000000000000000000000000000001",
+          CC_ROUTER_TEST_TRACE_ID: "0123456789abcdef0123456789abcdef",
           CC_ROUTER_TEST_OTLP_TRACE_URL: capture.endpoint("/i/v1/traces"),
           CC_ROUTER_TEST_OTLP_LOG_URL: capture.endpoint("/i/v1/logs"),
           CC_ROUTER_TEST_POSTHOG_ORIGIN: capture.origin,
@@ -1338,6 +1338,126 @@ export async function resolve(specifier, context, nextResolve) {
     }
   });
 
+  it("joins a held first-start immediate send in bootstrap finally and preserves setup exit 1", async () => {
+    const testHome = mkdtempSync(join(tmpdir(), "cc-router-cli-held-send-"));
+    const networkLog = join(testHome, "network.jsonl");
+    let release!: () => void;
+    let requests = 0;
+    const held = createServer((_request, response) => {
+      requests += 1;
+      release = () => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end("{}\n");
+      };
+    });
+    await listen(held);
+    auxiliaryServers.push(held);
+    const address = held.address();
+    if (!address || typeof address === "string") throw new Error("held collector did not bind");
+    const origin = `http://127.0.0.1:${address.port}`;
+    const child = spawn(installedBinary, ["setup"], {
+      cwd: installedCwd,
+      env: {
+        ...process.env,
+        HOME: testHome,
+        TELEMETRY_PATH: join(testHome, "fresh-telemetry.json"),
+        NODE_ENV: "test",
+        CC_ROUTER_TEST_OTLP_LOG_URL: `${origin}/i/v1/logs`,
+        CC_ROUTER_EU_GUARD_MODE: "offline-test",
+        CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: origin,
+        CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: origin,
+        CC_ROUTER_EU_NETWORK_LOG: networkLog,
+        NODE_OPTIONS: `--import=${pathToFileURL(join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs")).href}`,
+        NO_UPDATE_NOTIFIER: "1",
+        CI: "1",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout?.on("data", chunk => { output += String(chunk); });
+    child.stderr?.on("data", chunk => { output += String(chunk); });
+    try {
+      await waitUntil(() => requests > 0, 2_000, () => `immediate send was not attempted\n${output}\n${
+        existsSync(networkLog) ? readFileSync(networkLog, "utf8") : "no network log"
+      }`);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(child.exitCode).toBeNull();
+      release();
+      child.stdin?.write("\u0003");
+      child.stdin?.end();
+      expect(await waitForChildExit(child, 2_000), output).toBe(true);
+      expect(child.exitCode).toBe(1);
+    } finally {
+      if (child.exitCode === null) child.kill("SIGKILL");
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  it("bounds a hung immediate CLI send and keeps opt-out silent without changing exit 1", async () => {
+    let requests = 0;
+    const hung = createServer(() => { requests += 1; });
+    await listen(hung);
+    auxiliaryServers.push(hung);
+    const address = hung.address();
+    if (!address || typeof address === "string") throw new Error("hung collector did not bind");
+    const origin = `http://127.0.0.1:${address.port}`;
+
+    for (const disabled of [false, true]) {
+      const testHome = mkdtempSync(join(tmpdir(), `cc-router-cli-${disabled ? "off" : "hung"}-`));
+      const networkLog = join(testHome, "network.jsonl");
+      const requestsBefore = requests;
+      const started = Date.now();
+      try {
+        const child = spawn(installedBinary, ["setup"], {
+          cwd: installedCwd,
+          env: {
+            ...process.env,
+            HOME: testHome,
+            TELEMETRY_PATH: join(testHome, "fresh-telemetry.json"),
+            NODE_ENV: "test",
+            CC_ROUTER_TEST_OTLP_LOG_URL: `${origin}/i/v1/logs`,
+            CC_ROUTER_EU_GUARD_MODE: "offline-test",
+            CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: origin,
+            CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: origin,
+            CC_ROUTER_EU_NETWORK_LOG: networkLog,
+            NODE_OPTIONS: `--import=${pathToFileURL(join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs")).href}`,
+            ...(disabled ? { DO_NOT_TRACK: "1" } : {}),
+            NO_UPDATE_NOTIFIER: "1",
+            CI: "1",
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        let output = "";
+        child.stdout?.on("data", chunk => { output += String(chunk); });
+        child.stderr?.on("data", chunk => { output += String(chunk); });
+        await waitUntil(
+          () => disabled ? output.includes("What do you want to do?") : requests > requestsBefore,
+          2_000,
+          () => `setup did not reach its prompt/held telemetry send\n${output}`,
+        );
+        const cancelledAt = Date.now();
+        child.stdin?.write("\u0003");
+        child.stdin?.end();
+        expect(await waitForChildExit(child, 2_000), output).toBe(true);
+        expect(child.exitCode).toBe(1);
+        // The setup wrapper has a 1.5 s bound and bootstrap combined shutdown
+        // has a 0.5 s bound; neither may inherit the transport's lifetime.
+        expect(Date.now() - cancelledAt).toBeLessThan(2_250);
+        expect(Date.now() - started).toBeLessThan(3_000);
+        const audit = existsSync(networkLog) ? readFileSync(networkLog, "utf8") : "";
+        if (disabled) {
+          expect(requests).toBe(requestsBefore);
+          expect(audit).toBe("");
+        } else {
+          expect(audit).toContain("offline-posthog-loopback");
+          expect(audit).toContain("/batch/");
+        }
+      } finally {
+        rmSync(testHome, { recursive: true, force: true });
+      }
+    }
+  }, 10_000);
+
   it("exports compiled setup diagnostics for every method through the bounded log-only CLI runtime", async () => {
     const testHome = mkdtempSync(join(tmpdir(), "cc-router-cli-telemetry-"));
     const telemetryPath = join(testHome, "telemetry.json");
@@ -1430,9 +1550,91 @@ export async function resolve(specifier, context, nextResolve) {
     expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "accounts", "add"])).toBe(true);
     expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "accounts", "add-openai"])).toBe(true);
     expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "accounts", "login-openai"])).toBe(true);
+    expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "start"])).toBe(true);
     expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "accounts", "list"])).toBe(false);
-    expect(runtime.shouldStartCliTelemetry(["node", "cc-router", "start"])).toBe(false);
   });
+
+  it("hands fresh-start setup logs to one full proxy provider without loss or duplication", async () => {
+    const testHome = mkdtempSync(join(tmpdir(), "cc-router-start-handoff-"));
+    const telemetryPath = join(testHome, "telemetry.json");
+    const networkLog = join(testHome, "network.jsonl");
+    const isolated = await startTransportCaptureServer();
+    writeFileSync(telemetryPath, JSON.stringify({
+      enabled: true,
+      installId: "88888888-8888-4888-8888-888888888888",
+      firstRunAt: "2026-08-13T00:00:00.000Z",
+    }));
+    try {
+      await runNodeFixture(
+        join(PROJECT_ROOT, "src", "__tests__", "fixtures", "cli-proxy-handoff-carrier.mjs"),
+        {
+          HOME: testHome,
+          TELEMETRY_PATH: telemetryPath,
+          NODE_ENV: "test",
+          CC_ROUTER_TEST_OTLP_TRACE_URL: isolated.endpoint("/i/v1/traces"),
+          CC_ROUTER_TEST_OTLP_LOG_URL: isolated.endpoint("/i/v1/logs"),
+          CC_ROUTER_TEST_TRACE_ID: "0123456789abcdef0123456789abcdef",
+          CC_ROUTER_EU_GUARD_MODE: "offline-test",
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: isolated.origin,
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: isolated.origin,
+          CC_ROUTER_EU_NETWORK_LOG: networkLog,
+          NODE_OPTIONS: `--import=${pathToFileURL(join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs")).href}`,
+          CC_ROUTER_COMPILED_PACKAGE_ROOT: installedCwd,
+        },
+      );
+      const logRequests = isolated.requests.filter(request => request.url === "/i/v1/logs");
+      const logStrings = semanticStrings(logRequests.map(request => request.json));
+      expect(logStrings.filter(value => value === "account.setup.diagnostic")).toHaveLength(6);
+      expect(logStrings).toContain("runtime.failure");
+      const traces = isolated.requests
+        .filter(request => request.url === "/i/v1/traces")
+        .map(request => decodeOtlpProtobuf(request.rawBody, "traces"));
+      expect(semanticStrings(traces), JSON.stringify({
+        requests: isolated.requests.map(request => request.url),
+        network: existsSync(networkLog) ? readFileSync(networkLog, "utf8") : "",
+      }))
+        .toContain("proxy.request");
+      isolated.assertOnlyApprovedRequests();
+    } finally {
+      await isolated.close();
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("keeps the fresh-start setup-to-proxy transition silent when telemetry is disabled", async () => {
+    const testHome = mkdtempSync(join(tmpdir(), "cc-router-start-handoff-off-"));
+    const telemetryPath = join(testHome, "telemetry.json");
+    const before = telemetry.requests.length;
+    writeFileSync(telemetryPath, JSON.stringify({
+      enabled: false,
+      installId: "99999999-9999-4999-8999-999999999999",
+      firstRunAt: "2026-08-13T00:00:00.000Z",
+    }));
+    const started = Date.now();
+    try {
+      await runNodeFixture(
+        join(PROJECT_ROOT, "src", "__tests__", "fixtures", "cli-proxy-handoff-carrier.mjs"),
+        {
+          HOME: testHome,
+          TELEMETRY_PATH: telemetryPath,
+          NODE_ENV: "test",
+          CC_ROUTER_TEST_OTLP_TRACE_URL: telemetry.endpoint("/i/v1/traces"),
+          CC_ROUTER_TEST_OTLP_LOG_URL: telemetry.endpoint("/i/v1/logs"),
+          CC_ROUTER_EU_GUARD_MODE: "offline-test",
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: telemetry.origin,
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: telemetry.origin,
+          NODE_OPTIONS: `--import=${pathToFileURL(join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs")).href}`,
+          CC_ROUTER_EXPECT_TELEMETRY_DISABLED: "1",
+          CC_ROUTER_COMPILED_PACKAGE_ROOT: installedCwd,
+        },
+      );
+      expect(Date.now() - started).toBeLessThan(2_000);
+      await new Promise(resolveWait => setTimeout(resolveWait, 100));
+      expect(telemetry.requests).toHaveLength(before);
+    } finally {
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it.each(["SIGTERM", "SIGINT"] as const)(
     "flushes completed spans within the bounded %s shutdown before preserving exit 0",

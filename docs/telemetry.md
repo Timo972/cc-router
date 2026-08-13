@@ -55,6 +55,16 @@ sampled. A safe log carries trace/span correlation only when it occurs inside a
 sampled trace. Inbound trace context and baggage cannot force sampling, and no
 trace or baggage headers are injected into provider requests.
 
+Short-lived setup, account-add, and status-add commands use a log-only provider:
+it does not install tracing or HTTP, Express, or Undici instrumentation. The
+`start` command creates that provider before a first-run setup wizard can emit a
+diagnostic. At the proxy boundary CC-Router boundedly drains and deregisters the
+CLI provider, then starts the full proxy provider before importing the server.
+This handoff prevents duplicate providers and preserves queued setup logs. CLI
+teardown also boundedly joins immediate analytics/exception sends; a failed or
+hung telemetry transport never changes the command exit status or keeps it
+alive indefinitely.
+
 ## Closed signal inventory
 
 No application caller can choose an arbitrary event name, log body, operation,
@@ -280,8 +290,11 @@ paths:
 - `https://eu.i.posthog.com/i/v1/traces`;
 - `https://eu.i.posthog.com/i/v1/logs`.
 
-All other fetch, HTTP(S), and socket attempts are recorded before being blocked;
-the run fails even if application code catches the thrown error. The harness
+All other fetch, `http.request`, `http.get`, `https.request`, `https.get`, and
+IPv4/IPv6 socket attempts are recorded before being blocked; the run fails even
+if application code catches the thrown error. Method and path checks happen at
+the request layer, so an allowed PostHog hostname cannot be reused with GET or
+an unapproved path. The harness
 emits a sampled proxy/provider waterfall with a correlated `runtime.failure`
 log. Its synthetic child starts the same log-only CLI runtime used by real
 short-lived setup/account/status-add flows and drives `createSetupAttempt`

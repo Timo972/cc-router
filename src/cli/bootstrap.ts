@@ -21,15 +21,15 @@ if (proxyTelemetryPrepared) {
 }
 
 let cliTelemetryPrepared = false;
-if (!proxyTelemetryPrepared) {
-  try {
-    const { shouldStartCliTelemetry, startCliTelemetry } = await import("../telemetry/cli-runtime.js");
-    if (shouldStartCliTelemetry(process.argv) && getTelemetrySnapshot().enabled) {
-      cliTelemetryPrepared = startCliTelemetry("foreground");
-    }
-  } catch {
-    // Short-lived command telemetry is strictly best effort.
+let cliTelemetryCommand = false;
+try {
+  const { shouldStartCliTelemetry, startCliTelemetry } = await import("../telemetry/cli-runtime.js");
+  cliTelemetryCommand = shouldStartCliTelemetry(process.argv);
+  if (cliTelemetryCommand && getTelemetrySnapshot().enabled) {
+    cliTelemetryPrepared = startCliTelemetry("foreground");
   }
+} catch {
+  // Short-lived/start-capable command telemetry is strictly best effort.
 }
 
 try {
@@ -45,12 +45,15 @@ try {
       // A flush failure must not change the command's exit status.
     }
   }
-  if (cliTelemetryPrepared) {
+  if (cliTelemetryCommand) {
     try {
-      const { shutdownCliTelemetryWithin } = await import("../telemetry/cli-runtime.js");
-      await shutdownCliTelemetryWithin(500);
+      const { wasCliTelemetryHandedOffToProxy } = await import("../telemetry/cli-runtime.js");
+      if (!wasCliTelemetryHandedOffToProxy()) {
+        const { shutdownTelemetryWithin } = await import("../telemetry/facade.js");
+        await shutdownTelemetryWithin(cliTelemetryPrepared ? 500 : 250);
+      }
     } catch {
-      // A shutdown failure must not change the command's exit status.
+      // Combined CLI shutdown must not change the command's exit status.
     }
   }
   process.exitCode = commandExitCode;

@@ -13,6 +13,7 @@ const VALIDATOR = join(PROJECT_ROOT, "scripts", "validate-telemetry-eu.mjs");
 const GUARD = join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs");
 const SYNTHETIC_CHILD = join(PROJECT_ROOT, "scripts", "telemetry-eu-synthetic-child.mjs");
 const CAUGHT_NETWORK_ATTEMPTS = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "caught-network-attempts.mjs");
+const NO_TRANSPORT = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network-no-transport-preload.mjs");
 
 describe("personal EU telemetry release validator", () => {
   it("defaults to an offline plan with the complete synthetic matrix", () => {
@@ -143,6 +144,7 @@ describe("personal EU telemetry release validator", () => {
     const networkLog = join(root, "network.jsonl");
     try {
       const result = spawnSync(process.execPath, [
+        "--import", pathToFileURL(NO_TRANSPORT).href,
         "--import", pathToFileURL(GUARD).href,
         CAUGHT_NETWORK_ATTEMPTS,
       ], {
@@ -157,9 +159,12 @@ describe("personal EU telemetry release validator", () => {
       });
       expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
       const networkWire = readFileSync(networkLog, "utf8");
-      expect(networkWire).toContain('"kind":"blocked-fetch"');
-      expect(networkWire.match(/"kind":"blocked-request"/g)).toHaveLength(2);
-      expect(networkWire).toContain('"kind":"blocked-socket"');
+      expect(networkWire.match(/"kind":"blocked-fetch"/g)).toHaveLength(2);
+      expect(networkWire.match(/"kind":"blocked-request"/g)).toHaveLength(5);
+      expect(networkWire.match(/"kind":"blocked-socket"/g)).toHaveLength(2);
+      expect(networkWire).toContain('"hostname":"2001:db8::1"');
+      expect(networkWire).toContain('"hostname":"eu.i.posthog.com"');
+      expect(networkWire).toContain('"path":"/not-approved"');
 
       const audit = spawnSync(process.execPath, [
         VALIDATOR,

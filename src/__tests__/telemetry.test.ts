@@ -242,6 +242,7 @@ describe("typed telemetry facade", () => {
     expect(Object.keys(facade).sort()).toEqual([
       "annotateActiveSpan",
       "flushTelemetryWithin",
+      "handoffCliTelemetryToProxyWithin",
       "recordApplicationStart",
       "recordExpectedSetupFailure",
       "recordProxyStarted",
@@ -620,6 +621,72 @@ describe("typed telemetry facade", () => {
     expect(() => facade.annotateActiveSpan("proxy.request", {})).not.toThrow();
     await expect(facade.flushTelemetryWithin(20)).resolves.toBeUndefined();
     await expect(facade.shutdownTelemetryWithin(20)).resolves.toBeUndefined();
+  });
+
+  it("joins facade-owned immediate setup sends before combined CLI shutdown", async () => {
+    const { createTelemetryFacade } = await import("../telemetry/facade.js");
+    let releaseImmediate!: () => void;
+    const immediate = new Promise<void>(resolve => { releaseImmediate = resolve; });
+    let analyticsShutdowns = 0;
+    let runtimeShutdowns = 0;
+    const facade = createTelemetryFacade({
+      getSnapshot: () => snapshot(),
+      claimFirstStart: () => undefined,
+      getAnalytics: () => ({
+        captureAnalytics: () => undefined,
+        captureAnalyticsImmediate: () => immediate,
+        captureException: () => undefined,
+        captureExceptionImmediate: () => immediate,
+        flushWithin: async () => undefined,
+        shutdownWithin: async () => { analyticsShutdowns += 1; },
+        discardPending: () => undefined,
+      }),
+      shutdownRuntime: async () => { runtimeShutdowns += 1; },
+    });
+    facade.recordSetupStage({
+      provider: "openai",
+      method: "device_oauth",
+      stage: "attempt_start",
+      diagnosticId: DIAGNOSTIC_ID,
+    });
+
+    let settled = false;
+    const shutdown = facade.shutdownTelemetryWithin(500).then(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(settled).toBe(false);
+    releaseImmediate();
+    await shutdown;
+    expect(analyticsShutdowns).toBe(1);
+    expect(runtimeShutdowns).toBe(1);
+  });
+
+  it("bounds a hung immediate setup send without changing shutdown success", async () => {
+    const { createTelemetryFacade } = await import("../telemetry/facade.js");
+    const facade = createTelemetryFacade({
+      getSnapshot: () => snapshot(),
+      claimFirstStart: () => undefined,
+      getAnalytics: () => ({
+        captureAnalytics: () => undefined,
+        captureAnalyticsImmediate: () => new Promise<void>(() => undefined),
+        captureException: () => undefined,
+        captureExceptionImmediate: () => new Promise<void>(() => undefined),
+        flushWithin: async () => undefined,
+        shutdownWithin: async () => undefined,
+        discardPending: () => undefined,
+      }),
+      shutdownRuntime: async () => undefined,
+    });
+    facade.recordSetupStage({
+      provider: "anthropic",
+      method: "manual_token",
+      stage: "attempt_start",
+      diagnosticId: DIAGNOSTIC_ID,
+    });
+
+    const started = Date.now();
+    await expect(facade.shutdownTelemetryWithin(20)).resolves.toBeUndefined();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(10);
+    expect(Date.now() - started).toBeLessThan(250);
   });
 
   it("rejects a non-random diagnostic identity at the facade boundary", async () => {

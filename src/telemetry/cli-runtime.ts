@@ -18,6 +18,7 @@ interface ActiveCliRuntime {
 }
 
 let activeRuntime: ActiveCliRuntime | undefined;
+let handedOffToProxy = false;
 
 function osFamily(): "macos" | "linux" | "windows" | "other" {
   switch (process.platform) {
@@ -77,7 +78,7 @@ function settleWithin(operation: () => Promise<void>, deadlineMs: number): Promi
 
 export function shouldStartCliTelemetry(argv: readonly string[]): boolean {
   const command = argv[2];
-  if (command === "setup" || command === "status") return true;
+  if (command === "setup" || command === "status" || command === "start") return true;
   return command === "accounts"
     && ["add", "add-openai", "login-openai"].includes(argv[3] ?? "");
 }
@@ -85,6 +86,7 @@ export function shouldStartCliTelemetry(argv: readonly string[]): boolean {
 export function startCliTelemetry(runtimeMode: RuntimeMode): boolean {
   if (activeRuntime) return true;
   try {
+    handedOffToProxy = false;
     const snapshot = getTelemetrySnapshot();
     if (!snapshot.enabled) return false;
     const loopback = testLogUrl();
@@ -118,6 +120,18 @@ export function startCliTelemetry(runtimeMode: RuntimeMode): boolean {
   } catch {
     return false;
   }
+}
+
+export function isCliTelemetryActive(): boolean {
+  return activeRuntime !== undefined && !activeRuntime.shuttingDown;
+}
+
+export function markCliTelemetryHandedOffToProxy(): void {
+  handedOffToProxy = true;
+}
+
+export function wasCliTelemetryHandedOffToProxy(): boolean {
+  return handedOffToProxy;
 }
 
 export async function flushCliTelemetryWithin(deadlineMs: number): Promise<void> {

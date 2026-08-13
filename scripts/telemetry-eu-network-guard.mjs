@@ -16,9 +16,15 @@ const offlineCaptureOrigin = offlineTest
 const networkLog = process.env.CC_ROUTER_EU_NETWORK_LOG;
 const approvedPostHogPaths = new Set(["/batch/", "/i/v1/traces", "/i/v1/logs"]);
 
-function record(kind, url) {
+function record(kind, target) {
   if (!networkLog) return;
-  appendFileSync(networkLog, `${JSON.stringify({ kind, protocol: url.protocol, hostname: url.hostname, path: url.pathname })}\n`);
+  appendFileSync(networkLog, `${JSON.stringify({
+    kind,
+    protocol: target.protocol,
+    hostname: target.hostname,
+    ...(target.port ? { port: String(target.port) } : {}),
+    path: target.pathname,
+  })}\n`);
 }
 
 function literalLoopback(hostname) {
@@ -27,11 +33,12 @@ function literalLoopback(hostname) {
   return normalized === "::1";
 }
 
-function approvedUrl(url) {
-  if (url.protocol === "https:"
-    && url.hostname === "eu.i.posthog.com"
-    && approvedPostHogPaths.has(url.pathname)) return true;
-  return url.protocol === "http:" && literalLoopback(url.hostname);
+function approvedTarget(target, method) {
+  if (target.protocol === "https:"
+    && target.hostname === "eu.i.posthog.com"
+    && method === "POST"
+    && approvedPostHogPaths.has(target.pathname)) return true;
+  return target.protocol === "http:" && literalLoopback(target.hostname);
 }
 
 if (offlineCaptureOrigin
@@ -39,19 +46,77 @@ if (offlineCaptureOrigin
   throw new Error("offline capture origin must be a literal-loopback HTTP URL");
 }
 
-function requestUrl(args, protocol) {
+function targetFromUrl(url) {
+  return {
+    protocol: url.protocol,
+    hostname: url.hostname,
+    port: url.port,
+    pathname: url.pathname,
+  };
+}
+
+function splitHost(value) {
+  const raw = String(value ?? "").trim();
+  if (raw.startsWith("[")) {
+    const end = raw.indexOf("]");
+    if (end !== -1) return { hostname: raw.slice(1, end), port: raw.slice(end + 1).replace(/^:/, "") };
+  }
+  if (isIP(raw) !== 0) return { hostname: raw, port: "" };
+  const colon = raw.lastIndexOf(":");
+  return colon > 0 && raw.indexOf(":") === colon
+    ? { hostname: raw.slice(0, colon), port: raw.slice(colon + 1) }
+    : { hostname: raw, port: "" };
+}
+
+function requestTarget(args, protocol) {
   const first = args[0];
-  if (typeof first === "string" || first instanceof URL) return new URL(first);
+  if (typeof first === "string" || first instanceof URL) return targetFromUrl(new URL(first));
   const options = first ?? {};
-  const hostname = options.hostname ?? options.host;
-  const port = options.port ? `:${String(options.port)}` : "";
-  const path = options.path ?? "/";
-  return new URL(`${protocol}//${String(hostname)}${port}${String(path)}`);
+  const authority = splitHost(options.hostname ?? options.host);
+  const rawPath = typeof options.path === "string" ? options.path : "/";
+  return {
+    protocol: typeof options.protocol === "string" ? options.protocol : protocol,
+    hostname: authority.hostname,
+    port: options.port ? String(options.port) : authority.port,
+    pathname: rawPath.startsWith("/") ? rawPath.split("?", 1)[0] : "/",
+  };
+}
+
+function requestMethod(args) {
+  const first = args[0];
+  if (typeof first === "object" && first !== null && !(first instanceof URL)) {
+    return String(first.method ?? "GET").toUpperCase();
+  }
+  const options = args[1];
+  return String(options?.method ?? "GET").toUpperCase();
+}
+
+function malformedTarget(protocol, args) {
+  const first = args[0];
+  const options = typeof first === "object" && first !== null ? first : {};
+  return {
+    protocol,
+    hostname: splitHost(options.hostname ?? options.host).hostname || "invalid",
+    port: options.port ? String(options.port) : "",
+    pathname: "/",
+  };
 }
 
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
-  const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+  let url;
+  try {
+    url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+  } catch {
+    record("blocked-fetch", {
+      protocol: "invalid:",
+      hostname: "invalid",
+      port: "",
+      pathname: "/",
+    });
+    throw new Error("blocked malformed external fetch");
+  }
+  const method = String(init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
   if (url.hostname === "chatgpt.com" && url.pathname === "/backend-api/codex/responses") {
     const redirected = new URL(`${url.pathname}${url.search}`, providerOrigin);
     record("provider-loopback", redirected);
@@ -60,13 +125,15 @@ globalThis.fetch = async (input, init) => {
   if (offlineCaptureOrigin
     && url.protocol === "https:"
     && url.hostname === "eu.i.posthog.com"
+    && method === "POST"
     && approvedPostHogPaths.has(url.pathname)) {
     const redirected = new URL(`${url.pathname}${url.search}`, offlineCaptureOrigin);
     record("offline-posthog-loopback", redirected);
     return originalFetch(redirected, init);
   }
-  if (!approvedUrl(url)) {
-    record("blocked-fetch", url);
+  const target = targetFromUrl(url);
+  if (!approvedTarget(target, method)) {
+    record("blocked-fetch", target);
     throw new Error(`blocked external fetch: ${url.protocol}//${url.hostname}${url.pathname}`);
   }
   record("fetch", url);
@@ -75,12 +142,20 @@ globalThis.fetch = async (input, init) => {
 
 function guardRequest(original, protocol) {
   return function guardedRequest(...args) {
-    const url = requestUrl(args, protocol);
+    let target;
+    try {
+      target = requestTarget(args, protocol);
+    } catch {
+      record("blocked-request", malformedTarget(protocol, args));
+      throw new Error("blocked malformed external request");
+    }
+    const method = requestMethod(args);
     if (offlineCaptureOrigin
-      && url.protocol === "https:"
-      && url.hostname === "eu.i.posthog.com"
-      && approvedPostHogPaths.has(url.pathname)) {
-      const redirected = new URL(`${url.pathname}${url.search}`, offlineCaptureOrigin);
+      && target.protocol === "https:"
+      && target.hostname === "eu.i.posthog.com"
+      && method === "POST"
+      && approvedPostHogPaths.has(target.pathname)) {
+      const redirected = new URL(target.pathname, offlineCaptureOrigin);
       record("offline-posthog-loopback", redirected);
       const first = args[0];
       if (typeof first === "string" || first instanceof URL) {
@@ -96,17 +171,29 @@ function guardRequest(original, protocol) {
         path: `${redirected.pathname}${redirected.search}`,
       }, ...args.slice(1)]);
     }
-    if (!approvedUrl(url)) {
-      record("blocked-request", url);
-      throw new Error(`blocked external request: ${url.protocol}//${url.hostname}${url.pathname}`);
+    if (!approvedTarget(target, method)) {
+      record("blocked-request", target);
+      throw new Error(`blocked external request: ${target.protocol}//${target.hostname}${target.pathname}`);
     }
-    record("request", url);
+    record("request", target);
     return Reflect.apply(original, this, args);
   };
 }
 
-http.request = guardRequest(http.request, "http:");
-https.request = guardRequest(https.request, "https:");
+const guardedHttpRequest = guardRequest(http.request, "http:");
+const guardedHttpsRequest = guardRequest(https.request, "https:");
+http.request = guardedHttpRequest;
+https.request = guardedHttpsRequest;
+http.get = function guardedGet(...args) {
+  const request = Reflect.apply(guardedHttpRequest, this, args);
+  request.end();
+  return request;
+};
+https.get = function guardedGet(...args) {
+  const request = Reflect.apply(guardedHttpsRequest, this, args);
+  request.end();
+  return request;
+};
 
 const originalConnect = net.Socket.prototype.connect;
 net.Socket.prototype.connect = function guardedConnect(...args) {
@@ -115,7 +202,12 @@ net.Socket.prototype.connect = function guardedConnect(...args) {
   const options = typeof candidate === "object" && candidate !== null ? candidate : undefined;
   const hostname = options?.host ?? options?.hostname ?? (typeof args[1] === "string" ? args[1] : undefined);
   if (!literalLoopback(hostname) && hostname !== "eu.i.posthog.com") {
-    record("blocked-socket", new URL(`tcp://${String(hostname ?? "unknown")}`));
+    record("blocked-socket", {
+      protocol: "tcp:",
+      hostname: String(hostname ?? "unknown").replace(/^\[|\]$/g, ""),
+      port: options?.port ?? (typeof args[0] === "number" ? args[0] : ""),
+      pathname: "",
+    });
     throw new Error(`blocked external socket: ${String(hostname ?? "unknown")}`);
   }
   return Reflect.apply(originalConnect, this, args);

@@ -16,6 +16,8 @@ import { isProxyRunning } from "../daemon/pid.js";
 import { installService } from "../daemon/service.js";
 import { getLocalIPs } from "../utils/network.js";
 import { startProxyTelemetry } from "../telemetry/runtime.js";
+import { handoffCliTelemetryToProxyWithin } from "../telemetry/facade.js";
+import { markCliTelemetryHandedOffToProxy } from "../telemetry/cli-runtime.js";
 import type { RuntimeMode } from "../telemetry/contracts.js";
 
 export function registerStart(program: Command): void {
@@ -338,6 +340,7 @@ async function startForeground(opts: {
     : process.env["CC_ROUTER_DAEMON"] === "1"
       ? "daemon"
       : "foreground";
+  await handoffCliTelemetryToProxyWithin(1_500);
   startProxyTelemetry(runtimeMode, { trustedProviderTarget: litellmUrl });
   const { startServer } = await import("../proxy/server.js");
   await startServer({
@@ -345,6 +348,9 @@ async function startForeground(opts: {
     litellmUrl,
     accountsPath: opts.accounts !== ACCOUNTS_PATH ? opts.accounts : undefined,
   });
+  // startServer has now installed the proxy's combined signal teardown. If
+  // import/initialization throws before here, bootstrap still owns cleanup.
+  markCliTelemetryHandedOffToProxy();
 }
 
 // ─── LiteLLM Docker helper ──────────────────────────────────────────────────

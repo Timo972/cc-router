@@ -141,6 +141,7 @@ export interface TelemetryFacadeDependencies {
     source: TrustedExceptionSource,
   ) => SafeExceptionContract | undefined;
   flushRuntime: (deadlineMs: number) => Promise<void>;
+  handoffRuntime: (deadlineMs: number) => Promise<void>;
   shutdownRuntime: (deadlineMs: number) => Promise<void>;
   runtimeMetadata: () => RuntimeTelemetryMetadata;
   now: () => number;
@@ -165,6 +166,7 @@ export interface TelemetryFacade {
   ): DiagnosticId | undefined;
   annotateActiveSpan(operation: Operation, attributes: SafeSpanAttributes): void;
   flushTelemetryWithin(deadlineMs: number): Promise<void>;
+  handoffCliTelemetryToProxyWithin(deadlineMs: number): Promise<void>;
   shutdownTelemetryWithin(deadlineMs: number): Promise<void>;
 }
 
@@ -370,6 +372,7 @@ function defaultDependencies(): TelemetryFacadeDependencies {
         flushCliTelemetryWithin(deadlineMs),
       ]);
     },
+    handoffRuntime: shutdownCliTelemetryWithin,
     shutdownRuntime: async deadlineMs => {
       await Promise.all([
         shutdownProxyTelemetryWithin(deadlineMs),
@@ -419,15 +422,35 @@ function expectedSetupFailureOutcome(reason: SetupReason): Outcome | undefined {
   }
 }
 
-function ignoreRejection(operation: Promise<void>): void {
-  void operation.catch(() => undefined);
-}
-
 export function createTelemetryFacade(
   overrides: Partial<TelemetryFacadeDependencies> = {},
 ): TelemetryFacade {
   const dependencies = { ...defaultDependencies(), ...overrides };
   let activeAnalytics: PostHogTelemetryClient | undefined;
+  const immediateOperations = new Set<Promise<void>>();
+
+  const boundedDeadline = (deadlineMs: number): number => Number.isFinite(deadlineMs)
+    ? Math.max(0, Math.min(10_000, Math.floor(deadlineMs)))
+    : 0;
+
+  const settleWithin = async (operations: readonly Promise<unknown>[], deadlineMs: number): Promise<void> => {
+    if (operations.length === 0) return;
+    const bounded = boundedDeadline(deadlineMs);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled(operations).then(() => undefined),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, bounded);
+        timer.unref?.();
+      }),
+    ]).catch(() => undefined).finally(() => clearTimeout(timer));
+  };
+
+  const trackImmediate = (operation: Promise<void>): void => {
+    const contained = Promise.resolve(operation).catch(() => undefined);
+    immediateOperations.add(contained);
+    void contained.then(() => { immediateOperations.delete(contained); });
+  };
 
   const enabledSnapshot = (): TelemetrySnapshot | undefined => {
     try {
@@ -469,7 +492,7 @@ export function createTelemetryFacade(
       });
       const client = safe && analytics();
       if (!safe || !client) return;
-      if (immediate) ignoreRejection(client.captureAnalyticsImmediate(safe));
+      if (immediate) trackImmediate(client.captureAnalyticsImmediate(safe));
       else client.captureAnalytics(safe);
     } catch {
       // Application behavior never depends on telemetry capture.
@@ -644,7 +667,7 @@ export function createTelemetryFacade(
           const client = analytics();
           if (client) {
             if (context.category === "setup") {
-              ignoreRejection(client.captureExceptionImmediate(exception));
+              trackImmediate(client.captureExceptionImmediate(exception));
             } else {
               client.captureException(exception);
             }
@@ -668,30 +691,59 @@ export function createTelemetryFacade(
 
     async flushTelemetryWithin(deadlineMs): Promise<void> {
       try {
+        const startedAt = dependencies.now();
+        const remaining = (): number => Math.max(0, boundedDeadline(deadlineMs)
+          - Math.max(0, dependencies.now() - startedAt));
         const snapshot = enabledSnapshot();
         if (!snapshot) {
           try { activeAnalytics?.discardPending(); } catch { /* isolated */ }
-          await dependencies.flushRuntime(deadlineMs).catch(() => undefined);
+          await dependencies.flushRuntime(remaining()).catch(() => undefined);
           return;
         }
+        await settleWithin([...immediateOperations], remaining());
         await Promise.all([
-          activeAnalytics?.flushWithin(deadlineMs).catch(() => undefined),
-          dependencies.flushRuntime(deadlineMs).catch(() => undefined),
+          activeAnalytics?.flushWithin(remaining()).catch(() => undefined),
+          dependencies.flushRuntime(remaining()).catch(() => undefined),
         ]);
       } catch {
         // A flush failure never changes the command result.
       }
     },
 
-    async shutdownTelemetryWithin(deadlineMs): Promise<void> {
+    async handoffCliTelemetryToProxyWithin(deadlineMs): Promise<void> {
       try {
+        const startedAt = dependencies.now();
+        const remaining = (): number => Math.max(0, boundedDeadline(deadlineMs)
+          - Math.max(0, dependencies.now() - startedAt));
         const snapshot = enabledSnapshot();
         if (!snapshot) {
           try { activeAnalytics?.discardPending(); } catch { /* isolated */ }
+        } else {
+          await settleWithin([...immediateOperations], remaining());
         }
         await Promise.all([
-          activeAnalytics?.shutdownWithin(deadlineMs).catch(() => undefined),
-          dependencies.shutdownRuntime(deadlineMs).catch(() => undefined),
+          snapshot ? activeAnalytics?.flushWithin(remaining()).catch(() => undefined) : undefined,
+          dependencies.handoffRuntime(remaining()).catch(() => undefined),
+        ]);
+      } catch {
+        // A handoff failure never prevents the proxy boundary from starting.
+      }
+    },
+
+    async shutdownTelemetryWithin(deadlineMs): Promise<void> {
+      try {
+        const startedAt = dependencies.now();
+        const remaining = (): number => Math.max(0, boundedDeadline(deadlineMs)
+          - Math.max(0, dependencies.now() - startedAt));
+        const snapshot = enabledSnapshot();
+        if (!snapshot) {
+          try { activeAnalytics?.discardPending(); } catch { /* isolated */ }
+        } else {
+          await settleWithin([...immediateOperations], remaining());
+        }
+        await Promise.all([
+          activeAnalytics?.shutdownWithin(remaining()).catch(() => undefined),
+          dependencies.shutdownRuntime(remaining()).catch(() => undefined),
         ]);
       } catch {
         // A shutdown failure never changes proxy lifecycle behavior.
@@ -713,4 +765,5 @@ export const recordExpectedSetupFailure = telemetry.recordExpectedSetupFailure;
 export const recordUnexpectedException = telemetry.recordUnexpectedException;
 export const annotateActiveSpan = telemetry.annotateActiveSpan;
 export const flushTelemetryWithin = telemetry.flushTelemetryWithin;
+export const handoffCliTelemetryToProxyWithin = telemetry.handoffCliTelemetryToProxyWithin;
 export const shutdownTelemetryWithin = telemetry.shutdownTelemetryWithin;
