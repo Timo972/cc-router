@@ -1,4 +1,5 @@
 import { appendFileSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import http from "node:http";
 import https from "node:https";
 import { syncBuiltinESMExports } from "node:module";
@@ -10,20 +11,40 @@ if (guardMode !== "validation" && !offlineTest) {
   throw new Error("telemetry EU network guard requires CC_ROUTER_EU_GUARD_MODE=validation");
 }
 
-const providerOrigin = new URL(process.env.CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN ?? "http://127.0.0.1:1");
+function explicitLoopbackOrigin(value, label) {
+  if (!value) throw new Error(`${label} must be supplied`);
+  const url = new URL(value);
+  if (url.protocol !== "http:"
+    || !literalLoopback(url.hostname)
+    || url.port === ""
+    || url.pathname !== "/"
+    || url.username !== ""
+    || url.password !== ""
+    || url.search !== ""
+    || url.hash !== "") {
+    throw new Error(`${label} must be an explicit literal-loopback HTTP origin`);
+  }
+  return url;
+}
+
+const providerOrigin = explicitLoopbackOrigin(
+  process.env.CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN,
+  "provider origin",
+);
 const offlineCaptureOrigin = offlineTest
-  ? new URL(process.env.CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN ?? "http://127.0.0.1:1")
+  ? explicitLoopbackOrigin(process.env.CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN, "offline capture origin")
   : undefined;
 const networkLog = process.env.CC_ROUTER_EU_NETWORK_LOG;
 const approvedPostHogPaths = new Set(["/batch/", "/i/v1/traces", "/i/v1/logs"]);
 
-function record(kind, target) {
+function record(kind, target, method) {
   if (!networkLog) return;
   appendFileSync(networkLog, `${JSON.stringify({
     kind,
     protocol: target.protocol,
     hostname: target.hostname,
     ...(target.port ? { port: String(target.port) } : {}),
+    ...(method ? { method } : {}),
     path: target.pathname,
   })}\n`);
 }
@@ -42,14 +63,38 @@ function approvedPostHogTarget(target, method) {
     && approvedPostHogPaths.has(target.pathname);
 }
 
-function approvedTarget(target, method) {
-  if (approvedPostHogTarget(target, method)) return true;
-  return target.protocol === "http:" && literalLoopback(target.hostname);
+function exactOriginTarget(target, origin, method, paths) {
+  return target.protocol === origin.protocol
+    && target.hostname === origin.hostname
+    && String(target.port) === String(origin.port)
+    && method === "POST"
+    && paths.has(target.pathname);
 }
 
-if (offlineCaptureOrigin
-  && (offlineCaptureOrigin.protocol !== "http:" || !literalLoopback(offlineCaptureOrigin.hostname))) {
-  throw new Error("offline capture origin must be a literal-loopback HTTP URL");
+function approvedTarget(target, method) {
+  if (approvedPostHogTarget(target, method)) return true;
+  if (exactOriginTarget(target, providerOrigin, method, new Set(["/backend-api/codex/responses"]))) return true;
+  return offlineCaptureOrigin !== undefined
+    && exactOriginTarget(target, offlineCaptureOrigin, method, approvedPostHogPaths);
+}
+
+const socketAuthorization = new AsyncLocalStorage();
+
+function effectivePort(target) {
+  if (target.port) return String(target.port);
+  if (target.protocol === "https:") return "443";
+  if (target.protocol === "http:") return "80";
+  return "";
+}
+
+function withAuthorizedSocket(target, method, operation) {
+  return socketAuthorization.run({
+    hostname: target.hostname,
+    port: effectivePort(target),
+    method,
+    path: target.pathname,
+    used: false,
+  }, operation);
 }
 
 function targetFromUrl(url) {
@@ -123,23 +168,26 @@ globalThis.fetch = async (input, init) => {
     throw new Error("blocked malformed external fetch");
   }
   const method = String(init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
-  if (url.hostname === "chatgpt.com" && url.pathname === "/backend-api/codex/responses") {
+  if (method === "POST" && url.protocol === "https:" && url.hostname === "chatgpt.com"
+    && url.pathname === "/backend-api/codex/responses") {
     const redirected = new URL(`${url.pathname}${url.search}`, providerOrigin);
-    record("provider-loopback", redirected);
-    return originalFetch(redirected, init);
+    const target = targetFromUrl(redirected);
+    record("provider-loopback", target, method);
+    return withAuthorizedSocket(target, method, () => originalFetch(redirected, init));
   }
   const target = targetFromUrl(url);
   if (offlineCaptureOrigin && approvedPostHogTarget(target, method)) {
     const redirected = new URL(`${url.pathname}${url.search}`, offlineCaptureOrigin);
-    record("offline-posthog-loopback", redirected);
-    return originalFetch(redirected, init);
+    const redirectedTarget = targetFromUrl(redirected);
+    record("offline-posthog-loopback", redirectedTarget, method);
+    return withAuthorizedSocket(redirectedTarget, method, () => originalFetch(redirected, init));
   }
   if (!approvedTarget(target, method)) {
-    record("blocked-fetch", target);
+    record("blocked-fetch", target, method);
     throw new Error(`blocked external fetch: ${url.protocol}//${url.hostname}${url.pathname}`);
   }
-  record("fetch", url);
-  return originalFetch(input, init);
+  record("fetch", target, method);
+  return withAuthorizedSocket(target, method, () => originalFetch(input, init));
 };
 
 const originalHttpRequest = http.request;
@@ -157,27 +205,32 @@ function guardRequest(original, protocol) {
     const method = requestMethod(args);
     if (offlineCaptureOrigin && approvedPostHogTarget(target, method)) {
       const redirected = new URL(target.pathname, offlineCaptureOrigin);
-      record("offline-posthog-loopback", redirected);
+      const redirectedTarget = targetFromUrl(redirected);
+      record("offline-posthog-loopback", redirectedTarget, method);
       const first = args[0];
       if (typeof first === "string" || first instanceof URL) {
-        return Reflect.apply(originalHttpRequest, http, [redirected, ...args.slice(1)]);
+        return withAuthorizedSocket(redirectedTarget, method, () => (
+          Reflect.apply(originalHttpRequest, http, [redirected, ...args.slice(1)])
+        ));
       }
       const options = first ?? {};
-      return Reflect.apply(originalHttpRequest, http, [{
-        ...options,
-        protocol: redirected.protocol,
-        hostname: redirected.hostname,
-        host: redirected.host,
-        port: redirected.port,
-        path: `${redirected.pathname}${redirected.search}`,
-      }, ...args.slice(1)]);
+      return withAuthorizedSocket(redirectedTarget, method, () => (
+        Reflect.apply(originalHttpRequest, http, [{
+          ...options,
+          protocol: redirected.protocol,
+          hostname: redirected.hostname,
+          host: redirected.host,
+          port: redirected.port,
+          path: `${redirected.pathname}${redirected.search}`,
+        }, ...args.slice(1)])
+      ));
     }
     if (!approvedTarget(target, method)) {
-      record("blocked-request", target);
+      record("blocked-request", target, method);
       throw new Error(`blocked external request: ${target.protocol}//${target.hostname}${target.pathname}`);
     }
-    record("request", target);
-    return Reflect.apply(original, this, args);
+    record("request", target, method);
+    return withAuthorizedSocket(target, method, () => Reflect.apply(original, this, args));
   };
 }
 
@@ -203,16 +256,27 @@ net.Socket.prototype.connect = function guardedConnect(...args) {
   const options = typeof candidate === "object" && candidate !== null ? candidate : undefined;
   const hostname = options?.host ?? options?.hostname ?? (typeof args[1] === "string" ? args[1] : undefined);
   const port = options?.port ?? (typeof args[0] === "number" ? args[0] : "");
-  const approvedPostHogSocket = hostname === "eu.i.posthog.com" && String(port) === "443";
-  if (!literalLoopback(hostname) && !approvedPostHogSocket) {
+  const authorization = socketAuthorization.getStore();
+  const normalizedHostname = String(hostname ?? "").replace(/^\[|\]$/g, "");
+  if (!authorization
+    || authorization.used
+    || authorization.hostname !== normalizedHostname
+    || authorization.port !== String(port)) {
     record("blocked-socket", {
       protocol: "tcp:",
-      hostname: String(hostname ?? "unknown").replace(/^\[|\]$/g, ""),
+      hostname: normalizedHostname || "unknown",
       port,
       pathname: "",
     });
     throw new Error(`blocked external socket: ${String(hostname ?? "unknown")}`);
   }
+  authorization.used = true;
+  record("approved-socket", {
+    protocol: "tcp:",
+    hostname: normalizedHostname,
+    port,
+    pathname: authorization.path,
+  }, authorization.method);
   return Reflect.apply(originalConnect, this, args);
 };
 

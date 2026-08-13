@@ -10,6 +10,7 @@ import {
   BatchSpanProcessor,
   ParentBasedSampler,
   RandomIdGenerator,
+  SamplingDecision,
   TraceIdRatioBasedSampler,
   type IdGenerator,
   type Sampler,
@@ -17,12 +18,18 @@ import {
 import { ExpressInstrumentation } from "@opentelemetry/instrumentation-express";
 import { HttpInstrumentation } from "@opentelemetry/instrumentation-http";
 import { UndiciInstrumentation, type UndiciRequest } from "@opentelemetry/instrumentation-undici";
-import { getTelemetrySnapshot } from "../config/telemetry.js";
+import {
+  createTelemetryConsentGate,
+  getTelemetrySnapshot,
+  type TelemetryConsentGate,
+  type TelemetrySnapshot,
+} from "../config/telemetry.js";
 import { getCurrentVersion } from "../utils/self-update.js";
 import type { RuntimeMode } from "./contracts.js";
 import { createPostHogOtlpExporters } from "./otel-exporters.js";
 import { createPostHogTelemetryClient, type PostHogTelemetryClient } from "./posthog-client.js";
 import { sanitizeException } from "./privacy.js";
+import { reportRuntimeExceptionLocally } from "./local-diagnostics.js";
 
 const TRACE_SAMPLE_RATIO = 0.1;
 const QUEUE_SIZE = 100;
@@ -41,8 +48,25 @@ export const proxyNetworkPropagator: TextMapPropagator = {
   },
 };
 
-export function createProxyTraceSampler(): Sampler {
-  return new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(TRACE_SAMPLE_RATIO) });
+export interface ProxyTraceSamplerOptions {
+  getSnapshot?: () => TelemetrySnapshot;
+  initialSnapshot?: TelemetrySnapshot;
+}
+
+export function createProxyTraceSampler(options: ProxyTraceSamplerOptions = {}): Sampler {
+  const consent = createTelemetryConsentGate(
+    options.getSnapshot ?? getTelemetrySnapshot,
+    options.initialSnapshot,
+  );
+  const delegate = new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(TRACE_SAMPLE_RATIO) });
+  return {
+    shouldSample(...args) {
+      return consent.getSnapshot()
+        ? delegate.shouldSample(...args)
+        : { decision: SamplingDecision.NOT_RECORD };
+    },
+    toString: () => `ConsentGated{${delegate.toString()}}`,
+  };
 }
 
 interface ActiveRuntime {
@@ -52,6 +76,7 @@ interface ActiveRuntime {
   posthog: PostHogTelemetryClient;
   fatalMonitor: (error: unknown) => void;
   exitCleanup: () => void;
+  consent: TelemetryConsentGate;
   shuttingDown: boolean;
 }
 
@@ -354,12 +379,25 @@ export function startProxyTelemetry(
   try {
     const snapshot = getTelemetrySnapshot();
     if (!snapshot.enabled) return false;
+    let discardQueuedTelemetry = (): void => undefined;
+    const consent = createTelemetryConsentGate(
+      getTelemetrySnapshot,
+      snapshot,
+      () => discardQueuedTelemetry(),
+    );
     const testOtlpUrls = loopbackTestOtlpUrls();
     if (!testOtlpUrls.valid) return false;
-    const exporters = createPostHogOtlpExporters(testOtlpUrls.configured ? {
+    const exporterOptions = {
+      getSnapshot: () => consent.getSnapshot() ?? {
+        ...snapshot,
+        enabled: false,
+      },
+      ...(testOtlpUrls.configured ? {
       traceUrl: testOtlpUrls.traceUrl,
       logUrl: testOtlpUrls.logUrl,
-    } : {});
+      } : {}),
+    };
+    const exporters = createPostHogOtlpExporters(exporterOptions);
     const spanProcessor = new BatchSpanProcessor(exporters.spanExporter, {
       maxQueueSize: QUEUE_SIZE,
       maxExportBatchSize: BATCH_SIZE,
@@ -386,7 +424,10 @@ export function startProxyTelemetry(
         "host.arch": cpuArchitecture(),
         "cc_router.runtime_mode": runtimeMode,
       }),
-      sampler: createProxyTraceSampler(),
+      sampler: createProxyTraceSampler({
+        getSnapshot: getTelemetrySnapshot,
+        initialSnapshot: snapshot,
+      }),
       textMapPropagator: proxyNetworkPropagator,
       ...(idGenerator === undefined ? {} : { idGenerator }),
       instrumentations: createInstrumentations(
@@ -398,11 +439,16 @@ export function startProxyTelemetry(
       metricReaders: [],
       views: [],
     });
-    const posthog = createPostHogTelemetryClient();
+    const posthog = createPostHogTelemetryClient({ getSnapshot: getTelemetrySnapshot });
+    discardQueuedTelemetry = () => {
+      posthog.discardPending();
+      void spanProcessor.shutdown().catch(() => undefined);
+      void logProcessor.shutdown().catch(() => undefined);
+    };
     const fatalMonitor = (error: unknown): void => {
       try {
-        const current = getTelemetrySnapshot();
-        if (!current.enabled) return;
+        const current = consent.getSnapshot();
+        if (!current) return;
         const exception = sanitizeException(error, {
           category: "runtime",
           reason: "other",
@@ -414,7 +460,10 @@ export function startProxyTelemetry(
         }, {
           projectRoot: PROJECT_ROOT,
         });
-        if (exception) void posthog.captureExceptionImmediate(exception);
+        if (exception) {
+          reportRuntimeExceptionLocally(error, exception.diagnosticId);
+          void posthog.captureExceptionImmediate(exception);
+        }
       } catch {
         // The monitor observes only; it never changes Node's crash behavior.
       }
@@ -431,6 +480,7 @@ export function startProxyTelemetry(
       posthog,
       fatalMonitor,
       exitCleanup,
+      consent,
       shuttingDown: false,
     };
     process.on("uncaughtExceptionMonitor", fatalMonitor);
@@ -445,7 +495,7 @@ export async function flushProxyTelemetryWithin(deadlineMs: number): Promise<voi
   const runtime = activeRuntime;
   if (!runtime || runtime.shuttingDown) return;
   try {
-    if (!getTelemetrySnapshot().enabled) {
+    if (!runtime.consent.getSnapshot()) {
       runtime.posthog.discardPending();
       return;
     }
@@ -468,7 +518,7 @@ export async function shutdownProxyTelemetryWithin(deadlineMs: number): Promise<
   process.removeListener("uncaughtExceptionMonitor", runtime.fatalMonitor);
   process.removeListener("exit", runtime.exitCleanup);
   try {
-    if (!getTelemetrySnapshot().enabled) runtime.posthog.discardPending();
+    if (!runtime.consent.getSnapshot()) runtime.posthog.discardPending();
   } catch {
     runtime.posthog.discardPending();
   }

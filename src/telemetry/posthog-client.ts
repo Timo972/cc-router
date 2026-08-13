@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { PostHog, type PostHogOptions } from "posthog-node";
-import { getTelemetrySnapshot, type TelemetrySnapshot } from "../config/telemetry.js";
+import {
+  createTelemetryConsentGate,
+  getTelemetrySnapshot,
+  type TelemetrySnapshot,
+} from "../config/telemetry.js";
 import {
   ERROR_KINDS,
   MAX_STACK_FRAMES,
@@ -57,6 +61,7 @@ type PersistedKey = Parameters<PostHog["setPersistedProperty"]>[0];
 
 const CAPTURE_GENERATION_PROPERTY = "__cc_router_capture_generation";
 const CAPTURE_ID_PROPERTY = "__cc_router_capture_id";
+const CAPTURE_REVISION_PROPERTY = "__cc_router_consent_revision";
 const QUEUE_KEYS = ["queue", "ai_queue", "logs_queue"] as const;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -226,15 +231,6 @@ function reconstructExceptionEvent(event: SdkEvent, installationId: string, capt
   };
 }
 
-function safeSnapshot(getSnapshot: () => TelemetrySnapshot): TelemetrySnapshot | undefined {
-  try {
-    const snapshot = getSnapshot();
-    return snapshot.enabled && uuid(snapshot.state.installId) ? snapshot : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function noOpResponse(): Awaited<ReturnType<PostHogTransport>> {
   return {
     status: 204,
@@ -275,6 +271,7 @@ function exceptionProperties(
   exception: SafeExceptionContract,
   generation: number,
   captureId: string,
+  revision: number,
 ): Record<string, unknown> {
   const properties: Record<string, unknown> = {
     $exception_fingerprint: exception.fingerprint,
@@ -286,6 +283,7 @@ function exceptionProperties(
     $geoip_disable: true,
     [CAPTURE_GENERATION_PROPERTY]: generation,
     [CAPTURE_ID_PROPERTY]: captureId,
+    [CAPTURE_REVISION_PROPERTY]: revision,
   };
   if (exception.systemErrorCode !== undefined) properties.systemErrorCode = exception.systemErrorCode;
   if (exception.httpStatusCode !== undefined) properties.httpStatusCode = exception.httpStatusCode;
@@ -306,31 +304,50 @@ export function createPostHogTelemetryClient(
   let initializationFailed = false;
   let shutdownStarted = false;
   let captureGeneration = 0;
-  const preparedCaptureGenerations = new Map<string, number>();
+  const preparedCaptures = new Map<string, { generation: number; revision: number }>();
 
-  const rememberPreparedCapture = (captureId: string, generation: number): void => {
-    preparedCaptureGenerations.set(captureId, generation);
-    while (preparedCaptureGenerations.size > POSTHOG_MAX_QUEUE_SIZE) {
-      const oldestCaptureId = preparedCaptureGenerations.keys().next().value as string | undefined;
+  const discardPendingInternal = (): void => {
+    captureGeneration += 1;
+    preparedCaptures.clear();
+    const client = sdkClient;
+    if (!client) return;
+    for (const key of QUEUE_KEYS) {
+      try {
+        client.setPersistedProperty(key as PersistedKey, []);
+      } catch {
+        // Queue cleanup failures are isolated by the final transport gate.
+      }
+    }
+  };
+  const consent = createTelemetryConsentGate(getSnapshot, undefined, discardPendingInternal);
+
+  const rememberPreparedCapture = (captureId: string, generation: number, revision: number): void => {
+    preparedCaptures.set(captureId, { generation, revision });
+    while (preparedCaptures.size > POSTHOG_MAX_QUEUE_SIZE) {
+      const oldestCaptureId = preparedCaptures.keys().next().value as string | undefined;
       if (!oldestCaptureId) break;
-      preparedCaptureGenerations.delete(oldestCaptureId);
+      preparedCaptures.delete(oldestCaptureId);
     }
   };
 
   const beforeSend = (event: SdkEvent | null): SdkEvent | null => {
     try {
       if (!event || !isRecord(event.properties)) return null;
-      const snapshot = safeSnapshot(getSnapshot);
+      const snapshot = consent.getSnapshot();
       if (!snapshot) return null;
       const eventGeneration = own(event.properties, CAPTURE_GENERATION_PROPERTY);
+      const eventRevision = own(event.properties, CAPTURE_REVISION_PROPERTY);
       const captureId = uuid(own(event.properties, CAPTURE_ID_PROPERTY));
-      if (!Number.isSafeInteger(eventGeneration) || eventGeneration !== captureGeneration || !captureId) return null;
+      if (!Number.isSafeInteger(eventGeneration)
+        || eventGeneration !== captureGeneration
+        || eventRevision !== consent.acceptedRevision
+        || !captureId) return null;
       const installationId = uuid(snapshot.state.installId);
       if (!installationId) return null;
 
       if (event.event === "$exception") {
         const safe = reconstructExceptionEvent(event, installationId, captureId);
-        if (safe) rememberPreparedCapture(captureId, eventGeneration as number);
+        if (safe) rememberPreparedCapture(captureId, eventGeneration as number, eventRevision as number);
         return safe;
       }
       const diagnosticId = own(event.properties, "diagnosticId");
@@ -342,7 +359,7 @@ export function createPostHogTelemetryClient(
         ...(typeof diagnosticId === "string" ? { diagnosticId } : {}),
       });
       if (!safe) return null;
-      rememberPreparedCapture(captureId, eventGeneration as number);
+      rememberPreparedCapture(captureId, eventGeneration as number, eventRevision as number);
       return {
         event: safe.event,
         distinctId: safe.distinctId,
@@ -374,13 +391,14 @@ export function createPostHogTelemetryClient(
         const captureId = uuid(own(candidate, "uuid"));
         if (!captureId) continue;
         captureIds.push(captureId);
-        if (preparedCaptureGenerations.get(captureId) === captureGeneration) {
+        const prepared = preparedCaptures.get(captureId);
+        if (prepared?.generation === captureGeneration && prepared.revision === consent.acceptedRevision) {
           activeBatch.push(candidate);
         }
       }
 
-      if (!safeSnapshot(getSnapshot) || activeBatch.length === 0) {
-        for (const captureId of captureIds) preparedCaptureGenerations.delete(captureId);
+      if (!consent.getSnapshot() || activeBatch.length === 0) {
+        for (const captureId of captureIds) preparedCaptures.delete(captureId);
         return noOpResponse();
       }
 
@@ -391,7 +409,7 @@ export function createPostHogTelemetryClient(
       const path = new URL(url).pathname;
       const accepted = response.status >= 200 && (path === "/batch/" ? response.status < 400 : response.status < 300);
       if (accepted) {
-        for (const captureId of captureIds) preparedCaptureGenerations.delete(captureId);
+        for (const captureId of captureIds) preparedCaptures.delete(captureId);
       }
       return response;
     } catch {
@@ -401,7 +419,7 @@ export function createPostHogTelemetryClient(
 
   const getClient = (): { client: PostHogSdkClient; installationId: string } | undefined => {
     if (shutdownStarted || initializationFailed) return undefined;
-    const snapshot = safeSnapshot(getSnapshot);
+    const snapshot = consent.getSnapshot();
     const installationId = snapshot && uuid(snapshot.state.installId);
     if (!snapshot || !installationId) return undefined;
     if (!sdkClient) {
@@ -445,6 +463,7 @@ export function createPostHogTelemetryClient(
             $geoip_disable: true,
             [CAPTURE_GENERATION_PROPERTY]: captureGeneration,
             [CAPTURE_ID_PROPERTY]: captureId,
+            [CAPTURE_REVISION_PROPERTY]: consent.acceptedRevision,
           },
         });
       } catch {
@@ -467,12 +486,13 @@ export function createPostHogTelemetryClient(
             $geoip_disable: true,
             [CAPTURE_GENERATION_PROPERTY]: captureGeneration,
             [CAPTURE_ID_PROPERTY]: captureId,
+            [CAPTURE_REVISION_PROPERTY]: consent.acceptedRevision,
           },
         });
       } catch {
         // Immediate CLI capture must not change command behavior.
       } finally {
-        if (captureId) preparedCaptureGenerations.delete(captureId);
+        if (captureId) preparedCaptures.delete(captureId);
       }
     },
     captureException(exception) {
@@ -483,7 +503,7 @@ export function createPostHogTelemetryClient(
         active.client.captureException(
           exception.error,
           active.installationId,
-          exceptionProperties(exception, captureGeneration, captureId),
+          exceptionProperties(exception, captureGeneration, captureId, consent.acceptedRevision),
         );
       } catch {
         // Capture is best effort only.
@@ -498,17 +518,21 @@ export function createPostHogTelemetryClient(
         await active.client.captureExceptionImmediate(
           exception.error,
           active.installationId,
-          exceptionProperties(exception, captureGeneration, captureId),
+          exceptionProperties(exception, captureGeneration, captureId, consent.acceptedRevision),
         );
       } catch {
         // Immediate CLI capture must not change command behavior.
       } finally {
-        if (captureId) preparedCaptureGenerations.delete(captureId);
+        if (captureId) preparedCaptures.delete(captureId);
       }
     },
     async flushWithin(deadlineMs) {
       const client = sdkClient;
       if (!client) return;
+      if (!consent.getSnapshot()) {
+        discardPendingInternal();
+        return;
+      }
       await settleWithin(() => client.flush(), deadlineMs);
     },
     async shutdownWithin(deadlineMs) {
@@ -516,23 +540,11 @@ export function createPostHogTelemetryClient(
       shutdownStarted = true;
       if (!client) return;
       await settleWithin(() => client.shutdown(boundedDeadline(deadlineMs)), deadlineMs);
-      preparedCaptureGenerations.clear();
+      preparedCaptures.clear();
       sdkClient = undefined;
     },
     discardPending() {
-      captureGeneration += 1;
-      for (const [captureId, generation] of preparedCaptureGenerations) {
-        if (generation !== captureGeneration) preparedCaptureGenerations.delete(captureId);
-      }
-      const client = sdkClient;
-      if (!client) return;
-      for (const key of QUEUE_KEYS) {
-        try {
-          client.setPersistedProperty(key as PersistedKey, []);
-        } catch {
-          // Queue cleanup failures are isolated by the final transport gate.
-        }
-      }
+      discardPendingInternal();
     },
   };
 }

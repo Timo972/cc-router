@@ -20,12 +20,13 @@ const SPAN_ID = "0123456789abcdef";
 const PARENT_SPAN_ID = "fedcba9876543210";
 const PRIVATE_CANARY = "PRIVATE prompt token@example.test /Users/alice ?secret=true";
 
-function snapshot(enabled = true): TelemetrySnapshot {
+function snapshot(enabled = true, revision = 0): TelemetrySnapshot {
   return {
     state: {
       enabled,
       installId: INSTALL_ID,
       firstRunAt: "2026-08-03T00:00:00.000Z",
+      revision,
     },
     environmentDisabled: false,
     enabled,
@@ -318,6 +319,27 @@ describe("privacy-safe span exporter", () => {
     expect(delegateCalls).toBe(0);
   });
 
+  it("latches an old automatic-span exporter off across off then on and lets a new exporter adopt the revision", async () => {
+    let current = snapshot(true, 30);
+    let delegateCalls = 0;
+    const delegate: SpanExporter = {
+      export: (_spans, callback) => { delegateCalls += 1; callback({ code: 0 }); },
+      shutdown: async () => undefined,
+    };
+    const oldExporter = createPrivacySafeSpanExporter({ delegate, getSnapshot: () => current });
+
+    current = snapshot(true, 32);
+    await exportSpans(oldExporter, [unsafeSpan()]);
+    current = snapshot(true, 30);
+    await exportSpans(oldExporter, [unsafeSpan()]);
+    expect(delegateCalls).toBe(0);
+
+    current = snapshot(true, 32);
+    const newExporter = createPrivacySafeSpanExporter({ delegate, getSnapshot: () => current });
+    await exportSpans(newExporter, [unsafeSpan()]);
+    expect(delegateCalls).toBe(1);
+  });
+
   it("contains synchronous and callback delegate failures without forwarding raw errors", async () => {
     const thrown = createPrivacySafeSpanExporter({
       delegate: {
@@ -513,6 +535,36 @@ describe("privacy-safe log exporter", () => {
 
     expect(reads).toBe(2);
     expect(delegateCalls).toBe(0);
+  });
+
+  it("latches an old log exporter off across off then on and lets a new exporter adopt the revision", async () => {
+    let current = snapshot(true, 40);
+    let delegateCalls = 0;
+    const delegate: LogRecordExporter = {
+      export: (_logs, callback) => { delegateCalls += 1; callback({ code: 0 }); },
+      forceFlush: async () => undefined,
+      shutdown: async () => undefined,
+    };
+    const oldExporter = createPrivacySafeLogExporter({
+      delegate,
+      getSnapshot: () => current,
+      getDiagnosticId: () => DIAGNOSTIC_ID,
+    });
+
+    current = snapshot(true, 42);
+    await exportLogs(oldExporter, [unsafeLog()]);
+    current = snapshot(true, 40);
+    await exportLogs(oldExporter, [unsafeLog()]);
+    expect(delegateCalls).toBe(0);
+
+    current = snapshot(true, 42);
+    const newExporter = createPrivacySafeLogExporter({
+      delegate,
+      getSnapshot: () => current,
+      getDiagnosticId: () => DIAGNOSTIC_ID,
+    });
+    await exportLogs(newExporter, [unsafeLog()]);
+    expect(delegateCalls).toBe(1);
   });
 
   it("contains synchronous and callback log delegate failures without forwarding raw errors", async () => {

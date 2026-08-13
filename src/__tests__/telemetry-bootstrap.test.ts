@@ -355,27 +355,20 @@ globalThis.fetch = async (input, init) => {
 }
 
 function installedVersionForEntry(entry: string): string {
-  let directory = dirname(entry);
-  while (directory !== dirname(directory)) {
-    const packageJsonPath = join(directory, "package.json");
-    if (existsSync(packageJsonPath)) {
-      const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version?: unknown };
-      if (typeof packageJson.version === "string") return packageJson.version;
-    }
-    directory = dirname(directory);
-  }
+  const packageJsonPath = installedPackageJsonForEntry(entry);
+  const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version?: unknown };
+  if (typeof packageJson.version === "string") return packageJson.version;
   throw new Error(`could not resolve package version for ${entry}`);
 }
 
-function offlinePostHogPins(): string[] {
-  const postHogPackageJson = realpathSync(join(PROJECT_ROOT, "node_modules/posthog-node/package.json"));
-  const postHogPackage = JSON.parse(readFileSync(postHogPackageJson, "utf8")) as { version: string };
-  const requireFromPostHog = createRequire(postHogPackageJson);
-  return [
-    `posthog-node@${postHogPackage.version}`,
-    `@posthog/core@${installedVersionForEntry(requireFromPostHog.resolve("@posthog/core"))}`,
-    `@posthog/types@${installedVersionForEntry(requireFromPostHog.resolve("@posthog/types"))}`,
-  ];
+function installedPackageJsonForEntry(entry: string): string {
+  let directory = dirname(entry);
+  while (directory !== dirname(directory)) {
+    const packageJsonPath = join(directory, "package.json");
+    if (existsSync(packageJsonPath)) return packageJsonPath;
+    directory = dirname(directory);
+  }
+  throw new Error(`could not resolve package manifest for ${entry}`);
 }
 
 describe("compiled ESM telemetry bootstrap", () => {
@@ -512,6 +505,10 @@ describe("compiled ESM telemetry bootstrap", () => {
     const tarballs = readdirSync(packDirectory).filter(name => name.endsWith(".tgz"));
     expect(tarballs).toHaveLength(1);
     const tarball = join(packDirectory, tarballs[0]!);
+    const packedManifest = JSON.parse(execFileSync("tar", ["-xOf", tarball, "package/package.json"], {
+      encoding: "utf8",
+    })) as { dependencies?: Record<string, string> };
+    expect(packedManifest.dependencies?.["posthog-node"]).toBe("5.47.3");
     execFileSync("pnpm", [
       "add",
       "--dir",
@@ -519,10 +516,26 @@ describe("compiled ESM telemetry bootstrap", () => {
       "--ignore-workspace",
       "--offline",
       "--allow-build=protobufjs",
-      ...offlinePostHogPins(),
+      "@posthog/core@1.46.1",
+      "@posthog/types@1.399.0",
+      "@types/node@20.19.43",
+      "ansi-regex@6.2.2",
+      "ws@8.21.1",
       tarball,
     ], { cwd: PROJECT_ROOT, stdio: "pipe" });
     const installedPackage = join(installedCwd, "node_modules", "@timo972", "cc-router");
+    const installedManifest = JSON.parse(readFileSync(join(installedPackage, "package.json"), "utf8")) as {
+      dependencies?: Record<string, string>;
+    };
+    expect(installedManifest.dependencies?.["posthog-node"]).toBe("5.47.3");
+    const requireFromInstalledPackage = createRequire(join(realpathSync(installedPackage), "package.json"));
+    const postHogEntry = requireFromInstalledPackage.resolve("posthog-node");
+    const postHogPackageJson = realpathSync(installedPackageJsonForEntry(postHogEntry));
+    const postHogPackage = JSON.parse(readFileSync(postHogPackageJson, "utf8")) as { version: string };
+    const requireFromPostHog = createRequire(postHogPackageJson);
+    expect(postHogPackage.version).toBe("5.47.3");
+    expect(installedVersionForEntry(requireFromPostHog.resolve("@posthog/core"))).toBe("1.46.1");
+    expect(installedVersionForEntry(requireFromPostHog.resolve("@posthog/types"))).toBe("1.399.0");
     installedBinary = join(installedCwd, "node_modules", ".bin", "cc-router");
     for (const requiredFile of [
       "dist/cli/bootstrap.js",
@@ -540,10 +553,10 @@ describe("compiled ESM telemetry bootstrap", () => {
     ]) {
       expect(existsSync(join(installedPackage, requiredFile)), requiredFile).toBe(true);
     }
-    const installedManifest = JSON.parse(
+    const installedBinManifest = JSON.parse(
       readFileSync(join(installedPackage, "package.json"), "utf8"),
     ) as { bin?: Record<string, string> };
-    expect(installedManifest.bin?.["cc-router"]).toBe("dist/cli/bootstrap.js");
+    expect(installedBinManifest.bin?.["cc-router"]).toBe("dist/cli/bootstrap.js");
     expect(existsSync(installedBinary)).toBe(true);
     expect(existsSync(join(installedPackage, "dist", "__stale-build-output.js"))).toBe(false);
     expect(existsSync(join(installedPackage, "dist", "__stale-prepack-output.js"))).toBe(false);
@@ -1438,7 +1451,7 @@ export async function resolve(specifier, context, nextResolve) {
         const cancelledAt = Date.now();
         child.stdin?.write("\u0003");
         child.stdin?.end();
-        expect(await waitForChildExit(child, 2_000), output).toBe(true);
+        expect(await waitForChildExit(child, 2_250), output).toBe(true);
         expect(child.exitCode).toBe(1);
         // The setup wrapper has a 1.5 s bound and bootstrap combined shutdown
         // has a 0.5 s bound; neither may inherit the transport's lifetime.
@@ -2124,6 +2137,7 @@ describe("proxy telemetry runtime lifecycle", () => {
     const uncaughtBefore = process.listenerCount("uncaughtException");
     const rejectionBefore = process.listenerCount("unhandledRejection");
     await withRuntimeLifecycleTestEnvironment(async ({ telemetryPath, fetchMock, runtime }) => {
+      const localErrors = vi.spyOn(console, "error").mockImplementation(() => undefined);
       expect(runtime.startProxyTelemetry("foreground")).toBe(true);
       expect(process.listenerCount("uncaughtExceptionMonitor")).toBe(monitorBefore + 1);
       expect(process.listenerCount("uncaughtException")).toBe(uncaughtBefore);
@@ -2145,6 +2159,14 @@ describe("proxy telemetry runtime lifecycle", () => {
       const capturedWire = fetchMock.mock.calls.map(call => JSON.stringify(call)).join("\n");
       expect(capturedWire).not.toContain("PRIVATE_FATAL_MESSAGE");
       expect(capturedWire).toContain("other");
+      expect(localErrors).toHaveBeenCalledExactlyOnceWith(
+        expect.stringMatching(/diagnostic ID: [0-9a-f-]{36}/),
+        fatal,
+      );
+      const localDiagnosticId = String(localErrors.mock.calls[0]?.[0]).match(/[0-9a-f-]{36}/)?.[0];
+      expect(localDiagnosticId).toBeDefined();
+      expect(capturedWire).toContain(localDiagnosticId);
+      expect(localDiagnosticId).not.toBe("22222222-2222-4222-8222-222222222222");
 
       const started = Date.now();
       await runtime.shutdownProxyTelemetryWithin(100);

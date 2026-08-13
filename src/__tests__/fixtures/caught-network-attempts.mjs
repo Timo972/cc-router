@@ -16,6 +16,9 @@ try { namedHttpRequest("http://example.invalid/named-after-http-request"); } cat
 try { namedHttpGet("http://example.invalid/named-after-http-get"); } catch {}
 try { namedHttpsRequest({ hostname: "eu.i.posthog.com", method: "POST", path: "/named-after-not-approved" }); } catch {}
 try { namedHttpsGet({ hostname: "eu.i.posthog.com", method: "POST", path: "/batch/", port: 9443 }); } catch {}
+try { http.request("http://127.0.0.1:43199/arbitrary-loopback"); } catch {}
 try { new net.Socket().connect({ host: "203.0.113.1", port: 443 }); } catch {}
 try { new net.Socket().connect({ host: "2001:db8::1", port: 443 }); } catch {}
 try { new net.Socket().connect({ host: "eu.i.posthog.com", port: 8443 }); } catch {}
+try { new net.Socket().connect({ host: "eu.i.posthog.com", port: 443 }); } catch {}
+try { new net.Socket().connect({ host: "127.0.0.1", port: 43199 }); } catch {}

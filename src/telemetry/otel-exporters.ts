@@ -5,7 +5,11 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { resourceFromAttributes, type Resource } from "@opentelemetry/resources";
 import type { LogRecordExporter, ReadableLogRecord } from "@opentelemetry/sdk-logs";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
-import { getTelemetrySnapshot, type TelemetrySnapshot } from "../config/telemetry.js";
+import {
+  createTelemetryConsentGate,
+  getTelemetrySnapshot,
+  type TelemetrySnapshot,
+} from "../config/telemetry.js";
 import type {
   SafeLog,
   SafeResource,
@@ -72,15 +76,6 @@ function own(input: object, key: string): unknown {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(input, key);
     return descriptor && "value" in descriptor ? descriptor.value : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function safeSnapshot(getSnapshot: () => TelemetrySnapshot): TelemetrySnapshot | undefined {
-  try {
-    const snapshot = getSnapshot();
-    return snapshot.enabled ? snapshot : undefined;
   } catch {
     return undefined;
   }
@@ -406,6 +401,7 @@ export function createPrivacySafeSpanExporter(
   options: PrivacySafeExporterOptions<SpanExporter>,
 ): SpanExporter {
   const getSnapshot = options.getSnapshot ?? getTelemetrySnapshot;
+  const consent = createTelemetryConsentGate(getSnapshot);
   const exportTimeoutMillis = deadline(options.exportTimeoutMillis);
   const lifecycleTimeoutMillis = deadline(options.lifecycleTimeoutMillis);
   const batchLimit = maxBatchSize(options.maxBatchSize);
@@ -420,7 +416,7 @@ export function createPrivacySafeSpanExporter(
         callback(result);
       };
       try {
-        const snapshot = safeSnapshot(getSnapshot);
+        const snapshot = consent.getSnapshot();
         if (!snapshot) {
           settle(SUCCESS);
           return;
@@ -429,7 +425,7 @@ export function createPrivacySafeSpanExporter(
           const safe = reconstructReadableSpan(span, snapshot);
           return safe ? [safe] : [];
         });
-        if (safeSpans.length === 0 || !safeSnapshot(getSnapshot)) {
+        if (safeSpans.length === 0 || !consent.getSnapshot()) {
           settle(SUCCESS);
           return;
         }
@@ -441,7 +437,7 @@ export function createPrivacySafeSpanExporter(
       }
     },
     forceFlush: async () => {
-      if (!safeSnapshot(getSnapshot)) return;
+      if (!consent.getSnapshot()) return;
       await settleWithin(
         () => options.delegate.forceFlush?.(),
         lifecycleTimeoutMillis,
@@ -458,6 +454,7 @@ export function createPrivacySafeLogExporter(
   options: PrivacySafeLogExporterOptions,
 ): LogRecordExporter {
   const getSnapshot = options.getSnapshot ?? getTelemetrySnapshot;
+  const consent = createTelemetryConsentGate(getSnapshot);
   const exportTimeoutMillis = deadline(options.exportTimeoutMillis);
   const lifecycleTimeoutMillis = deadline(options.lifecycleTimeoutMillis);
   const batchLimit = maxBatchSize(options.maxBatchSize);
@@ -472,7 +469,7 @@ export function createPrivacySafeLogExporter(
         callback(result);
       };
       try {
-        const snapshot = safeSnapshot(getSnapshot);
+        const snapshot = consent.getSnapshot();
         if (!snapshot) {
           settle(SUCCESS);
           return;
@@ -481,7 +478,7 @@ export function createPrivacySafeLogExporter(
           const safe = reconstructReadableLog(log, snapshot, options.getDiagnosticId);
           return safe ? [safe] : [];
         });
-        if (safeLogs.length === 0 || !safeSnapshot(getSnapshot)) {
+        if (safeLogs.length === 0 || !consent.getSnapshot()) {
           settle(SUCCESS);
           return;
         }
@@ -493,7 +490,7 @@ export function createPrivacySafeLogExporter(
       }
     },
     forceFlush: async () => {
-      if (!safeSnapshot(getSnapshot)) return;
+      if (!consent.getSnapshot()) return;
       await settleWithin(
         () => options.delegate.forceFlush(),
         lifecycleTimeoutMillis,

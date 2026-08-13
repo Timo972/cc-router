@@ -1170,6 +1170,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             operationDurationMs: durationMs,
             severity: "error",
           });
+          logError("proxy", 0, err.message);
         } else {
           recordUnexpectedException(err, {
             category: "runtime",
@@ -1180,7 +1181,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         }
         request._ccReleaseLease?.();
         stats.totalErrors++;
-        logError("proxy", 0, err.message);
 
         // Complete the pending log entry for connection-level errors
         const pendingLog = request._pendingLog;

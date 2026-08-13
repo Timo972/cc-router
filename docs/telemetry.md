@@ -152,6 +152,14 @@ Stages are `attempt_start`, `credential_source_selection`, `credential_read`,
 `authorization_polling`, `token_exchange`, `access_token_parse`, `persistence`,
 `success`, `cancellation`, and `failure`.
 
+Successful Anthropic methods complete source selection, credential read and
+parse, real token validation, then persistence. OpenAI manual-token setup
+completes source selection, credential read and structural parse, then
+persistence; it does not claim provider token validation. OpenAI device OAuth
+completes source selection, device-code request, authorization polling, token
+exchange, access-token parse, then persistence; the OAuth exchange is not also
+reported as a separate token-validation stage.
+
 Safe reasons are `not_found`, `permission_denied`, `malformed_credentials`,
 `invalid_token`, `unauthorized`, `forbidden`, `rate_limited`, `upstream_4xx`,
 `upstream_5xx`, `timeout`, `network_failure`, `unexpected_response_shape`,
@@ -176,6 +184,11 @@ An unexpected failure is reconstructed as a new Error and may contain only:
   optional line/column, capped at 20 frames and 256 characters per frame path;
 - a stable fingerprint derived only from safe kind/context/frames;
 - a fresh random diagnostic ID for that occurrence.
+
+For runtime exceptions, the same diagnostic ID is printed with the detailed
+local-only error and attached to the sanitized remote exception. Setup commands
+likewise print their attempt diagnostic ID at their existing local failure
+boundary. Raw error messages remain local and never enter telemetry.
 
 The new Error message is the fixed safe reason. The original message, cause,
 custom properties, source context, code variables, and unrecognized frames are

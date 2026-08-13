@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import type { TelemetrySnapshot } from "../config/telemetry.js";
 import {
   startTransportCaptureServer,
   TELEMETRY_CANARY,
@@ -194,6 +195,51 @@ describe("proxy runtime sampling and propagation", () => {
       {},
       [],
     ).decision).toBe(SamplingDecision.NOT_RECORD);
+  });
+
+  it("stops sampling permanently after a persisted revision mismatch", async () => {
+    const { createProxyTraceSampler } = await import("../telemetry/runtime.js");
+    const consentSnapshot = (revision: number): TelemetrySnapshot => ({
+      state: {
+        enabled: true,
+        installId: INSTALL_ID,
+        firstRunAt: "2026-08-01T00:00:00.000Z",
+        revision,
+      },
+      environmentDisabled: false,
+      enabled: true,
+    });
+    let current = consentSnapshot(50);
+    const oldSampler = createProxyTraceSampler({ getSnapshot: () => current } as never);
+    current = consentSnapshot(52);
+    expect(oldSampler.shouldSample(
+      ROOT_CONTEXT,
+      SAMPLED_BELOW_THRESHOLD,
+      "old daemon root",
+      SpanKind.SERVER,
+      {},
+      [],
+    ).decision).toBe(SamplingDecision.NOT_RECORD);
+    current = consentSnapshot(50);
+    expect(oldSampler.shouldSample(
+      ROOT_CONTEXT,
+      SAMPLED_BELOW_THRESHOLD,
+      "old daemon cannot resume",
+      SpanKind.SERVER,
+      {},
+      [],
+    ).decision).toBe(SamplingDecision.NOT_RECORD);
+
+    current = consentSnapshot(52);
+    const newSampler = createProxyTraceSampler({ getSnapshot: () => current } as never);
+    expect(newSampler.shouldSample(
+      ROOT_CONTEXT,
+      SAMPLED_BELOW_THRESHOLD,
+      "new daemon root",
+      SpanKind.SERVER,
+      {},
+      [],
+    ).decision).toBe(SamplingDecision.RECORD_AND_SAMPLED);
   });
 
   it("keeps the network propagator inert for hostile carriers", async () => {

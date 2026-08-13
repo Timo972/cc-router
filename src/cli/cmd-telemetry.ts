@@ -1,6 +1,6 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { getTelemetrySnapshot, loadTelemetryState, writeTelemetryState } from "../config/telemetry.js";
+import { getTelemetrySnapshot, updateTelemetryConsent } from "../config/telemetry.js";
 
 export function registerTelemetry(program: Command): void {
   program
@@ -15,9 +15,7 @@ export function registerTelemetry(program: Command): void {
       }
 
       if (resolved === "on") {
-        const state = loadTelemetryState();
-        state.enabled = true;
-        writeTelemetryState(state);
+        const state = updateTelemetryConsent(true);
         console.log(chalk.green("Telemetry enabled for future daemon starts."));
         console.log(chalk.dim("Restart a daemon that started with telemetry disabled to begin sending telemetry."));
         console.log(chalk.dim(`Install ID: ${state.installId}`));
@@ -26,9 +24,7 @@ export function registerTelemetry(program: Command): void {
 
       if (resolved === "off") {
         // Do not beacon on opt-out: an explicit "turn it off" must not send data.
-        const state = loadTelemetryState();
-        state.enabled = false;
-        writeTelemetryState(state);
+        updateTelemetryConsent(false);
         console.log(chalk.yellow("Telemetry disabled. New outbound telemetry stops immediately."));
         console.log(chalk.dim("Re-enable anytime with: cc-router telemetry on"));
         return;

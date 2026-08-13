@@ -169,6 +169,7 @@ export async function setupSingleAccountDetailed(
       if (!extraction.ok) {
         console.log(chalk.red("✗"));
         console.log(chalk.yellow("  Could not read usable credentials from Keychain."));
+        console.log(chalk.yellow("  Run claude login, then retry."));
         const retry = await dependencies.confirmRetry("keychain");
         if (retry) {
           const outcome = attempt.failed(extraction.error, extraction.error.classification.stage);
@@ -189,6 +190,7 @@ export async function setupSingleAccountDetailed(
       const extraction = dependencies.extractCredentials();
       if (!extraction.ok) {
         console.log(chalk.red("  ✗ ~/.claude/.credentials.json not found or unreadable."));
+        console.log(chalk.yellow("  Run claude login, then retry."));
         const retry = await dependencies.confirmRetry("credentials");
         if (retry) {
           const outcome = attempt.failed(extraction.error, extraction.error.classification.stage);

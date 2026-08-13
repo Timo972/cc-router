@@ -55,7 +55,7 @@ describe("setup diagnostic stage matrix", () => {
     ["anthropic", "macos_keychain", ["credential_read", "credential_parse", "token_validation", "persistence"]],
     ["anthropic", "claude_credentials_file", ["credential_read", "credential_parse", "token_validation", "persistence"]],
     ["anthropic", "manual_token", ["credential_read", "credential_parse", "token_validation", "persistence"]],
-    ["openai", "manual_token", ["credential_read", "credential_parse", "token_validation", "persistence"]],
+    ["openai", "manual_token", ["credential_read", "credential_parse", "persistence"]],
     ["openai", "device_oauth", ["device_code_request", "authorization_polling", "token_exchange", "access_token_parse", "persistence"]],
   ] as const)("records the complete %s/%s success path", (provider, method, completedStages) => {
     const recorded = recorder();

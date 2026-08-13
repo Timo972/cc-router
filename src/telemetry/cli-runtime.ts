@@ -2,7 +2,11 @@ import { isIP } from "node:net";
 import { logs } from "@opentelemetry/api-logs";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BatchLogRecordProcessor, LoggerProvider, type ReadableLogRecord } from "@opentelemetry/sdk-logs";
-import { getTelemetrySnapshot } from "../config/telemetry.js";
+import {
+  createTelemetryConsentGate,
+  getTelemetrySnapshot,
+  type TelemetryConsentGate,
+} from "../config/telemetry.js";
 import { getCurrentVersion } from "../utils/self-update.js";
 import type { RuntimeMode } from "./contracts.js";
 import { createPostHogOtlpLogExporter } from "./otel-exporters.js";
@@ -14,6 +18,7 @@ const EXPORT_TIMEOUT_MS = 2_000;
 
 interface ActiveCliRuntime {
   provider: LoggerProvider;
+  consent: TelemetryConsentGate;
   shuttingDown: boolean;
 }
 
@@ -89,10 +94,17 @@ export function startCliTelemetry(runtimeMode: RuntimeMode): boolean {
     handedOffToProxy = false;
     const snapshot = getTelemetrySnapshot();
     if (!snapshot.enabled) return false;
+    let discardQueuedTelemetry = (): void => undefined;
+    const consent = createTelemetryConsentGate(
+      getTelemetrySnapshot,
+      snapshot,
+      () => discardQueuedTelemetry(),
+    );
     const loopback = testLogUrl();
     if (!loopback.valid) return false;
     const exporter = createPostHogOtlpLogExporter({
       ...(loopback.configured ? { logUrl: loopback.url } : {}),
+      getSnapshot: () => consent.getSnapshot() ?? { ...snapshot, enabled: false },
       getDiagnosticId: diagnosticId,
     });
     const processor = new BatchLogRecordProcessor({
@@ -114,8 +126,11 @@ export function startCliTelemetry(runtimeMode: RuntimeMode): boolean {
       }),
       processors: [processor],
     });
+    discardQueuedTelemetry = () => {
+      void processor.shutdown().catch(() => undefined);
+    };
     logs.setGlobalLoggerProvider(provider);
-    activeRuntime = { provider, shuttingDown: false };
+    activeRuntime = { provider, consent, shuttingDown: false };
     return true;
   } catch {
     return false;
@@ -138,7 +153,7 @@ export async function flushCliTelemetryWithin(deadlineMs: number): Promise<void>
   const runtime = activeRuntime;
   if (!runtime || runtime.shuttingDown) return;
   try {
-    if (!getTelemetrySnapshot().enabled) return;
+    if (!runtime.consent.getSnapshot()) return;
   } catch {
     return;
   }

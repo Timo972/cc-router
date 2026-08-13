@@ -12,6 +12,7 @@ import {
 import { logs, SeverityNumber, type LogAttributes } from "@opentelemetry/api-logs";
 import {
   claimTelemetryFirstStart,
+  createTelemetryConsentGate,
   getTelemetrySnapshot,
   type TelemetrySnapshot,
 } from "../config/telemetry.js";
@@ -40,6 +41,7 @@ import type {
   TrustedTelemetryIdentity,
 } from "./contracts.js";
 import { createPostHogTelemetryClient, type PostHogTelemetryClient } from "./posthog-client.js";
+import { reportRuntimeExceptionLocally } from "./local-diagnostics.js";
 import {
   reconstructAnalyticsEvent,
   reconstructLog,
@@ -146,6 +148,7 @@ export interface TelemetryFacadeDependencies {
   runtimeMetadata: () => RuntimeTelemetryMetadata;
   now: () => number;
   randomUUID: () => string;
+  reportRuntimeException: (error: unknown, diagnosticId: string) => void;
   projectRoot: string;
   setInterval: (callback: () => void, delayMs: number) => FacadeTimer;
 }
@@ -297,6 +300,8 @@ function reconstructedSpan(
   return safe ? { operation: safe.name, attributes: safe.attributes } : undefined;
 }
 
+const automaticSpanConsent = createTelemetryConsentGate();
+
 /**
  * Run one closed runtime operation in the active OTel context. The callback is
  * invoked exactly once even if telemetry is disabled or the OTel API fails.
@@ -308,7 +313,7 @@ export function withTelemetrySpan<T>(
 ): T {
   let callbackStarted = false;
   try {
-    if (!getTelemetrySnapshot().enabled) return callback();
+    if (!automaticSpanConsent.getSnapshot()) return callback();
     const safe = reconstructedSpan(operation, attributes);
     if (!safe) return callback();
 
@@ -382,6 +387,7 @@ function defaultDependencies(): TelemetryFacadeDependencies {
     runtimeMetadata,
     now: Date.now,
     randomUUID,
+    reportRuntimeException: reportRuntimeExceptionLocally,
     projectRoot: PROJECT_ROOT,
     setInterval: (callback, delayMs) => setInterval(callback, delayMs),
   };
@@ -428,6 +434,9 @@ export function createTelemetryFacade(
   const dependencies = { ...defaultDependencies(), ...overrides };
   let activeAnalytics: PostHogTelemetryClient | undefined;
   const immediateOperations = new Set<Promise<void>>();
+  const consent = createTelemetryConsentGate(dependencies.getSnapshot, undefined, () => {
+    try { activeAnalytics?.discardPending(); } catch { /* isolated */ }
+  });
 
   const boundedDeadline = (deadlineMs: number): number => Number.isFinite(deadlineMs)
     ? Math.max(0, Math.min(10_000, Math.floor(deadlineMs)))
@@ -453,12 +462,7 @@ export function createTelemetryFacade(
   };
 
   const enabledSnapshot = (): TelemetrySnapshot | undefined => {
-    try {
-      const snapshot = dependencies.getSnapshot();
-      return snapshot.enabled ? snapshot : undefined;
-    } catch {
-      return undefined;
-    }
+    return consent.getSnapshot();
   };
 
   const analytics = (): PostHogTelemetryClient | undefined => {
@@ -536,11 +540,12 @@ export function createTelemetryFacade(
   return {
     recordApplicationStart(): void {
       try {
-        const current = dependencies.getSnapshot();
+        const current = enabledSnapshot();
         const snapshot = dependencies.claimFirstStart();
-        const properties = current.enabled
+        const properties = current
           && snapshot?.enabled
           && current.state.installId === snapshot.state.installId
+          && current.state.revision === snapshot.state.revision
           ? metadata()
           : undefined;
         if (snapshot && properties) {
@@ -664,6 +669,9 @@ export function createTelemetryFacade(
           projectRoot: dependencies.projectRoot,
         });
         if (exception) {
+          if (context.category === "runtime") {
+            dependencies.reportRuntimeException(error, exception.diagnosticId);
+          }
           const client = analytics();
           if (client) {
             if (context.category === "setup") {

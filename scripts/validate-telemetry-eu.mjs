@@ -23,6 +23,15 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const guardPath = join(repositoryRoot, "scripts", "telemetry-eu-network-guard.mjs");
 const syntheticChildPath = join(repositoryRoot, "scripts", "telemetry-eu-synthetic-child.mjs");
 const approvalPhrase = "I_UNDERSTAND_SYNTHETIC_TELEMETRY_WILL_BE_SENT";
+// Freeze only transitive/offline-cache compatibility edges. posthog-node itself
+// must come exclusively from the packed manifest's exact dependency.
+const offlineTransitiveConstraints = [
+  "@posthog/core@1.46.1",
+  "@posthog/types@1.399.0",
+  "@types/node@20.19.43",
+  "ansi-regex@6.2.2",
+  "ws@8.21.1",
+];
 
 const dryRunPlan = `
 CC-Router personal EU telemetry validation
@@ -67,24 +76,38 @@ function argument(name) {
   return index === -1 ? undefined : process.argv[index + 1];
 }
 
-function offlinePostHogPins() {
-  const postHogPackageJson = realpathSync(join(repositoryRoot, "node_modules", "posthog-node", "package.json"));
+function versionForEntry(entry) {
+  let directory = dirname(entry);
+  while (directory !== dirname(directory)) {
+    const manifest = join(directory, "package.json");
+    if (existsSync(manifest)) return JSON.parse(readFileSync(manifest, "utf8")).version;
+    directory = dirname(directory);
+  }
+  throw new Error(`cannot resolve package version for ${entry}`);
+}
+
+function assertInstalledPostHogCompatibility(packageRoot) {
+  const requireFromPackage = createRequire(join(realpathSync(packageRoot), "package.json"));
+  const postHogPackageJson = realpathSync(join(versionForEntryRoot(requireFromPackage.resolve("posthog-node")), "package.json"));
   const postHogPackage = JSON.parse(readFileSync(postHogPackageJson, "utf8"));
+  if (postHogPackage.version !== "5.47.3") throw new Error("installed posthog-node version differs from exact manifest pin");
   const requireFromPostHog = createRequire(postHogPackageJson);
-  const versionFor = entry => {
-    let directory = dirname(entry);
-    while (directory !== dirname(directory)) {
-      const manifest = join(directory, "package.json");
-      if (existsSync(manifest)) return JSON.parse(readFileSync(manifest, "utf8")).version;
-      directory = dirname(directory);
-    }
-    throw new Error(`cannot resolve package version for ${entry}`);
-  };
-  return [
-    `posthog-node@${postHogPackage.version}`,
-    `@posthog/core@${versionFor(requireFromPostHog.resolve("@posthog/core"))}`,
-    `@posthog/types@${versionFor(requireFromPostHog.resolve("@posthog/types"))}`,
-  ];
+  if (versionForEntry(requireFromPostHog.resolve("@posthog/core")) !== "1.46.1") {
+    throw new Error("installed @posthog/core version differs from privacy-audited compatibility version");
+  }
+  if (versionForEntry(requireFromPostHog.resolve("@posthog/types")) !== "1.399.0") {
+    throw new Error("installed @posthog/types version differs from privacy-audited compatibility version");
+  }
+}
+
+function versionForEntryRoot(entry) {
+  let directory = dirname(entry);
+  while (directory !== dirname(directory)) {
+    const manifest = join(directory, "package.json");
+    if (existsSync(manifest)) return directory;
+    directory = dirname(directory);
+  }
+  throw new Error(`cannot resolve package root for ${entry}`);
 }
 
 function listen(server) {
@@ -195,10 +218,77 @@ function readNetworkEntries(networkLog) {
     : [];
 }
 
-function assertNoBlockedAttempts(networkLog) {
+function auditOrigin(value) {
+  if (!value) return undefined;
+  const url = new URL(value);
+  return {
+    protocol: url.protocol,
+    hostname: url.hostname,
+    port: url.port,
+  };
+}
+
+function expectedNetworkEntry(entry, providerOrigin, offlineCaptureOrigin) {
+  const method = String(entry.method ?? "").toUpperCase();
+  const path = String(entry.path ?? "");
+  const matchesOrigin = origin => origin !== undefined
+    && entry.protocol === origin.protocol
+    && entry.hostname === origin.hostname
+    && String(entry.port ?? "") === origin.port;
+  const matchesEndpoint = origin => origin !== undefined
+    && entry.hostname === origin.hostname
+    && String(entry.port ?? "") === origin.port;
+  if (entry.kind === "provider-loopback" || entry.kind === "provider-fixture") {
+    return matchesOrigin(providerOrigin)
+      && method === "POST"
+      && path === "/backend-api/codex/responses";
+  }
+  if (entry.kind === "offline-posthog-loopback") {
+    return matchesOrigin(offlineCaptureOrigin)
+      && method === "POST"
+      && ["/batch/", "/i/v1/traces", "/i/v1/logs"].includes(path);
+  }
+  if (entry.kind === "approved-socket") {
+    const remotePostHog = entry.protocol === "tcp:"
+      && entry.hostname === "eu.i.posthog.com"
+      && String(entry.port) === "443"
+      && method === "POST"
+      && ["/batch/", "/i/v1/traces", "/i/v1/logs"].includes(path);
+    const loopback = entry.protocol === "tcp:"
+      && method === "POST"
+      && ((matchesEndpoint(providerOrigin) && path === "/backend-api/codex/responses")
+        || (matchesEndpoint(offlineCaptureOrigin)
+          && ["/batch/", "/i/v1/traces", "/i/v1/logs"].includes(path)));
+    return remotePostHog || loopback;
+  }
+  if (entry.kind === "request" || entry.kind === "fetch") {
+    const postHog = entry.protocol === "https:"
+      && entry.hostname === "eu.i.posthog.com"
+      && (String(entry.port ?? "") === "" || String(entry.port) === "443")
+      && method === "POST"
+      && ["/batch/", "/i/v1/traces", "/i/v1/logs"].includes(path);
+    const provider = matchesOrigin(providerOrigin)
+      && method === "POST"
+      && path === "/backend-api/codex/responses";
+    const offline = matchesOrigin(offlineCaptureOrigin)
+      && method === "POST"
+      && ["/batch/", "/i/v1/traces", "/i/v1/logs"].includes(path);
+    return postHog || provider || offline;
+  }
+  return false;
+}
+
+function assertNoBlockedAttempts(networkLog, expected = {}) {
   const entries = readNetworkEntries(networkLog);
   if (entries.some(entry => String(entry.kind).includes("blocked"))) {
     throw new Error("network guard recorded a blocked egress attempt");
+  }
+  const providerOrigin = auditOrigin(expected.providerOrigin
+    ?? process.env.CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN);
+  const offlineCaptureOrigin = auditOrigin(expected.offlineCaptureOrigin
+    ?? process.env.CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN);
+  if (entries.some(entry => !expectedNetworkEntry(entry, providerOrigin, offlineCaptureOrigin))) {
+    throw new Error("unexpected network audit entry");
   }
   return entries;
 }
@@ -268,14 +358,24 @@ const workRoot = mkdtempSync(join(tmpdir(), "cc-router-eu-validation-work-"));
 try {
   const installRoot = join(workRoot, "installed");
   mkdirSync(installRoot, { recursive: true });
+  const packedManifest = JSON.parse(execFileSync("tar", ["-xOf", tarball, "package/package.json"], {
+    encoding: "utf8",
+  }));
+  if (packedManifest.dependencies?.["posthog-node"] !== "5.47.3") {
+    throw new Error("packed manifest must exact-pin posthog-node 5.47.3");
+  }
   execFileSync("pnpm", [
     "add", "--dir", installRoot, "--ignore-workspace", "--offline", "--allow-build=protobufjs",
-    ...offlinePostHogPins(), tarball,
+    ...offlineTransitiveConstraints, tarball,
   ], { cwd: repositoryRoot, stdio: "pipe" });
   const packageRoot = join(installRoot, "node_modules", "@timo972", "cc-router");
   const binary = join(installRoot, "node_modules", ".bin", "cc-router");
   scanPackagedArtifact(packageRoot);
   const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+  if (manifest.dependencies?.["posthog-node"] !== "5.47.3") {
+    throw new Error("installed packed manifest lost the exact posthog-node pin");
+  }
+  assertInstalledPostHogCompatibility(packageRoot);
   evidence.packageVersion = manifest.version;
   secureWrite(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
 
@@ -289,7 +389,14 @@ try {
     const chunks = [];
     request.on("data", chunk => chunks.push(Buffer.from(chunk)));
     request.on("end", () => {
-      appendFileSync(networkLog, `${JSON.stringify({ kind: "provider-fixture", protocol: "http:", hostname: "127.0.0.1", path: request.url })}\n`);
+      appendFileSync(networkLog, `${JSON.stringify({
+        kind: "provider-fixture",
+        protocol: "http:",
+        hostname: "127.0.0.1",
+        port: new URL(providerOrigin).port,
+        method: request.method,
+        path: new URL(request.url ?? "/", providerOrigin).pathname,
+      })}\n`);
       response.writeHead(429, { "content-type": "application/json", "retry-after": "1" });
       response.end(JSON.stringify({ synthetic: true, body: evidence.canaries.providerBody }));
     });
@@ -367,7 +474,7 @@ try {
     stdio: "pipe",
   });
 
-  const networkEntries = assertNoBlockedAttempts(networkLog);
+  const networkEntries = assertNoBlockedAttempts(networkLog, { providerOrigin });
   assertMode(evidenceRoot, 0o700, "evidence directory");
   assertMode(evidencePath, 0o600, "evidence file");
   assertMode(networkLog, 0o600, "evidence file");

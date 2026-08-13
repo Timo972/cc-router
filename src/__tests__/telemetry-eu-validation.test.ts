@@ -164,8 +164,8 @@ describe("personal EU telemetry release validator", () => {
       expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
       const networkWire = readFileSync(networkLog, "utf8");
       expect(networkWire.match(/"kind":"blocked-fetch"/g)).toHaveLength(2);
-      expect(networkWire.match(/"kind":"blocked-request"/g)).toHaveLength(12);
-      expect(networkWire.match(/"kind":"blocked-socket"/g)).toHaveLength(3);
+      expect(networkWire.match(/"kind":"blocked-request"/g)).toHaveLength(13);
+      expect(networkWire.match(/"kind":"blocked-socket"/g)).toHaveLength(5);
       expect(networkWire).toContain('"hostname":"2001:db8::1"');
       expect(networkWire).toContain('"hostname":"eu.i.posthog.com"');
       expect(networkWire).toContain('"path":"/named-before-not-approved"');
@@ -184,6 +184,39 @@ describe("personal EU telemetry release validator", () => {
       });
       expect(audit.status).not.toBe(0);
       expect(`${audit.stdout}${audit.stderr}`).toContain("blocked egress attempt");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects every unexpected network entry, even when it is not labeled blocked", () => {
+    const root = mkdtempSync(join(tmpdir(), "cc-router-guard-audit-"));
+    const networkLog = join(root, "network.jsonl");
+    try {
+      writeFileSync(networkLog, `${JSON.stringify({
+        kind: "request",
+        protocol: "http:",
+        hostname: "127.0.0.1",
+        port: "43199",
+        method: "GET",
+        path: "/arbitrary",
+      })}\n`);
+      const audit = spawnSync(process.execPath, [
+        VALIDATOR,
+        "--test-audit-network-log",
+        "--network-log", networkLog,
+      ], {
+        cwd: PROJECT_ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          NODE_ENV: "test",
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: "http://127.0.0.1:43198",
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: "http://127.0.0.1:43197",
+        },
+      });
+      expect(audit.status).not.toBe(0);
+      expect(`${audit.stdout}${audit.stderr}`).toContain("unexpected network audit entry");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -240,7 +273,24 @@ describe("personal EU telemetry release validator", () => {
       expect(requests.filter(path => path === "/i/v1/logs")).toHaveLength(2);
       const networkWire = readFileSync(networkLog, "utf8");
       expect(networkWire.match(/"kind":"offline-posthog-loopback"/g)).toHaveLength(6);
+      expect(networkWire.match(/"kind":"approved-socket"/g)?.length).toBeGreaterThanOrEqual(1);
+      expect(networkWire.match(/"method":"POST"/g)?.length).toBeGreaterThanOrEqual(7);
       expect(networkWire).not.toContain("blocked-");
+      const audit = spawnSync(process.execPath, [
+        VALIDATOR,
+        "--test-audit-network-log",
+        "--network-log", networkLog,
+      ], {
+        cwd: PROJECT_ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          NODE_ENV: "test",
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: `http://127.0.0.1:${address.port}`,
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: `http://127.0.0.1:${address.port}`,
+        },
+      });
+      expect(audit.status, `${audit.stdout}${audit.stderr}`).toBe(0);
     } finally {
       await new Promise<void>(resolveClose => {
         server.close(() => resolveClose());
@@ -333,6 +383,18 @@ describe("personal EU telemetry release validator", () => {
         "openai/manual_token",
         "openai/device_oauth",
       ]));
+      const completedStages = (provider: string, method: string) => batches
+        .filter(event => event.event === "account_setup.stage_completed"
+          && event.properties.provider === provider
+          && event.properties.method === method)
+        .map(event => event.properties.stage);
+      expect(completedStages("openai", "manual_token")).toEqual([
+        "credential_source_selection", "credential_read", "credential_parse", "persistence",
+      ]);
+      expect(completedStages("openai", "device_oauth")).toEqual([
+        "credential_source_selection", "device_code_request", "authorization_polling",
+        "token_exchange", "access_token_parse", "persistence",
+      ]);
       expect(batches.filter(event => event.event === "$exception")).toHaveLength(2);
       expect(batches.every(event => event.properties["$process_person_profile"] === false)).toBe(true);
       expect(batches.every(event => event.properties["$geoip_disable"] === true)).toBe(true);

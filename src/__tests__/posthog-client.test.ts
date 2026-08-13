@@ -15,12 +15,13 @@ const OTHER_INSTALL_ID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
 const DIAGNOSTIC_ID = "ad94f035-1e08-4e29-8517-fd56bdc83d99";
 const PROJECT_ROOT = "/workspace/cc-router";
 
-function snapshot(enabled = true): TelemetrySnapshot {
+function snapshot(enabled = true, revision = 0): TelemetrySnapshot {
   return {
     state: {
       enabled,
       installId: INSTALL_ID,
       firstRunAt: "2026-08-03T00:00:00.000Z",
+      revision,
     },
     environmentDisabled: false,
     enabled,
@@ -344,6 +345,62 @@ describe("gated PostHog EU client", () => {
 
     expect(requests).toHaveLength(0);
     await client.shutdownWithin(100);
+  });
+
+  it("never revives queued analytics after persisted off then on before flush", async () => {
+    let currentSnapshot = snapshot(true, 10);
+    const requests: CapturedRequest[] = [];
+    const oldClient = createPostHogTelemetryClient({
+      getSnapshot: () => currentSnapshot,
+      transport: captureTransport(requests),
+    });
+
+    oldClient.captureAnalytics(analyticsEvent());
+    await waitForImmediate();
+    currentSnapshot = snapshot(true, 12);
+    await oldClient.flushWithin(100);
+    currentSnapshot = snapshot(true, 10);
+    oldClient.captureAnalytics(analyticsEvent());
+    await oldClient.flushWithin(100);
+    expect(requests).toHaveLength(0);
+
+    currentSnapshot = snapshot(true, 12);
+    const newClient = createPostHogTelemetryClient({
+      getSnapshot: () => currentSnapshot,
+      transport: captureTransport(requests),
+    });
+    await newClient.captureAnalyticsImmediate(analyticsEvent());
+    expect(requests).toHaveLength(1);
+    await oldClient.shutdownWithin(100);
+    await newClient.shutdownWithin(100);
+  });
+
+  it("never revives queued exceptions after persisted off then on before flush", async () => {
+    let currentSnapshot = snapshot(true, 20);
+    const requests: CapturedRequest[] = [];
+    const oldClient = createPostHogTelemetryClient({
+      getSnapshot: () => currentSnapshot,
+      transport: captureTransport(requests),
+    });
+
+    oldClient.captureException(exceptionContract());
+    await waitForImmediate();
+    currentSnapshot = snapshot(true, 22);
+    await oldClient.flushWithin(100);
+    currentSnapshot = snapshot(true, 20);
+    oldClient.captureException(exceptionContract());
+    await oldClient.flushWithin(100);
+    expect(requests).toHaveLength(0);
+
+    currentSnapshot = snapshot(true, 22);
+    const newClient = createPostHogTelemetryClient({
+      getSnapshot: () => currentSnapshot,
+      transport: captureTransport(requests),
+    });
+    await newClient.captureExceptionImmediate(exceptionContract());
+    expect(requests).toHaveLength(1);
+    await oldClient.shutdownWithin(100);
+    await newClient.shutdownWithin(100);
   });
 
   it("discards queued events without contacting transport", async () => {

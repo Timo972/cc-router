@@ -33,17 +33,19 @@ function writeEvidence(contents) {
 if (!startCliTelemetry("foreground")) throw new Error("synthetic CLI telemetry runtime did not start");
 
 const methods = [
-  { provider: "anthropic", method: "macos_keychain", stages: ["credential_source_selection", "credential_read", "credential_parse", "token_validation", "persistence"], reason: "not_found" },
-  { provider: "anthropic", method: "claude_credentials_file", stages: ["credential_source_selection", "credential_read", "credential_parse", "token_validation", "persistence"], reason: "malformed_credentials" },
-  { provider: "anthropic", method: "manual_token", stages: ["credential_source_selection", "credential_read", "credential_parse", "token_validation", "persistence"], reason: "invalid_token" },
-  { provider: "openai", method: "manual_token", stages: ["credential_source_selection", "credential_read", "credential_parse", "token_validation", "persistence"], reason: "unauthorized" },
-  { provider: "openai", method: "device_oauth", stages: ["credential_source_selection", "device_code_request", "authorization_polling", "token_exchange", "access_token_parse", "token_validation", "persistence"], reason: "timeout" },
+  { provider: "anthropic", method: "macos_keychain", reason: "not_found" },
+  { provider: "anthropic", method: "claude_credentials_file", reason: "malformed_credentials" },
+  { provider: "anthropic", method: "manual_token", reason: "invalid_token" },
+  { provider: "openai", method: "manual_token", reason: "unauthorized" },
+  { provider: "openai", method: "device_oauth", reason: "timeout" },
 ];
 
 evidence.setupAttempts = [];
 for (const entry of methods) {
   const successful = diagnostics.createSetupAttempt({ provider: entry.provider, method: entry.method });
-  for (const stage of entry.stages) successful.stageCompleted(stage);
+  const stages = diagnostics.SETUP_SUCCESS_STAGE_SEQUENCES[entry.provider][entry.method];
+  if (!stages) throw new Error("missing authoritative setup success sequence");
+  for (const stage of stages) successful.stageCompleted(stage);
   successful.succeeded();
 
   const failed = diagnostics.createSetupAttempt({ provider: entry.provider, method: entry.method });

@@ -112,7 +112,6 @@ export async function runOpenAIManualAccountSetup(
       attempt.stageCompleted("credential_read");
       record = createOpenAIAccountRecord(collected);
       attempt.stageCompleted("credential_parse");
-      attempt.stageCompleted("token_validation");
     } catch (error) {
       if (isPromptCancellation(error)) {
         attempt.cancelled();

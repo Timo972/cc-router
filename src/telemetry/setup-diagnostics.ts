@@ -20,6 +20,28 @@ import {
 
 export type SetupDiagnosticProvider = "anthropic" | "openai";
 
+/** Exact stages that production can complete for each successful setup path. */
+export const SETUP_SUCCESS_STAGE_SEQUENCES = {
+  anthropic: {
+    macos_keychain: [
+      "credential_source_selection", "credential_read", "credential_parse", "token_validation", "persistence",
+    ],
+    claude_credentials_file: [
+      "credential_source_selection", "credential_read", "credential_parse", "token_validation", "persistence",
+    ],
+    manual_token: [
+      "credential_source_selection", "credential_read", "credential_parse", "token_validation", "persistence",
+    ],
+  },
+  openai: {
+    manual_token: ["credential_source_selection", "credential_read", "credential_parse", "persistence"],
+    device_oauth: [
+      "credential_source_selection", "device_code_request", "authorization_polling", "token_exchange",
+      "access_token_parse", "persistence",
+    ],
+  },
+} as const satisfies Record<SetupDiagnosticProvider, Partial<Record<SetupMethod, readonly SetupStage[]>>>;
+
 export interface SetupFailureClassification {
   stage: SetupStage;
   reason: SetupReason;

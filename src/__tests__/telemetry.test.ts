@@ -21,6 +21,7 @@ vi.mock("../config/paths.js", () => ({
 import {
   loadTelemetryState,
   writeTelemetryState,
+  updateTelemetryConsent,
   getTelemetrySnapshot,
   isTelemetryEnabled,
   claimTelemetryFirstStart,
@@ -46,6 +47,7 @@ describe("loadTelemetryState", () => {
   it("creates fresh state with UUID and persists on first call", () => {
     const state = loadTelemetryState();
     expect(state.enabled).toBe(true);
+    expect((state as TelemetryState & { revision?: unknown }).revision).toBe(0);
     expect(state.installId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
     );
@@ -103,11 +105,13 @@ describe("loadTelemetryState", () => {
       enabled: true,
       installId: "existing-install-id",
       firstRunAt: "2026-01-01T00:00:00.000Z",
+      revision: 0,
     });
     expect(JSON.parse(fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"))).toEqual({
       enabled: true,
       installId: "existing-install-id",
       firstRunAt: "2026-01-01T00:00:00.000Z",
+      revision: 0,
     });
   });
 
@@ -142,6 +146,7 @@ describe("writeTelemetryState", () => {
       enabled: false,
       installId: "test-uuid",
       firstRunAt: "2026-01-01T00:00:00.000Z",
+      revision: 0,
     };
     writeTelemetryState(state);
     const raw = JSON.parse(
@@ -150,6 +155,16 @@ describe("writeTelemetryState", () => {
     expect(raw).toEqual(state);
     // .tmp was cleaned up (rename replaces)
     expect(fs.existsSync(`${MOCK_DIR}/telemetry.json.tmp`)).toBe(false);
+  });
+
+  it("advances the persisted revision for every explicit choice, including repeats", () => {
+    const first = updateTelemetryConsent(false);
+    const second = updateTelemetryConsent(false);
+    const third = updateTelemetryConsent(true);
+
+    expect([first.revision, second.revision, third.revision]).toEqual([1, 2, 3]);
+    expect(loadTelemetryState()).toEqual(third);
+    expect(fs.existsSync(`${MOCK_DIR}/telemetry.json.lock`)).toBe(false);
   });
 });
 
@@ -207,6 +222,7 @@ describe("getTelemetrySnapshot", () => {
         enabled: true,
         installId: "existing-install-id",
         firstRunAt: "2026-01-01T00:00:00.000Z",
+        revision: 0,
       },
       environmentDisabled: true,
       enabled: false,
@@ -220,12 +236,13 @@ describe("typed telemetry facade", () => {
   const INSTALL_ID = "123e4567-e89b-42d3-a456-426614174000";
   const DIAGNOSTIC_ID = "123e4567-e89b-42d3-a456-426614174001";
 
-  function snapshot(enabled = true) {
+  function snapshot(enabled = true, revision = 0) {
     return {
       state: {
         enabled,
         installId: INSTALL_ID,
         firstRunAt: "2026-08-11T12:00:00.000Z",
+        revision,
       },
       environmentDisabled: false,
       enabled,
@@ -583,6 +600,100 @@ describe("typed telemetry facade", () => {
         accountPoolSize: 2,
       },
     }]);
+  });
+
+  it("latches an active facade off after a persisted revision change and requires a new facade", async () => {
+    const { createTelemetryFacade } = await import("../telemetry/facade.js");
+    let current = snapshot(true, 4);
+    const oldEvents: string[] = [];
+    const oldFacade = createTelemetryFacade({
+      getSnapshot: () => current,
+      claimFirstStart: () => undefined,
+      runtimeMetadata: () => ({ serviceVersion: "0.8.2", osFamily: "macos", runtimeMode: "daemon" }),
+      getAnalytics: () => ({
+        captureAnalytics: event => { oldEvents.push(event.event); },
+        captureAnalyticsImmediate: async event => { oldEvents.push(event.event); },
+        captureException: () => undefined,
+        captureExceptionImmediate: async () => undefined,
+        flushWithin: async () => undefined,
+        shutdownWithin: async () => undefined,
+        discardPending: () => undefined,
+      }),
+    });
+
+    oldFacade.recordProxyStarted(1);
+    current = snapshot(true, 6); // explicit off (5), then on (6) before this daemon observes either write
+    oldFacade.recordProxyStarted(1);
+    current = snapshot(true, 4);
+    oldFacade.recordProxyStarted(1);
+
+    expect(oldEvents).toEqual(["proxy.started"]);
+
+    current = snapshot(true, 6);
+    const newEvents: string[] = [];
+    const newFacade = createTelemetryFacade({
+      getSnapshot: () => current,
+      claimFirstStart: () => undefined,
+      runtimeMetadata: () => ({ serviceVersion: "0.8.2", osFamily: "macos", runtimeMode: "daemon" }),
+      getAnalytics: () => ({
+        captureAnalytics: event => { newEvents.push(event.event); },
+        captureAnalyticsImmediate: async event => { newEvents.push(event.event); },
+        captureException: () => undefined,
+        captureExceptionImmediate: async () => undefined,
+        flushWithin: async () => undefined,
+        shutdownWithin: async () => undefined,
+        discardPending: () => undefined,
+      }),
+    });
+    newFacade.recordProxyStarted(1);
+    expect(newEvents).toEqual(["proxy.started"]);
+  });
+
+  it("reports the exact remote runtime diagnostic ID once with raw detail kept local", async () => {
+    const { createTelemetryFacade } = await import("../telemetry/facade.js");
+    const ids = [
+      "123e4567-e89b-42d3-a456-426614174011",
+      "123e4567-e89b-42d3-a456-426614174012",
+    ];
+    const local: Array<{ error: unknown; diagnosticId: string }> = [];
+    const remote: Array<{ diagnosticId: string; serialized: string }> = [];
+    const facade = createTelemetryFacade({
+      getSnapshot: () => snapshot(true, 7),
+      claimFirstStart: () => undefined,
+      randomUUID: () => ids.shift() ?? DIAGNOSTIC_ID,
+      reportRuntimeException: (error: unknown, diagnosticId: string) => {
+        local.push({ error, diagnosticId });
+      },
+      getAnalytics: () => ({
+        captureAnalytics: () => undefined,
+        captureAnalyticsImmediate: async () => undefined,
+        captureException: exception => {
+          remote.push({ diagnosticId: exception.diagnosticId, serialized: JSON.stringify(exception) });
+        },
+        captureExceptionImmediate: async () => undefined,
+        flushWithin: async () => undefined,
+        shutdownWithin: async () => undefined,
+        discardPending: () => undefined,
+      }),
+    } as never);
+    const first = new Error("PRIVATE runtime detail one");
+    const second = new Error("PRIVATE runtime detail two");
+
+    facade.recordUnexpectedException(first, { category: "runtime", reason: "other", operation: "proxy.request" });
+    facade.recordUnexpectedException(second, { category: "runtime", reason: "other", operation: "proxy.request" });
+
+    expect(local).toEqual([
+      { error: first, diagnosticId: "123e4567-e89b-42d3-a456-426614174011" },
+      { error: second, diagnosticId: "123e4567-e89b-42d3-a456-426614174012" },
+    ]);
+    expect(remote.map(entry => entry.diagnosticId)).toEqual(local.map(entry => entry.diagnosticId));
+    expect(new Set(remote.map(entry => entry.diagnosticId)).size).toBe(2);
+    expect(remote.every(entry => entry.diagnosticId !== INSTALL_ID)).toBe(true);
+    expect(local.map(entry => (entry.error as Error).message)).toEqual([
+      "PRIVATE runtime detail one",
+      "PRIVATE runtime detail two",
+    ]);
+    expect(remote.map(entry => entry.serialized).join("\n")).not.toContain("PRIVATE runtime detail");
   });
 
   it("contains synchronous and asynchronous dependency failures", async () => {

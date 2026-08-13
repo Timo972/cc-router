@@ -289,7 +289,7 @@ async function _doRefresh(account: Account, signal?: AbortSignal): Promise<boole
       });
     }
     logRefresh(account.id, false);
-    console.error(`  Error:`, err);
+    if (expectedReason) console.error(`  Error:`, err);
     account.consecutiveErrors++;
     account.healthy = false;
     return false;

@@ -164,6 +164,27 @@ describe("Anthropic account-add methods", () => {
     expect(JSON.stringify(recorded.safe)).not.toContain("PRIVATE");
   });
 
+  it.each([
+    ["keychain", "macos_keychain"],
+    ["credentials", "claude_credentials_file"],
+  ] as const)("prints the local claude login recovery hint for %s without recording it remotely", async (selected) => {
+    const recorded = recorder();
+    const deps = dependencies(selected, recorded);
+    const failure = new SetupDiagnosticError("PRIVATE extraction detail", {
+      stage: "credential_read",
+      reason: "not_found",
+      expected: true,
+    });
+    deps.extractKeychain = async () => ({ ok: false, error: failure });
+    deps.extractCredentials = () => ({ ok: false, error: failure });
+
+    await setupSingleAccountDetailed(1, deps);
+
+    const localOutput = vi.mocked(console.log).mock.calls.flat().map(String).join("\n");
+    expect(localOutput).toContain("Run claude login, then retry");
+    expect(JSON.stringify(recorded.safe)).not.toContain("claude login");
+  });
+
   it("closes a failed extraction attempt before retrying with a fresh attempt", async () => {
     const recorded = recorder();
     const deps = dependencies("keychain", recorded);
@@ -439,7 +460,6 @@ describe("OpenAI account-add methods", () => {
       expect.objectContaining({ stage: "credential_source_selection", diagnosticId: DIAGNOSTIC_ID }),
       expect.objectContaining({ stage: "credential_read", diagnosticId: DIAGNOSTIC_ID }),
       expect.objectContaining({ stage: "credential_parse", diagnosticId: DIAGNOSTIC_ID }),
-      expect.objectContaining({ stage: "token_validation", diagnosticId: DIAGNOSTIC_ID }),
       expect.objectContaining({ stage: "persistence", diagnosticId: DIAGNOSTIC_ID }),
       expect.objectContaining({ result: "succeeded", diagnosticId: DIAGNOSTIC_ID }),
     ]);
