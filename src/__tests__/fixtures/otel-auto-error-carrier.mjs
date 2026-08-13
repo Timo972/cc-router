@@ -10,7 +10,18 @@ function requiredEnvironment(name) {
 const markerPath = requiredEnvironment("CC_ROUTER_TEST_CANDIDATE_MARKER");
 const hostileMessage = requiredEnvironment("CC_ROUTER_TEST_HOSTILE_MESSAGE");
 const hostileStackPath = requiredEnvironment("CC_ROUTER_TEST_HOSTILE_STACK_PATH");
+const networkGuardMarker = requiredEnvironment("CC_ROUTER_TEST_NETWORK_GUARD_MARKER");
 const originalOnEnd = BatchSpanProcessor.prototype.onEnd;
+
+function withinDeadline(promise, context) {
+  let deadline;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      deadline = setTimeout(() => reject(new Error(`${context} after 8000ms`)), 8_000);
+    }),
+  ]).finally(() => clearTimeout(deadline));
+}
 
 // Observe the exact candidate accepted by the production processor, immediately
 // before its production reconstructive exporter receives the span.
@@ -54,7 +65,46 @@ try {
   const response = await fetch(`http://127.0.0.1:${address.port}/v1/responses`, { method: "POST" });
   if (response.status !== 500) throw new Error(`unexpected carrier response ${response.status}`);
   await response.arrayBuffer();
+
+  const fatalError = new Error(requiredEnvironment("CC_ROUTER_TEST_FATAL_MESSAGE"));
+  fatalError.stack = [
+    `Error: ${fatalError.message}`,
+    `    at fatal (${process.cwd()}/dist/proxy/server.js:10:20)`,
+  ].join("\n");
+  let resolveFatal;
+  let rejectFatal;
+  const fatalCaptured = new Promise((resolve, reject) => {
+    resolveFatal = resolve;
+    rejectFatal = reject;
+  });
+  process.setUncaughtExceptionCaptureCallback(error => {
+    if (error === fatalError) resolveFatal();
+    else rejectFatal(error);
+  });
+  setImmediate(() => { throw fatalError; });
+  try {
+    await withinDeadline(fatalCaptured, "fatal exception capture callback did not run");
+    await withinDeadline(
+      globalThis.__ccRouterTestNetworkGuard.postHogCaptured,
+      "fatal monitor did not send the immediate PostHog exception",
+    );
+  } finally {
+    process.setUncaughtExceptionCaptureCallback(null);
+  }
+
+  let externalBlocked = false;
+  try {
+    await fetch("https://external.invalid/forbidden", { method: "POST" });
+  } catch (error) {
+    externalBlocked = String(error).includes("blocked before socket creation");
+  }
+  if (!externalBlocked) throw new Error("network guard allowed an external fetch");
   await runtime.flushProxyTelemetryWithin(8_000);
+  writeFileSync(networkGuardMarker, JSON.stringify({
+    blocked: globalThis.__ccRouterTestNetworkGuard.blocked,
+    redirected: globalThis.__ccRouterTestNetworkGuard.redirected,
+    fatalCaptured: true,
+  }));
 } finally {
   if (server) {
     await new Promise((resolveClose, reject) => {

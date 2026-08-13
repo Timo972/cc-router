@@ -54,6 +54,16 @@ function close(server: Server): Promise<void> {
   });
 }
 
+async function reserveLoopbackPort(): Promise<number> {
+  const server = createServer();
+  try {
+    return await listen(server);
+  } finally {
+    if (server.listening) await close(server);
+    else server.closeAllConnections();
+  }
+}
+
 async function waitUntil(
   predicate: () => boolean | Promise<boolean>,
   timeoutMs: number,
@@ -158,6 +168,41 @@ async function collectHttpRequest(
   return startHttpRequest(url, body, headers).completed;
 }
 
+function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise(resolveExit => {
+    let settled = false;
+    const finish = (exited: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      child.off("exit", onExit);
+      resolveExit(exited);
+    };
+    const onExit = (): void => finish(true);
+    const deadline = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
+async function cleanupBuiltPackage(
+  child: ChildProcess | undefined,
+  testHome: string,
+  signal: "SIGTERM" | "SIGINT" = "SIGTERM",
+): Promise<void> {
+  try {
+    if (!child || child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+    child.kill(signal);
+    if (await waitForChildExit(child, 2_000)) return;
+    child.kill("SIGKILL");
+    if (!await waitForChildExit(child, 2_000)) {
+      throw new Error(`test child ${String(child.pid)} survived SIGKILL`);
+    }
+  } finally {
+    rmSync(testHome, { recursive: true, force: true });
+  }
+}
+
 async function startBuiltPackage(options: {
   telemetryEnabled: boolean;
   proxyPort: number;
@@ -171,34 +216,37 @@ async function startBuiltPackage(options: {
   cwd?: string;
   launchBinaryDirectly?: boolean;
   config?: Record<string, unknown>;
+  readinessTimeoutMs?: number;
 }): Promise<RunningPackage> {
   const testHome = mkdtempSync(join(tmpdir(), "cc-router-bootstrap-"));
-  const accountsPath = join(testHome, "accounts.json");
-  const telemetryPath = join(testHome, "telemetry.json");
-  const configPath = join(testHome, "config.json");
-  const preloadPath = join(testHome, "loopback-fetch-preload.mjs");
-  const packageJson = JSON.parse(readFileSync(join(PROJECT_ROOT, "package.json"), "utf8")) as {
-    bin: { "cc-router": string };
-  };
-  const binary = options.binary ?? join(PROJECT_ROOT, packageJson.bin["cc-router"]);
+  let child: ChildProcess | undefined;
+  try {
+    const accountsPath = join(testHome, "accounts.json");
+    const telemetryPath = join(testHome, "telemetry.json");
+    const configPath = join(testHome, "config.json");
+    const preloadPath = join(testHome, "loopback-fetch-preload.mjs");
+    const packageJson = JSON.parse(readFileSync(join(PROJECT_ROOT, "package.json"), "utf8")) as {
+      bin: { "cc-router": string };
+    };
+    const binary = options.binary ?? join(PROJECT_ROOT, packageJson.bin["cc-router"]);
 
-  writeFileSync(accountsPath, JSON.stringify(options.accounts ?? [{
-    id: TELEMETRY_CANARY.accountId,
-    provider: "openai_subscription",
-    accessToken: TELEMETRY_CANARY.bearerToken.slice("Bearer ".length),
-    refreshToken: TELEMETRY_CANARY.prompt,
-    expiresAt: Date.now() + 3_600_000,
-    scopes: [TELEMETRY_CANARY.email, TELEMETRY_CANARY.homePath],
-    enabled: true,
-  }]));
-  writeFileSync(telemetryPath, JSON.stringify({
-    enabled: options.telemetryEnabled,
-    installId: "11111111-1111-4111-8111-111111111111",
-    firstRunAt: "2026-08-01T00:00:00.000Z",
-  }));
-  writeFileSync(configPath, JSON.stringify(options.config ?? {}));
+    writeFileSync(accountsPath, JSON.stringify(options.accounts ?? [{
+      id: TELEMETRY_CANARY.accountId,
+      provider: "openai_subscription",
+      accessToken: TELEMETRY_CANARY.bearerToken.slice("Bearer ".length),
+      refreshToken: TELEMETRY_CANARY.prompt,
+      expiresAt: Date.now() + 3_600_000,
+      scopes: [TELEMETRY_CANARY.email, TELEMETRY_CANARY.homePath],
+      enabled: true,
+    }]));
+    writeFileSync(telemetryPath, JSON.stringify({
+      enabled: options.telemetryEnabled,
+      installId: "11111111-1111-4111-8111-111111111111",
+      firstRunAt: "2026-08-01T00:00:00.000Z",
+    }));
+    writeFileSync(configPath, JSON.stringify(options.config ?? {}));
 
-  writeFileSync(preloadPath, `
+    writeFileSync(preloadPath, `
 import { ServerResponse } from "node:http";
 const realFetch = globalThis.fetch;
 const targetOrigin = ${JSON.stringify(options.targetOrigin)};
@@ -231,74 +279,77 @@ globalThis.fetch = async (input, init) => {
 };
 `);
 
-  let output = "";
-  const applicationArgs = [
-    "start",
-    "--foreground",
-    "--port", String(options.proxyPort),
-    "--accounts", accountsPath,
-  ];
-  const executable = options.launchBinaryDirectly ? binary : process.execPath;
-  const childArgs = options.launchBinaryDirectly
-    ? applicationArgs
-    : ["--import", pathToFileURL(preloadPath).href, binary, ...applicationArgs];
-  const child = spawn(executable, childArgs, {
-    cwd: options.cwd ?? PROJECT_ROOT,
-    env: {
-      ...process.env,
-      ...options.environment,
-      HOME: testHome,
-      ACCOUNTS_PATH: accountsPath,
-      CONFIG_PATH: configPath,
-      TELEMETRY_PATH: telemetryPath,
-      NODE_ENV: "test",
-      CC_ROUTER_TEST_OTLP_TRACE_URL:
-        options.testTraceUrl ?? `${options.telemetryCaptureOrigin}/i/v1/traces`,
-      CC_ROUTER_TEST_OTLP_LOG_URL:
-        options.testLogUrl ?? `${options.telemetryCaptureOrigin}/i/v1/logs`,
-      ...(options.launchBinaryDirectly
-        ? {
-            NODE_OPTIONS: [
-              process.env["NODE_OPTIONS"],
-              `--import=${pathToFileURL(preloadPath).href}`,
-            ].filter(Boolean).join(" "),
-          }
-        : {}),
-      NO_UPDATE_NOTIFIER: "1",
-      CI: "1",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  child.stdout?.on("data", chunk => { output += chunk.toString(); });
-  child.stderr?.on("data", chunk => { output += chunk.toString(); });
+    let output = "";
+    const applicationArgs = [
+      "start",
+      "--foreground",
+      "--port", String(options.proxyPort),
+      "--accounts", accountsPath,
+    ];
+    const executable = options.launchBinaryDirectly ? binary : process.execPath;
+    const childArgs = options.launchBinaryDirectly
+      ? applicationArgs
+      : ["--import", pathToFileURL(preloadPath).href, binary, ...applicationArgs];
+    child = spawn(executable, childArgs, {
+      cwd: options.cwd ?? PROJECT_ROOT,
+      env: {
+        ...process.env,
+        ...options.environment,
+        HOME: testHome,
+        ACCOUNTS_PATH: accountsPath,
+        CONFIG_PATH: configPath,
+        TELEMETRY_PATH: telemetryPath,
+        NODE_ENV: "test",
+        CC_ROUTER_TEST_OTLP_TRACE_URL:
+          options.testTraceUrl ?? `${options.telemetryCaptureOrigin}/i/v1/traces`,
+        CC_ROUTER_TEST_OTLP_LOG_URL:
+          options.testLogUrl ?? `${options.telemetryCaptureOrigin}/i/v1/logs`,
+        ...(options.launchBinaryDirectly
+          ? {
+              NODE_OPTIONS: [
+                process.env["NODE_OPTIONS"],
+                `--import=${pathToFileURL(preloadPath).href}`,
+              ].filter(Boolean).join(" "),
+            }
+          : {}),
+        NO_UPDATE_NOTIFIER: "1",
+        CI: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let startupError: Error | undefined;
+    child.once("error", error => {
+      startupError = error;
+      output += `${error.stack ?? error.message}\n`;
+    });
+    child.stdout?.on("data", chunk => { output += chunk.toString(); });
+    child.stderr?.on("data", chunk => { output += chunk.toString(); });
 
-  await waitUntil(async () => {
-    if (child.exitCode !== null) return false;
-    try {
-      const response = await fetch(`http://127.0.0.1:${options.proxyPort}/cc-router/health`);
-      return response.ok;
-    } catch {
-      return false;
-    }
-  }, 8_000, () => `compiled package did not start\n${output}`);
-
-  return {
-    child,
-    output: () => output,
-    stop: async (signal = "SIGTERM") => {
-      if (child.exitCode !== null || child.signalCode !== null) {
-        rmSync(testHome, { recursive: true, force: true });
-        return;
+    await waitUntil(async () => {
+      if (startupError) throw startupError;
+      if (child!.exitCode !== null) return false;
+      try {
+        const response = await fetch(`http://127.0.0.1:${options.proxyPort}/cc-router/health`);
+        return response.ok;
+      } catch {
+        return false;
       }
-      if (child.exitCode === null) child.kill(signal);
-      await Promise.race([
-        new Promise<void>(resolveExit => child.once("exit", () => resolveExit())),
-        new Promise<void>(resolveTimeout => setTimeout(resolveTimeout, 2_000)),
-      ]);
-      if (child.exitCode === null) child.kill("SIGKILL");
-      rmSync(testHome, { recursive: true, force: true });
-    },
-  };
+    }, options.readinessTimeoutMs ?? 8_000, () => `compiled package did not start\n${output}`);
+
+    let stopPromise: Promise<void> | undefined;
+    const readyChild = child;
+    return {
+      child: readyChild,
+      output: () => output,
+      stop: (signal = "SIGTERM") => {
+        stopPromise ??= cleanupBuiltPackage(readyChild, testHome, signal);
+        return stopPromise;
+      },
+    };
+  } catch (error) {
+    await cleanupBuiltPackage(child, testHome);
+    throw error;
+  }
 }
 
 function installedVersionForEntry(entry: string): string {
@@ -584,9 +635,7 @@ export async function resolve(specifier, context, nextResolve) {
       const isolatedCapture = await startTransportCaptureServer();
       try {
       const targetBefore = targetBodies.length;
-      const probe = createServer();
-      const proxyPort = await listen(probe);
-      await close(probe);
+      const proxyPort = await reserveLoopbackPort();
       const running = await startBuiltPackage({
         telemetryEnabled: mode.telemetryEnabled,
         proxyPort,
@@ -676,15 +725,17 @@ export async function resolve(specifier, context, nextResolve) {
 
   it("removes a real automatic Express error message, stack, and status description before OTLP export", async () => {
     const testHome = mkdtempSync(join(tmpdir(), "cc-router-auto-express-error-"));
-    const candidateMarker = join(testHome, "candidate.json");
-    const telemetryPath = join(testHome, "telemetry.json");
-    writeFileSync(telemetryPath, JSON.stringify({
-      enabled: true,
-      installId: "70d8062e-1fa0-4ae4-a115-bf782ecca462",
-      firstRunAt: "2026-08-03T00:00:00.000Z",
-    }));
-    const capture = await startTransportCaptureServer();
+    let capture: TransportCaptureServer | undefined;
     try {
+      const candidateMarker = join(testHome, "candidate.json");
+      const networkGuardMarker = join(testHome, "network-guard.json");
+      const telemetryPath = join(testHome, "telemetry.json");
+      writeFileSync(telemetryPath, JSON.stringify({
+        enabled: true,
+        installId: "70d8062e-1fa0-4ae4-a115-bf782ecca462",
+        firstRunAt: "2026-08-03T00:00:00.000Z",
+      }));
+      capture = await startTransportCaptureServer();
       await runNodeFixture(
         join(import.meta.dirname, "fixtures", "otel-auto-error-carrier-bootstrap.mjs"),
         {
@@ -693,9 +744,12 @@ export async function resolve(specifier, context, nextResolve) {
           CC_ROUTER_TEST_TRACE_ID: "00000000000000000000000000000001",
           CC_ROUTER_TEST_OTLP_TRACE_URL: capture.endpoint("/i/v1/traces"),
           CC_ROUTER_TEST_OTLP_LOG_URL: capture.endpoint("/i/v1/logs"),
+          CC_ROUTER_TEST_POSTHOG_ORIGIN: capture.origin,
           CC_ROUTER_TEST_CANDIDATE_MARKER: candidateMarker,
+          CC_ROUTER_TEST_NETWORK_GUARD_MARKER: networkGuardMarker,
           CC_ROUTER_TEST_HOSTILE_MESSAGE: TELEMETRY_CANARY.exceptionMessage,
           CC_ROUTER_TEST_HOSTILE_STACK_PATH: TELEMETRY_CANARY.homePath,
+          CC_ROUTER_TEST_FATAL_MESSAGE: TELEMETRY_CANARY.prompt,
         },
       );
 
@@ -718,46 +772,98 @@ export async function resolve(specifier, context, nextResolve) {
       ]));
       expect(candidate.attributes["cc_router.operation"]).toBe("proxy.request");
 
-      expect(capture.requests.map(request => `${request.method} ${request.url}`)).toEqual([
+      const networkGuard = JSON.parse(readFileSync(networkGuardMarker, "utf8")) as {
+        blocked: string[];
+        redirected: string[];
+        fatalCaptured: boolean;
+      };
+      expect(networkGuard).toEqual({
+        blocked: ["POST https://external.invalid/forbidden"],
+        redirected: ["POST https://eu.i.posthog.com/batch/"],
+        fatalCaptured: true,
+      });
+      expect(capture.requests.map(request => `${request.method} ${request.url}`).sort()).toEqual([
+        "POST /batch/",
         "POST /i/v1/traces",
       ]);
       capture.assertOnlyApprovedRequests();
-      const decoded = capture.requests.map(request => decodeOtlpProtobuf(request.rawBody, "traces"));
+      const decoded = capture.requests.map(request => request.json
+        ?? decodeOtlpProtobuf(request.rawBody, request.url.endsWith("traces") ? "traces" : "logs"));
       const decodedValues = semanticStrings(decoded);
       const wire = Buffer.concat(capture.requests.map(request => request.rawBody));
       expect(decodedValues).toContain("@opentelemetry/instrumentation-express");
       expect(decodedValues).toContain("proxy.request");
-      for (const canary of [TELEMETRY_CANARY.exceptionMessage, TELEMETRY_CANARY.homePath]) {
+      expect(decodedValues).toContain("$exception");
+      for (const canary of [
+        TELEMETRY_CANARY.exceptionMessage,
+        TELEMETRY_CANARY.homePath,
+        TELEMETRY_CANARY.prompt,
+      ]) {
         expect(decodedValues.some(value => value.includes(canary)), canary).toBe(false);
         for (const representation of telemetryWireRepresentations(canary)) {
           expect(wire.includes(Buffer.from(representation)), representation).toBe(false);
         }
       }
     } finally {
-      await capture.close();
+      if (capture) await capture.close();
       rmSync(testHome, { recursive: true, force: true });
     }
   }, 20_000);
 
-  it("sanitizes a production PostHog exception after a hostile provider failure", async () => {
-    const capture = await startTransportCaptureServer();
-    const probe = createServer();
-    const proxyPort = await listen(probe);
-    await close(probe);
-    const running = await startBuiltPackage({
-      telemetryEnabled: true,
-      proxyPort,
-      targetOrigin,
-      telemetryCaptureOrigin: capture.origin,
-      environment: { DO_NOT_TRACK: "0", CC_ROUTER_TELEMETRY: "1" },
-      binary: installedBinary,
-      cwd: installedCwd,
-      launchBinaryDirectly: true,
-    });
-    children.push(running);
-    const hostileBefore = hostileStatusDescriptions.length;
-    let stopped = false;
+  it("cleans a child, listener, and temp home when package readiness times out", async () => {
+    const markerHome = mkdtempSync(join(tmpdir(), "cc-router-readiness-marker-"));
+    const markerPath = join(markerHome, "resources.json");
+    let resources: { pid: number; home: string; port: number } | undefined;
+    let capture: TransportCaptureServer | undefined;
     try {
+      capture = await startTransportCaptureServer();
+      const proxyPort = await reserveLoopbackPort();
+      await expect(startBuiltPackage({
+        telemetryEnabled: true,
+        proxyPort,
+        targetOrigin,
+        telemetryCaptureOrigin: capture.origin,
+        binary: join(import.meta.dirname, "fixtures", "unready-package.mjs"),
+        readinessTimeoutMs: 150,
+        environment: { CC_ROUTER_TEST_STARTUP_MARKER: markerPath },
+      })).rejects.toThrow("compiled package did not start");
+      resources = JSON.parse(readFileSync(markerPath, "utf8")) as typeof resources;
+      expect(resources).toBeDefined();
+      expect(existsSync(resources!.home), "failed startup leaked its temp home").toBe(false);
+      expect(() => process.kill(resources!.pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+      await expect(fetch(`http://127.0.0.1:${resources!.port}/cc-router/health`)).rejects.toThrow();
+    } finally {
+      if (resources) {
+        try {
+          process.kill(resources.pid, "SIGKILL");
+        } catch {
+          // Already reaped by the helper, as required.
+        }
+        rmSync(resources.home, { recursive: true, force: true });
+      }
+      if (capture) await capture.close();
+      rmSync(markerHome, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  it("sanitizes a production PostHog exception after a hostile provider failure", async () => {
+    let capture: TransportCaptureServer | undefined;
+    let running: RunningPackage | undefined;
+    try {
+      capture = await startTransportCaptureServer();
+      const proxyPort = await reserveLoopbackPort();
+      running = await startBuiltPackage({
+        telemetryEnabled: true,
+        proxyPort,
+        targetOrigin,
+        telemetryCaptureOrigin: capture.origin,
+        environment: { DO_NOT_TRACK: "0", CC_ROUTER_TELEMETRY: "1" },
+        binary: installedBinary,
+        cwd: installedCwd,
+        launchBinaryDirectly: true,
+      });
+      children.push(running);
+      const hostileBefore = hostileStatusDescriptions.length;
       const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses${TELEMETRY_CANARY.queryString}`, {
         method: "POST",
         headers: {
@@ -790,7 +896,6 @@ export async function resolve(specifier, context, nextResolve) {
         () => `hostile provider flow exported no sanitized PostHog exception or trace\n${running.output()}`,
       );
       await running.stop("SIGTERM");
-      stopped = true;
       capture.assertOnlyApprovedRequests();
       expect(semanticStrings(capture.requests
         .filter(request => request.url === "/batch/")
@@ -811,8 +916,8 @@ export async function resolve(specifier, context, nextResolve) {
         }
       }
     } finally {
-      if (!stopped) await running.stop("SIGTERM");
-      await capture.close();
+      if (running) await running.stop("SIGTERM");
+      if (capture) await capture.close();
     }
   }, 20_000);
 
@@ -840,6 +945,9 @@ export async function resolve(specifier, context, nextResolve) {
       max_tokens: 32,
       stream,
     }));
+    const isStreamingFlow = (flow: string): boolean => flow === "sse"
+      || flow === "abort"
+      || flow.startsWith("concurrent-");
     const requestHeaders = (flow: string): Record<string, string> => ({
       "content-type": "application/json",
       "x-test-flow": flow,
@@ -854,9 +962,7 @@ export async function resolve(specifier, context, nextResolve) {
       expect(process.env["CC_ROUTER_TELEMETRY"]).toBe(priorEnvironment.CC_ROUTER_TELEMETRY);
       const flowBefore = targetFlows.length;
       const closedBefore = closedTargetFlows.length;
-      const probe = createServer();
-      const proxyPort = await listen(probe);
-      await close(probe);
+      const proxyPort = await reserveLoopbackPort();
       const running = await startBuiltPackage({
         telemetryEnabled: mode.telemetryEnabled,
         proxyPort,
@@ -951,16 +1057,21 @@ export async function resolve(specifier, context, nextResolve) {
       if (mode.name === "failing") expect(modeCapture.requests.length).toBeGreaterThan(0);
       expect(process.env["DO_NOT_TRACK"]).toBe(priorEnvironment.DO_NOT_TRACK);
       expect(process.env["CC_ROUTER_TELEMETRY"]).toBe(priorEnvironment.CC_ROUTER_TELEMETRY);
-      // A downstream abort can happen before the proxy finishes uploading to or
-      // reading from upstream, so only the observed prefix and upstream close are
-      // meaningful; complete forwarded bytes are asserted for every non-abort flow.
       const forwarded = targetFlows.slice(flowBefore)
-        .filter(flow => !flow.flow.startsWith("abort"))
         .sort((left, right) => left.flow.localeCompare(right.flow));
+      expect(forwarded.map(flow => flow.flow)).toEqual([
+        "abort",
+        "concurrent-one",
+        "concurrent-two",
+        "failure",
+        "nonstream",
+        "sse",
+        "timeout",
+      ]);
       for (const flow of forwarded) {
         expect(flow.headers["authorization"]).toBe("Bearer transparent-access-token");
         expect(flow.headers["x-forwarded-private"]).toBe("forwarded-byte-for-byte");
-        expect(flow.body).toEqual(requestBody(flow.flow, flow.flow.startsWith("sse") || flow.flow.startsWith("concurrent-")));
+        expect(flow.body).toEqual(requestBody(flow.flow, isStreamingFlow(flow.flow)));
       }
       snapshots.push({
         responses,
@@ -1010,41 +1121,28 @@ export async function resolve(specifier, context, nextResolve) {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ id: "env_target_response" }));
     });
-    const environmentTargetPort = await new Promise<number>((resolvePort, reject) => {
-      environmentTargetServer.once("error", reject);
-      environmentTargetServer.listen(0, "127.0.0.1", () => {
-        environmentTargetServer.off("error", reject);
-        const address = environmentTargetServer.address();
-        if (!address || typeof address === "string") {
-          reject(new Error("environment target did not expose a TCP port"));
-          return;
-        }
-        resolvePort(address.port);
-      });
-    });
-    const probe = createServer();
-    const proxyPort = await listen(probe);
-    await close(probe);
-    const environmentTarget = `http://127.0.0.1:${environmentTargetPort}`;
-    const running = await startBuiltPackage({
-      telemetryEnabled: true,
-      proxyPort,
-      targetOrigin,
-      telemetryCaptureOrigin: telemetry.origin,
-      environment: { LITELLM_URL: environmentTarget },
-      accounts: [{
-        id: "bootstrap-anthropic",
-        provider: "anthropic_subscription",
-        accessToken: "test-anthropic-access-token",
-        refreshToken: "test-anthropic-refresh-token",
-        expiresAt: Date.now() + 3_600_000,
-        scopes: ["user:inference"],
-        enabled: true,
-      }],
-    });
-    children.push(running);
-
+    let running: RunningPackage | undefined;
     try {
+      const environmentTargetPort = await listen(environmentTargetServer);
+      const proxyPort = await reserveLoopbackPort();
+      const environmentTarget = `http://127.0.0.1:${environmentTargetPort}`;
+      running = await startBuiltPackage({
+        telemetryEnabled: true,
+        proxyPort,
+        targetOrigin,
+        telemetryCaptureOrigin: telemetry.origin,
+        environment: { LITELLM_URL: environmentTarget },
+        accounts: [{
+          id: "bootstrap-anthropic",
+          provider: "anthropic_subscription",
+          accessToken: "test-anthropic-access-token",
+          refreshToken: "test-anthropic-refresh-token",
+          expiresAt: Date.now() + 3_600_000,
+          scopes: ["user:inference"],
+          enabled: true,
+        }],
+      });
+      children.push(running);
       const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1077,15 +1175,15 @@ export async function resolve(specifier, context, nextResolve) {
       expect(wire).not.toContain("PRIVATE_ENV_TARGET_PROMPT");
       expect(wire).not.toContain("test-anthropic-access-token");
     } finally {
-      await close(environmentTargetServer);
+      if (running) await running.stop();
+      if (environmentTargetServer.listening) await close(environmentTargetServer);
+      else environmentTargetServer.closeAllConnections();
     }
   }, 20_000);
 
   it("does not initialize or export from the compiled package when persisted telemetry is off", async () => {
     const before = telemetry.requests.length;
-    const probe = createServer();
-    const proxyPort = await listen(probe);
-    await close(probe);
+    const proxyPort = await reserveLoopbackPort();
     const running = await startBuiltPackage({
       telemetryEnabled: false,
       proxyPort,
@@ -1093,42 +1191,48 @@ export async function resolve(specifier, context, nextResolve) {
       telemetryCaptureOrigin: telemetry.origin,
     });
     children.push(running);
-
-    const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: false }),
-    });
-    expect(response.status).toBe(200);
-    await response.arrayBuffer();
-    await new Promise(resolveWait => setTimeout(resolveWait, 750));
+    try {
+      const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: false }),
+      });
+      expect(response.status).toBe(200);
+      await response.arrayBuffer();
+    } finally {
+      await running.stop();
+    }
     expect(telemetry.requests).toHaveLength(before);
   }, 15_000);
 
   it("fails closed before SDK initialization when a test OTLP override is not literal loopback", async () => {
-    const before = telemetry.requests.length;
-    const probe = createServer();
-    const proxyPort = await listen(probe);
-    await close(probe);
-    const running = await startBuiltPackage({
-      telemetryEnabled: true,
-      proxyPort,
-      targetOrigin,
-      telemetryCaptureOrigin: telemetry.origin,
-      testTraceUrl: "https://example.test/i/v1/traces",
-      testLogUrl: "https://example.test/i/v1/logs",
-    });
-    children.push(running);
-
-    const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: false }),
-    });
-    expect(response.status).toBe(200);
-    await response.arrayBuffer();
-    await new Promise(resolveWait => setTimeout(resolveWait, 750));
-    expect(telemetry.requests).toHaveLength(before);
+    let isolatedCapture: TransportCaptureServer | undefined;
+    let running: RunningPackage | undefined;
+    try {
+      isolatedCapture = await startTransportCaptureServer();
+      const proxyPort = await reserveLoopbackPort();
+      running = await startBuiltPackage({
+        telemetryEnabled: true,
+        proxyPort,
+        targetOrigin,
+        telemetryCaptureOrigin: isolatedCapture.origin,
+        testTraceUrl: "https://example.test/i/v1/traces",
+        testLogUrl: "https://example.test/i/v1/logs",
+      });
+      children.push(running);
+      const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: false }),
+      });
+      expect(response.status).toBe(200);
+      await response.arrayBuffer();
+      await new Promise(resolveWait => setTimeout(resolveWait, 750));
+      expect(isolatedCapture.requests).toEqual([]);
+    } finally {
+      if (running) await running.stop();
+      if (isolatedCapture) await isolatedCapture.close();
+    }
   }, 15_000);
 
   it("preserves a command exit code across bootstrap cleanup", () => {
@@ -1163,9 +1267,7 @@ export async function resolve(specifier, context, nextResolve) {
     "flushes completed spans within the bounded %s shutdown before preserving exit 0",
     async signal => {
       const before = telemetry.requests.length;
-      const probe = createServer();
-      const proxyPort = await listen(probe);
-      await close(probe);
+      const proxyPort = await reserveLoopbackPort();
       const running = await startBuiltPackage({
         telemetryEnabled: true,
         proxyPort,
@@ -1202,9 +1304,7 @@ export async function resolve(specifier, context, nextResolve) {
     const unavailableCapture = await startTransportCaptureServer();
     const unavailableOrigin = unavailableCapture.origin;
     await unavailableCapture.close();
-    const probe = createServer();
-    const proxyPort = await listen(probe);
-    await close(probe);
+    const proxyPort = await reserveLoopbackPort();
     const running = await startBuiltPackage({
       telemetryEnabled: true,
       proxyPort,

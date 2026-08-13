@@ -474,33 +474,40 @@ describe("end-to-end telemetry privacy boundaries", () => {
   });
 
   it("correlates repeated sanitized failures by installation without profiles or raw canaries", async () => {
-    const postHogCapture = await startTransportCaptureServer();
-    const otlpCapture = await startTransportCaptureServer();
-    const firstClient = createPostHogTelemetryClient({
-      getSnapshot: () => ({ ...snapshot(true), state: { ...snapshot(true).state, installId: INSTALL_ID } }),
-      transport: postHogLoopbackTransport(postHogCapture),
-    });
-    const secondClient = createPostHogTelemetryClient({
-      getSnapshot: () => ({ ...snapshot(true), state: { ...snapshot(true).state, installId: OTHER_INSTALL_ID } }),
-      transport: postHogLoopbackTransport(postHogCapture),
-    });
-    const first = sanitizedFailure(
-      INSTALL_ID,
-      "ad94f035-1e08-4e29-8517-fd56bdc83d99",
-      TELEMETRY_CANARY.exceptionMessage,
-    );
-    const repeated = sanitizedFailure(
-      INSTALL_ID,
-      "2c61632e-7841-462f-a343-c792666ef57b",
-      TELEMETRY_CANARY.prompt,
-    );
-    const otherInstall = sanitizedFailure(
-      OTHER_INSTALL_ID,
-      "529c9281-f128-446f-a4eb-0c3309e37a61",
-      TELEMETRY_CANARY.rawProviderBody,
-    );
-
+    let postHogCaptureOwner: TransportCaptureServer | undefined;
+    let otlpCaptureOwner: TransportCaptureServer | undefined;
+    let firstClientOwner: ReturnType<typeof createPostHogTelemetryClient> | undefined;
+    let secondClientOwner: ReturnType<typeof createPostHogTelemetryClient> | undefined;
     try {
+      const postHogCapture = await startTransportCaptureServer();
+      postHogCaptureOwner = postHogCapture;
+      const otlpCapture = await startTransportCaptureServer();
+      otlpCaptureOwner = otlpCapture;
+      const firstClient = createPostHogTelemetryClient({
+        getSnapshot: () => ({ ...snapshot(true), state: { ...snapshot(true).state, installId: INSTALL_ID } }),
+        transport: postHogLoopbackTransport(postHogCapture),
+      });
+      firstClientOwner = firstClient;
+      const secondClient = createPostHogTelemetryClient({
+        getSnapshot: () => ({ ...snapshot(true), state: { ...snapshot(true).state, installId: OTHER_INSTALL_ID } }),
+        transport: postHogLoopbackTransport(postHogCapture),
+      });
+      secondClientOwner = secondClient;
+      const first = sanitizedFailure(
+        INSTALL_ID,
+        "ad94f035-1e08-4e29-8517-fd56bdc83d99",
+        TELEMETRY_CANARY.exceptionMessage,
+      );
+      const repeated = sanitizedFailure(
+        INSTALL_ID,
+        "2c61632e-7841-462f-a343-c792666ef57b",
+        TELEMETRY_CANARY.prompt,
+      );
+      const otherInstall = sanitizedFailure(
+        OTHER_INSTALL_ID,
+        "529c9281-f128-446f-a4eb-0c3309e37a61",
+        TELEMETRY_CANARY.rawProviderBody,
+      );
       await firstClient.captureExceptionImmediate(first);
       await firstClient.captureExceptionImmediate(repeated);
       await secondClient.captureExceptionImmediate(otherInstall);
@@ -576,10 +583,10 @@ describe("end-to-end telemetry privacy boundaries", () => {
         expect(decodedValues.some(value => value.includes(canary))).toBe(false);
       }
     } finally {
-      await firstClient.shutdownWithin(100);
-      await secondClient.shutdownWithin(100);
-      await postHogCapture.close();
-      await otlpCapture.close();
+      await firstClientOwner?.shutdownWithin(100);
+      await secondClientOwner?.shutdownWithin(100);
+      await postHogCaptureOwner?.close();
+      await otlpCaptureOwner?.close();
     }
   });
 });

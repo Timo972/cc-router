@@ -328,6 +328,17 @@ function listen(server: Server): Promise<void> {
   });
 }
 
+function closeCaptureServer(server: Server): Promise<void> {
+  if (!server.listening) {
+    server.closeAllConnections();
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve());
+    server.closeAllConnections();
+  });
+}
+
 const APPROVED_TELEMETRY_REQUESTS = new Set([
   "POST /batch/",
   "POST /i/v1/traces",
@@ -376,10 +387,15 @@ export async function startTransportCaptureServer(
     });
   });
 
-  await listen(server);
+  try {
+    await listen(server);
+  } catch (error) {
+    await closeCaptureServer(server);
+    throw error;
+  }
   const address = server.address();
   if (!address || typeof address === "string") {
-    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await closeCaptureServer(server);
     throw new Error("transport capture server did not bind to a TCP port");
   }
 
@@ -400,10 +416,7 @@ export async function startTransportCaptureServer(
       }
     },
     async close() {
-      await new Promise<void>((resolve, reject) => {
-        server.close(error => error ? reject(error) : resolve());
-        server.closeAllConnections();
-      });
+      await closeCaptureServer(server);
       if (!options.allowUnapprovedRequests && violations.length > 0) {
         const attempted = violations.map(request => `${request.method} ${request.url}`).join(", ");
         throw new Error(`unapproved telemetry capture request(s): ${attempted}`);
