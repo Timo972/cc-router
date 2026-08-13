@@ -1,7 +1,10 @@
 import {
   appendFileSync as nativeAppendFileSync,
-  chmodSync,
+  chmodSync as nativeChmodSync,
   closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
   existsSync as nativeExistsSync,
   fsyncSync,
   linkSync as nativeLinkSync,
@@ -19,8 +22,10 @@ import {
 import { join } from "node:path";
 
 export {
-  chmodSync,
   closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -41,6 +46,9 @@ let authoritativeLockReads = 0;
 let heldFirstStateRead = false;
 let pausedValidation = false;
 let signalledQueueEntry = false;
+let signalledQueueSwap = false;
+let signalledQueueMutation = false;
+let signalledQuarantineMutation = false;
 
 function enabled() {
   return process.env.NODE_ENV === "test" && barrier && worker && telemetryPath && lockPath;
@@ -101,6 +109,30 @@ export function readFileSync(path, ...args) {
 }
 
 export function openSync(path, ...args) {
+  if (
+    enabled()
+    && worker === "queue-open-swap"
+    && !signalledQueueMutation
+    && String(path).includes(`${lockPath}.queue`)
+  ) {
+    signalledQueueMutation = true;
+    signal("before-queue-open");
+    waitFor("release-queue-open");
+    const descriptor = nativeOpenSync(path, ...args);
+    signal("queue-opened");
+    waitFor("release-queue-opened");
+    return descriptor;
+  }
+  if (
+    enabled()
+    && worker === "queue-swap"
+    && !signalledQueueSwap
+    && String(path).includes(`${lockPath}.queue.v1.`)
+  ) {
+    signalledQueueSwap = true;
+    signal("queue-ready");
+    waitFor("release-queue");
+  }
   const descriptor = nativeOpenSync(path, ...args);
   if (
     enabled()
@@ -114,13 +146,58 @@ export function openSync(path, ...args) {
   return descriptor;
 }
 
+export function chmodSync(path, ...args) {
+  if (
+    enabled()
+    && worker === "queue-swap"
+    && !signalledQueueSwap
+    && String(path) === `${lockPath}.queue`
+  ) {
+    signalledQueueSwap = true;
+    signal("queue-ready");
+    waitFor("release-queue");
+  }
+  return nativeChmodSync(path, ...args);
+}
+
 export function renameSync(oldPath, newPath) {
+  if (
+    enabled()
+    && worker === "queue-stale-swap"
+    && !signalledQueueMutation
+    && String(oldPath).includes(`${lockPath}.queue.v1.`)
+    && String(newPath).includes(`${lockPath}.queue-cleanup.v1.`)
+  ) {
+    signalledQueueMutation = true;
+    signal("before-stale-queue-retire");
+    waitFor("release-stale-queue-retire");
+  }
+  if (
+    enabled()
+    && worker === "queue-rename-swap"
+    && !signalledQueueMutation
+    && String(oldPath).includes(`${lockPath}.queue`)
+  ) {
+    signalledQueueMutation = true;
+    signal("before-queue-rename");
+    waitFor("release-queue-rename");
+  }
+  if (
+    enabled()
+    && worker === "quarantine-swap"
+    && !signalledQuarantineMutation
+    && String(oldPath).includes(`${lockPath}.reclaim.`)
+  ) {
+    signalledQuarantineMutation = true;
+    signal("before-quarantine-mutation");
+    waitFor("release-quarantine-mutation");
+  }
   if (
     enabled()
     && String(oldPath) === lockPath
     && String(newPath).includes(`${lockPath}.reclaim.`)
   ) {
-    if (worker !== "reclaimer") pauseAfterStaleValidation();
+    if (worker === "first" || worker === "second") pauseAfterStaleValidation();
     const result = nativeRenameSync(oldPath, newPath);
     if (worker === "reclaimer") {
       signal("renamed-quarantine");
@@ -137,6 +214,38 @@ export function linkSync(existingPath, newPath) {
 }
 
 export function unlinkSync(path) {
+  if (
+    enabled()
+    && worker === "queue-unlink-swap"
+    && !signalledQueueMutation
+    && String(path).includes(`${lockPath}.queue`)
+  ) {
+    signalledQueueMutation = true;
+    signal("before-queue-unlink");
+    waitFor("release-queue-unlink");
+  }
+  if (
+    enabled()
+    && worker === "quarantine-swap"
+    && !signalledQuarantineMutation
+    && String(path).includes(`${lockPath}.reclaim.`)
+  ) {
+    signalledQuarantineMutation = true;
+    signal("before-quarantine-mutation");
+    waitFor("release-quarantine-mutation");
+  }
+  if (
+    enabled()
+    && worker === "empty-quarantine"
+    && !signalledQuarantineMutation
+    && String(path).includes(`${lockPath}.reclaim.`)
+  ) {
+    const result = nativeUnlinkSync(path);
+    signalledQuarantineMutation = true;
+    signal("removed-quarantine-file");
+    waitFor("release-removed-quarantine");
+    return result;
+  }
   if (String(path) === lockPath) audit("unlinked-authoritative", path);
   return nativeUnlinkSync(path);
 }
