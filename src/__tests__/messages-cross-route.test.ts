@@ -5,6 +5,20 @@ import { ReadableStream } from "stream/web";
 import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
 
+const TELEMETRY_MODES = ["enabled", "disabled"] as const;
+
+async function runWithTelemetryMode<T>(
+  mode: typeof TELEMETRY_MODES[number],
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (mode === "disabled") process.env["DO_NOT_TRACK"] = "1";
+  try {
+    return await operation();
+  } finally {
+    delete process.env["DO_NOT_TRACK"];
+  }
+}
+
 describe("mountMessagesCrossProviderRoute", () => {
   it("does not continue OpenAI-routed messages into Anthropic account selection", async () => {
     const anthropicSelection = vi.fn();
@@ -237,7 +251,9 @@ describe("mountMessagesCrossProviderRoute", () => {
     }
   });
 
-  it("collapses OpenAI Responses SSE into Anthropic-shaped JSON for non-stream messages", async () => {
+  it.each(TELEMETRY_MODES)(
+    "collapses OpenAI Responses SSE into Anthropic-shaped JSON for non-stream messages with telemetry %s",
+    async telemetryMode => runWithTelemetryMode(telemetryMode, async () => {
     const app = express();
 
     mountMessagesCrossProviderRoute(app, {
@@ -300,9 +316,12 @@ describe("mountMessagesCrossProviderRoute", () => {
         server.close(err => err ? reject(err) : resolve());
       });
     }
-  });
+    }),
+  );
 
-  it("streams OpenAI Responses SSE back as Anthropic Messages SSE", async () => {
+  it.each(TELEMETRY_MODES)(
+    "streams OpenAI Responses SSE back as Anthropic Messages SSE with telemetry %s",
+    async telemetryMode => runWithTelemetryMode(telemetryMode, async () => {
     const app = express();
 
     mountMessagesCrossProviderRoute(app, {
@@ -359,7 +378,8 @@ describe("mountMessagesCrossProviderRoute", () => {
         server.close(err => err ? reject(err) : resolve());
       });
     }
-  });
+    }),
+  );
 
   it("passes non-openai models to later Anthropic proxy middleware with route context and replayable raw body", async () => {
     const app = express();
