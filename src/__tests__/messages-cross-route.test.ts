@@ -392,6 +392,45 @@ describe("mountMessagesCrossProviderRoute", () => {
     expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
   });
 
+  it("reports a 502 when a non-stream collect's terminal event carries no response object", async () => {
+    // Well-formed SSE and a real terminal event type, but nothing to read a
+    // response out of. Treating the type alone as terminal turned this into a
+    // fabricated empty assistant turn on a 200.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.incomplete\",\"response\":null}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(502);
+      const body = await res.json() as { type: string; error: { type: string } };
+      expect(body.type).toBe("error");
+      expect(body.error.type).toBe("upstream_error");
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
   it("reports a 502 when a non-stream collect gets a truncated stream", async () => {
     // Every frame parses, but the stream simply stops before completing —
     // partial text must not be dressed up as a finished answer.

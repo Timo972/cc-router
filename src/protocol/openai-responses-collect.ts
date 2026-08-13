@@ -42,6 +42,15 @@ const TERMINAL_RESPONSE_EVENT_TYPES: ReadonlySet<string> = new Set([
  * carry no usable response to return. Shared by every ingress that needs to
  * recognize "the stream produced a result", so that notion cannot drift
  * apart between the `/v1/responses` and `/v1/messages` paths.
+ *
+ * The event type alone does not make a result: it has to carry an actual
+ * response object. Upstream can emit `{"type":"response.incomplete",
+ * "response":null}` — or a string, a number, an array — and every consumer
+ * here asks whether the payload is `undefined`, so anything else would count
+ * as a terminal success. That would hand a `200` with a `null` body to a
+ * non-streaming caller and mark an observed stream complete, which is exactly
+ * what the terminal-event checks exist to prevent. A payload nothing can be
+ * read out of is not a result.
  */
 export function terminalResponsePayload(event: unknown): unknown {
   if (typeof event !== "object" || event === null) return undefined;
@@ -49,7 +58,9 @@ export function terminalResponsePayload(event: unknown): unknown {
   if (typeof typed.type !== "string" || !TERMINAL_RESPONSE_EVENT_TYPES.has(typed.type)) {
     return undefined;
   }
-  return typed.response;
+  const payload = typed.response;
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return undefined;
+  return payload;
 }
 
 /**

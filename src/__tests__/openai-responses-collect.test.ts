@@ -101,6 +101,25 @@ describe("collectCodexResponseStream", () => {
     });
   });
 
+  it("maps a terminal event carrying no response object to a 502 upstream_error", async () => {
+    // The event type alone is not a result. Rejecting only `undefined` let
+    // `"response":null` through as a terminal success — a 200 whose body was
+    // literally `null`.
+    for (const payload of ["null", '"nope"', "42", "[]"]) {
+      const upstream = sseResponse([
+        `data: {"type":"response.incomplete","response":${payload}}\n\n`,
+      ]);
+
+      const result = await collectCodexResponseStream(upstream);
+
+      expect(result).toEqual({
+        kind: "json",
+        status: 502,
+        body: { error: { type: "upstream_error", message: "Stream ended before any terminal response event" } },
+      });
+    }
+  });
+
   it("maps a response.failed event to a 502 upstream_error carrying its message", async () => {
     const upstream = sseResponse([
       'data: {"type":"response.failed","response":{"error":{"message":"boom"}}}\n\n',
@@ -261,6 +280,15 @@ describe("createCodexUsageObserver", () => {
     // Tolerant parsing drops the malformed frame instead of throwing, so
     // without a completion check this would look identical to a clean 200.
     observer.push(encoder.encode('data: {"type":"response.completed","response":{"id":\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBe("Upstream stream ended before any terminal response event");
+  });
+
+  it("reports a synthetic failure when a terminal frame carries no response object", () => {
+    const observer = createCodexUsageObserver();
+    // Well-formed SSE, so tolerant parsing keeps the frame — the payload
+    // itself is what makes this no result at all.
+    observer.push(encoder.encode('data: {"type":"response.incomplete","response":null}\n\n'));
     observer.finish();
     expect(observer.failure()).toBe("Upstream stream ended before any terminal response event");
   });

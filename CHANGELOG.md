@@ -45,6 +45,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   backoff the server asked for — instead of being parsed as an event stream and
   reported as a success or a generic failure; non-2xx Codex responses also keep
   their real content type instead of being rewritten to `text/event-stream`.
+- A terminal event that carries no response object is no longer treated as a
+  successful result. `{"type":"response.completed","response":null}` — or any
+  other non-object payload — satisfied the completion check, so a
+  non-streaming request got HTTP 200 with a `null` body, and `/v1/messages` got
+  a fabricated empty assistant turn. Both now report the `502` that a stream
+  ending without a terminal event already did.
 - A single malformed SSE frame no longer truncates a `/v1/messages` stream.
   Parsing a chunk was all-or-nothing, so one bad frame discarded the valid
   events beside it and ended the response as a clean `200` the client could
