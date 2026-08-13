@@ -1458,6 +1458,157 @@ export async function resolve(specifier, context, nextResolve) {
     }
   }, 10_000);
 
+  it("drains an installed fresh-start setup cancellation before exiting without starting the proxy", async () => {
+    const promptPreload = pathToFileURL(join(
+      PROJECT_ROOT,
+      "src",
+      "__tests__",
+      "fixtures",
+      "cli-start-cancellation-preload.mjs",
+    )).href;
+    const guardPreload = pathToFileURL(join(
+      PROJECT_ROOT,
+      "scripts",
+      "telemetry-eu-network-guard.mjs",
+    )).href;
+
+    const runCancellation = async (mode: "released" | "disabled" | "hung") => {
+      const testHome = mkdtempSync(join(tmpdir(), `cc-router-start-cancel-${mode}-`));
+      const promptLog = join(testHome, "prompts.log");
+      const proxyMarker = join(testHome, "proxy-started.log");
+      const cliRuntimeMarker = join(testHome, "cli-runtime.log");
+      const networkLog = join(testHome, "network.jsonl");
+      const observed: Array<{ url: string; body: Buffer }> = [];
+      const heldResponses: import("node:http").ServerResponse[] = [];
+      let holding = mode !== "disabled";
+      const collector = createServer((request, response) => {
+        const chunks: Buffer[] = [];
+        request.on("data", chunk => chunks.push(Buffer.from(chunk)));
+        request.on("end", () => {
+          observed.push({ url: request.url ?? "", body: Buffer.concat(chunks) });
+          if (holding) {
+            heldResponses.push(response);
+          } else {
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end("{}\n");
+          }
+        });
+      });
+      const port = await listen(collector);
+      auxiliaryServers.push(collector);
+      const origin = `http://127.0.0.1:${port}`;
+      const started = Date.now();
+      const child = spawn(installedBinary, ["start", "--foreground"], {
+        cwd: installedCwd,
+        env: {
+          ...process.env,
+          HOME: testHome,
+          ACCOUNTS_PATH: join(testHome, "accounts.json"),
+          CONFIG_PATH: join(testHome, "config.json"),
+          TELEMETRY_PATH: join(testHome, "fresh-telemetry.json"),
+          NODE_ENV: "test",
+          CC_ROUTER_TEST_OTLP_LOG_URL: `${origin}/i/v1/logs`,
+          CC_ROUTER_EU_GUARD_MODE: "offline-test",
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: origin,
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: origin,
+          CC_ROUTER_EU_NETWORK_LOG: networkLog,
+          CC_ROUTER_TEST_PROMPT_LOG: promptLog,
+          CC_ROUTER_TEST_PROXY_MARKER: proxyMarker,
+          CC_ROUTER_TEST_CLI_RUNTIME_MARKER: cliRuntimeMarker,
+          CC_ROUTER_COMPILED_PACKAGE_ROOT: installedCwd,
+          NODE_OPTIONS: `--import=${promptPreload} --import=${guardPreload}`,
+          ...(mode === "disabled" ? { DO_NOT_TRACK: "1" } : {}),
+          NO_UPDATE_NOTIFIER: "1",
+          CI: "1",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout?.on("data", chunk => { output += String(chunk); });
+      child.stderr?.on("data", chunk => { output += String(chunk); });
+      try {
+        await waitUntil(
+          () => mode === "disabled"
+            ? existsSync(promptLog) && readFileSync(promptLog, "utf8").includes("setup.cancel_access_token")
+            : existsSync(promptLog)
+              && readFileSync(promptLog, "utf8").includes("setup.cancel_access_token")
+              && observed.some(request => request.url === "/batch/"),
+          2_000,
+          () => `start cancellation did not reach its controlled attempt\n${output}`,
+        );
+        const cancellationReachedAt = Date.now();
+        if (mode === "released") {
+          await new Promise(resolveWait => setTimeout(resolveWait, 50));
+          expect(child.exitCode, output).toBeNull();
+          holding = false;
+          for (const response of heldResponses.splice(0)) {
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end("{}\n");
+          }
+        }
+        expect(await waitForChildExit(child, mode === "hung" ? 3_000 : 2_000), output).toBe(true);
+        expect(child.exitCode, output).toBe(1);
+        expect(Date.now() - cancellationReachedAt).toBeLessThan(mode === "hung" ? 2_750 : 1_750);
+        expect(Date.now() - started).toBeLessThan(3_500);
+        expect(readFileSync(promptLog, "utf8").trim().split("\n")).toEqual([
+          "start.confirm_setup",
+          "setup.mode_server",
+          "setup.account_count_one",
+          "setup.method_manual",
+          "setup.cancel_access_token",
+        ]);
+        expect(output.match(/No accounts configured\. Run cc-router setup again/g)).toHaveLength(1);
+        expect(output.match(/Setup did not produce accounts/g)).toHaveLength(1);
+        expect(existsSync(proxyMarker)).toBe(false);
+        expect(readFileSync(cliRuntimeMarker, "utf8")).toBe("inactive\n");
+        const networkWire = existsSync(networkLog) ? readFileSync(networkLog, "utf8") : "";
+        expect(networkWire).not.toContain("provider-loopback");
+        if (mode === "disabled") {
+          expect(observed).toEqual([]);
+          expect(networkWire).not.toContain("offline-posthog-loopback");
+          expect(networkWire).not.toContain("/batch/");
+          expect(networkWire).not.toContain("/i/v1/logs");
+          return;
+        }
+        expect(networkWire).toContain("/batch/");
+        if (mode === "hung") return;
+
+        const analytics = observed
+          .filter(request => request.url === "/batch/")
+          .flatMap(request => {
+            const batch = JSON.parse(request.body.toString("utf8")) as { batch?: unknown[] };
+            return batch.batch ?? [];
+          }) as Array<{ event: string; properties: Record<string, unknown> }>;
+        expect(analytics.filter(event => event.event === "app.first_start")).toHaveLength(1);
+        expect(analytics.filter(event => event.event === "account_setup.started")).toHaveLength(1);
+        expect(analytics.filter(event => event.event === "account_setup.cancelled")).toHaveLength(1);
+        expect(analytics.filter(event => event.event === "account_setup.failed")).toHaveLength(0);
+        expect(analytics.filter(event => event.event === "account_setup.succeeded")).toHaveLength(0);
+        const setupAnalytics = analytics.filter(event => event.event.startsWith("account_setup."));
+        expect(new Set(setupAnalytics.map(event => event.properties.diagnosticId)).size).toBe(1);
+
+        const logStrings = semanticStrings(observed
+          .filter(request => request.url === "/i/v1/logs")
+          .map(request => JSON.parse(request.body.toString("utf8")) as unknown));
+        expect(logStrings.filter(value => value === "account.setup.diagnostic")).toHaveLength(3);
+        expect(logStrings.filter(value => value === "credential_source_selection")).toHaveLength(1);
+        expect(logStrings.filter(value => value === "cancellation")).toHaveLength(1);
+        expect(logStrings.filter(value => value === "user_cancelled")).toHaveLength(1);
+        const wire = Buffer.concat(observed.map(request => request.body)).toString("utf8");
+        expect(wire).not.toContain("Run the setup wizard now?");
+        expect(wire).not.toContain("Paste accessToken");
+        expect(wire).not.toContain("controlled prompt cancellation");
+      } finally {
+        if (child.exitCode === null) child.kill("SIGKILL");
+        rmSync(testHome, { recursive: true, force: true });
+      }
+    };
+
+    await runCancellation("released");
+    await runCancellation("disabled");
+    await runCancellation("hung");
+  }, 15_000);
+
   it("exports compiled setup diagnostics for every method through the bounded log-only CLI runtime", async () => {
     const testHome = mkdtempSync(join(tmpdir(), "cc-router-cli-telemetry-"));
     const telemetryPath = join(testHome, "telemetry.json");

@@ -1,6 +1,7 @@
 import { appendFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
+import { syncBuiltinESMExports } from "node:module";
 import net, { isIP } from "node:net";
 
 const guardMode = process.env.CC_ROUTER_EU_GUARD_MODE;
@@ -33,11 +34,16 @@ function literalLoopback(hostname) {
   return normalized === "::1";
 }
 
-function approvedTarget(target, method) {
-  if (target.protocol === "https:"
+function approvedPostHogTarget(target, method) {
+  return target.protocol === "https:"
     && target.hostname === "eu.i.posthog.com"
+    && (target.port === "" || String(target.port) === "443")
     && method === "POST"
-    && approvedPostHogPaths.has(target.pathname)) return true;
+    && approvedPostHogPaths.has(target.pathname);
+}
+
+function approvedTarget(target, method) {
+  if (approvedPostHogTarget(target, method)) return true;
   return target.protocol === "http:" && literalLoopback(target.hostname);
 }
 
@@ -122,16 +128,12 @@ globalThis.fetch = async (input, init) => {
     record("provider-loopback", redirected);
     return originalFetch(redirected, init);
   }
-  if (offlineCaptureOrigin
-    && url.protocol === "https:"
-    && url.hostname === "eu.i.posthog.com"
-    && method === "POST"
-    && approvedPostHogPaths.has(url.pathname)) {
+  const target = targetFromUrl(url);
+  if (offlineCaptureOrigin && approvedPostHogTarget(target, method)) {
     const redirected = new URL(`${url.pathname}${url.search}`, offlineCaptureOrigin);
     record("offline-posthog-loopback", redirected);
     return originalFetch(redirected, init);
   }
-  const target = targetFromUrl(url);
   if (!approvedTarget(target, method)) {
     record("blocked-fetch", target);
     throw new Error(`blocked external fetch: ${url.protocol}//${url.hostname}${url.pathname}`);
@@ -139,6 +141,9 @@ globalThis.fetch = async (input, init) => {
   record("fetch", url);
   return originalFetch(input, init);
 };
+
+const originalHttpRequest = http.request;
+const originalHttpsRequest = https.request;
 
 function guardRequest(original, protocol) {
   return function guardedRequest(...args) {
@@ -150,19 +155,15 @@ function guardRequest(original, protocol) {
       throw new Error("blocked malformed external request");
     }
     const method = requestMethod(args);
-    if (offlineCaptureOrigin
-      && target.protocol === "https:"
-      && target.hostname === "eu.i.posthog.com"
-      && method === "POST"
-      && approvedPostHogPaths.has(target.pathname)) {
+    if (offlineCaptureOrigin && approvedPostHogTarget(target, method)) {
       const redirected = new URL(target.pathname, offlineCaptureOrigin);
       record("offline-posthog-loopback", redirected);
       const first = args[0];
       if (typeof first === "string" || first instanceof URL) {
-        return Reflect.apply(original, this, [redirected, ...args.slice(1)]);
+        return Reflect.apply(originalHttpRequest, http, [redirected, ...args.slice(1)]);
       }
       const options = first ?? {};
-      return Reflect.apply(original, this, [{
+      return Reflect.apply(originalHttpRequest, http, [{
         ...options,
         protocol: redirected.protocol,
         hostname: redirected.hostname,
@@ -180,8 +181,8 @@ function guardRequest(original, protocol) {
   };
 }
 
-const guardedHttpRequest = guardRequest(http.request, "http:");
-const guardedHttpsRequest = guardRequest(https.request, "https:");
+const guardedHttpRequest = guardRequest(originalHttpRequest, "http:");
+const guardedHttpsRequest = guardRequest(originalHttpsRequest, "https:");
 http.request = guardedHttpRequest;
 https.request = guardedHttpsRequest;
 http.get = function guardedGet(...args) {
@@ -201,14 +202,18 @@ net.Socket.prototype.connect = function guardedConnect(...args) {
   const candidate = Array.isArray(first) ? first[0] : first;
   const options = typeof candidate === "object" && candidate !== null ? candidate : undefined;
   const hostname = options?.host ?? options?.hostname ?? (typeof args[1] === "string" ? args[1] : undefined);
-  if (!literalLoopback(hostname) && hostname !== "eu.i.posthog.com") {
+  const port = options?.port ?? (typeof args[0] === "number" ? args[0] : "");
+  const approvedPostHogSocket = hostname === "eu.i.posthog.com" && String(port) === "443";
+  if (!literalLoopback(hostname) && !approvedPostHogSocket) {
     record("blocked-socket", {
       protocol: "tcp:",
       hostname: String(hostname ?? "unknown").replace(/^\[|\]$/g, ""),
-      port: options?.port ?? (typeof args[0] === "number" ? args[0] : ""),
+      port,
       pathname: "",
     });
     throw new Error(`blocked external socket: ${String(hostname ?? "unknown")}`);
   }
   return Reflect.apply(originalConnect, this, args);
 };
+
+syncBuiltinESMExports();

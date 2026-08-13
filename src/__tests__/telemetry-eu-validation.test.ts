@@ -14,6 +14,9 @@ const GUARD = join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs");
 const SYNTHETIC_CHILD = join(PROJECT_ROOT, "scripts", "telemetry-eu-synthetic-child.mjs");
 const CAUGHT_NETWORK_ATTEMPTS = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "caught-network-attempts.mjs");
 const NO_TRANSPORT = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network-no-transport-preload.mjs");
+const NAMED_BEFORE = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network-named-import-before-preload.mjs");
+const LOOPBACK_ONLY = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network-loopback-only-preload.mjs");
+const ALLOWED_NETWORK_ATTEMPTS = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "allowed-network-attempts.mjs");
 
 describe("personal EU telemetry release validator", () => {
   it("defaults to an offline plan with the complete synthetic matrix", () => {
@@ -144,6 +147,7 @@ describe("personal EU telemetry release validator", () => {
     const networkLog = join(root, "network.jsonl");
     try {
       const result = spawnSync(process.execPath, [
+        "--import", pathToFileURL(NAMED_BEFORE).href,
         "--import", pathToFileURL(NO_TRANSPORT).href,
         "--import", pathToFileURL(GUARD).href,
         CAUGHT_NETWORK_ATTEMPTS,
@@ -160,11 +164,14 @@ describe("personal EU telemetry release validator", () => {
       expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
       const networkWire = readFileSync(networkLog, "utf8");
       expect(networkWire.match(/"kind":"blocked-fetch"/g)).toHaveLength(2);
-      expect(networkWire.match(/"kind":"blocked-request"/g)).toHaveLength(5);
-      expect(networkWire.match(/"kind":"blocked-socket"/g)).toHaveLength(2);
+      expect(networkWire.match(/"kind":"blocked-request"/g)).toHaveLength(12);
+      expect(networkWire.match(/"kind":"blocked-socket"/g)).toHaveLength(3);
       expect(networkWire).toContain('"hostname":"2001:db8::1"');
       expect(networkWire).toContain('"hostname":"eu.i.posthog.com"');
-      expect(networkWire).toContain('"path":"/not-approved"');
+      expect(networkWire).toContain('"path":"/named-before-not-approved"');
+      expect(networkWire).toContain('"path":"/named-after-not-approved"');
+      expect(networkWire).toContain('"port":"8443"');
+      expect(networkWire).toContain('"port":"9443"');
 
       const audit = spawnSync(process.execPath, [
         VALIDATOR,
@@ -178,6 +185,67 @@ describe("personal EU telemetry release validator", () => {
       expect(audit.status).not.toBe(0);
       expect(`${audit.stdout}${audit.stderr}`).toContain("blocked egress attempt");
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("redirects exact allowed POST paths for default and named request/get bindings", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cc-router-guard-allowed-"));
+    const networkLog = join(root, "network.jsonl");
+    const requests: string[] = [];
+    const server = createServer((request, response) => {
+      requests.push(request.url ?? "");
+      request.resume();
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end("{}\n");
+    });
+    await new Promise<void>((resolveListen, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolveListen());
+    });
+    const address = server.address() as AddressInfo;
+    try {
+      const child = spawn(process.execPath, [
+        "--import", pathToFileURL(NAMED_BEFORE).href,
+        "--import", pathToFileURL(LOOPBACK_ONLY).href,
+        "--import", pathToFileURL(GUARD).href,
+        ALLOWED_NETWORK_ATTEMPTS,
+      ], {
+        cwd: PROJECT_ROOT,
+        env: {
+          ...process.env,
+          NODE_ENV: "test",
+          CC_ROUTER_EU_GUARD_MODE: "offline-test",
+          CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: `http://127.0.0.1:${address.port}`,
+          CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: `http://127.0.0.1:${address.port}`,
+          CC_ROUTER_EU_NETWORK_LOG: networkLog,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", chunk => { output += String(chunk); });
+      child.stderr.on("data", chunk => { output += String(chunk); });
+      const status = await new Promise<number | null>((resolveExit, reject) => {
+        const timeout = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error(`allowed network fixture timed out\n${output}`));
+        }, 5_000);
+        child.once("error", error => { clearTimeout(timeout); reject(error); });
+        child.once("exit", code => { clearTimeout(timeout); resolveExit(code); });
+      });
+      expect(status, output).toBe(0);
+      expect(requests).toHaveLength(6);
+      expect(requests.filter(path => path === "/batch/")).toHaveLength(2);
+      expect(requests.filter(path => path === "/i/v1/traces")).toHaveLength(2);
+      expect(requests.filter(path => path === "/i/v1/logs")).toHaveLength(2);
+      const networkWire = readFileSync(networkLog, "utf8");
+      expect(networkWire.match(/"kind":"offline-posthog-loopback"/g)).toHaveLength(6);
+      expect(networkWire).not.toContain("blocked-");
+    } finally {
+      await new Promise<void>(resolveClose => {
+        server.close(() => resolveClose());
+        server.closeAllConnections();
+      });
       rmSync(root, { recursive: true, force: true });
     }
   });

@@ -47,12 +47,13 @@ export function registerStart(program: Command): void {
           default: true,
         });
         if (runSetup) {
-          const { runSetupWizard } = await import("./cmd-setup.js");
-          await runSetupWizard({ addMode: false });
+          const { runSetupCommand } = await import("./cmd-setup.js");
+          await runSetupCommand({ addMode: false });
           // After setup, re-check
           if (!accountsFileExists()) {
             console.log(chalk.red("\n✗ Setup did not produce accounts. Cannot start.\n"));
-            process.exit(1);
+            process.exitCode = 1;
+            return;
           }
         } else {
           console.log(chalk.gray("  Run 'cc-router setup' when you're ready.\n"));
