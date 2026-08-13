@@ -126,6 +126,9 @@ export function applyCodexRateLimits(
     if (!existing && limits.buckets.size >= MAX_CODEX_BUCKETS) {
       evictLeastRecentlySeenBucket(limits);
     }
+    // Built field by field rather than spread over `existing` on purpose: a
+    // bucket upstream has just reported is live again, so any pending-reap
+    // mark the sweep left on it has to be dropped here.
     const merged: CodexLimitBucket = { limitId: bucket.limitId };
     const limitName = bucket.limitName ?? existing?.limitName;
     if (limitName) merged.limitName = limitName;
@@ -311,13 +314,6 @@ export function sweepCodexRateLimits(
 
     if (limitId === DEFAULT_CODEX_LIMIT_ID) continue;
 
-    // A bucket the pool is actively cooling down on (a bucket-scoped
-    // cooldown learned independently of this snapshot, e.g. from a
-    // header-only 429) must keep both its snapshot and its model mapping for
-    // as long as that cooldown is live, even if every window it reports has
-    // just been zeroed above.
-    if (isRetained(limitId)) continue;
-
     // Named buckets (and their model mappings) are cleaned up entirely once
     // every window the bucket still carries is at exactly zero utilization
     // and a window expired this sweep — not merely "below 100%". A bucket
@@ -326,13 +322,32 @@ export function sweepCodexRateLimits(
     // mapping intact, until the secondary clears too.
     const allZero = windows.every(window => window === undefined || window.utilization === 0);
 
+    // Zeroing a window is a one-time observation: it leaves `utilization` and
+    // `resetAt` at 0, which no later sweep can tell apart from a bucket that
+    // has simply never been used, so `anyWindowExpiredHere` is false from here
+    // on. Record the verdict now, or a bucket that had to be held back below
+    // could never be reaped by this rule again.
+    if (anyWindowExpiredHere && allZero) bucket.reapPending = true;
+
+    // A bucket the pool is actively cooling down on (a bucket-scoped
+    // cooldown learned independently of this snapshot, e.g. from a
+    // header-only 429) must keep both its snapshot and its model mapping for
+    // as long as that cooldown is live, even if every window it reports has
+    // just been zeroed above. The mark set above is what carries the reap
+    // across that wait: without it the bucket would linger, zeroed and
+    // unmentioned, until the eight-day stale reap — still naming its model in
+    // `bucketIdForModel`, where a live bucket outranks the cached mapping, so
+    // a header-only 429 that moved the model to a new bucket would keep
+    // resolving to this corpse and its long-expired cooldown.
+    if (isRetained(limitId)) continue;
+
     // Independently, a bucket upstream has simply stopped mentioning at all
     // for longer than the header-trust horizon is reaped outright — see
     // UNMENTIONED_BUCKET_STALE_MS above for why this can't collide with the
     // zero-utilization check just above.
     const unmentionedTooLong = nowMs - bucketSeenAt > UNMENTIONED_BUCKET_STALE_MS;
 
-    if ((anyWindowExpiredHere && allZero) || unmentionedTooLong) {
+    if (bucket.reapPending === true || unmentionedTooLong) {
       account.rateLimits.buckets.delete(limitId);
       for (const [model, mappedLimitId] of account.modelBuckets) {
         if (mappedLimitId === limitId) account.modelBuckets.delete(model);

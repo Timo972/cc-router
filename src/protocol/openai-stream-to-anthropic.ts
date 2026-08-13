@@ -1,4 +1,5 @@
 import { anthropicStopReasonForResponse } from "./openai-response-to-anthropic.js";
+import { terminalResponsePayload } from "./openai-responses-collect.js";
 
 interface OpenAIStreamEvent {
   type?: string;
@@ -78,7 +79,17 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
       // Emitting nothing for `response.incomplete` would end the HTTP stream
       // without `message_stop`, leaving the client waiting on a turn that is
       // already over.
-      if (event.type === "response.completed" || event.type === "response.incomplete") {
+      //
+      // The same predicate the collector and the usage observer use, not the
+      // event type alone: a terminal frame carrying no response object
+      // (`"response":null`, an array, a string) is not a result, and those two
+      // already treat it as a failed stream. Closing the message here anyway
+      // would emit `stop_reason: end_turn` — telling the client a truncated
+      // turn ended normally, the one outcome worse than a truncated stream.
+      // Emitting nothing ends the body without `message_stop`, which is what
+      // a stream that never reached a terminal event looks like, and what
+      // clients already detect and surface as an error.
+      if (terminalResponsePayload(event) !== undefined) {
         const usage = event.response?.usage ?? {};
         const prefix = textBlockStarted
           ? [{ type: "content_block_stop", index: 0 }]

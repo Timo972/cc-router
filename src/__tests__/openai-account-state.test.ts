@@ -335,6 +335,52 @@ describe("sweepCodexRateLimits", () => {
     expect(bucketForModel(account, "gpt-5.6-sol")?.limitId).toBe("codex_bengalfox");
   });
 
+  it("reaps a retained bucket once its cooldown ends, not eight days later", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "100",
+      "x-codex-bengalfox-primary-reset-at": String(NOW_SEC + 60),
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+
+    // The window resets while a longer bucket cooldown is still holding the
+    // bucket, so the reap it earned has to wait.
+    sweepCodexRateLimits(account, NOW_MS + 61_000, {
+      isRetained: limitId => limitId === "codex_bengalfox",
+    });
+    expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(true);
+
+    // Zeroing is not re-observable — utilization and resetAt are both 0 now,
+    // indistinguishable from a bucket that was never used — so this sweep has
+    // no expiry of its own to go on and must act on the deferred verdict.
+    sweepCodexRateLimits(account, NOW_MS + 120_000);
+    expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(false);
+    expect(account.modelBuckets.get("gpt-5.6-sol")).toBeUndefined();
+  });
+
+  it("cancels a deferred reap when upstream reports the bucket again", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "100",
+      "x-codex-bengalfox-primary-reset-at": String(NOW_SEC + 60),
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+    sweepCodexRateLimits(account, NOW_MS + 61_000, {
+      isRetained: limitId => limitId === "codex_bengalfox",
+    });
+
+    // A bucket upstream is mentioning again is live, whatever the sweep
+    // concluded while it was being held back.
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "30",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS + 90_000), NOW_MS + 90_000);
+
+    sweepCodexRateLimits(account, NOW_MS + 120_000);
+    expect(account.rateLimits.buckets.has("codex_bengalfox")).toBe(true);
+    expect(bucketForModel(account, "gpt-5.6-sol")?.primary?.utilization).toBe(0.3);
+  });
+
   it("reaps a named bucket the upstream has not mentioned in over the 8-day trust horizon", () => {
     const account = createOpenAIAccount(record());
     applyCodexRateLimits(account, parseCodexRateLimits({

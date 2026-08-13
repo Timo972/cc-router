@@ -20,6 +20,11 @@ export interface CodexLimitBucket {
    *  the account-wide lastUpdated so traffic on other buckets cannot defer a
    *  quiet bucket's recovery. */
   lastSeenAt?: number;
+  /** Set by the sweep when every window this bucket carries has expired to
+   *  zero, so the reap survives a pool cooldown holding the bucket back. A
+   *  fresh report from upstream clears it — see `applyCodexRateLimits`.
+   *  Internal bookkeeping: never parsed from headers, never serialized. */
+  reapPending?: boolean;
 }
 
 export interface CodexCredits {

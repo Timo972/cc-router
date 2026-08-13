@@ -49,8 +49,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   successful result. `{"type":"response.completed","response":null}` — or any
   other non-object payload — satisfied the completion check, so a
   non-streaming request got HTTP 200 with a `null` body, and `/v1/messages` got
-  a fabricated empty assistant turn. Both now report the `502` that a stream
-  ending without a terminal event already did.
+  a fabricated empty assistant turn; a streamed `/v1/messages` turn was closed
+  with `message_stop` and `end_turn`, telling the client a truncated answer had
+  finished normally. The collected paths now report the `502` that a stream
+  ending without a terminal event already did, and the streamed path ends
+  without `message_stop`, which is what clients already surface as a
+  truncation.
 - A single malformed SSE frame no longer truncates a `/v1/messages` stream.
   Parsing a chunk was all-or-nothing, so one bad frame discarded the valid
   events beside it and ended the response as a clean `200` the client could

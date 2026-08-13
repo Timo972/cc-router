@@ -718,6 +718,38 @@ describe("mountMessagesCrossProviderRoute crash safety (F1)", () => {
     expect(errorEntry).toEqual(expect.objectContaining({ statusCode: 502 }));
   });
 
+  it("does not close a streamed message when the terminal frame carries no response object", async () => {
+    // Well-formed SSE, real terminal event type, nothing inside it. The
+    // lifecycle already reports this stream as failed; emitting message_stop
+    // with end_turn would tell the client the opposite.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.incomplete\",\"response\":null}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("message_start");
+      expect(text).toContain("\"text\":\"Hi\"");
+      expect(text).not.toContain("message_stop");
+      expect(text).not.toContain("end_turn");
+    });
+
+    const errorEntry = activity.find(entry => entry.type === "error");
+    expect(errorEntry).toEqual(expect.objectContaining({ statusCode: 502 }));
+  });
+
   it("reports a 502 for a streamed response that stops before response.completed, without altering the relayed bytes", async () => {
     const forward: ForwardOpenAI = async () => new Response(
       new ReadableStream({

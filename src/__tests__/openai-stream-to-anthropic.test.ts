@@ -95,6 +95,23 @@ describe("openAIStreamEventToAnthropicEvents", () => {
     ]);
   });
 
+  it("emits nothing for a terminal event carrying no response object", () => {
+    const normalizer = createOpenAIStreamToAnthropicNormalizer();
+    normalizer.convert({ type: "response.created", response: { id: "resp_1" } });
+    normalizer.convert({ type: "response.output_text.delta", delta: "Par" });
+
+    // The collector and the usage observer both read this frame as a failed
+    // stream. Closing the message here would emit end_turn — telling the
+    // client a truncated turn finished normally. Ending without message_stop
+    // is what a truncated stream looks like, and what clients surface as the
+    // error it is.
+    for (const response of [null, [], "nope", 42]) {
+      expect(normalizer.convert(
+        { type: "response.incomplete", response } as Parameters<typeof normalizer.convert>[0],
+      )).toEqual([]);
+    }
+  });
+
   it("falls back to end_turn for an incomplete response with another reason", () => {
     const normalizer = createOpenAIStreamToAnthropicNormalizer();
     normalizer.convert({ type: "response.created", response: { id: "resp_1" } });
