@@ -445,14 +445,14 @@ describe("end-to-end telemetry privacy boundaries", () => {
     });
 
     try {
-      const alreadyInFlight = client.captureAnalyticsImmediate(proxyStartedEvent());
+      const alreadyInFlight = client.captureAnalyticsImmediate(proxyStartedEvent(), CONSENT_GENERATION);
       await withinDeadline(requestInFlight, "first PostHog request did not become in-flight");
-      client.captureAnalytics(proxyStartedEvent());
+      client.captureAnalytics(proxyStartedEvent(), CONSENT_GENERATION);
       client.captureException(sanitizedFailure(
         INSTALL_ID,
         "ad94f035-1e08-4e29-8517-fd56bdc83d99",
         TELEMETRY_CANARY.exceptionMessage,
-      ));
+      ), CONSENT_GENERATION);
       const optOutOutput = persistTelemetryOff(testHome, telemetryPath);
       expect(persistedSnapshot(telemetryPath).enabled).toBe(false);
       expect(optOutOutput).toContain("New outbound telemetry stops immediately");
@@ -511,9 +511,9 @@ describe("end-to-end telemetry privacy boundaries", () => {
         "529c9281-f128-446f-a4eb-0c3309e37a61",
         TELEMETRY_CANARY.rawProviderBody,
       );
-      await firstClient.captureExceptionImmediate(first);
-      await firstClient.captureExceptionImmediate(repeated);
-      await secondClient.captureExceptionImmediate(otherInstall);
+      await firstClient.captureExceptionImmediate(first, CONSENT_GENERATION);
+      await firstClient.captureExceptionImmediate(repeated, CONSENT_GENERATION);
+      await secondClient.captureExceptionImmediate(otherInstall, CONSENT_GENERATION);
 
       postHogCapture.assertOnlyApprovedRequests();
       expect(postHogCapture.requests).toHaveLength(3);

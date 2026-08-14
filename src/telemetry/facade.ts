@@ -496,8 +496,11 @@ export function createTelemetryFacade(
       });
       const client = safe && analytics();
       if (!safe || !client) return;
-      if (immediate) trackImmediate(client.captureAnalyticsImmediate(safe));
-      else client.captureAnalytics(safe);
+      if (immediate) {
+        trackImmediate(client.captureAnalyticsImmediate(safe, snapshot.state.consentGeneration));
+      } else {
+        client.captureAnalytics(safe, snapshot.state.consentGeneration);
+      }
     } catch {
       // Application behavior never depends on telemetry capture.
     }
@@ -675,9 +678,12 @@ export function createTelemetryFacade(
           const client = analytics();
           if (client) {
             if (context.category === "setup") {
-              trackImmediate(client.captureExceptionImmediate(exception));
+              trackImmediate(client.captureExceptionImmediate(
+                exception,
+                snapshot.state.consentGeneration,
+              ));
             } else {
-              client.captureException(exception);
+              client.captureException(exception, snapshot.state.consentGeneration);
             }
           }
         }

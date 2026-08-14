@@ -40,10 +40,10 @@ export type PostHogSdkClient = Pick<
 >;
 
 export interface PostHogTelemetryClient {
-  captureAnalytics(event: SafeAnalyticsEvent): void;
-  captureAnalyticsImmediate(event: SafeAnalyticsEvent): Promise<void>;
-  captureException(exception: SafeExceptionContract): void;
-  captureExceptionImmediate(exception: SafeExceptionContract): Promise<void>;
+  captureAnalytics(event: SafeAnalyticsEvent, consentGeneration: string): void;
+  captureAnalyticsImmediate(event: SafeAnalyticsEvent, consentGeneration: string): Promise<void>;
+  captureException(exception: SafeExceptionContract, consentGeneration: string): void;
+  captureExceptionImmediate(exception: SafeExceptionContract, consentGeneration: string): Promise<void>;
   flushWithin(deadlineMs: number): Promise<void>;
   shutdownWithin(deadlineMs: number): Promise<void>;
   discardPending(): void;
@@ -271,7 +271,7 @@ function exceptionProperties(
   exception: SafeExceptionContract,
   generation: number,
   captureId: string,
-  consentGeneration: string | undefined,
+  consentGeneration: string,
 ): Record<string, unknown> {
   const properties: Record<string, unknown> = {
     $exception_fingerprint: exception.fingerprint,
@@ -423,11 +423,18 @@ export function createPostHogTelemetryClient(
     }
   };
 
-  const getClient = (): { client: PostHogSdkClient; installationId: string } | undefined => {
+  const getClient = (
+    capturedConsentGeneration: string,
+  ): { client: PostHogSdkClient; installationId: string; consentGeneration: string } | undefined => {
     if (shutdownStarted || initializationFailed) return undefined;
+    const provenance = uuid(capturedConsentGeneration);
+    if (!provenance) return undefined;
     const snapshot = consent.getSnapshot();
     const installationId = snapshot && uuid(snapshot.state.installId);
-    if (!snapshot || !installationId) return undefined;
+    if (!snapshot
+      || !installationId
+      || snapshot.state.consentGeneration !== provenance
+      || consent.acceptedGeneration !== provenance) return undefined;
     if (!sdkClient) {
       try {
         sdkClient = createSdkClient(POSTHOG_PROJECT_TOKEN, {
@@ -450,13 +457,13 @@ export function createPostHogTelemetryClient(
         return undefined;
       }
     }
-    return { client: sdkClient, installationId };
+    return { client: sdkClient, installationId, consentGeneration: provenance };
   };
 
   return {
-    captureAnalytics(event) {
+    captureAnalytics(event, capturedConsentGeneration) {
       try {
-        const active = getClient();
+        const active = getClient(capturedConsentGeneration);
         if (!active) return;
         const captureId = randomUUID();
         active.client.capture({
@@ -469,17 +476,17 @@ export function createPostHogTelemetryClient(
             $geoip_disable: true,
             [CAPTURE_GENERATION_PROPERTY]: captureGeneration,
             [CAPTURE_ID_PROPERTY]: captureId,
-            [CAPTURE_CONSENT_GENERATION_PROPERTY]: consent.acceptedGeneration,
+            [CAPTURE_CONSENT_GENERATION_PROPERTY]: active.consentGeneration,
           },
         });
       } catch {
         // Capture is best effort only.
       }
     },
-    async captureAnalyticsImmediate(event) {
+    async captureAnalyticsImmediate(event, capturedConsentGeneration) {
       let captureId: string | undefined;
       try {
-        const active = getClient();
+        const active = getClient(capturedConsentGeneration);
         if (!active) return;
         captureId = randomUUID();
         await active.client.captureImmediate({
@@ -492,7 +499,7 @@ export function createPostHogTelemetryClient(
             $geoip_disable: true,
             [CAPTURE_GENERATION_PROPERTY]: captureGeneration,
             [CAPTURE_ID_PROPERTY]: captureId,
-            [CAPTURE_CONSENT_GENERATION_PROPERTY]: consent.acceptedGeneration,
+            [CAPTURE_CONSENT_GENERATION_PROPERTY]: active.consentGeneration,
           },
         });
       } catch {
@@ -501,30 +508,30 @@ export function createPostHogTelemetryClient(
         if (captureId) preparedCaptures.delete(captureId);
       }
     },
-    captureException(exception) {
+    captureException(exception, capturedConsentGeneration) {
       try {
-        const active = getClient();
+        const active = getClient(capturedConsentGeneration);
         if (!active) return;
         const captureId = randomUUID();
         active.client.captureException(
           exception.error,
           active.installationId,
-          exceptionProperties(exception, captureGeneration, captureId, consent.acceptedGeneration),
+          exceptionProperties(exception, captureGeneration, captureId, active.consentGeneration),
         );
       } catch {
         // Capture is best effort only.
       }
     },
-    async captureExceptionImmediate(exception) {
+    async captureExceptionImmediate(exception, capturedConsentGeneration) {
       let captureId: string | undefined;
       try {
-        const active = getClient();
+        const active = getClient(capturedConsentGeneration);
         if (!active) return;
         captureId = randomUUID();
         await active.client.captureExceptionImmediate(
           exception.error,
           active.installationId,
-          exceptionProperties(exception, captureGeneration, captureId, consent.acceptedGeneration),
+          exceptionProperties(exception, captureGeneration, captureId, active.consentGeneration),
         );
       } catch {
         // Immediate CLI capture must not change command behavior.

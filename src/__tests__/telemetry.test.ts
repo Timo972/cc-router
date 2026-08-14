@@ -25,6 +25,7 @@ import {
   getTelemetrySnapshot,
   isTelemetryEnabled,
   claimTelemetryFirstStart,
+  createTelemetryConsentGate,
   type TelemetryState,
 } from "../config/telemetry.js";
 
@@ -238,6 +239,55 @@ describe("getTelemetrySnapshot", () => {
       environmentDisabled: true,
       enabled: false,
     });
+  });
+
+  it.each([
+    ["invalid string", "not-a-consent-generation"],
+    ["null", null],
+    ["non-string type", 42],
+    ["wrong UUID version", "123e4567-e89b-12d3-a456-426614174010"],
+    ["wrong UUID variant", "123e4567-e89b-42d3-7456-426614174010"],
+  ] as const)("fails closed for a present %s consent generation", (_label, consentGeneration) => {
+    const malformed = {
+      enabled: true,
+      installId: "123e4567-e89b-42d3-a456-426614174000",
+      firstRunAt: "2026-08-11T12:00:00.000Z",
+      consentGeneration,
+      revision: 7,
+    };
+    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, JSON.stringify(malformed), "utf-8");
+
+    expect(() => getTelemetrySnapshot()).toThrow("Telemetry state is malformed");
+    expect(isTelemetryEnabled()).toBe(false);
+    expect(JSON.parse(fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"))).toEqual(malformed);
+  });
+
+  it("contains malformed-generation errors and latches off across invalid value changes", () => {
+    const malformed = (consentGeneration: string) => ({
+      enabled: true,
+      installId: "123e4567-e89b-42d3-a456-426614174000",
+      firstRunAt: "2026-08-11T12:00:00.000Z",
+      consentGeneration,
+      revision: 7,
+    });
+    fs.writeFileSync(
+      `${MOCK_DIR}/telemetry.json`,
+      JSON.stringify(malformed("invalid-generation-a")),
+      "utf-8",
+    );
+
+    const gate = createTelemetryConsentGate(getTelemetrySnapshot);
+    expect(gate.acceptedGeneration).toBeUndefined();
+    expect(gate.latchedDisabled).toBe(true);
+
+    fs.writeFileSync(
+      `${MOCK_DIR}/telemetry.json`,
+      JSON.stringify(malformed("invalid-generation-b")),
+      "utf-8",
+    );
+    expect(() => gate.getSnapshot()).not.toThrow();
+    expect(gate.getSnapshot()).toBeUndefined();
+    expect(gate.latchedDisabled).toBe(true);
   });
 });
 
@@ -662,6 +712,127 @@ describe("typed telemetry facade", () => {
     newFacade.recordProxyStarted(1);
     expect(newEvents).toEqual(["proxy.started"]);
   });
+
+  it.each([
+    ["analytics", "repeated on"],
+    ["analytics", "off then on"],
+    ["exception", "repeated on"],
+    ["exception", "off then on"],
+  ] as const)(
+    "does not let stale facade %s cross a lazy PostHog client created after %s",
+    async (captureKind, transition) => {
+      const { PostHog } = await import("posthog-node");
+      const { createPostHogTelemetryClient } = await import("../telemetry/posthog-client.js");
+      const { createTelemetryFacade } = await import("../telemetry/facade.js");
+      let current = snapshot(true, CONSENT_GENERATION, 30);
+      let analyticsCalls = 0;
+      let sdkCreations = 0;
+      let sdkCaptureCalls = 0;
+      let captureOperation: Promise<void> | undefined;
+      let clientOwner: ReturnType<typeof createPostHogTelemetryClient> | undefined;
+      const transportRequests: unknown[] = [];
+      const safeError = new Error("persistence_failure");
+      safeError.stack = [
+        "Error: persistence_failure",
+        `    at persist (${process.cwd()}/dist/config/store.js:42:7)`,
+      ].join("\n");
+
+      const facade = createTelemetryFacade({
+        getSnapshot: () => current,
+        claimFirstStart: () => undefined,
+        runtimeMetadata: () => ({
+          serviceVersion: "0.8.2",
+          osFamily: "macos",
+          runtimeMode: "foreground",
+        }),
+        emitLog: () => undefined,
+        sanitizeException: (_error, _context, identity) => ({
+          error: safeError,
+          category: "setup",
+          reason: "persistence_failure",
+          errorKind: "unexpected_error",
+          frames: [{ filename: "dist/config/store.js", line: 42, column: 7 }],
+          fingerprint: "a".repeat(64) as never,
+          diagnosticId: identity.diagnosticId as never,
+        }),
+        getAnalytics: () => {
+          analyticsCalls += 1;
+          if (transition === "repeated on") {
+            current = snapshot(true, NEXT_CONSENT_GENERATION, 31);
+          } else {
+            current = snapshot(false, NEXT_CONSENT_GENERATION, 31);
+            current = snapshot(true, "123e4567-e89b-42d3-a456-426614174012", 32);
+          }
+          const client = createPostHogTelemetryClient({
+            getSnapshot: () => current,
+            transport: async (url, options) => {
+              transportRequests.push({ url, options });
+              return {
+                status: 200,
+                text: async () => "",
+                json: async () => ({}),
+                headers: { get: () => null },
+              };
+            },
+            createSdkClient: (token, options) => {
+              sdkCreations += 1;
+              const sdk = new PostHog(token, options);
+              const captureImmediate = sdk.captureImmediate.bind(sdk);
+              sdk.captureImmediate = (...args: Parameters<typeof sdk.captureImmediate>) => {
+                sdkCaptureCalls += 1;
+                return captureImmediate(...args);
+              };
+              const captureExceptionImmediate = sdk.captureExceptionImmediate.bind(sdk);
+              sdk.captureExceptionImmediate = (
+                ...args: Parameters<typeof sdk.captureExceptionImmediate>
+              ) => {
+                sdkCaptureCalls += 1;
+                return captureExceptionImmediate(...args);
+              };
+              return sdk;
+            },
+          });
+          clientOwner = client;
+          const trackImmediate = <Args extends unknown[]>(
+            operation: (...args: Args) => Promise<void>,
+          ) => (...args: Args): Promise<void> => {
+            captureOperation = operation(...args);
+            return captureOperation;
+          };
+          return {
+            ...client,
+            captureAnalyticsImmediate: trackImmediate(client.captureAnalyticsImmediate.bind(client)),
+            captureExceptionImmediate: trackImmediate(client.captureExceptionImmediate.bind(client)),
+          };
+        },
+      });
+
+      if (captureKind === "analytics") {
+        facade.recordSetupStage({
+          provider: "openai",
+          method: "device_oauth",
+          stage: "token_exchange",
+          diagnosticId: DIAGNOSTIC_ID,
+        });
+      } else {
+        expect(facade.recordUnexpectedException(new Error("PRIVATE raw failure"), {
+          category: "setup",
+          reason: "persistence_failure",
+          setupStage: "persistence",
+        }, DIAGNOSTIC_ID)).toBe(DIAGNOSTIC_ID);
+      }
+
+      expect(analyticsCalls).toBe(1);
+      expect(captureOperation).toBeDefined();
+      await captureOperation;
+      expect({
+        sdkCreations,
+        sdkCaptureCalls,
+        transportRequests: transportRequests.length,
+      }).toEqual({ sdkCreations: 0, sdkCaptureCalls: 0, transportRequests: 0 });
+      await clientOwner?.shutdownWithin(100);
+    },
+  );
 
   it("reports the exact remote runtime diagnostic ID once with raw detail kept local", async () => {
     const { createTelemetryFacade } = await import("../telemetry/facade.js");

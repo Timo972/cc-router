@@ -153,11 +153,11 @@ describe("gated PostHog EU client", () => {
       },
     });
 
-    await client.captureAnalyticsImmediate(analyticsEvent());
+    await client.captureAnalyticsImmediate(analyticsEvent(), CONSENT_GENERATION);
     expect(creations).toBe(0);
 
     currentSnapshot = snapshot(true);
-    await client.captureAnalyticsImmediate(analyticsEvent());
+    await client.captureAnalyticsImmediate(analyticsEvent(), CONSENT_GENERATION);
 
     expect(creations).toBe(1);
     expect(requests).toHaveLength(1);
@@ -183,7 +183,7 @@ describe("gated PostHog EU client", () => {
       },
     } as unknown as SafeAnalyticsEvent;
 
-    await client.captureAnalyticsImmediate(hostile);
+    await client.captureAnalyticsImmediate(hostile, CONSENT_GENERATION);
 
     expect(requests).toHaveLength(1);
     expect(new URL(requests[0]!.url).origin).toBe("https://eu.i.posthog.com");
@@ -224,7 +224,7 @@ describe("gated PostHog EU client", () => {
       request: { url: "https://private.example.test" },
     } as SafeExceptionContract;
 
-    await client.captureExceptionImmediate(hostile);
+    await client.captureExceptionImmediate(hostile, CONSENT_GENERATION);
 
     expect(requests).toHaveLength(1);
     const event = capturedEvent(requests[0]!);
@@ -293,8 +293,14 @@ describe("gated PostHog EU client", () => {
       fingerprint: "not-a-safe-fingerprint",
     } as unknown as SafeExceptionContract;
 
-    await expect(client.captureAnalyticsImmediate(malformedAnalytics)).resolves.toBeUndefined();
-    await expect(client.captureExceptionImmediate(malformedException)).resolves.toBeUndefined();
+    await expect(client.captureAnalyticsImmediate(
+      malformedAnalytics,
+      CONSENT_GENERATION,
+    )).resolves.toBeUndefined();
+    await expect(client.captureExceptionImmediate(
+      malformedException,
+      CONSENT_GENERATION,
+    )).resolves.toBeUndefined();
 
     expect(requests).toHaveLength(0);
     await client.shutdownWithin(100);
@@ -311,7 +317,10 @@ describe("gated PostHog EU client", () => {
       transport: captureTransport(requests),
     });
 
-    await expect(client.captureAnalyticsImmediate(analyticsEvent())).resolves.toBeUndefined();
+    await expect(client.captureAnalyticsImmediate(
+      analyticsEvent(),
+      CONSENT_GENERATION,
+    )).resolves.toBeUndefined();
 
     expect(reads).toBeGreaterThanOrEqual(3);
     expect(requests).toHaveLength(0);
@@ -326,7 +335,7 @@ describe("gated PostHog EU client", () => {
       transport: captureTransport(requests),
     });
 
-    client.captureAnalytics(analyticsEvent());
+    client.captureAnalytics(analyticsEvent(), CONSENT_GENERATION);
     currentSnapshot = snapshot(false);
     client.discardPending();
     currentSnapshot = snapshot(true);
@@ -344,7 +353,7 @@ describe("gated PostHog EU client", () => {
       transport: captureTransport(requests),
     });
 
-    client.captureException(exceptionContract());
+    client.captureException(exceptionContract(), CONSENT_GENERATION);
     currentSnapshot = snapshot(false);
     client.discardPending();
     currentSnapshot = snapshot(true);
@@ -362,12 +371,12 @@ describe("gated PostHog EU client", () => {
       transport: captureTransport(requests),
     });
 
-    oldClient.captureAnalytics(analyticsEvent());
+    oldClient.captureAnalytics(analyticsEvent(), CONSENT_GENERATION);
     await waitForImmediate();
     currentSnapshot = snapshot(true, NEXT_CONSENT_GENERATION, 10);
     await oldClient.flushWithin(100);
     currentSnapshot = snapshot(true, CONSENT_GENERATION, 10);
-    oldClient.captureAnalytics(analyticsEvent());
+    oldClient.captureAnalytics(analyticsEvent(), CONSENT_GENERATION);
     await oldClient.flushWithin(100);
     expect(requests).toHaveLength(0);
 
@@ -376,7 +385,7 @@ describe("gated PostHog EU client", () => {
       getSnapshot: () => currentSnapshot,
       transport: captureTransport(requests),
     });
-    await newClient.captureAnalyticsImmediate(analyticsEvent());
+    await newClient.captureAnalyticsImmediate(analyticsEvent(), NEXT_CONSENT_GENERATION);
     expect(requests).toHaveLength(1);
     await oldClient.shutdownWithin(100);
     await newClient.shutdownWithin(100);
@@ -390,12 +399,12 @@ describe("gated PostHog EU client", () => {
       transport: captureTransport(requests),
     });
 
-    oldClient.captureException(exceptionContract());
+    oldClient.captureException(exceptionContract(), CONSENT_GENERATION);
     await waitForImmediate();
     currentSnapshot = snapshot(true, NEXT_CONSENT_GENERATION, 20);
     await oldClient.flushWithin(100);
     currentSnapshot = snapshot(true, CONSENT_GENERATION, 20);
-    oldClient.captureException(exceptionContract());
+    oldClient.captureException(exceptionContract(), CONSENT_GENERATION);
     await oldClient.flushWithin(100);
     expect(requests).toHaveLength(0);
 
@@ -404,7 +413,7 @@ describe("gated PostHog EU client", () => {
       getSnapshot: () => currentSnapshot,
       transport: captureTransport(requests),
     });
-    await newClient.captureExceptionImmediate(exceptionContract());
+    await newClient.captureExceptionImmediate(exceptionContract(), NEXT_CONSENT_GENERATION);
     expect(requests).toHaveLength(1);
     await oldClient.shutdownWithin(100);
     await newClient.shutdownWithin(100);
@@ -417,7 +426,7 @@ describe("gated PostHog EU client", () => {
       transport: captureTransport(requests),
     });
 
-    client.captureAnalytics(analyticsEvent());
+    client.captureAnalytics(analyticsEvent(), CONSENT_GENERATION);
     await waitForImmediate();
     client.discardPending();
     await client.flushWithin(100);
@@ -435,7 +444,7 @@ describe("gated PostHog EU client", () => {
       getSnapshot: () => snapshot(),
       transport,
     });
-    client.captureAnalytics(analyticsEvent());
+    client.captureAnalytics(analyticsEvent(), CONSENT_GENERATION);
     await waitForImmediate();
 
     const flushStarted = Date.now();
@@ -476,9 +485,9 @@ describe("gated PostHog EU client", () => {
       });
 
       if (captureKind === "analytics") {
-        await client.captureAnalyticsImmediate(analyticsEvent());
+        await client.captureAnalyticsImmediate(analyticsEvent(), CONSENT_GENERATION);
       } else {
-        await client.captureExceptionImmediate(exceptionContract());
+        await client.captureExceptionImmediate(exceptionContract(), CONSENT_GENERATION);
       }
       expect(underlyingCalls).toBe(1);
       if (!gatedFetch || !attemptedRequest) throw new Error("test must capture the gated SDK request");
@@ -515,7 +524,9 @@ describe("gated PostHog EU client", () => {
       },
     });
 
-    for (let index = 0; index < 101; index += 1) client.captureAnalytics(analyticsEvent());
+    for (let index = 0; index < 101; index += 1) {
+      client.captureAnalytics(analyticsEvent(), CONSENT_GENERATION);
+    }
     await waitForImmediate();
 
     expect(queuedMessages).toHaveLength(101);
@@ -547,9 +558,18 @@ describe("gated PostHog EU client", () => {
       createSdkClient: throwingFactory,
     });
 
-    expect(() => initializationFailure.captureAnalytics(analyticsEvent())).not.toThrow();
-    await expect(initializationFailure.captureAnalyticsImmediate(analyticsEvent())).resolves.toBeUndefined();
-    await expect(initializationFailure.captureExceptionImmediate(exceptionContract())).resolves.toBeUndefined();
+    expect(() => initializationFailure.captureAnalytics(
+      analyticsEvent(),
+      CONSENT_GENERATION,
+    )).not.toThrow();
+    await expect(initializationFailure.captureAnalyticsImmediate(
+      analyticsEvent(),
+      CONSENT_GENERATION,
+    )).resolves.toBeUndefined();
+    await expect(initializationFailure.captureExceptionImmediate(
+      exceptionContract(),
+      CONSENT_GENERATION,
+    )).resolves.toBeUndefined();
     await expect(initializationFailure.flushWithin(10)).resolves.toBeUndefined();
     await expect(initializationFailure.shutdownWithin(10)).resolves.toBeUndefined();
     expect(throwingFactory).toHaveBeenCalled();
@@ -558,7 +578,10 @@ describe("gated PostHog EU client", () => {
       getSnapshot: () => snapshot(),
       transport: async () => { throw new Error("transport failed"); },
     });
-    await expect(transportFailure.captureAnalyticsImmediate(analyticsEvent())).resolves.toBeUndefined();
+    await expect(transportFailure.captureAnalyticsImmediate(
+      analyticsEvent(),
+      CONSENT_GENERATION,
+    )).resolves.toBeUndefined();
     await expect(transportFailure.flushWithin(10)).resolves.toBeUndefined();
     await expect(transportFailure.shutdownWithin(10)).resolves.toBeUndefined();
 
@@ -575,9 +598,18 @@ describe("gated PostHog EU client", () => {
         setPersistedProperty: () => { throw new Error("discard failed"); },
       }),
     });
-    expect(() => lifecycleFailure.captureAnalytics(analyticsEvent())).not.toThrow();
-    await expect(lifecycleFailure.captureAnalyticsImmediate(analyticsEvent())).resolves.toBeUndefined();
-    await expect(lifecycleFailure.captureExceptionImmediate(exceptionContract())).resolves.toBeUndefined();
+    expect(() => lifecycleFailure.captureAnalytics(
+      analyticsEvent(),
+      CONSENT_GENERATION,
+    )).not.toThrow();
+    await expect(lifecycleFailure.captureAnalyticsImmediate(
+      analyticsEvent(),
+      CONSENT_GENERATION,
+    )).resolves.toBeUndefined();
+    await expect(lifecycleFailure.captureExceptionImmediate(
+      exceptionContract(),
+      CONSENT_GENERATION,
+    )).resolves.toBeUndefined();
     expect(() => lifecycleFailure.discardPending()).not.toThrow();
     await expect(lifecycleFailure.flushWithin(10)).resolves.toBeUndefined();
     await expect(lifecycleFailure.shutdownWithin(10)).resolves.toBeUndefined();

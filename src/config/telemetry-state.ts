@@ -113,6 +113,7 @@ function normalizeTelemetryState(raw: unknown): NormalizedTelemetryState | undef
   const firstRunAt = typeof candidate.firstRunAt === "string" && candidate.firstRunAt
     ? candidate.firstRunAt
     : undefined;
+  const hasConsentGeneration = Object.prototype.hasOwnProperty.call(candidate, "consentGeneration");
   const generation = uuid(candidate.consentGeneration);
   const revision = typeof candidate.revision === "number"
     && Number.isSafeInteger(candidate.revision)
@@ -123,7 +124,7 @@ function normalizeTelemetryState(raw: unknown): NormalizedTelemetryState | undef
   // A complete pre-generation record is a supported legacy state. Arbitrary
   // partial current records fail closed on normal reads and are repaired only
   // by explicit initialization/update APIs.
-  const legacy = generation === undefined
+  const legacy = !hasConsentGeneration
     && installId !== undefined
     && firstRunAt !== undefined
     && (candidate.enabled === undefined || typeof candidate.enabled === "boolean")

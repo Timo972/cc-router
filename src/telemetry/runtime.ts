@@ -462,7 +462,7 @@ export function startProxyTelemetry(
         });
         if (exception) {
           reportFatalExceptionCorrelationLocally(exception.diagnosticId);
-          void posthog.captureExceptionImmediate(exception);
+          void posthog.captureExceptionImmediate(exception, current.state.consentGeneration);
         }
       } catch {
         // The monitor observes only; it never changes Node's crash behavior.
