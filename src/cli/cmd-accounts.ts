@@ -507,6 +507,38 @@ export interface LiveAccountAddOptions {
   fetch?: typeof globalThis.fetch;
 }
 
+const CONFIRMED_PRECONNECT_FAILURE_CODES = new Set([
+  "ECONNREFUSED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+]);
+
+function ownStringProperty(value: unknown, property: "code"): string | undefined {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, property);
+  return descriptor && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : undefined;
+}
+
+function ownCause(value: unknown): unknown {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, "cause");
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+}
+
+function isConfirmedPreconnectFailure(error: unknown): boolean {
+  let candidate = error;
+  for (let depth = 0; depth < 5 && candidate !== undefined; depth++) {
+    const code = ownStringProperty(candidate, "code");
+    if (code && CONFIRMED_PRECONNECT_FAILURE_CODES.has(code)) return true;
+    candidate = ownCause(candidate);
+  }
+  return false;
+}
+
 /**
  * Add an account to a running proxy so it becomes routable without a restart.
  * Returns false only when no running proxy can be reached (the caller then
@@ -531,8 +563,12 @@ export async function tryAddAccountToRunningProxy(
       body: JSON.stringify(record),
       signal: AbortSignal.timeout(3_000),
     });
-  } catch {
-    return false;
+  } catch (error) {
+    if (isConfirmedPreconnectFailure(error)) return false;
+    throw new Error(
+      "Live proxy account add outcome is unknown; refusing offline fallback",
+      { cause: error },
+    );
   }
   if (!response.ok) {
     let detail = "";

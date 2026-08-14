@@ -10,6 +10,60 @@ interface CodexStreamEvent {
   error?: { message?: string };
 }
 
+export type CodexResponseTerminal =
+  | { kind: "completed"; response: unknown }
+  | { kind: "incomplete"; response: unknown }
+  | { kind: "failed"; message: string }
+  | { kind: "error"; message: string }
+  | { kind: "missing" };
+
+export interface CodexResponseTerminalObserver {
+  push(chunk: Uint8Array): void;
+  finish(): CodexResponseTerminal;
+}
+
+/** Observe terminal Responses events while another consumer relays the same bytes. */
+export function createCodexResponseTerminalObserver(): CodexResponseTerminalObserver {
+  const decoder = new TextDecoder();
+  let remainder = "";
+  let terminal: CodexResponseTerminal | undefined;
+
+  const applyEvent = (event: unknown): void => {
+    if (terminal || typeof event !== "object" || event === null) return;
+    const candidate = event as CodexStreamEvent;
+    if (candidate.type === "response.completed") {
+      terminal = { kind: "completed", response: candidate.response };
+    } else if (candidate.type === "response.incomplete") {
+      terminal = { kind: "incomplete", response: candidate.response };
+    } else if (candidate.type === "response.failed") {
+      const err = (candidate.response as { error?: { message?: string } } | undefined)?.error;
+      terminal = { kind: "failed", message: err?.message ?? "Response failed" };
+    } else if (candidate.type === "error") {
+      terminal = { kind: "error", message: candidate.error?.message ?? "Upstream error event" };
+    }
+  };
+
+  const parse = (input: string): void => {
+    const parsed = parseSseLines(input);
+    remainder = parsed.remainder;
+    for (const event of parsed.events) applyEvent(event);
+  };
+
+  return {
+    push(chunk) {
+      parse(remainder + decoder.decode(chunk, { stream: true }));
+    },
+    finish() {
+      const tail = remainder + decoder.decode();
+      if (tail.length > 0) {
+        remainder = "";
+        for (const event of parseSseLines(tail + "\n").events) applyEvent(event);
+      }
+      return terminal ?? { kind: "missing" };
+    },
+  };
+}
+
 function upstreamError(message: string): CollectedCodexResponse {
   return { kind: "json", status: 502, body: { error: { type: "upstream_error", message } } };
 }
@@ -39,42 +93,29 @@ export async function collectCodexResponseStream(
 
   const reader = upstream.body?.getReader();
   if (!reader) return upstreamError("Empty upstream body");
-
-  const decoder = new TextDecoder();
-  let remainder = "";
-  let completed: unknown;
-  let failure: string | undefined;
-
-  const applyEvent = (event: unknown): void => {
-    if (typeof event !== "object" || event === null) return;
-    const e = event as CodexStreamEvent;
-    if (e.type === "response.completed") {
-      completed = e.response;
-    } else if (e.type === "response.failed") {
-      const err = (e.response as { error?: { message?: string } } | undefined)?.error;
-      failure = err?.message ?? "Response failed";
-    } else if (e.type === "error") {
-      failure = e.error?.message ?? "Upstream error event";
-    }
-  };
+  const observer = createCodexResponseTerminalObserver();
 
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }));
-      remainder = parsed.remainder;
-      for (const event of parsed.events) applyEvent(event);
-    }
-    const tail = remainder + decoder.decode();
-    if (tail.length > 0) {
-      for (const event of parseSseLines(tail + "\n").events) applyEvent(event);
+      observer.push(value);
     }
   } catch {
     return upstreamError("Malformed upstream stream");
   }
 
-  if (failure !== undefined) return upstreamError(failure);
-  if (completed === undefined) return upstreamError("Stream ended before response.completed");
-  return { kind: "json", status: upstream.status, body: completed };
+  let terminal: CodexResponseTerminal;
+  try {
+    terminal = observer.finish();
+  } catch {
+    return upstreamError("Malformed upstream stream");
+  }
+  if (terminal.kind === "failed" || terminal.kind === "error") {
+    return upstreamError(terminal.message);
+  }
+  if (terminal.kind === "missing" || terminal.response === undefined) {
+    return upstreamError("Stream ended before response.completed");
+  }
+  return { kind: "json", status: upstream.status, body: terminal.response };
 }

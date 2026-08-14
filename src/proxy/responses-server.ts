@@ -3,7 +3,10 @@ import type { Express, NextFunction, Request, Response } from "express";
 import { selectRoute } from "../providers/route-selector.js";
 import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
-import { collectCodexResponseStream } from "../protocol/openai-responses-collect.js";
+import {
+  collectCodexResponseStream,
+  createCodexResponseTerminalObserver,
+} from "../protocol/openai-responses-collect.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 import {
@@ -36,32 +39,74 @@ function isResponsesRequest(value: unknown): value is OpenAIResponsesRequest {
   );
 }
 
-async function sendUpstreamResponse(upstream: globalThis.Response, res: Response): Promise<"complete"> {
+const SAFE_UPSTREAM_RESPONSE_HEADERS = ["content-type", "retry-after"] as const;
+
+function copySafeUpstreamResponseHeaders(
+  upstream: globalThis.Response,
+  res: Response,
+  names: readonly (typeof SAFE_UPSTREAM_RESPONSE_HEADERS)[number][] = SAFE_UPSTREAM_RESPONSE_HEADERS,
+): void {
+  for (const name of names) {
+    const value = upstream.headers.get(name);
+    if (value !== null) res.setHeader(name, value);
+  }
+}
+
+type ResponseStreamOutcome = "complete" | "upstream_error";
+
+async function sendUpstreamResponse(
+  upstream: globalThis.Response,
+  res: Response,
+): Promise<ResponseStreamOutcome> {
   const contentType = upstream.headers.get("content-type");
-  if (contentType) res.setHeader("content-type", contentType);
+  copySafeUpstreamResponseHeaders(upstream, res);
 
   res.status(upstream.status);
   if (!upstream.body) {
+    if (upstream.ok && contentType?.includes("text/event-stream")) {
+      res.destroy();
+      return "upstream_error";
+    }
     res.end();
-    return "complete";
+    return upstream.ok ? "complete" : "upstream_error";
   }
 
-  if (contentType?.includes("text/event-stream")) {
+  const observeTerminal = upstream.ok && contentType?.includes("text/event-stream");
+  if (observeTerminal) {
     res.setHeader("cache-control", "no-cache");
     res.flushHeaders?.();
   }
 
   const reader = upstream.body.getReader();
+  const observer = observeTerminal ? createCodexResponseTerminalObserver() : undefined;
+  let shouldAbort = false;
+  let streamOutcome: ResponseStreamOutcome = upstream.ok ? "complete" : "upstream_error";
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      if (value) res.write(Buffer.from(value));
+      if (value) {
+        observer?.push(value);
+        res.write(Buffer.from(value));
+      }
     }
+    if (observer) {
+      const terminal = observer.finish();
+      if (terminal.kind === "failed" || terminal.kind === "error") {
+        streamOutcome = "upstream_error";
+      } else if (terminal.kind === "missing") {
+        streamOutcome = "upstream_error";
+        shouldAbort = true;
+      }
+    }
+  } catch (error) {
+    shouldAbort = true;
+    throw error;
   } finally {
-    res.end();
+    if (shouldAbort) res.destroy();
+    else res.end();
   }
-  return "complete";
+  return streamOutcome;
 }
 
 function requestSource(req: Request): "cli" | "desktop" | "api" {
@@ -274,6 +319,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         }
         const streamOutcome = await sendUpstreamResponse(upstream, res);
         annotateActiveSpan("proxy.request", {
+          outcome: streamOutcome === "upstream_error" && upstream.ok ? "upstream_error" : outcome,
           streamOutcome,
           operationDurationMs: Date.now() - startedAt,
         });
@@ -281,6 +327,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       }
 
       const collected = await collectCodexResponseStream(upstream);
+      copySafeUpstreamResponseHeaders(upstream, res, ["retry-after"]);
       const outcome = responseOutcome(collected.status);
       annotateActiveSpan("proxy.request", {
         httpStatusCode: collected.status,

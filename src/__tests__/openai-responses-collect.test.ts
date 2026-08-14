@@ -89,6 +89,25 @@ describe("collectCodexResponseStream", () => {
     });
   });
 
+  it("returns response.incomplete as a valid terminal Responses object", async () => {
+    const upstream = sseResponse([
+      'data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}\n\n',
+    ]);
+
+    const result = await collectCodexResponseStream(upstream);
+
+    expect(result).toEqual({
+      kind: "json",
+      status: 200,
+      body: {
+        id: "resp_incomplete",
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        output: [],
+      },
+    });
+  });
+
   it("reassembles a response.completed event split across chunks", async () => {
     const upstream = sseResponse([
       'data: {"type":"response.completed","response":{"id":"split"',

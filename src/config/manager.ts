@@ -133,8 +133,21 @@ export function writeAccountsAtomic(data: unknown[]): void {
 }
 
 function writeAccountsAtomicToPath(path: string, data: unknown[]): void {
+  assertUniqueAccountIds(data);
   // accounts.json holds plaintext OAuth access + refresh tokens — owner-only.
   writeFileSecureSync(path, JSON.stringify(data, null, 2));
+}
+
+function assertUniqueAccountIds(data: unknown[]): void {
+  const owners = new Map<string, AccountProvider>();
+  for (const candidate of data) {
+    if (!isAccountRecordShape(candidate)) continue;
+    const provider = normalizeAccountProvider(candidate);
+    if (owners.has(candidate.id)) {
+      throw new Error("Account IDs must be unique across providers");
+    }
+    owners.set(candidate.id, provider);
+  }
 }
 
 export function writeAnthropicAccountsPreservingOtherProviders(data: AccountRecord[]): void {
@@ -150,7 +163,8 @@ export function upsertAccountRecord(record: AccountRecord): void {
   ensureConfigDir();
   const existing = readAccountStateOrThrow() as AccountRecord[];
   const next = [
-    ...existing.filter(a => !(a.id === record.id && a.provider === record.provider)),
+    ...existing.filter(a => !(a.id === record.id
+      && normalizeAccountProvider(a) === normalizeAccountProvider(record))),
     record,
   ];
   writeAccountsAtomicToPath(ACCOUNTS_PATH, next);

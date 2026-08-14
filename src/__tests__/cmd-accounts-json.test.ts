@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { createServer } from "node:http";
 import {
   addAccountRuntimeAware,
   buildStoredAccountsJson,
@@ -177,9 +178,39 @@ describe("runtime-aware account add", () => {
   });
 
   it("reports no reachable proxy when the POST connection fails", async () => {
-    const fetch = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
+    const refusal = Object.assign(new Error("connect refused"), { code: "ECONNREFUSED" });
+    const fetch = vi.fn(async () => { throw new TypeError("fetch failed", { cause: refusal }); });
 
     await expect(tryAddAccountToRunningProxy(record, { fetch })).resolves.toBe(false);
+  });
+
+  it("does not fall back to disk when the live POST commits before the connection resets", async () => {
+    let committed = false;
+    const server = createServer((request) => {
+      request.resume();
+      request.on("end", () => {
+        committed = true;
+        request.socket.destroy();
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("ambiguous-commit server did not bind");
+    const addStored = vi.fn();
+
+    try {
+      await expect(addAccountRuntimeAware(record, {
+        tryAddLive: candidate => tryAddAccountToRunningProxy(candidate, {
+          baseUrl: `http://127.0.0.1:${address.port}`,
+        }),
+        addStored,
+      })).rejects.toThrow("outcome is unknown");
+      expect(committed).toBe(true);
+      expect(addStored).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      server.closeAllConnections();
+    }
   });
 
   it("surfaces HTTP errors from the live account API instead of falling back", async () => {

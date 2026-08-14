@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { TelemetrySnapshot } from "../config/telemetry.js";
 import {
+  decodeOtlpProtobuf,
   startTransportCaptureServer,
   TELEMETRY_CANARY,
   type TransportCaptureServer,
@@ -127,7 +128,11 @@ describe("proxy runtime sampling and propagation", () => {
         if (codexUnexpected) throw new TypeError("PRIVATE_CODEX_FAILURE");
         return new Response("private codex response", {
           status: codexStatus,
-          headers: { "content-type": "text/plain" },
+          headers: {
+            "content-type": "text/plain",
+            "retry-after": "23",
+            "x-private-upstream": "private-header-value",
+          },
         });
       }
       return responseFor(url);
@@ -667,6 +672,97 @@ describe("proxy runtime sampling and propagation", () => {
     }
   });
 
+  it.each([
+    {
+      name: "response.incomplete",
+      event: { type: "response.incomplete", response: { id: "private-response-id", status: "incomplete" } },
+      expectedOutcome: "complete",
+      aborts: false,
+    },
+    {
+      name: "response.failed",
+      event: { type: "response.failed", response: { error: { message: TELEMETRY_CANARY.prompt } } },
+      expectedOutcome: "upstream_error",
+      aborts: false,
+    },
+    {
+      name: "error",
+      event: { type: "error", error: { message: TELEMETRY_CANARY.prompt } },
+      expectedOutcome: "upstream_error",
+      aborts: false,
+    },
+    {
+      name: "premature EOF",
+      event: { type: "response.created", response: { id: "private-response-id" } },
+      expectedOutcome: "upstream_error",
+      aborts: true,
+    },
+  ])("classifies streaming Responses $name without exporting terminal contents", async testCase => {
+    const express = (await import("express")).default;
+    const { createServer } = await import("node:http");
+    const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
+    const { flushTelemetryWithin } = await import("../telemetry/facade.js");
+    const responseBody = `data: ${JSON.stringify(testCase.event)}\n\n`;
+    const app = express();
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: TELEMETRY_CANARY.accountId,
+        provider: "openai_subscription",
+        accessToken: TELEMETRY_CANARY.bearerToken,
+        refreshToken: "private-refresh",
+        expiresAt: Date.now() + 60_000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(responseBody, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("terminal app did not bind");
+    const started = capture.requests.length;
+
+    try {
+      const response = await originalFetch(`http://127.0.0.1:${address.port}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5-codex",
+          input: [{ role: "user", content: TELEMETRY_CANARY.prompt }],
+          stream: true,
+        }),
+      });
+      if (testCase.aborts) await expect(response.text()).rejects.toThrow();
+      else expect(await response.text()).toBe(responseBody);
+
+      await flushTelemetryWithin(500);
+      await waitForRequest(capture, "/i/v1/traces", started);
+      const decoded = capture.requests
+        .slice(started)
+        .filter(request => request.url === "/i/v1/traces")
+        .map(request => decodeOtlpProtobuf(request.rawBody, "traces"));
+      const proxySpans = decoded.flatMap(payload => (payload.resourceSpans ?? []).flatMap(resource =>
+        ((resource as { scopeSpans?: Array<{ spans?: Array<Record<string, unknown>> }> }).scopeSpans ?? [])
+          .flatMap(scope => scope.spans ?? [])
+          .filter(span => span.name === "proxy.request")
+      ));
+      expect(proxySpans).not.toHaveLength(0);
+      const attributes = proxySpans.at(-1)?.attributes as Record<string, unknown>;
+      expect(attributes["cc_router.stream_outcome"]).toBe(testCase.expectedOutcome);
+      expect(attributes["cc_router.outcome"]).toBe(testCase.expectedOutcome);
+
+      const traceWire = wireFor(capture, "/i/v1/traces", started).toString("utf8");
+      expect(traceWire).not.toContain(TELEMETRY_CANARY.prompt);
+      expect(traceWire).not.toContain(TELEMETRY_CANARY.accountId);
+      expect(traceWire).not.toContain("private-response-id");
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      server.closeAllConnections();
+    }
+  });
+
   it("records cross-routed Messages outcomes and usage without retaining translated content", async () => {
     const express = (await import("express")).default;
     const { createServer } = await import("node:http");
@@ -886,6 +982,9 @@ describe("proxy runtime sampling and propagation", () => {
         body: JSON.stringify({ model: "openai/gpt-5-codex", input: [] }),
       });
       expect(response.status).toBe(429);
+      expect(response.headers.get("content-type")).toContain("text/plain");
+      expect(response.headers.get("retry-after")).toBe("23");
+      expect(response.headers.get("x-private-upstream")).toBeNull();
       await response.arrayBuffer();
       await flushTelemetryWithin(500);
       await waitForRequest(capture, "/i/v1/logs", started);
@@ -894,6 +993,7 @@ describe("proxy runtime sampling and propagation", () => {
       expect(countOccurrences(logWire, "runtime.failure")).toBe(1);
       expect(logWire).toContain("rate_limited");
       expect(logWire).not.toContain("private codex response");
+      expect(logWire).not.toContain("private-header-value");
     } finally {
       codexStatus = 200;
       await new Promise<void>(resolve => server.close(() => resolve()));

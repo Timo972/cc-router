@@ -119,6 +119,7 @@ export function toCodexBackendRequest(body: OpenAIResponsesRequest): OpenAIRespo
 }
 
 function ensureEventStreamContentType(upstream: Response): Response {
+  if (!upstream.ok) return upstream;
   const contentType = upstream.headers.get("content-type");
   if (contentType?.includes("text/event-stream")) return upstream;
 

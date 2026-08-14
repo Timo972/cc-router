@@ -55,7 +55,10 @@ import {
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
 import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
-import { saveProviderAccountsOnShutdown } from "./shutdown-persistence.js";
+import {
+  createProxyExitCoordinator,
+  saveProviderAccountsOnShutdown,
+} from "./shutdown-persistence.js";
 
 const TELEMETRY_SHUTDOWN_DEADLINE_MS = 500;
 const REFRESH_SHUTDOWN_DEADLINE_MS = 500;
@@ -1328,37 +1331,29 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   // ─── Graceful shutdown ────────────────────────────────────────────────────
   let listener: ReturnType<typeof app.listen> | undefined;
-  let shutdownStarted = false;
+  const exitCoordinator = createProxyExitCoordinator({
+    stopAccepting: () => {
+      listener?.close();
+      console.log(chalk.yellow("\nShutting down — saving tokens..."));
+    },
+    stopUsageRefresh: () => usageRefresher.stop(),
+    removePid: () => {
+      if (process.env["CC_ROUTER_DAEMON"] === "1") removePid();
+    },
+    drainRefresh: async () => {
+      await Promise.all([
+        stopAnthropicRefreshLoop(REFRESH_SHUTDOWN_DEADLINE_MS),
+        stopOpenAIRefreshLoop(REFRESH_SHUTDOWN_DEADLINE_MS),
+      ]);
+    },
+    persistAccounts: () => saveProviderAccountsOnShutdown(pool.getAll(), openAIAccounts, {
+      saveAnthropic: saveAccounts,
+      saveOpenAI: saveOpenAIAccounts,
+    }),
+    shutdownTelemetry: () => shutdownTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS),
+  });
   const shutdown = () => {
-    if (shutdownStarted) return;
-    shutdownStarted = true;
-    listener?.close();
-    console.log(chalk.yellow("\nShutting down — saving tokens..."));
-    usageRefresher.stop();
-    if (process.env["CC_ROUTER_DAEMON"] === "1") {
-      removePid();
-    }
-    void (async () => {
-      try {
-        await Promise.all([
-          stopAnthropicRefreshLoop(REFRESH_SHUTDOWN_DEADLINE_MS),
-          stopOpenAIRefreshLoop(REFRESH_SHUTDOWN_DEADLINE_MS),
-        ]);
-      } catch {
-        // Refresh drainage is bounded and never changes the proxy exit path.
-      }
-      saveProviderAccountsOnShutdown(pool.getAll(), openAIAccounts, {
-        saveAnthropic: saveAccounts,
-        saveOpenAI: saveOpenAIAccounts,
-      });
-      try {
-        await shutdownTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS);
-      } catch {
-        // Telemetry shutdown never changes proxy exit behavior.
-      } finally {
-        process.exit(0);
-      }
-    })();
+    void exitCoordinator.finish(() => process.exit(0));
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
@@ -1383,8 +1378,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const ok = await performUpdate(check.latest);
         if (ok) {
           console.log(chalk.green("[auto-update] Restarting with new version..."));
-          saveAccounts(pool.getAll());
-          restartSelf();
+          await exitCoordinator.finish(restartSelf);
         }
       } catch (err) {
         console.error(chalk.gray(`[auto-update] Check failed: ${(err as Error).message}`));

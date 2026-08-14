@@ -286,6 +286,25 @@ describe("writeAnthropicAccountsPreservingOtherProviders", () => {
     ]);
     expect(parsed[1].provider).toBe("openai_subscription");
   });
+
+  it("rejects an Anthropic ID already owned by OpenAI without overwriting storage", () => {
+    writeAccountsAtomic([{
+      id: "shared-account",
+      provider: "openai_subscription",
+      accessToken: "openai-access",
+      refreshToken: "openai-refresh",
+      expiresAt: 1999999999000,
+      scopes: ["openid"],
+    }]);
+    const before = fs.readFileSync(accountsPath(), "utf-8");
+
+    expect(() => writeAnthropicAccountsPreservingOtherProviders([{
+      ...sampleRecord,
+      id: "shared-account",
+      provider: "anthropic_subscription",
+    }])).toThrow("Account IDs must be unique across providers");
+    expect(fs.readFileSync(accountsPath(), "utf-8")).toBe(before);
+  });
 });
 
 describe("upsertAccountRecord", () => {
@@ -316,6 +335,22 @@ describe("upsertAccountRecord", () => {
     expect(parsed).toHaveLength(2);
     expect(parsed[0].id).toBe("max-account-1");
     expect(parsed[1].accessToken).toBe("openai-access-updated");
+  });
+
+  it("rejects an OpenAI ID already owned by a legacy Anthropic record without overwriting storage", () => {
+    writeAccountsAtomic([{ ...sampleRecord, id: "shared-account" }]);
+    const before = fs.readFileSync(accountsPath(), "utf-8");
+
+    expect(() => upsertAccountRecord({
+      id: "shared-account",
+      provider: "openai_subscription",
+      accessToken: "openai-access",
+      refreshToken: "openai-refresh",
+      expiresAt: 1999999999000,
+      scopes: ["openid"],
+      enabled: true,
+    })).toThrow("Account IDs must be unique across providers");
+    expect(fs.readFileSync(accountsPath(), "utf-8")).toBe(before);
   });
 });
 

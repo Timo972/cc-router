@@ -5,6 +5,8 @@ import { forwardOpenAICodexResponse, toCodexBackendRequest } from "../providers/
 import { mountResponsesRoutes } from "../proxy/responses-server.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
 
+const networkFetch = globalThis.fetch;
+
 async function withServer(
   app: ReturnType<typeof express>,
   fn: (baseUrl: string) => Promise<void>,
@@ -98,6 +100,118 @@ describe("toCodexBackendRequest", () => {
 
 describe("mountResponsesRoutes", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it.each([false, true])(
+    "preserves default-forwarder JSON errors and only forwards safe response headers (stream=%s)",
+    async stream => {
+      const privateBody = JSON.stringify({ error: { message: "private upstream detail" } });
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        if (url.hostname === "chatgpt.com") {
+          return new Response(privateBody, {
+            status: 429,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": "17",
+              "set-cookie": "private_session=secret",
+              "x-upstream-secret": "do-not-forward",
+            },
+          });
+        }
+        return networkFetch(input, init);
+      });
+
+      const app = express();
+      mountResponsesRoutes(app, {
+        getOpenAIAccount: () => ({
+          id: "openai-victor",
+          provider: "openai_subscription",
+          accessToken: "access",
+          refreshToken: "refresh",
+          expiresAt: Date.now() + 60_000,
+          enabled: true,
+        }),
+      });
+
+      await withServer(app, async baseUrl => {
+        const res = await networkFetch(`${baseUrl}/v1/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream }),
+        });
+
+        expect(res.status).toBe(429);
+        expect(res.headers.get("content-type")).toContain("application/json");
+        expect(res.headers.get("retry-after")).toBe("17");
+        expect(res.headers.get("set-cookie")).toBeNull();
+        expect(res.headers.get("x-upstream-secret")).toBeNull();
+        expect(await res.text()).toBe(privateBody);
+      });
+    },
+  );
+
+  it("aborts a successful SSE response that reaches EOF without a terminal event", async () => {
+    const app = express();
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60_000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(
+        'data: {"type":"response.created","response":{"id":"resp_cut_off"}}\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+
+      expect(res.status).toBe(200);
+      await expect(res.text()).rejects.toThrow();
+    });
+  });
+
+  it.each([
+    ["response.incomplete", { type: "response.incomplete", response: { id: "resp_1", status: "incomplete" } }],
+    ["response.failed", { type: "response.failed", response: { error: { message: "failed" } } }],
+    ["error", { type: "error", error: { message: "errored" } }],
+  ])("relays a %s terminal event exactly once before closing", async (_name, event) => {
+    const body = `data: ${JSON.stringify(event)}\n\n`;
+    const app = express();
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60_000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(body);
+    });
+  });
 
   it("rejects an explicit store:true with 400 and records exactly one warn entry", async () => {
     const record = vi.fn();
