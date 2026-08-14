@@ -697,12 +697,24 @@ describe("proxy runtime sampling and propagation", () => {
       expectedOutcome: "upstream_error",
       aborts: true,
     },
+    {
+      name: "oversized terminal event",
+      event: { type: "response.completed" },
+      responseBody: `data: ${JSON.stringify({
+        type: "response.completed",
+        response: { private: TELEMETRY_CANARY.prompt.repeat(8_192) },
+      })}\n\n`,
+      expectedOutcome: "upstream_error",
+      aborts: true,
+    },
   ])("classifies streaming Responses $name without exporting terminal contents", async testCase => {
     const express = (await import("express")).default;
     const { createServer } = await import("node:http");
     const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
     const { flushTelemetryWithin } = await import("../telemetry/facade.js");
-    const responseBody = `data: ${JSON.stringify(testCase.event)}\n\n`;
+    const responseBody = "responseBody" in testCase
+      ? testCase.responseBody
+      : `data: ${JSON.stringify(testCase.event)}\n\n`;
     const app = express();
     mountResponsesRoutes(app, {
       getOpenAIAccount: () => ({
@@ -734,8 +746,12 @@ describe("proxy runtime sampling and propagation", () => {
           stream: true,
         }),
       });
-      if (testCase.aborts) await expect(response.text()).rejects.toThrow();
-      else expect(await response.text()).toBe(responseBody);
+      if (testCase.aborts) {
+        const delivery = await response.text().then(() => "completed", () => "aborted");
+        expect(delivery).toBe("aborted");
+      } else {
+        expect(await response.text()).toBe(responseBody);
+      }
 
       await flushTelemetryWithin(500);
       await waitForRequest(capture, "/i/v1/traces", started);

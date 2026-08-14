@@ -86,7 +86,13 @@ async function sendUpstreamResponse(
       const { value, done } = await reader.read();
       if (done) break;
       if (value) {
-        observer?.push(value);
+        const observed = observer?.push(value);
+        if (observed?.kind === "overflow" || observed?.kind === "malformed") {
+          streamOutcome = "upstream_error";
+          shouldAbort = true;
+          void reader.cancel().catch(() => undefined);
+          break;
+        }
         res.write(Buffer.from(value));
       }
     }
@@ -94,7 +100,9 @@ async function sendUpstreamResponse(
       const terminal = observer.finish();
       if (terminal.kind === "failed" || terminal.kind === "error") {
         streamOutcome = "upstream_error";
-      } else if (terminal.kind === "missing") {
+      } else if (terminal.kind === "missing"
+        || terminal.kind === "overflow"
+        || terminal.kind === "malformed") {
         streamOutcome = "upstream_error";
         shouldAbort = true;
       }

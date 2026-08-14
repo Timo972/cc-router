@@ -533,7 +533,7 @@ function isConfirmedPreconnectFailure(error: unknown): boolean {
   let candidate = error;
   for (let depth = 0; depth < 5 && candidate !== undefined; depth++) {
     const code = ownStringProperty(candidate, "code");
-    if (code && CONFIRMED_PRECONNECT_FAILURE_CODES.has(code)) return true;
+    if (code) return CONFIRMED_PRECONNECT_FAILURE_CODES.has(code);
     candidate = ownCause(candidate);
   }
   return false;

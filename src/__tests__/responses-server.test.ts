@@ -18,6 +18,7 @@ async function withServer(
     if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
     await fn(`http://127.0.0.1:${address.port}`);
   } finally {
+    server.closeAllConnections();
     await new Promise<void>((resolve, reject) => {
       server.close(err => err ? reject(err) : resolve());
     });
@@ -176,6 +177,47 @@ describe("mountResponsesRoutes", () => {
 
       expect(res.status).toBe(200);
       await expect(res.text()).rejects.toThrow();
+    });
+  });
+
+  it("aborts an oversized no-newline SSE field without waiting for upstream EOF", async () => {
+    let upstreamCancelled = false;
+    const app = express();
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60_000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(`data: ${"x".repeat(64 * 1024 + 1)}`));
+        },
+        cancel() {
+          upstreamCancelled = true;
+        },
+      }) as BodyInit, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+      const outcome = await Promise.race([
+        res.text().then(() => "completed", () => "aborted"),
+        new Promise<"timed_out">(resolve => setTimeout(() => resolve("timed_out"), 100)),
+      ]);
+
+      expect(outcome).toBe("aborted");
+      expect(upstreamCancelled).toBe(true);
     });
   });
 

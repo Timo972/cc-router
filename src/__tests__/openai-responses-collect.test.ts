@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { collectCodexResponseStream } from "../protocol/openai-responses-collect.js";
+import {
+  collectCodexResponseStream,
+  createCodexResponseTerminalObserver,
+} from "../protocol/openai-responses-collect.js";
 
 function sseResponse(chunks: string[], init?: ResponseInit): Response {
   const encoder = new TextEncoder();
@@ -17,6 +20,45 @@ function sseResponse(chunks: string[], init?: ResponseInit): Response {
 }
 
 describe("collectCodexResponseStream", () => {
+  it("classifies a split terminal without retaining its payload or mutating chunks", () => {
+    const encoder = new TextEncoder();
+    const first = encoder.encode('data: {"type":"response.com');
+    const second = encoder.encode('pleted","response":{"private":"not retained"}}\n\n');
+    const firstBefore = first.slice();
+    const secondBefore = second.slice();
+    const observer = createCodexResponseTerminalObserver();
+
+    observer.push(first);
+    observer.push(second);
+
+    expect(observer.finish()).toEqual({ kind: "completed" });
+    expect(first).toEqual(firstBefore);
+    expect(second).toEqual(secondBefore);
+  });
+
+  it("classifies response.incomplete without retaining the response object", () => {
+    const observer = createCodexResponseTerminalObserver();
+    observer.push(new TextEncoder().encode(
+      'data: {"type":"response.incomplete","response":{"private":"not retained"}}\n\n',
+    ));
+
+    expect(observer.finish()).toEqual({ kind: "incomplete" });
+  });
+
+  it.each([
+    ["a no-newline data field", `data: ${"x".repeat(64 * 1024 + 1)}`],
+    ["an oversized terminal event", `data: ${JSON.stringify({
+      type: "response.completed",
+      response: { output: "x".repeat(64 * 1024) },
+    })}\n\n`],
+  ])("classifies %s as overflow with bounded framing state", (_name, input) => {
+    const observer = createCodexResponseTerminalObserver();
+
+    observer.push(new TextEncoder().encode(input));
+
+    expect(observer.finish().kind).toBe("overflow");
+  });
+
   it("returns the verbatim response.completed object as JSON", async () => {
     const upstream = sseResponse([
       'data: {"type":"response.created","response":{"id":"resp_1"}}\n\n',
@@ -175,6 +217,23 @@ describe("collectCodexResponseStream", () => {
       kind: "json",
       status: 502,
       body: { error: { type: "upstream_error", message: "Malformed upstream JSON body" } },
+    });
+  });
+
+  it("bounds a non-streaming terminal response at 10 MiB", async () => {
+    const upstream = sseResponse([
+      `data: ${JSON.stringify({
+        type: "response.completed",
+        response: { output: "x".repeat(10 * 1024 * 1024) },
+      })}\n\n`,
+    ]);
+
+    const result = await collectCodexResponseStream(upstream);
+
+    expect(result.kind).toBe("json");
+    expect(result.status).toBe(502);
+    expect(result.body).toEqual({
+      error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
     });
   });
 });

@@ -14,8 +14,10 @@ import {
 } from "../cli/cmd-setup.js";
 import { runAddAccountFlow, type AddAccountFlowDependencies } from "../cli/cmd-status.js";
 import {
+  addAccountRuntimeAware,
   runOpenAIDeviceAccountSetup,
   runOpenAIManualAccountSetup,
+  tryAddAccountToRunningProxy,
   type OpenAIDeviceAccountSetupDependencies,
   type OpenAIManualAccountSetupDependencies,
 } from "../cli/cmd-accounts.js";
@@ -502,6 +504,65 @@ describe("OpenAI account-add methods", () => {
       expect.objectContaining({ stage: "persistence", diagnosticId: DIAGNOSTIC_ID }),
       expect.objectContaining({ result: "succeeded", diagnosticId: DIAGNOSTIC_ID }),
     ]));
+  });
+
+  it("records one truthful persistence failure when a reset wraps a deeper refusal", async () => {
+    const recorded = recorder();
+    const addStored = vi.fn();
+    const innerRefusal = Object.assign(new Error("PRIVATE inner refusal"), {
+      code: "ECONNREFUSED",
+    });
+    const outerReset = Object.assign(new Error("PRIVATE outer reset"), {
+      code: "ECONNRESET",
+      cause: innerRefusal,
+    });
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError("PRIVATE fetch wrapper", { cause: outerReset });
+    });
+    const deps: OpenAIManualAccountSetupDependencies = {
+      collectInput: async () => ({
+        id: PRIVATE_ACCOUNT,
+        accessToken: record.accessToken,
+        refreshToken: record.refreshToken,
+        expiresAt: record.expiresAt,
+        scopes: record.scopes,
+      }),
+      persist: candidate => addAccountRuntimeAware(candidate, {
+        tryAddLive: account => tryAddAccountToRunningProxy(account, {
+          baseUrl: "http://127.0.0.1:1",
+          fetch: fetchImpl,
+        }),
+        addStored,
+      }).then(() => undefined),
+      readAccountState: () => ({ ok: true, records: [] }),
+      createAttempt: input => createSetupAttempt({
+        ...input,
+        recorder: recorded.value,
+        randomUUID: () => DIAGNOSTIC_ID,
+        now: () => 1_000,
+      }),
+      flush: async () => undefined,
+    };
+
+    await expect(runOpenAIManualAccountSetup(deps)).rejects.toThrow("outcome is unknown");
+
+    expect(addStored).not.toHaveBeenCalled();
+    expect(recorded.results).toEqual([]);
+    expect(recorded.terminalFailures).toEqual([
+      expect.objectContaining({
+        stage: "persistence",
+        reason: "persistence_failure",
+        diagnosticId: DIAGNOSTIC_ID,
+      }),
+    ]);
+    expect(recorded.exceptions).toEqual([
+      expect.objectContaining({ diagnosticId: DIAGNOSTIC_ID }),
+    ]);
+    const remote = JSON.stringify(recorded.safe) + JSON.stringify(recorded.exceptions);
+    const local = vi.mocked(console.error).mock.calls.flat().map(String).join("\n");
+    expect(remote).not.toContain("PRIVATE");
+    expect(local).toContain(DIAGNOSTIC_ID);
+    expect(local).not.toContain("PRIVATE");
   });
 
   it("records every successful device-OAuth stage with one attempt ID", async () => {
