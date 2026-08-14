@@ -4,7 +4,7 @@ export interface LogEntry {
   ts: number;
   accountId: string;
   model: string;
-  type: "route" | "refresh" | "error";
+  type: "route" | "refresh" | "error" | "warn";
   details?: string;
   statusCode?: number;
   durationMs?: number;

@@ -8,6 +8,7 @@ import {
   upsertAccountRecord,
   removeAccountRecordById,
   readConfig,
+  serialize,
   type AccountStateReadResult,
 } from "../config/manager.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
@@ -38,7 +39,7 @@ import { flushTelemetryWithin } from "../telemetry/facade.js";
 
 export interface OpenAIManualAccountSetupDependencies {
   collectInput(): Promise<CreateOpenAIAccountRecordInput>;
-  persist(record: OpenAIAccountRecord): void;
+  persist(record: OpenAIAccountRecord): void | Promise<void>;
   readAccountState(): AccountStateReadResult;
   createAttempt(input: Pick<CreateSetupAttemptInput, "provider" | "method">): SetupAttempt;
   flush(deadlineMs: number): Promise<void>;
@@ -48,7 +49,7 @@ export interface OpenAIDeviceAccountSetupDependencies {
   collectAccountId(): Promise<string>;
   login(options: LoginOpenAIWithDeviceCodeOptions): Promise<OpenAIAccountRecord>;
   onDeviceCode(code: OpenAIDeviceCode): void;
-  persist(record: OpenAIAccountRecord): void;
+  persist(record: OpenAIAccountRecord): void | Promise<void>;
   readAccountState(): AccountStateReadResult;
   createAttempt(input: Pick<CreateSetupAttemptInput, "provider" | "method">): SetupAttempt;
   flush(deadlineMs: number): Promise<void>;
@@ -303,14 +304,21 @@ export function registerAccounts(program: Command): void {
           account,
         ];
 
+        let mode: "live" | "stored" = "stored";
         try {
-          await persistSetupAttempts([setup.attempt], () => saveAccounts(merged));
+          await persistSetupAttempts([setup.attempt], async () => {
+            const result = await addAccountRuntimeAware(serialize([account])[0], {
+              tryAddLive: tryAddAccountToRunningProxy,
+              addStored: () => saveAccounts(merged),
+            });
+            mode = result.mode;
+          });
         } catch (error) {
           printSetupException(error, setup.attempt.diagnosticId);
           throw error;
         }
         console.log(chalk.green(`\n✓ Account "${account.id}" added (${merged.length} total).\n`));
-        console.log(chalk.gray("  Restart the proxy to load the new account: cc-router start\n"));
+        printAddOutcome(mode);
       });
     });
 
@@ -319,11 +327,17 @@ export function registerAccounts(program: Command): void {
     .command("add-openai")
     .description("Add an OpenAI ChatGPT/Codex subscription account manually")
     .action(async () => {
-      const record = await runOpenAIManualAccountSetup();
+      let mode: "live" | "stored" = "stored";
+      const record = await runOpenAIManualAccountSetup({
+        ...defaultOpenAIManualDependencies,
+        persist: async candidate => {
+          mode = (await addAccountRuntimeAware(candidate)).mode;
+        },
+      });
       if (!record) return;
 
       console.log(chalk.green(`\n✓ OpenAI account "${record.id}" saved.\n`));
-      console.log(chalk.gray("  Restart the proxy to load the new account: cc-router start\n"));
+      printAddOutcome(mode);
       console.log(chalk.yellow("  Treat this as experimental until the OAuth login wizard lands.\n"));
     });
 
@@ -334,11 +348,17 @@ export function registerAccounts(program: Command): void {
     .action(async () => {
       console.log(chalk.cyan("\nOpenAI Codex device login"));
       console.log(chalk.gray("This will open no local callback server. You will approve the login in your browser.\n"));
-      const record = await runOpenAIDeviceAccountSetup();
+      let mode: "live" | "stored" = "stored";
+      const record = await runOpenAIDeviceAccountSetup({
+        ...defaultOpenAIDeviceDependencies,
+        persist: async candidate => {
+          mode = (await addAccountRuntimeAware(candidate)).mode;
+        },
+      });
       if (!record) return;
 
       console.log(chalk.green(`\n✓ OpenAI account "${record.id}" saved via device login.\n`));
-      console.log(chalk.gray("  Restart the proxy to load the new account: cc-router start\n"));
+      printAddOutcome(mode);
     });
 
   // ── accounts remove ───────────────────────────────────────────────────────
@@ -391,6 +411,15 @@ export function registerAccounts(program: Command): void {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Tell the user whether the new account is already live or needs a restart. */
+function printAddOutcome(mode: "live" | "stored"): void {
+  console.log(
+    mode === "live"
+      ? chalk.gray("  Loaded into the running proxy — available now, no restart needed.\n")
+      : chalk.gray("  Restart the proxy to load the new account: cc-router start\n"),
+  );
+}
 
 export function buildStoredAccountsJson(
   anthropicAccounts: Account[],
@@ -470,6 +499,72 @@ export async function removeAccountRuntimeAware(
   const removed = dependencies.removeStored(id);
   if (!removed) throw new Error(`Account "${id}" disappeared before it could be removed`);
   return { mode: "stored", removed };
+}
+
+export interface LiveAccountAddOptions {
+  baseUrl?: string;
+  authToken?: string;
+  fetch?: typeof globalThis.fetch;
+}
+
+/**
+ * Add an account to a running proxy so it becomes routable without a restart.
+ * Returns false only when no running proxy can be reached (the caller then
+ * persists to disk itself); HTTP error responses — e.g. 409 for a duplicate —
+ * are authoritative and thrown so the caller does not silently write to disk.
+ */
+export async function tryAddAccountToRunningProxy(
+  record: AccountRecord,
+  options: LiveAccountAddOptions = {},
+): Promise<boolean> {
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  const baseUrl = (options.baseUrl ?? `http://localhost:${PROXY_PORT}`).replace(/\/+$/, "");
+  const authToken = options.authToken ?? readConfig().proxySecret;
+  let response: Response;
+  try {
+    response = await fetchImpl(`${baseUrl}/cc-router/accounts`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+      },
+      body: JSON.stringify(record),
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch {
+    return false;
+  }
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const payload = await response.json() as { error?: unknown };
+      if (typeof payload.error === "string") detail = `: ${payload.error}`;
+    } catch { /* best effort */ }
+    throw new Error(`HTTP ${response.status}${detail}`);
+  }
+  return true;
+}
+
+export interface RuntimeAwareAddDependencies {
+  tryAddLive(record: AccountRecord): Promise<boolean>;
+  addStored(record: AccountRecord): void;
+}
+
+/**
+ * Persist a newly added account so it is usable immediately. When a proxy is
+ * running the record is handed to it (live pool + disk in one step); otherwise
+ * it is written to disk via `addStored` and picked up on the next start.
+ */
+export async function addAccountRuntimeAware(
+  record: AccountRecord,
+  dependencies: RuntimeAwareAddDependencies = {
+    tryAddLive: tryAddAccountToRunningProxy,
+    addStored: upsertAccountRecord,
+  },
+): Promise<{ mode: "live" } | { mode: "stored" }> {
+  if (await dependencies.tryAddLive(record)) return { mode: "live" };
+  dependencies.addStored(record);
+  return { mode: "stored" };
 }
 
 async function fetchLiveStats(): Promise<null | Array<{

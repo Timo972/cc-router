@@ -3,6 +3,7 @@ import type { Express, NextFunction, Request, Response } from "express";
 import { selectRoute } from "../providers/route-selector.js";
 import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
+import { collectCodexResponseStream } from "../protocol/openai-responses-collect.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 import {
@@ -11,6 +12,9 @@ import {
   recordSafeLog,
   recordUnexpectedException,
 } from "../telemetry/facade.js";
+import { stats } from "./stats.js";
+import type { LogEntry } from "./stats.js";
+import { logWarn } from "./logger.js";
 
 type ForwardOpenAI = typeof forwardOpenAICodexResponse;
 
@@ -20,6 +24,7 @@ export interface ResponsesRoutesOptions {
   forwardOpenAI?: ForwardOpenAI;
   modelRouting?: ModelRoutingConfig;
   prepareOpenAIAccountOwnsDiagnostics?: boolean;
+  recordActivity?: (entry: LogEntry) => void;
 }
 
 function isResponsesRequest(value: unknown): value is OpenAIResponsesRequest {
@@ -89,6 +94,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
   const forwardOwnsDiagnostics = opts.forwardOpenAI === undefined;
   const prepareOwnsDiagnostics = opts.prepareOpenAIAccountOwnsDiagnostics === true;
   const prepareOpenAIAccount = opts.prepareOpenAIAccount ?? (async () => true);
+  const recordActivity = opts.recordActivity ?? ((entry: LogEntry) => stats.addLog(entry));
 
   app.post("/v1/responses", express.json({ limit: "10mb" }), async (
     req: Request,
@@ -115,6 +121,47 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
     }
 
     const route = selectRoute(req.body.model, opts.modelRouting);
+    if (req.body.store === true) {
+      annotateActiveSpan("proxy.request", {
+        httpMethod: "POST",
+        provider: route.provider === "openai_subscription" ? "openai" : "anthropic",
+        route: "responses",
+        modelFamily: modelFamily(route.upstreamModel),
+        requestSource: requestSource(req),
+        streaming: req.body.stream === true,
+        httpStatusCode: 400,
+        outcome: "upstream_error",
+        operationDurationMs: Date.now() - startedAt,
+      });
+      recordActivity({
+        ts: Date.now(),
+        accountId: "-",
+        model: req.body.model,
+        type: "warn",
+        statusCode: 400,
+        details: "store:true rejected — Codex backend is stateless (store:false only)",
+      });
+      logWarn("responses", "store:true is not supported by the Codex backend; rejecting request");
+      res.status(400).json({
+        error: {
+          type: "invalid_request_error",
+          message: "store:true is not supported: the Codex subscription backend operates only in stateless (store:false) mode.",
+        },
+      });
+      return;
+    }
+
+    if (req.body.max_output_tokens !== undefined) {
+      recordActivity({
+        ts: Date.now(),
+        accountId: "-",
+        model: req.body.model,
+        type: "warn",
+        details: "max_output_tokens ignored — unsupported by the Codex backend",
+      });
+      logWarn("responses", "max_output_tokens is unsupported by the Codex backend and was dropped");
+    }
+
     const streaming = req.body.stream === true;
     annotateActiveSpan("proxy.request", {
       httpMethod: "POST",
@@ -206,29 +253,58 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         stream: body.stream === true,
       });
       failurePhase = "delivery";
-      const outcome = responseOutcome(upstream.status);
+      if (body.stream === true) {
+        const outcome = responseOutcome(upstream.status);
+        annotateActiveSpan("proxy.request", {
+          httpStatusCode: upstream.status,
+          outcome,
+          operationDurationMs: Date.now() - startedAt,
+        });
+        if (!forwardOwnsDiagnostics && (upstream.status === 401 || upstream.status === 403
+          || upstream.status === 429 || upstream.status === 529)) {
+          recordSafeLog({
+            operation: "provider.inference",
+            provider: "openai",
+            reason: responseReason(upstream.status),
+            outcome,
+            httpStatusCode: upstream.status,
+            operationDurationMs: Date.now() - startedAt,
+            severity: "warn",
+          });
+        }
+        const streamOutcome = await sendUpstreamResponse(upstream, res);
+        annotateActiveSpan("proxy.request", {
+          streamOutcome,
+          operationDurationMs: Date.now() - startedAt,
+        });
+        return;
+      }
+
+      const collected = await collectCodexResponseStream(upstream);
+      const outcome = responseOutcome(collected.status);
       annotateActiveSpan("proxy.request", {
-        httpStatusCode: upstream.status,
+        httpStatusCode: collected.status,
         outcome,
         operationDurationMs: Date.now() - startedAt,
       });
-      if (!forwardOwnsDiagnostics && (upstream.status === 401 || upstream.status === 403
-        || upstream.status === 429 || upstream.status === 529)) {
+      const collectionFailed = collected.status >= 400 && collected.status !== upstream.status;
+      if (collectionFailed || (!forwardOwnsDiagnostics && (collected.status === 401
+        || collected.status === 403 || collected.status === 429 || collected.status === 529))) {
         recordSafeLog({
           operation: "provider.inference",
           provider: "openai",
-          reason: responseReason(upstream.status),
+          reason: responseReason(collected.status),
           outcome,
-          httpStatusCode: upstream.status,
+          httpStatusCode: collected.status,
           operationDurationMs: Date.now() - startedAt,
           severity: "warn",
         });
       }
-      const streamOutcome = await sendUpstreamResponse(upstream, res);
-      annotateActiveSpan("proxy.request", {
-        streamOutcome: streaming ? streamOutcome : undefined,
-        operationDurationMs: Date.now() - startedAt,
-      });
+      if (collected.kind === "json") {
+        res.status(collected.status).json(collected.body);
+      } else {
+        res.status(collected.status).type(collected.contentType ?? "text/plain").send(collected.body);
+      }
     } catch (error) {
       const reason = classifyExpectedRuntimeFailure(error);
       annotateActiveSpan("proxy.request", {

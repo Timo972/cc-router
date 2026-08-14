@@ -606,6 +606,67 @@ describe("proxy runtime sampling and propagation", () => {
     }
   });
 
+  it("records the effective 502 when non-streaming Responses collection rejects malformed SSE", async () => {
+    const express = (await import("express")).default;
+    const { createServer } = await import("node:http");
+    const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
+    const { flushTelemetryWithin } = await import("../telemetry/facade.js");
+    const app = express();
+    mountResponsesRoutes(app, {
+      getOpenAIAccount: () => ({
+        id: TELEMETRY_CANARY.accountId,
+        provider: "openai_subscription",
+        accessToken: TELEMETRY_CANARY.bearerToken,
+        refreshToken: "private-refresh",
+        expiresAt: Date.now() + 60_000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(
+        `data: {"type":"response.created","response":{"private":"${TELEMETRY_CANARY.prompt}"}}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Responses collection app did not bind");
+    const started = capture.requests.length;
+
+    try {
+      const response = await originalFetch(`http://127.0.0.1:${address.port}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5-codex",
+          input: [{ role: "user", content: TELEMETRY_CANARY.prompt }],
+        }),
+      });
+      expect(response.status).toBe(502);
+      expect(await response.json()).toEqual({
+        error: {
+          type: "upstream_error",
+          message: "Stream ended before response.completed",
+        },
+      });
+      await flushTelemetryWithin(500);
+      await Promise.all([
+        waitForRequest(capture, "/i/v1/traces", started),
+        waitForRequest(capture, "/i/v1/logs", started),
+      ]);
+
+      const traceWire = wireFor(capture, "/i/v1/traces", started).toString("utf8");
+      expect(traceWire).toContain("upstream_error");
+      const logWire = wireFor(capture, "/i/v1/logs", started).toString("utf8");
+      expect(logWire).toContain("upstream_5xx");
+      expect(logWire).toContain("502");
+      expect(traceWire + logWire).not.toContain(TELEMETRY_CANARY.prompt);
+      expect(traceWire + logWire).not.toContain(TELEMETRY_CANARY.accountId);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      server.closeAllConnections();
+    }
+  });
+
   it("records cross-routed Messages outcomes and usage without retaining translated content", async () => {
     const express = (await import("express")).default;
     const { createServer } = await import("node:http");

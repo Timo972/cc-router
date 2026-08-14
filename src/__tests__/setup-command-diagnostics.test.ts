@@ -467,6 +467,43 @@ describe("OpenAI account-add methods", () => {
     expect(flush).toHaveBeenCalledOnce();
   });
 
+  it("does not mark setup successful until asynchronous runtime persistence completes", async () => {
+    const recorded = recorder();
+    let releasePersistence: (() => void) | undefined;
+    const persist = vi.fn(() => new Promise<void>(resolve => {
+      releasePersistence = resolve;
+    }));
+    const deps: OpenAIManualAccountSetupDependencies = {
+      collectInput: async () => ({
+        id: PRIVATE_ACCOUNT,
+        accessToken: record.accessToken,
+        refreshToken: record.refreshToken,
+        expiresAt: record.expiresAt,
+        scopes: record.scopes,
+      }),
+      persist,
+      readAccountState: () => ({ ok: true, records: [] }),
+      createAttempt: input => createSetupAttempt({
+        ...input,
+        recorder: recorded.value,
+        randomUUID: () => DIAGNOSTIC_ID,
+        now: () => 1_000,
+      }),
+      flush: async () => undefined,
+    };
+
+    const setup = runOpenAIManualAccountSetup(deps);
+    await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce());
+    expect(recorded.results).toEqual([]);
+
+    releasePersistence?.();
+    await expect(setup).resolves.toEqual(record);
+    expect(recorded.safe).toEqual(expect.arrayContaining([
+      expect.objectContaining({ stage: "persistence", diagnosticId: DIAGNOSTIC_ID }),
+      expect.objectContaining({ result: "succeeded", diagnosticId: DIAGNOSTIC_ID }),
+    ]));
+  });
+
   it("records every successful device-OAuth stage with one attempt ID", async () => {
     const recorded = recorder();
     const flush = vi.fn(async () => undefined);

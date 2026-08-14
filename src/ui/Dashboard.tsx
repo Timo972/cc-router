@@ -1084,8 +1084,9 @@ function LogRow({ log, selected }: { log: LogEntry; selected: boolean }) {
   const time = new Date(log.ts).toLocaleTimeString("en-GB", { hour12: false });
   const isError = log.type === "error";
   const isRefresh = log.type === "refresh";
-  const typeColor = isError ? "red" : isRefresh ? "yellow" : "gray";
-  const typeIcon = isError ? "✗" : isRefresh ? "↻" : "→";
+  const isWarn = log.type === "warn";
+  const typeColor = isError ? "red" : isWarn ? "yellow" : isRefresh ? "yellow" : "gray";
+  const typeIcon = isError ? "✗" : isWarn ? "⚠" : isRefresh ? "↻" : "→";
 
   const statusColor = log.statusCode === undefined ? undefined
     : log.statusCode >= 500 ? "red"
@@ -1153,6 +1154,7 @@ function DetailPanel({ log }: { log: LogEntry }) {
     hour: "2-digit", minute: "2-digit", second: "2-digit",
   });
   const isError = log.type === "error";
+  const isWarn = log.type === "warn";
   const statusLabel = log.statusCode === undefined ? "—"
     : log.statusCode === 0 ? "connection error"
     : `${log.statusCode} ${httpStatusText(log.statusCode)}`;
@@ -1164,7 +1166,7 @@ function DetailPanel({ log }: { log: LogEntry }) {
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1}>
-      <Text bold color={isError ? "red" : "cyan"}> DETAILS </Text>
+      <Text bold color={isError ? "red" : isWarn ? "yellow" : "cyan"}> DETAILS </Text>
       <Box marginTop={1} flexDirection="column" gap={0}>
         <Box gap={2}>
           <Field label="Time"    value={time} />

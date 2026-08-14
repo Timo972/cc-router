@@ -476,14 +476,17 @@ describe("compiled ESM telemetry bootstrap", () => {
           return;
         }
         response.writeHead(200, {
-          "content-type": "application/json",
+          "content-type": "text/event-stream",
           "x-telemetry-canary": TELEMETRY_CANARY.headerValue,
         });
-        response.end(JSON.stringify({
-          id: "resp_bootstrap",
-          raw: TELEMETRY_CANARY.rawProviderBody,
-          email: TELEMETRY_CANARY.email,
-        }));
+        response.end(`data: ${JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_bootstrap",
+            raw: TELEMETRY_CANARY.rawProviderBody,
+            email: TELEMETRY_CANARY.email,
+          },
+        })}\n\n`);
       });
     });
     targetOrigin = `http://127.0.0.1:${await listen(target)}`;
