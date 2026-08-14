@@ -56,7 +56,18 @@ export interface OpenAIAccount extends OpenAISubscriptionAccount {
   lastUsed: number;
   lastRefresh: number;
   rateLimits: CodexRateLimits;
-  modelBuckets: Map<string, string>;
+  modelBuckets: Map<string, ModelBucketMapping>;
+}
+
+/**
+ * A model→bucket association and the timestamp of the evidence behind it —
+ * either a 429's `x-codex-active-limit` or the `lastSeenAt` of a bucket
+ * snapshot naming the model. Recency is what lets `bucketIdForModel` decide
+ * between the two when they disagree.
+ */
+export interface ModelBucketMapping {
+  limitId: string;
+  learnedAt: number;
 }
 
 export function createOpenAIAccount(record: OpenAISubscriptionAccount): OpenAIAccount {
@@ -148,10 +159,17 @@ function normalizeModelSlug(model: string | undefined): string | undefined {
   return normalized ? normalized.slice(0, 64) : undefined;
 }
 
+/**
+ * Record that `modelSlug` belongs to `limitId`, as of `learnedAtMs` — the
+ * moment the evidence was produced, not the moment this is called, so a
+ * mapping refreshed for LRU purposes does not pass itself off as newer than
+ * it is.
+ */
 export function learnModelBucket(
   account: Pick<OpenAIAccount, "modelBuckets">,
   modelSlug: string | undefined,
   limitId: string,
+  learnedAtMs: number,
 ): void {
   const model = normalizeModelSlug(modelSlug);
   if (!model || limitId === DEFAULT_CODEX_LIMIT_ID) return;
@@ -168,7 +186,7 @@ export function learnModelBucket(
     const oldest = account.modelBuckets.keys().next().value;
     if (oldest !== undefined) account.modelBuckets.delete(oldest);
   }
-  account.modelBuckets.set(model, limitId);
+  account.modelBuckets.set(model, { limitId, learnedAt: learnedAtMs });
 }
 
 /**
@@ -211,19 +229,35 @@ export function bucketIdForModel(
     }
     const seenAt = bucket.lastSeenAt ?? 0;
     const bestSeenAt = live.lastSeenAt ?? 0;
-    if (seenAt > bestSeenAt || (seenAt === bestSeenAt && bucket.limitId === cached)) live = bucket;
+    if (seenAt > bestSeenAt || (seenAt === bestSeenAt && bucket.limitId === cached?.limitId)) live = bucket;
   }
   if (live !== undefined) {
+    const liveSeenAt = live.lastSeenAt ?? 0;
+    // "Live wins" is really "the newer evidence wins", and a snapshot is not
+    // automatically the newer one. A header-only 429 carries no snapshot at
+    // all: it maps the model through `x-codex-active-limit` and leaves the
+    // previous bucket sitting in `rateLimits.buckets`, still naming the model
+    // from before the move. Relearning that older snapshot here would both
+    // resolve to the wrong bucket — missing the cooldown the 429 just set,
+    // sending the account straight back out for a model upstream told us to
+    // back off — and overwrite the mapping, so no later lookup could recover
+    // it either.
+    if (cached !== undefined && cached.learnedAt > liveSeenAt) {
+      // Re-learn at its own timestamp: this refreshes LRU recency without
+      // letting the mapping claim to be newer evidence than it is.
+      learnModelBucket(account, model, cached.limitId, cached.learnedAt);
+      return cached.limitId;
+    }
     // Re-learning also refreshes the mapping's LRU recency, so a model that
     // keeps routing stays mapped.
-    learnModelBucket(account, model, live.limitId);
+    learnModelBucket(account, model, live.limitId, liveSeenAt);
     return live.limitId;
   }
 
   // No live bucket names this model. The cached mapping is what keeps a
   // header-only 429's bucket cooldown enforceable — that path never carries a
   // bucket snapshot, so the cache is the only association available.
-  return account.modelBuckets.get(model);
+  return account.modelBuckets.get(model)?.limitId;
 }
 
 export function bucketForModel(
@@ -349,8 +383,8 @@ export function sweepCodexRateLimits(
 
     if (bucket.reapPending === true || unmentionedTooLong) {
       account.rateLimits.buckets.delete(limitId);
-      for (const [model, mappedLimitId] of account.modelBuckets) {
-        if (mappedLimitId === limitId) account.modelBuckets.delete(model);
+      for (const [model, mapping] of account.modelBuckets) {
+        if (mapping.limitId === limitId) account.modelBuckets.delete(model);
       }
     }
   }

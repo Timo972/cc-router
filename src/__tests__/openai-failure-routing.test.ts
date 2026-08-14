@@ -65,7 +65,7 @@ describe("applyCodexFailureRouting", () => {
     );
     expect(pool.setBucketCooldownForAccount).toHaveBeenCalledWith(account, "codex_bengalfox", 60_000);
     expect(pool.setGlobalCooldownForAccount).not.toHaveBeenCalled();
-    expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("codex_bengalfox");
+    expect(account.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("codex_bengalfox");
     expect(result.limitingScope).toBe("bucket:codex_bengalfox");
     expect(account.rateLimits.status).toBe("ok"); // named-bucket 429 is not account-global
   });

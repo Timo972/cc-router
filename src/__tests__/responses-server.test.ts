@@ -32,6 +32,26 @@ async function withServer(
   }
 }
 
+/**
+ * Snapshot the process-global error total once nothing is still settling.
+ *
+ * A handler finishes its stats and activity bookkeeping *after* the client's
+ * response resolves, so a test that ends the moment it reads the body can
+ * leave a tail still to run. That tail then lands inside a later test's
+ * window and turns an exact `before + 1` assertion into an intermittent
+ * `before + 2`. Waiting for a full turn with no change absorbs it before the
+ * baseline is taken, which keeps the assertions exact instead of loosening
+ * them to hide the race.
+ */
+async function drainedErrorTotal(): Promise<number> {
+  let previous = -1;
+  for (let attempt = 0; attempt < 20 && previous !== stats.totalErrors; attempt++) {
+    previous = stats.totalErrors;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  return stats.totalErrors;
+}
+
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(done => { resolve = done; });
@@ -714,7 +734,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
       forwardOpenAI: forward,
       recordActivity: entry => activity.push(entry),
     });
-    const before = stats.totalErrors;
+    const before = await drainedErrorTotal();
 
     await withServer(app, async baseUrl => {
       const res = await fetch(`${baseUrl}/v1/responses`, {
@@ -927,8 +947,8 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
       'data: {"type":"response.failed","response":{"error":{"message":"boom"}}}\n\n',
       { status: 200, headers: { "content-type": "text/event-stream" } },
     );
-    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
-    const before = stats.totalErrors;
+    const account = makeRuntimeAccount("openai-victor");
+    const { app, activity } = mountWithPool([account], forward);
 
     await withServer(app, async baseUrl => {
       const res = await fetch(`${baseUrl}/v1/responses`, {
@@ -943,8 +963,15 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
       );
     });
 
-    expect(stats.totalErrors).toBe(before + 1);
-    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+    // Counted through this test's own observables, not the process-global
+    // `stats.totalErrors`: the handler's bookkeeping runs after the client's
+    // response resolves, so an exact assertion on a shared counter picks up
+    // whatever an earlier test left settling. `account.errorCount` and
+    // `activity` are created by this test and are incremented from the same
+    // `failedFinal` branch as the global total.
+    await vi.waitFor(() => expect(activity).toHaveLength(1));
+    expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+    expect(account.errorCount).toBe(1);
   });
 
   it("relays a streamed upstream 200 ending in response.failed byte-for-byte, but reports it as a 502 error", async () => {
@@ -955,7 +982,6 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     });
     const account = makeRuntimeAccount("openai-victor");
     const { app, activity } = mountWithPool([account], forward);
-    const before = stats.totalErrors;
     const errorCountBefore = account.errorCount;
 
     await withServer(app, async baseUrl => {
@@ -972,9 +998,10 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
       expect(await res.text()).toBe(failedBody);
     });
 
-    expect(stats.totalErrors).toBe(before + 1);
-    const errorEntry = activity.find(entry => entry.type === "error");
-    expect(errorEntry).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+    // Per-test observables rather than the shared `stats.totalErrors` — see
+    // the note on the preceding test.
+    await vi.waitFor(() => expect(activity).toHaveLength(1));
+    expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
     // A relay-synthesized failure on an otherwise-200 upstream must still be
     // counted against the account exactly once — not silently dropped, and
     // not double-counted if upstream classification already counted it

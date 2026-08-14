@@ -66,28 +66,28 @@ describe("bucketForModel", () => {
 
     const bucket = bucketForModel(account, "gpt-5.6-sol");
     expect(bucket?.limitId).toBe("codex_bengalfox");
-    expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("codex_bengalfox");
+    expect(account.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("codex_bengalfox");
     expect(bucketForModel(account, "gpt-5.6-luna")).toBeUndefined();
   });
 
   it("retains a mapping to a limitId with no bucket snapshot yet, for cooldown lookups", () => {
     const account = createOpenAIAccount(record());
-    learnModelBucket(account, "gpt-5.6-sol", "codex_gone");
+    learnModelBucket(account, "gpt-5.6-sol", "codex_gone", NOW_MS);
     // No snapshot exists for "codex_gone" yet (e.g. a header-only 429 learned
     // the mapping before any rate-limit snapshot arrived for that bucket).
     // bucketForModel correctly has nothing to return, but must not delete the
     // mapping — bucketIdForModel still resolves it so a cooldown keyed on
     // that limitId keeps being enforced.
     expect(bucketForModel(account, "gpt-5.6-sol")).toBeUndefined();
-    expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("codex_gone");
+    expect(account.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("codex_gone");
     expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_gone");
   });
 
   it("never maps the default limit id and bounds the map", () => {
     const account = createOpenAIAccount(record());
-    learnModelBucket(account, "gpt-5.6-sol", DEFAULT_CODEX_LIMIT_ID);
+    learnModelBucket(account, "gpt-5.6-sol", DEFAULT_CODEX_LIMIT_ID, NOW_MS);
     expect(account.modelBuckets.size).toBe(0);
-    for (let i = 0; i < 40; i++) learnModelBucket(account, `model-${i}`, "codex_x");
+    for (let i = 0; i < 40; i++) learnModelBucket(account, `model-${i}`, "codex_x", NOW_MS);
     expect(account.modelBuckets.size).toBeLessThanOrEqual(32);
   });
 
@@ -109,7 +109,27 @@ describe("bucketForModel", () => {
 
     expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_newfox");
     expect(bucketForModel(account, "gpt-5.6-sol")?.primary?.utilization).toBe(1);
-    expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("codex_newfox");
+    expect(account.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("codex_newfox");
+  });
+
+  it("prefers a newer active-limit mapping over an older live snapshot", () => {
+    const account = createOpenAIAccount(record());
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "50",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_bengalfox");
+
+    // A header-only 429 carries no snapshot at all — it names the active
+    // limit and nothing else, so the pre-move bucket is still sitting in the
+    // map naming this model. The 429 is the newer evidence.
+    learnModelBucket(account, "gpt-5.6-sol", "codex_newfox", NOW_MS + 1000);
+
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_newfox");
+    // Resolving must not overwrite the mapping with the older snapshot's
+    // bucket either, or the second lookup has nothing left to find.
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_newfox");
+    expect(account.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("codex_newfox");
   });
 
   it("keeps the active-limit mapping when two live buckets tie on last-seen", () => {
@@ -125,20 +145,20 @@ describe("bucketForModel", () => {
 
     // A 429's `x-codex-active-limit` is upstream naming the bucket that
     // actually limited the request — the only authoritative mapping there is.
-    learnModelBucket(account, "gpt-5.6-sol", "codex_newfox");
+    learnModelBucket(account, "gpt-5.6-sol", "codex_newfox", NOW_MS);
 
     // Resolution must keep landing there, not drift back to whichever bucket
     // happened to be inserted first.
     expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_newfox");
     expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_newfox");
-    expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("codex_newfox");
+    expect(account.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("codex_newfox");
   });
 
   it("falls back to the cached mapping when no live bucket names the model", () => {
     const account = createOpenAIAccount(record());
     // The header-only 429 path: a mapping exists with no bucket snapshot, and
     // it must survive so the pool can still find that bucket's cooldown.
-    learnModelBucket(account, "gpt-5.6-sol", "codex_headeronly");
+    learnModelBucket(account, "gpt-5.6-sol", "codex_headeronly", NOW_MS);
     expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_headeronly");
     expect(bucketForModel(account, "gpt-5.6-sol")).toBeUndefined();
   });
@@ -146,15 +166,15 @@ describe("bucketForModel", () => {
   it("relearning a mapping refreshes its recency so eviction stays true LRU", () => {
     const account = createOpenAIAccount(record());
     // Fill the map exactly to capacity.
-    for (let i = 0; i < 32; i++) learnModelBucket(account, `model-${i}`, "codex_x");
+    for (let i = 0; i < 32; i++) learnModelBucket(account, `model-${i}`, "codex_x", NOW_MS);
 
     // `model-0` is the oldest by insertion, but relearning it must move it to
     // the back of the eviction queue — a plain Map.set would not.
-    learnModelBucket(account, "model-0", "codex_bengalfox");
-    learnModelBucket(account, "model-new", "codex_x");
+    learnModelBucket(account, "model-0", "codex_bengalfox", NOW_MS);
+    learnModelBucket(account, "model-new", "codex_x", NOW_MS);
 
     expect(account.modelBuckets.size).toBe(32);
-    expect(account.modelBuckets.get("model-0")).toBe("codex_bengalfox");
+    expect(account.modelBuckets.get("model-0")?.limitId).toBe("codex_bengalfox");
     expect(account.modelBuckets.has("model-new")).toBe(true);
     // `model-1` was the oldest entry never touched since insertion.
     expect(account.modelBuckets.has("model-1")).toBe(false);
@@ -479,7 +499,7 @@ describe("applyCodexRateLimits bucket cap", () => {
     // or a future bucketIdForModel lookup, still resolves with no snapshot
     // present — mirroring the header-only-429 case bucketIdForModel already
     // supports.
-    expect(account.modelBuckets.get("gpt-5.6-sol")).toBe("bucket0");
+    expect(account.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("bucket0");
     expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("bucket0");
   });
 });

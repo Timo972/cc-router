@@ -140,7 +140,7 @@ export function applyCodexFailureRouting(
   if (status === 429) {
     const activeLimit = resolveActiveLimit(failureHeaders);
     if (activeLimit !== undefined && activeLimit !== DEFAULT_CODEX_LIMIT_ID) {
-      learnModelBucket(route.account, requestedModel, activeLimit);
+      learnModelBucket(route.account, requestedModel, activeLimit, nowMs);
       const durationMs = rateLimitCooldownMs(failureHeaders, route.account, activeLimit, nowMs);
       pool.setBucketCooldownForAccount(route.account, activeLimit, durationMs);
       boundResetlessExhaustedWindows(route.account, activeLimit, nowMs + durationMs);

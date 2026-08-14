@@ -42,6 +42,12 @@ function persistCredentials(
 ): boolean {
   try {
     saveAccounts(allAccounts);
+    // The write is synchronous and covers the whole pool, so every account it
+    // was handed is on disk the moment it returns — not just the one that
+    // triggered it. An account whose own earlier write failed would otherwise
+    // keep reporting `credentialsPendingWrite` and re-attempting a write that
+    // has already landed, until its own next refresh happened to clear it.
+    for (const saved of allAccounts) pendingCredentialWrites.delete(saved);
     pendingCredentialWrites.delete(account);
     return true;
   } catch (error) {

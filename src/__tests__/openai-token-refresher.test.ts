@@ -333,6 +333,47 @@ describe("OpenAI subscription token refresher", () => {
     expect(hasPendingCredentialWrite(account)).toBe(false);
   });
 
+  it("clears every account's pending write when a later whole-pool save succeeds", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }),
+    } as Response);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const makeAccount = (id: string) => ({
+      id,
+      provider: "openai_subscription" as const,
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    });
+    const first = makeAccount("openai-victor");
+    const second = makeAccount("openai-wanda");
+    const accounts = [first, second];
+
+    await prepareOpenAIAccountForRequest(first, accounts, () => {
+      throw new Error("disk full");
+    });
+    expect(hasPendingCredentialWrite(first)).toBe(true);
+
+    // The save is whole-pool and synchronous, so the second account's
+    // refresh writes the first account's rotated credentials to disk too.
+    // Leaving its marker set would report an account as unsaved when it is
+    // already durable, and keep retrying a write that has landed.
+    const workingSave = vi.fn();
+    await prepareOpenAIAccountForRequest(second, accounts, workingSave);
+
+    expect(workingSave).toHaveBeenCalledWith(accounts);
+    expect(hasPendingCredentialWrite(second)).toBe(false);
+    expect(hasPendingCredentialWrite(first)).toBe(false);
+  });
+
   it("recomputes the account's plan from the rotated access token after a refresh", async () => {
     const oldToken = jwt({ "https://api.openai.com/auth": { chatgpt_plan_type: "Plus" } });
     const newToken = jwt({ "https://api.openai.com/auth": { chatgpt_plan_type: "Pro" } });

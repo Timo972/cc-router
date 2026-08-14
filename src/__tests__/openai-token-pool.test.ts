@@ -114,6 +114,29 @@ describe("OpenAITokenPool cooldowns", () => {
     expect(view.bucketCooldowns).toEqual([{ limitId: "codex_bengalfox", untilMs: NOW_MS + 60_000 }]);
   });
 
+  it("enforces a header-only 429's cooldown while the model's old bucket is still live", () => {
+    let now = NOW_MS;
+    const a = makeAccount("a");
+    // Healthy and still being reported by upstream, so nothing reaps it.
+    applyHeaders(a, {
+      "x-codex-bengalfox-primary-used-percent": "50",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    });
+    const pool = new OpenAITokenPool([a], { now: () => now });
+    expect(pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-sol" }).account.id).toBe("a");
+
+    // Upstream moves the model to a new limit id and says so with a 429 that
+    // carries no rate-limit snapshot — only the active limit and Retry-After.
+    now += 1000;
+    learnModelBucket(a, "gpt-5.6-sol", "codex_newfox", now);
+    pool.setBucketCooldownForAccount(a, "codex_newfox", 60_000);
+
+    expect(() => pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-sol" }))
+      .toThrow(NoEligibleAccountError);
+    // Scoped to the model that was limited, not the whole account.
+    expect(pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-luna" }).account.id).toBe("a");
+  });
+
   it("enforces the active-limit bucket cooldown when two buckets tie on last-seen", () => {
     const a = makeAccount("a");
     // Both buckets name the model and arrive in the same response, so they
@@ -128,7 +151,7 @@ describe("OpenAITokenPool cooldowns", () => {
 
     // The 429 named codex_newfox active, so that is the bucket holding the
     // cooldown — resolving the model to its tied sibling would lose it.
-    learnModelBucket(a, "gpt-5.6-sol", "codex_newfox");
+    learnModelBucket(a, "gpt-5.6-sol", "codex_newfox", NOW_MS);
     pool.setBucketCooldownForAccount(a, "codex_newfox", 60_000);
 
     expect(() => pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-sol" }))
@@ -156,7 +179,7 @@ describe("OpenAITokenPool cooldowns", () => {
     // different limit id — reported by a header-only 429, so the new bucket
     // has a cooldown and a mapping but no snapshot of its own.
     now += 9 * 60_000;
-    learnModelBucket(a, "gpt-5.6-sol", "codex_newfox");
+    learnModelBucket(a, "gpt-5.6-sol", "codex_newfox", now);
     pool.setBucketCooldownForAccount(a, "codex_newfox", 60_000);
 
     // The old bucket is a zeroed corpse upstream has stopped mentioning. If
@@ -174,7 +197,7 @@ describe("OpenAITokenPool cooldowns", () => {
   it("makes room for a new bucket cooldown by dropping expired entries, not live ones", () => {
     let now = NOW_MS;
     const a = makeAccount("a");
-    learnModelBucket(a, "model-live", "codex_live_0");
+    learnModelBucket(a, "model-live", "codex_live_0", NOW_MS);
     const pool = new OpenAITokenPool([a], { now: () => now });
 
     // One short cooldown that lapses, then fill the cap with long ones. The
@@ -194,8 +217,8 @@ describe("OpenAITokenPool cooldowns", () => {
 
   it("evicts the soonest-to-expire bucket cooldown when every entry is still live", () => {
     const a = makeAccount("a");
-    learnModelBucket(a, "model-soonest", "codex_soonest");
-    learnModelBucket(a, "model-longest", "codex_live_0");
+    learnModelBucket(a, "model-soonest", "codex_soonest", NOW_MS);
+    learnModelBucket(a, "model-longest", "codex_live_0", NOW_MS);
     const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
 
     // 16 live entries with codex_soonest the shortest, so it has the least
@@ -218,7 +241,7 @@ describe("OpenAITokenPool cooldowns", () => {
     // an active limit but carry no rate-limit snapshot for it: the model is
     // mapped to a limitId, and a cooldown is set on that limitId, without any
     // entry ever landing in account.rateLimits.buckets.
-    learnModelBucket(a, "gpt-5.6-sol", "codex_bengalfox");
+    learnModelBucket(a, "gpt-5.6-sol", "codex_bengalfox", NOW_MS);
     const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
     pool.setBucketCooldownForAccount(a, "codex_bengalfox", 60_000);
 
@@ -247,7 +270,7 @@ describe("OpenAITokenPool cooldowns", () => {
       .toThrow(NoEligibleAccountError);
     expect(pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-luna" }).account.id).toBe("a");
     expect(a.rateLimits.buckets.has("codex_bengalfox")).toBe(true);
-    expect(a.modelBuckets.get("gpt-5.6-sol")).toBe("codex_bengalfox");
+    expect(a.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("codex_bengalfox");
   });
 
   it("getGlobalCooldownUntil/isCoolingDown reflect only the global scope, not a shorter bucket cooldown", () => {
