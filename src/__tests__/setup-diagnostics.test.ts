@@ -428,7 +428,13 @@ describe("diagnostic identity and command flushing", () => {
     const facade = createTelemetryFacade({
       getSnapshot: () => ({
         enabled: true,
-        state: { enabled: true, installId: INSTALL_ID, firstRunAt: "2026-08-11T00:00:00.000Z" },
+        state: {
+          enabled: true,
+          installId: INSTALL_ID,
+          firstRunAt: "2026-08-11T00:00:00.000Z",
+          consentGeneration: "123e4567-e89b-42d3-a456-426614174010",
+          revision: 0,
+        },
       }),
       getAnalytics: () => ({
         captureAnalytics: vi.fn(),

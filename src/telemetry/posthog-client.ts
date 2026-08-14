@@ -61,7 +61,7 @@ type PersistedKey = Parameters<PostHog["setPersistedProperty"]>[0];
 
 const CAPTURE_GENERATION_PROPERTY = "__cc_router_capture_generation";
 const CAPTURE_ID_PROPERTY = "__cc_router_capture_id";
-const CAPTURE_REVISION_PROPERTY = "__cc_router_consent_revision";
+const CAPTURE_CONSENT_GENERATION_PROPERTY = "__cc_router_consent_generation";
 const QUEUE_KEYS = ["queue", "ai_queue", "logs_queue"] as const;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -271,7 +271,7 @@ function exceptionProperties(
   exception: SafeExceptionContract,
   generation: number,
   captureId: string,
-  revision: number,
+  consentGeneration: string | undefined,
 ): Record<string, unknown> {
   const properties: Record<string, unknown> = {
     $exception_fingerprint: exception.fingerprint,
@@ -283,7 +283,7 @@ function exceptionProperties(
     $geoip_disable: true,
     [CAPTURE_GENERATION_PROPERTY]: generation,
     [CAPTURE_ID_PROPERTY]: captureId,
-    [CAPTURE_REVISION_PROPERTY]: revision,
+    [CAPTURE_CONSENT_GENERATION_PROPERTY]: consentGeneration,
   };
   if (exception.systemErrorCode !== undefined) properties.systemErrorCode = exception.systemErrorCode;
   if (exception.httpStatusCode !== undefined) properties.httpStatusCode = exception.httpStatusCode;
@@ -304,7 +304,7 @@ export function createPostHogTelemetryClient(
   let initializationFailed = false;
   let shutdownStarted = false;
   let captureGeneration = 0;
-  const preparedCaptures = new Map<string, { generation: number; revision: number }>();
+  const preparedCaptures = new Map<string, { generation: number; consentGeneration: string }>();
 
   const discardPendingInternal = (): void => {
     captureGeneration += 1;
@@ -321,8 +321,12 @@ export function createPostHogTelemetryClient(
   };
   const consent = createTelemetryConsentGate(getSnapshot, undefined, discardPendingInternal);
 
-  const rememberPreparedCapture = (captureId: string, generation: number, revision: number): void => {
-    preparedCaptures.set(captureId, { generation, revision });
+  const rememberPreparedCapture = (
+    captureId: string,
+    generation: number,
+    consentGeneration: string,
+  ): void => {
+    preparedCaptures.set(captureId, { generation, consentGeneration });
     while (preparedCaptures.size > POSTHOG_MAX_QUEUE_SIZE) {
       const oldestCaptureId = preparedCaptures.keys().next().value as string | undefined;
       if (!oldestCaptureId) break;
@@ -336,18 +340,19 @@ export function createPostHogTelemetryClient(
       const snapshot = consent.getSnapshot();
       if (!snapshot) return null;
       const eventGeneration = own(event.properties, CAPTURE_GENERATION_PROPERTY);
-      const eventRevision = own(event.properties, CAPTURE_REVISION_PROPERTY);
+      const eventConsentGeneration = uuid(own(event.properties, CAPTURE_CONSENT_GENERATION_PROPERTY));
       const captureId = uuid(own(event.properties, CAPTURE_ID_PROPERTY));
       if (!Number.isSafeInteger(eventGeneration)
         || eventGeneration !== captureGeneration
-        || eventRevision !== consent.acceptedRevision
+        || !eventConsentGeneration
+        || eventConsentGeneration !== consent.acceptedGeneration
         || !captureId) return null;
       const installationId = uuid(snapshot.state.installId);
       if (!installationId) return null;
 
       if (event.event === "$exception") {
         const safe = reconstructExceptionEvent(event, installationId, captureId);
-        if (safe) rememberPreparedCapture(captureId, eventGeneration as number, eventRevision as number);
+        if (safe) rememberPreparedCapture(captureId, eventGeneration as number, eventConsentGeneration);
         return safe;
       }
       const diagnosticId = own(event.properties, "diagnosticId");
@@ -359,7 +364,7 @@ export function createPostHogTelemetryClient(
         ...(typeof diagnosticId === "string" ? { diagnosticId } : {}),
       });
       if (!safe) return null;
-      rememberPreparedCapture(captureId, eventGeneration as number, eventRevision as number);
+      rememberPreparedCapture(captureId, eventGeneration as number, eventConsentGeneration);
       return {
         event: safe.event,
         distinctId: safe.distinctId,
@@ -392,7 +397,8 @@ export function createPostHogTelemetryClient(
         if (!captureId) continue;
         captureIds.push(captureId);
         const prepared = preparedCaptures.get(captureId);
-        if (prepared?.generation === captureGeneration && prepared.revision === consent.acceptedRevision) {
+        if (prepared?.generation === captureGeneration
+          && prepared.consentGeneration === consent.acceptedGeneration) {
           activeBatch.push(candidate);
         }
       }
@@ -463,7 +469,7 @@ export function createPostHogTelemetryClient(
             $geoip_disable: true,
             [CAPTURE_GENERATION_PROPERTY]: captureGeneration,
             [CAPTURE_ID_PROPERTY]: captureId,
-            [CAPTURE_REVISION_PROPERTY]: consent.acceptedRevision,
+            [CAPTURE_CONSENT_GENERATION_PROPERTY]: consent.acceptedGeneration,
           },
         });
       } catch {
@@ -486,7 +492,7 @@ export function createPostHogTelemetryClient(
             $geoip_disable: true,
             [CAPTURE_GENERATION_PROPERTY]: captureGeneration,
             [CAPTURE_ID_PROPERTY]: captureId,
-            [CAPTURE_REVISION_PROPERTY]: consent.acceptedRevision,
+            [CAPTURE_CONSENT_GENERATION_PROPERTY]: consent.acceptedGeneration,
           },
         });
       } catch {
@@ -503,7 +509,7 @@ export function createPostHogTelemetryClient(
         active.client.captureException(
           exception.error,
           active.installationId,
-          exceptionProperties(exception, captureGeneration, captureId, consent.acceptedRevision),
+          exceptionProperties(exception, captureGeneration, captureId, consent.acceptedGeneration),
         );
       } catch {
         // Capture is best effort only.
@@ -518,7 +524,7 @@ export function createPostHogTelemetryClient(
         await active.client.captureExceptionImmediate(
           exception.error,
           active.installationId,
-          exceptionProperties(exception, captureGeneration, captureId, consent.acceptedRevision),
+          exceptionProperties(exception, captureGeneration, captureId, consent.acceptedGeneration),
         );
       } catch {
         // Immediate CLI capture must not change command behavior.

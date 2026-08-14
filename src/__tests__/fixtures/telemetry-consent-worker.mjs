@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-import { fsyncSync, openSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 
 const mode = process.argv[2];
 const telemetryPath = process.env.TELEMETRY_PATH;
@@ -9,6 +8,14 @@ if (!telemetryPath) throw new Error("missing TELEMETRY_PATH");
 
 const waitBuffer = new SharedArrayBuffer(4);
 const waitView = new Int32Array(waitBuffer);
+
+function waitForPath(path) {
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    Atomics.wait(waitView, 0, 0, 5);
+  }
+}
 
 function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -20,58 +27,60 @@ function errorCode(error) {
   return descriptor && "value" in descriptor ? descriptor.value : undefined;
 }
 
-if (mode === "hold-lock") {
-  const owner = {
-    version: 1,
-    token: randomUUID(),
-    pid: process.pid,
-    createdAt: Date.now(),
-  };
-  const descriptor = openSync(`${telemetryPath}.lock`, "wx", 0o600);
-  writeFileSync(descriptor, JSON.stringify(owner), "utf8");
-  fsyncSync(descriptor);
-  emit({ ok: true, owner });
-  setInterval(() => undefined, 1_000);
-} else {
-  const telemetry = await import("../../config/telemetry-state.ts");
-  const startedAt = Date.now();
-  try {
-    if (mode === "snapshot") {
-      emit({ ok: true, elapsedMs: Date.now() - startedAt, snapshot: telemetry.getTelemetrySnapshot() });
-    } else if (mode === "gate") {
-      emit({ ok: true, elapsedMs: Date.now() - startedAt, enabled: telemetry.isTelemetryEnabled() });
-    } else if (mode === "update") {
-      const requested = process.argv[3] === "true";
-      emit({
-        ok: true,
-        elapsedMs: Date.now() - startedAt,
-        requested,
-        state: telemetry.updateTelemetryConsent(requested),
-      });
-    } else if (mode === "update-many") {
-      const count = Number(process.argv[3]);
-      const pauseMs = Number(process.argv[4] ?? "0");
-      const states = [];
-      for (let index = 0; index < count; index += 1) {
-        states.push(telemetry.updateTelemetryConsent(index % 2 === 0));
-        if (pauseMs > 0) Atomics.wait(waitView, 0, 0, pauseMs);
-      }
-      emit({ ok: true, elapsedMs: Date.now() - startedAt, states });
-    } else if (mode === "read-many") {
-      const count = Number(process.argv[3]);
-      const snapshots = [];
-      for (let index = 0; index < count; index += 1) {
-        snapshots.push(telemetry.getTelemetrySnapshot());
-      }
-      emit({ ok: true, elapsedMs: Date.now() - startedAt, snapshots });
-    } else {
-      throw new Error(`unknown worker mode: ${mode}`);
-    }
-  } catch (error) {
+const telemetry = await import("../../config/telemetry-state.ts");
+const startedAt = Date.now();
+try {
+  if (mode === "initialize") {
+    emit({ ok: true, elapsedMs: Date.now() - startedAt, state: telemetry.loadTelemetryState() });
+  } else if (mode === "watch-gate") {
+    const readyPath = process.argv[3];
+    const releasePath = process.argv[4];
+    if (!readyPath || !releasePath) throw new Error("missing gate barrier paths");
+    const gate = telemetry.createTelemetryConsentGate();
+    writeFileSync(readyPath, "", { flag: "wx", mode: 0o600 });
+    waitForPath(releasePath);
     emit({
-      ok: false,
+      ok: true,
       elapsedMs: Date.now() - startedAt,
-      error: { code: errorCode(error), name: error?.name, message: error?.message },
+      enabled: gate.getSnapshot()?.enabled ?? false,
+      latchedDisabled: gate.latchedDisabled,
+      acceptedGeneration: gate.acceptedGeneration,
     });
+  } else if (mode === "snapshot") {
+    emit({ ok: true, elapsedMs: Date.now() - startedAt, snapshot: telemetry.getTelemetrySnapshot() });
+  } else if (mode === "gate") {
+    emit({ ok: true, elapsedMs: Date.now() - startedAt, enabled: telemetry.isTelemetryEnabled() });
+  } else if (mode === "update") {
+    const requested = process.argv[3] === "true";
+    emit({
+      ok: true,
+      elapsedMs: Date.now() - startedAt,
+      requested,
+      state: telemetry.updateTelemetryConsent(requested),
+    });
+  } else if (mode === "update-many") {
+    const count = Number(process.argv[3]);
+    const pauseMs = Number(process.argv[4] ?? "0");
+    const states = [];
+    for (let index = 0; index < count; index += 1) {
+      states.push(telemetry.updateTelemetryConsent(index % 2 === 0));
+      if (pauseMs > 0) Atomics.wait(waitView, 0, 0, pauseMs);
+    }
+    emit({ ok: true, elapsedMs: Date.now() - startedAt, states });
+  } else if (mode === "read-many") {
+    const count = Number(process.argv[3]);
+    const snapshots = [];
+    for (let index = 0; index < count; index += 1) {
+      snapshots.push(telemetry.getTelemetrySnapshot());
+    }
+    emit({ ok: true, elapsedMs: Date.now() - startedAt, snapshots });
+  } else {
+    throw new Error(`unknown worker mode: ${mode}`);
   }
+} catch (error) {
+  emit({
+    ok: false,
+    elapsedMs: Date.now() - startedAt,
+    error: { code: errorCode(error), name: error?.name, message: error?.message },
+  });
 }

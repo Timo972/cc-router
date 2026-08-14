@@ -76,11 +76,12 @@ describe("cc-router telemetry consent changes", () => {
   it.each([
     ["on", true],
     ["off", false],
-  ] as const)("routes every explicit %s through the monotonic consent update", async (action, enabled) => {
+  ] as const)("routes every explicit %s through the consent-generation update", async (action, enabled) => {
     const state = {
       enabled,
       installId: "persisted-install-id",
       firstRunAt: "2026-01-01T00:00:00.000Z",
+      consentGeneration: "123e4567-e89b-42d3-a456-426614174010",
       revision: 8,
     };
     telemetry.updateTelemetryConsent.mockReturnValue(state);

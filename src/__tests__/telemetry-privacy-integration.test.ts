@@ -34,6 +34,7 @@ import {
 
 const INSTALL_ID = "70d8062e-1fa0-4ae4-a115-bf782ecca462";
 const OTHER_INSTALL_ID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
+const CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174010";
 const PROJECT_ROOT = "/workspace/cc-router";
 const REPOSITORY_ROOT = resolve(import.meta.dirname, "..", "..");
 const CI_DEADLINE_MS = 8_000;
@@ -51,6 +52,8 @@ function snapshot(enabled: boolean): TelemetrySnapshot {
       enabled,
       installId: INSTALL_ID,
       firstRunAt: "2026-08-03T00:00:00.000Z",
+      consentGeneration: CONSENT_GENERATION,
+      revision: 0,
     },
     environmentDisabled: false,
     enabled,

@@ -19,13 +19,20 @@ const TRACE_ID = "0123456789abcdef0123456789abcdef";
 const SPAN_ID = "0123456789abcdef";
 const PARENT_SPAN_ID = "fedcba9876543210";
 const PRIVATE_CANARY = "PRIVATE prompt token@example.test /Users/alice ?secret=true";
+const CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174010";
+const NEXT_CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174011";
 
-function snapshot(enabled = true, revision = 0): TelemetrySnapshot {
+function snapshot(
+  enabled = true,
+  consentGeneration = CONSENT_GENERATION,
+  revision = 0,
+): TelemetrySnapshot {
   return {
     state: {
       enabled,
       installId: INSTALL_ID,
       firstRunAt: "2026-08-03T00:00:00.000Z",
+      consentGeneration,
       revision,
     },
     environmentDisabled: false,
@@ -319,8 +326,8 @@ describe("privacy-safe span exporter", () => {
     expect(delegateCalls).toBe(0);
   });
 
-  it("latches an old automatic-span exporter off across off then on and lets a new exporter adopt the revision", async () => {
-    let current = snapshot(true, 30);
+  it("latches an old automatic-span exporter off across choices and lets a new exporter adopt the generation", async () => {
+    let current = snapshot(true, CONSENT_GENERATION, 30);
     let delegateCalls = 0;
     const delegate: SpanExporter = {
       export: (_spans, callback) => { delegateCalls += 1; callback({ code: 0 }); },
@@ -328,13 +335,13 @@ describe("privacy-safe span exporter", () => {
     };
     const oldExporter = createPrivacySafeSpanExporter({ delegate, getSnapshot: () => current });
 
-    current = snapshot(true, 32);
+    current = snapshot(true, NEXT_CONSENT_GENERATION, 30);
     await exportSpans(oldExporter, [unsafeSpan()]);
-    current = snapshot(true, 30);
+    current = snapshot(true, CONSENT_GENERATION, 30);
     await exportSpans(oldExporter, [unsafeSpan()]);
     expect(delegateCalls).toBe(0);
 
-    current = snapshot(true, 32);
+    current = snapshot(true, NEXT_CONSENT_GENERATION, 30);
     const newExporter = createPrivacySafeSpanExporter({ delegate, getSnapshot: () => current });
     await exportSpans(newExporter, [unsafeSpan()]);
     expect(delegateCalls).toBe(1);
@@ -537,8 +544,8 @@ describe("privacy-safe log exporter", () => {
     expect(delegateCalls).toBe(0);
   });
 
-  it("latches an old log exporter off across off then on and lets a new exporter adopt the revision", async () => {
-    let current = snapshot(true, 40);
+  it("latches an old log exporter off across choices and lets a new exporter adopt the generation", async () => {
+    let current = snapshot(true, CONSENT_GENERATION, 40);
     let delegateCalls = 0;
     const delegate: LogRecordExporter = {
       export: (_logs, callback) => { delegateCalls += 1; callback({ code: 0 }); },
@@ -551,13 +558,13 @@ describe("privacy-safe log exporter", () => {
       getDiagnosticId: () => DIAGNOSTIC_ID,
     });
 
-    current = snapshot(true, 42);
+    current = snapshot(true, NEXT_CONSENT_GENERATION, 40);
     await exportLogs(oldExporter, [unsafeLog()]);
-    current = snapshot(true, 40);
+    current = snapshot(true, CONSENT_GENERATION, 40);
     await exportLogs(oldExporter, [unsafeLog()]);
     expect(delegateCalls).toBe(0);
 
-    current = snapshot(true, 42);
+    current = snapshot(true, NEXT_CONSENT_GENERATION, 40);
     const newExporter = createPrivacySafeLogExporter({
       delegate,
       getSnapshot: () => current,

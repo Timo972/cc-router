@@ -16,6 +16,8 @@ const SAMPLED_TRACE_ID = "0123456789abcdef0123456789abcdef";
 const MALICIOUS_TRACE_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SAMPLED_BELOW_THRESHOLD = "00000000000000000000000019999998";
 const UNSAMPLED_AT_THRESHOLD = "00000000000000000000000019999999";
+const CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174010";
+const NEXT_CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174011";
 
 function responseFor(url: URL): Response {
   if (url.hostname === "chatgpt.com" && url.pathname === "/backend-api/codex/responses") {
@@ -197,21 +199,22 @@ describe("proxy runtime sampling and propagation", () => {
     ).decision).toBe(SamplingDecision.NOT_RECORD);
   });
 
-  it("stops sampling permanently after a persisted revision mismatch", async () => {
+  it("stops sampling permanently after a persisted consent-generation mismatch", async () => {
     const { createProxyTraceSampler } = await import("../telemetry/runtime.js");
-    const consentSnapshot = (revision: number): TelemetrySnapshot => ({
+    const consentSnapshot = (consentGeneration: string): TelemetrySnapshot => ({
       state: {
         enabled: true,
         installId: INSTALL_ID,
         firstRunAt: "2026-08-01T00:00:00.000Z",
-        revision,
+        consentGeneration,
+        revision: 50,
       },
       environmentDisabled: false,
       enabled: true,
     });
-    let current = consentSnapshot(50);
+    let current = consentSnapshot(CONSENT_GENERATION);
     const oldSampler = createProxyTraceSampler({ getSnapshot: () => current } as never);
-    current = consentSnapshot(52);
+    current = consentSnapshot(NEXT_CONSENT_GENERATION);
     expect(oldSampler.shouldSample(
       ROOT_CONTEXT,
       SAMPLED_BELOW_THRESHOLD,
@@ -220,7 +223,7 @@ describe("proxy runtime sampling and propagation", () => {
       {},
       [],
     ).decision).toBe(SamplingDecision.NOT_RECORD);
-    current = consentSnapshot(50);
+    current = consentSnapshot(CONSENT_GENERATION);
     expect(oldSampler.shouldSample(
       ROOT_CONTEXT,
       SAMPLED_BELOW_THRESHOLD,
@@ -230,7 +233,7 @@ describe("proxy runtime sampling and propagation", () => {
       [],
     ).decision).toBe(SamplingDecision.NOT_RECORD);
 
-    current = consentSnapshot(52);
+    current = consentSnapshot(NEXT_CONSENT_GENERATION);
     const newSampler = createProxyTraceSampler({ getSnapshot: () => current } as never);
     expect(newSampler.shouldSample(
       ROOT_CONTEXT,

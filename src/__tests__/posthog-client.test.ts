@@ -14,13 +14,20 @@ const INSTALL_ID = "70d8062e-1fa0-4ae4-a115-bf782ecca462";
 const OTHER_INSTALL_ID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
 const DIAGNOSTIC_ID = "ad94f035-1e08-4e29-8517-fd56bdc83d99";
 const PROJECT_ROOT = "/workspace/cc-router";
+const CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174010";
+const NEXT_CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174011";
 
-function snapshot(enabled = true, revision = 0): TelemetrySnapshot {
+function snapshot(
+  enabled = true,
+  consentGeneration = CONSENT_GENERATION,
+  revision = 0,
+): TelemetrySnapshot {
   return {
     state: {
       enabled,
       installId: INSTALL_ID,
       firstRunAt: "2026-08-03T00:00:00.000Z",
+      consentGeneration,
       revision,
     },
     environmentDisabled: false,
@@ -348,7 +355,7 @@ describe("gated PostHog EU client", () => {
   });
 
   it("never revives queued analytics after persisted off then on before flush", async () => {
-    let currentSnapshot = snapshot(true, 10);
+    let currentSnapshot = snapshot(true, CONSENT_GENERATION, 10);
     const requests: CapturedRequest[] = [];
     const oldClient = createPostHogTelemetryClient({
       getSnapshot: () => currentSnapshot,
@@ -357,14 +364,14 @@ describe("gated PostHog EU client", () => {
 
     oldClient.captureAnalytics(analyticsEvent());
     await waitForImmediate();
-    currentSnapshot = snapshot(true, 12);
+    currentSnapshot = snapshot(true, NEXT_CONSENT_GENERATION, 10);
     await oldClient.flushWithin(100);
-    currentSnapshot = snapshot(true, 10);
+    currentSnapshot = snapshot(true, CONSENT_GENERATION, 10);
     oldClient.captureAnalytics(analyticsEvent());
     await oldClient.flushWithin(100);
     expect(requests).toHaveLength(0);
 
-    currentSnapshot = snapshot(true, 12);
+    currentSnapshot = snapshot(true, NEXT_CONSENT_GENERATION, 10);
     const newClient = createPostHogTelemetryClient({
       getSnapshot: () => currentSnapshot,
       transport: captureTransport(requests),
@@ -376,7 +383,7 @@ describe("gated PostHog EU client", () => {
   });
 
   it("never revives queued exceptions after persisted off then on before flush", async () => {
-    let currentSnapshot = snapshot(true, 20);
+    let currentSnapshot = snapshot(true, CONSENT_GENERATION, 20);
     const requests: CapturedRequest[] = [];
     const oldClient = createPostHogTelemetryClient({
       getSnapshot: () => currentSnapshot,
@@ -385,14 +392,14 @@ describe("gated PostHog EU client", () => {
 
     oldClient.captureException(exceptionContract());
     await waitForImmediate();
-    currentSnapshot = snapshot(true, 22);
+    currentSnapshot = snapshot(true, NEXT_CONSENT_GENERATION, 20);
     await oldClient.flushWithin(100);
-    currentSnapshot = snapshot(true, 20);
+    currentSnapshot = snapshot(true, CONSENT_GENERATION, 20);
     oldClient.captureException(exceptionContract());
     await oldClient.flushWithin(100);
     expect(requests).toHaveLength(0);
 
-    currentSnapshot = snapshot(true, 22);
+    currentSnapshot = snapshot(true, NEXT_CONSENT_GENERATION, 20);
     const newClient = createPostHogTelemetryClient({
       getSnapshot: () => currentSnapshot,
       transport: captureTransport(requests),

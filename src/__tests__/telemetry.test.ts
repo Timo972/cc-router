@@ -48,6 +48,9 @@ describe("loadTelemetryState", () => {
     const state = loadTelemetryState();
     expect(state.enabled).toBe(true);
     expect((state as TelemetryState & { revision?: unknown }).revision).toBe(0);
+    expect(state.consentGeneration).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
     expect(state.installId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
     );
@@ -95,24 +98,23 @@ describe("loadTelemetryState", () => {
     expect(state.installId).toBeDefined();
   });
 
-  it("migrates a state missing enabled to enabled without replacing its install identity", () => {
-    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, JSON.stringify({
+  it("normalizes a legacy state without rewriting it or replacing its install identity", () => {
+    const legacy = {
       installId: "existing-install-id",
       firstRunAt: "2026-01-01T00:00:00.000Z",
-    }), "utf-8");
+    };
+    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, JSON.stringify(legacy), "utf-8");
 
     expect(loadTelemetryState()).toEqual({
       enabled: true,
       installId: "existing-install-id",
       firstRunAt: "2026-01-01T00:00:00.000Z",
+      consentGeneration: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      ),
       revision: 0,
     });
-    expect(JSON.parse(fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"))).toEqual({
-      enabled: true,
-      installId: "existing-install-id",
-      firstRunAt: "2026-01-01T00:00:00.000Z",
-      revision: 0,
-    });
+    expect(JSON.parse(fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"))).toEqual(legacy);
   });
 
   it.each([true, false])("preserves a persisted enabled value of %s", (enabled) => {
@@ -146,6 +148,7 @@ describe("writeTelemetryState", () => {
       enabled: false,
       installId: "test-uuid",
       firstRunAt: "2026-01-01T00:00:00.000Z",
+      consentGeneration: "123e4567-e89b-42d3-a456-426614174020",
       revision: 0,
     };
     writeTelemetryState(state);
@@ -157,12 +160,17 @@ describe("writeTelemetryState", () => {
     expect(fs.existsSync(`${MOCK_DIR}/telemetry.json.tmp`)).toBe(false);
   });
 
-  it("advances the persisted revision for every explicit choice, including repeats", () => {
+  it("creates a unique generation for every explicit choice, including repeats", () => {
     const first = updateTelemetryConsent(false);
     const second = updateTelemetryConsent(false);
     const third = updateTelemetryConsent(true);
 
     expect([first.revision, second.revision, third.revision]).toEqual([1, 2, 3]);
+    expect(new Set([
+      first.consentGeneration,
+      second.consentGeneration,
+      third.consentGeneration,
+    ]).size).toBe(3);
     expect(loadTelemetryState()).toEqual(third);
     expect(fs.existsSync(`${MOCK_DIR}/telemetry.json.lock`)).toBe(false);
   });
@@ -222,6 +230,9 @@ describe("getTelemetrySnapshot", () => {
         enabled: true,
         installId: "existing-install-id",
         firstRunAt: "2026-01-01T00:00:00.000Z",
+        consentGeneration: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+        ),
         revision: 0,
       },
       environmentDisabled: true,
@@ -235,13 +246,16 @@ describe("getTelemetrySnapshot", () => {
 describe("typed telemetry facade", () => {
   const INSTALL_ID = "123e4567-e89b-42d3-a456-426614174000";
   const DIAGNOSTIC_ID = "123e4567-e89b-42d3-a456-426614174001";
+  const CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174010";
+  const NEXT_CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174011";
 
-  function snapshot(enabled = true, revision = 0) {
+  function snapshot(enabled = true, consentGeneration = CONSENT_GENERATION, revision = 0) {
     return {
       state: {
         enabled,
         installId: INSTALL_ID,
         firstRunAt: "2026-08-11T12:00:00.000Z",
+        consentGeneration,
         revision,
       },
       environmentDisabled: false,
@@ -602,9 +616,9 @@ describe("typed telemetry facade", () => {
     }]);
   });
 
-  it("latches an active facade off after a persisted revision change and requires a new facade", async () => {
+  it("latches an active facade off after a consent-generation change and requires a new facade", async () => {
     const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    let current = snapshot(true, 4);
+    let current = snapshot(true, CONSENT_GENERATION, 4);
     const oldEvents: string[] = [];
     const oldFacade = createTelemetryFacade({
       getSnapshot: () => current,
@@ -622,14 +636,14 @@ describe("typed telemetry facade", () => {
     });
 
     oldFacade.recordProxyStarted(1);
-    current = snapshot(true, 6); // explicit off (5), then on (6) before this daemon observes either write
+    current = snapshot(true, NEXT_CONSENT_GENERATION, 4);
     oldFacade.recordProxyStarted(1);
-    current = snapshot(true, 4);
+    current = snapshot(true, CONSENT_GENERATION, 4);
     oldFacade.recordProxyStarted(1);
 
     expect(oldEvents).toEqual(["proxy.started"]);
 
-    current = snapshot(true, 6);
+    current = snapshot(true, NEXT_CONSENT_GENERATION, 4);
     const newEvents: string[] = [];
     const newFacade = createTelemetryFacade({
       getSnapshot: () => current,
@@ -658,7 +672,7 @@ describe("typed telemetry facade", () => {
     const local: Array<{ error: unknown; diagnosticId: string }> = [];
     const remote: Array<{ diagnosticId: string; serialized: string }> = [];
     const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(true, 7),
+      getSnapshot: () => snapshot(true, CONSENT_GENERATION, 7),
       claimFirstStart: () => undefined,
       randomUUID: () => ids.shift() ?? DIAGNOSTIC_ID,
       reportRuntimeException: (error: unknown, diagnosticId: string) => {

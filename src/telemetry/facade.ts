@@ -545,7 +545,7 @@ export function createTelemetryFacade(
         const properties = current
           && snapshot?.enabled
           && current.state.installId === snapshot.state.installId
-          && current.state.revision === snapshot.state.revision
+          && current.state.consentGeneration === snapshot.state.consentGeneration
           ? metadata()
           : undefined;
         if (snapshot && properties) {
