@@ -346,6 +346,11 @@ async function sendOpenAIStreamAsAnthropic(
 
   try {
     while (true) {
+      // A client disconnect ends this loop through the upstream fetch: the
+      // ingress aborts its signal, which rejects the pending read. That is the
+      // cancellation path for every relay here — `sendUpstreamResponse` adds a
+      // close-event race on top only because it also relays bodies that may
+      // not honour the signal.
       const { value, done } = await reader.read();
       if (done) break;
 

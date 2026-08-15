@@ -68,9 +68,26 @@ async function sendUpstreamResponse(
   }
 
   const reader = upstream.body.getReader();
+  // Stop relaying the moment there is nobody to relay to. The ingress aborts
+  // the upstream fetch on disconnect, which normally makes the pending read
+  // reject on its own — but an upstream that has simply gone quiet leaves this
+  // loop parked in `read()`, where no amount of polling `res.destroyed` would
+  // ever run again. Racing the read against the close event is what actually
+  // releases a stalled stream, so the account's upstream slot is not held for
+  // a response nobody will receive.
+  const DISCONNECTED = Symbol("client-disconnected");
+  const disconnected = new Promise<typeof DISCONNECTED>(resolve => {
+    if (res.destroyed) resolve(DISCONNECTED);
+    else res.once("close", () => resolve(DISCONNECTED));
+  });
   try {
     while (true) {
-      const { value, done } = await reader.read();
+      const next = await Promise.race([reader.read(), disconnected]);
+      if (next === DISCONNECTED) {
+        await reader.cancel().catch(() => {});
+        break;
+      }
+      const { value, done } = next;
       if (done) break;
       if (value) {
         res.write(Buffer.from(value));

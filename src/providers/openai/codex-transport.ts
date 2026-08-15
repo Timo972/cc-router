@@ -8,6 +8,9 @@ export interface ForwardOpenAICodexResponseOptions {
   account: OpenAISubscriptionAccount;
   body: OpenAIResponsesRequest;
   stream: boolean;
+  /** Aborted when the client disconnects, so a request nobody is waiting for
+   *  stops occupying an upstream slot on the account. */
+  signal?: AbortSignal;
 }
 
 export async function forwardOpenAICodexResponse(
@@ -22,6 +25,7 @@ export async function forwardOpenAICodexResponse(
       accept: "text/event-stream",
     },
     body: JSON.stringify(body),
+    ...(opts.signal ? { signal: opts.signal } : {}),
   });
   return ensureEventStreamContentType(upstream);
 }

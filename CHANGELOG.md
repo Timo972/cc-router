@@ -55,6 +55,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ending without a terminal event already did, and the streamed path ends
   without `message_stop`, which is what clients already surface as a
   truncation.
+- A client that disconnects mid-response no longer leaves the upstream Codex
+  request running. Nothing propagated the disconnect, so the relay drained the
+  whole upstream body into a closed socket and held that connection open for a
+  response nobody would receive; the request is now cancelled as soon as the
+  client goes away.
 - A single malformed SSE frame no longer truncates a `/v1/messages` stream.
   Parsing a chunk was all-or-nothing, so one bad frame discarded the valid
   events beside it and ended the response as a clean `200` the client could

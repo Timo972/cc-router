@@ -161,6 +161,21 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   // it still carries whatever model the caller asked for.
   const requestedModel = boundModelId(opts.requestedModel);
 
+  // A client that hangs up must take the upstream request with it. Releasing
+  // the lease (which the response's own close listener does) only returns the
+  // account's *local* capacity — without this the Codex request keeps
+  // streaming to a socket nobody is reading, so the pool counts the account
+  // idle and routes more work onto an upstream slot that is still occupied.
+  //
+  // Registered before the lease is acquired so this listener runs before the
+  // lifecycle's release, and `once` so it cleans itself up. A normal end also
+  // emits `close`, hence the `writableEnded` guard: only a premature close is
+  // a disconnect.
+  const clientGone = new AbortController();
+  res.once("close", () => {
+    if (!res.writableEnded) clientGone.abort();
+  });
+
   let selected: { route: RoutedAccountLease<OpenAIAccount>; release: () => void; details: string };
   try {
     selected = acquireRequestRoute(sessionKey, res, openAIRouter, { requestedModel });
@@ -254,7 +269,12 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
 
   let upstream: globalThis.Response;
   try {
-    upstream = await forwardOpenAI({ account, body: forwardBody, stream: forwardBody.stream === true });
+    upstream = await forwardOpenAI({
+      account,
+      body: forwardBody,
+      stream: forwardBody.stream === true,
+      signal: clientGone.signal,
+    });
   } catch (error) {
     // A rejected forward call (network failure) must produce a local 502,
     // never an unhandled rejection. The lease releases via the response's
@@ -349,8 +369,14 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     relayFailed = true;
     const message = error instanceof Error ? error.message : String(error);
     logError(account.id, 502, `openai response relay failed: ${message}`);
+    // The recorded status is what this request *became*, which is a failure
+    // whether or not another HTTP response can still be sent. Leaving it at
+    // the upstream's 200 in the headers-already-sent case produced an
+    // activity entry typed "error" carrying statusCode 200 — a diagnostic
+    // that contradicts itself, and one that reads as a success in any view
+    // that keys off the status.
+    finalStatus = 502;
     if (!res.headersSent) {
-      finalStatus = 502;
       res.status(502).json(envelope.wrap("upstream_error", `OpenAI response relay failed: ${message}`));
     } else {
       if (!res.writableEnded && !res.destroyed) res.destroy();

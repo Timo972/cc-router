@@ -359,15 +359,24 @@ describe("mountResponsesRoutes", () => {
   });
 
   it("streams upstream Responses SSE chunks without waiting for the full body", async () => {
+    const timers: ReturnType<typeof setTimeout>[] = [];
     const forward: ForwardOpenAI = async () => new Response(
       new ReadableStream({
         start(controller) {
           const encoder = new TextEncoder();
           controller.enqueue(encoder.encode("data: {\"type\":\"response.created\"}\n\n"));
-          setTimeout(() => {
+          // The test asserts on the first chunk and returns, so the relay
+          // cancels this reader while the timer is still pending. Enqueuing
+          // into a cancelled controller throws, so stop producing — as a real
+          // upstream body does when its consumer goes away.
+          const pending = setTimeout(() => {
             controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\"}\n\n"));
             controller.close();
           }, 100);
+          timers.push(pending);
+        },
+        cancel() {
+          for (const timer of timers.splice(0)) clearTimeout(timer);
         },
       }) as BodyInit,
       {
@@ -629,6 +638,98 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
 
     expect(forward).not.toHaveBeenCalled();
     expect(activity.some(entry => entry.type === "error" && entry.statusCode === 401)).toBe(true);
+  });
+
+  it("records a relay failure after headers were sent as a failure status, not the upstream 200", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'));
+          controller.error(new Error("upstream stream exploded"));
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+      // Headers are already on the wire, so the client keeps the upstream 200
+      // and simply loses the connection partway through.
+      expect(res.status).toBe(200);
+      await res.text().catch(() => undefined);
+    });
+
+    // What the request *became* is a failure, and the recorded status has to
+    // say so — an entry typed "error" carrying 200 contradicts itself and
+    // reads as a success anywhere the status is what gets inspected.
+    await vi.waitFor(() => expect(activity).toHaveLength(1));
+    expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+  });
+
+  it("aborts the upstream request when the client disconnects mid-stream", async () => {
+    const account = makeRuntimeAccount("openai-victor");
+    const firstChunk = deferred<void>();
+    let upstreamSignal: AbortSignal | undefined;
+    let upstreamCancelled = false;
+    const forward: ForwardOpenAI = async opts => {
+      upstreamSignal = opts.signal;
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            controller.enqueue(encoder.encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'));
+            firstChunk.resolve();
+            // Deliberately never closed: a stream that would keep the
+            // account's upstream slot until it completes on its own.
+          },
+          cancel() { upstreamCancelled = true; },
+        }) as BodyInit,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    };
+    const { app, openAIPool } = mountWithPool([account], forward);
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/responses",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await firstChunk.promise;
+      expect(upstreamSignal?.aborted).toBe(false);
+
+      client!.destroy();
+      await clientClosed;
+
+      // Releasing the lease only frees local capacity. Unless the upstream
+      // request is cancelled too, the pool reports the account idle while a
+      // Codex request is still running on it.
+      await vi.waitFor(() => expect(upstreamSignal?.aborted).toBe(true));
+      await vi.waitFor(() => expect(upstreamCancelled).toBe(true));
+      expect(openAIPool.getInFlight(account.id)).toBe(0);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
   });
 
   it("does not forward after the client disconnects during token refresh (P2 disconnect)", async () => {
