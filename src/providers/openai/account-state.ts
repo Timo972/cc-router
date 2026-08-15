@@ -242,7 +242,15 @@ export function bucketIdForModel(
     // sending the account straight back out for a model upstream told us to
     // back off — and overwrite the mapping, so no later lookup could recover
     // it either.
-    if (cached !== undefined && cached.learnedAt > liveSeenAt) {
+    //
+    // Equal timestamps go to the mapping, for the same reason the loop above
+    // breaks its own ties that way. A 429 that carries rate-limit headers
+    // *and* `x-codex-active-limit` is applied and routed from one `now`, so
+    // the snapshot it refreshes and the mapping it learns are stamped
+    // identically — the common case, not a freak collision. Of the two, only
+    // the active-limit header is upstream naming the bucket that limited this
+    // request; the snapshot merely lists what exists.
+    if (cached !== undefined && cached.learnedAt >= liveSeenAt) {
       // Re-learn at its own timestamp: this refreshes LRU recency without
       // letting the mapping claim to be newer evidence than it is.
       learnModelBucket(account, model, cached.limitId, cached.learnedAt);
@@ -257,7 +265,15 @@ export function bucketIdForModel(
   // No live bucket names this model. The cached mapping is what keeps a
   // header-only 429's bucket cooldown enforceable — that path never carries a
   // bucket snapshot, so the cache is the only association available.
-  return account.modelBuckets.get(model)?.limitId;
+  if (cached === undefined) return undefined;
+  // Re-insert before returning, at its own evidence timestamp. Reading a Map
+  // does not move the key, so a mapping with no snapshot behind it would stay
+  // frozen at its original insertion position no matter how often it is
+  // consulted — and be evicted as "oldest" the moment a 33rd model is learned,
+  // even while the cooldown it exists to resolve is still live. Every other
+  // return path already relearns; this one has to as well.
+  learnModelBucket(account, model, cached.limitId, cached.learnedAt);
+  return cached.limitId;
 }
 
 export function bucketForModel(

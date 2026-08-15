@@ -20,6 +20,7 @@ import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
 import {
   hasPendingCredentialWrite,
+  markOpenAICredentialsPersisted,
   prepareOpenAIAccountForRequest,
   refreshAndPersistOpenAIAccount,
   startOpenAIRefreshLoop,
@@ -563,6 +564,26 @@ export function applyRateLimitHeaders(
   return true;
 }
 
+/**
+ * Build the single function through which this server writes OpenAI accounts.
+ *
+ * Two things have to be true of every such write, so they live together here
+ * rather than at each call site. It must land in the file the process was
+ * started against — a custom `--accounts <path>` must never silently fall back
+ * to the default accounts.json. And it must report its own durability: an add,
+ * patch, or delete rewrites the same file from the same live array, so it puts
+ * a rotation that failed to persist earlier on disk even though no refresh was
+ * involved, and the pending-write bookkeeping has to clear with it.
+ */
+export function createOpenAIPersister(
+  accountsPath: string | undefined,
+): (accounts: OpenAISubscriptionAccount[]) => void {
+  return (accountsToSave: OpenAISubscriptionAccount[]): void => {
+    saveOpenAIAccountsToPath(accountsToSave, accountsPath ?? ACCOUNTS_PATH);
+    markOpenAICredentialsPersisted(accountsToSave);
+  };
+}
+
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const port = opts.port ?? PROXY_PORT;
 
@@ -573,11 +594,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const mode = litellmUrl ? "litellm" : "standalone";
 
   const accountsPath = opts.accountsPath;
-  // Every OpenAI account write in this server must land in the same file the
-  // process was started against — a custom `--accounts <path>` must never
-  // silently fall back to writing the default accounts.json.
-  const persistOpenAIAccounts = (accountsToSave: OpenAISubscriptionAccount[]): void =>
-    saveOpenAIAccountsToPath(accountsToSave, accountsPath ?? ACCOUNTS_PATH);
+  const persistOpenAIAccounts = createOpenAIPersister(accountsPath);
 
   if (!accountsFileExists(accountsPath)) {
     console.error(chalk.red("\n✗ accounts.json not found."));

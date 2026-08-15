@@ -22,6 +22,23 @@ export function hasPendingCredentialWrite(account: OpenAISubscriptionAccount): b
 }
 
 /**
+ * Record that every account in `accounts` has reached disk.
+ *
+ * A whole-pool write makes all of them durable, not just whichever account
+ * prompted it — and those writes do not all come from a refresh. Adding,
+ * patching, or deleting an account rewrites the same file from the same live
+ * array, so a rotation that failed to persist earlier is on disk once any of
+ * those succeed. Without this, health keeps reporting `credentialsPendingWrite`
+ * for an account whose credentials are already saved, and later requests keep
+ * retrying a write that has already landed.
+ *
+ * Call it only after the write has actually returned.
+ */
+export function markOpenAICredentialsPersisted(accounts: OpenAISubscriptionAccount[]): void {
+  for (const account of accounts) pendingCredentialWrites.delete(account);
+}
+
+/**
  * Centralizes every write of the account pool to disk so every caller shares
  * the same durability bookkeeping: on success, clears the account's pending
  * flag; on a throw (e.g. disk full, a bad custom `--accounts` path), (re)sets
@@ -42,12 +59,7 @@ function persistCredentials(
 ): boolean {
   try {
     saveAccounts(allAccounts);
-    // The write is synchronous and covers the whole pool, so every account it
-    // was handed is on disk the moment it returns — not just the one that
-    // triggered it. An account whose own earlier write failed would otherwise
-    // keep reporting `credentialsPendingWrite` and re-attempting a write that
-    // has already landed, until its own next refresh happened to clear it.
-    for (const saved of allAccounts) pendingCredentialWrites.delete(saved);
+    markOpenAICredentialsPersisted(allAccounts);
     pendingCredentialWrites.delete(account);
     return true;
   } catch (error) {

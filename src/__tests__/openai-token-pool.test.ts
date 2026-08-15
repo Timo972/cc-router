@@ -137,6 +137,22 @@ describe("OpenAITokenPool cooldowns", () => {
     expect(pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-luna" }).account.id).toBe("a");
   });
 
+  it("enforces a 429's cooldown when its mapping ties with the snapshot it arrived with", () => {
+    const a = makeAccount("a");
+    // One 429 carrying rate-limit headers and an active limit: the snapshot it
+    // refreshes and the mapping it learns are stamped from the same `now`.
+    applyHeaders(a, {
+      "x-codex-bengalfox-primary-used-percent": "50",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    });
+    learnModelBucket(a, "gpt-5.6-sol", "codex_newfox", NOW_MS);
+    const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
+    pool.setBucketCooldownForAccount(a, "codex_newfox", 60_000);
+
+    expect(() => pool.acquireBest(new Map(), { requestedModel: "gpt-5.6-sol" }))
+      .toThrow(NoEligibleAccountError);
+  });
+
   it("enforces the active-limit bucket cooldown when two buckets tie on last-seen", () => {
     const a = makeAccount("a");
     // Both buckets name the model and arrive in the same response, so they

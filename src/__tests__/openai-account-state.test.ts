@@ -132,6 +132,42 @@ describe("bucketForModel", () => {
     expect(account.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("codex_newfox");
   });
 
+  it("prefers the active-limit mapping when it ties with the snapshot it arrived with", () => {
+    const account = createOpenAIAccount(record());
+    // A 429 carrying both rate-limit headers and `x-codex-active-limit` is
+    // applied and routed from one `now`, so the snapshot it refreshes and the
+    // mapping it learns share a timestamp. Only the header names the bucket
+    // that limited this request.
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "50",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+    learnModelBucket(account, "gpt-5.6-sol", "codex_newfox", NOW_MS);
+
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_newfox");
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_newfox");
+    expect(account.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("codex_newfox");
+  });
+
+  it("keeps a snapshot-less mapping from aging out while it is still being used", () => {
+    const account = createOpenAIAccount(record());
+    // A header-only 429's mapping has no bucket snapshot to fall back on, so
+    // losing it to eviction loses the cooldown with it.
+    learnModelBucket(account, "gpt-5.6-sol", "codex_headeronly", NOW_MS);
+    for (let i = 0; i < 31; i++) learnModelBucket(account, `filler-${i}`, "codex_x", NOW_MS + i);
+
+    // Consulted on every request right up to the cap being exceeded.
+    for (let i = 0; i < 31; i++) {
+      expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_headeronly");
+    }
+    learnModelBucket(account, "one-model-too-many", "codex_x", NOW_MS + 100);
+
+    // Reading a Map does not move the key, so without an explicit re-insert
+    // this mapping would still be the oldest entry and the first evicted.
+    expect(account.modelBuckets.get("gpt-5.6-sol")?.limitId).toBe("codex_headeronly");
+    expect(bucketIdForModel(account, "gpt-5.6-sol")).toBe("codex_headeronly");
+  });
+
   it("keeps the active-limit mapping when two live buckets tie on last-seen", () => {
     const account = createOpenAIAccount(record());
     // One response stamps every bucket it carries with the same `lastSeenAt`,

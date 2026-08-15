@@ -1,9 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   applyRateLimitHeaders,
   createHealthAccountViews,
+  createOpenAIPersister,
   createOperationalStatus,
 } from "../proxy/server.js";
+import { applyOpenAIAccountPatch } from "../proxy/account-patch.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
 import { applyUpstreamFailureRouting } from "../proxy/lease-lifecycle.js";
 import { TokenPool } from "../proxy/token-pool.js";
@@ -284,6 +289,29 @@ describe("createHealthAccountViews", () => {
     }
 
     expect(createHealthAccountViews([], [account])[0]?.credentialsPendingWrite).toBe(true);
+
+    // An account-management write (PATCH/add/delete) rewrites the same file
+    // from the same live array, so it puts the rotated credentials on disk
+    // even though no refresh was involved. Driven through the server's own
+    // persister — the marker has to clear because that write happened, not
+    // because a test called the bookkeeping helper directly.
+    const dir = mkdtempSync(join(tmpdir(), "cc-router-persist-"));
+    const accountsPath = join(dir, "accounts.json");
+    writeFileSync(accountsPath, "[]");
+    try {
+      const patched = applyOpenAIAccountPatch({
+        id: "openai-a",
+        patch: { enabled: false },
+        accounts: [account],
+        persist: createOpenAIPersister(accountsPath),
+      });
+
+      expect(patched).toBe(account);
+      expect(readFileSync(accountsPath, "utf8")).toContain("rotated-refresh");
+      expect(createHealthAccountViews([], [account])[0]?.credentialsPendingWrite).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("never exposes tokens or raw header values in the OpenAI health view", () => {
