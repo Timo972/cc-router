@@ -640,6 +640,58 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     expect(activity.some(entry => entry.type === "error" && entry.statusCode === 401)).toBe(true);
   });
 
+  it("does not count a client-cancelled forward against the account", async () => {
+    const account = makeRuntimeAccount("openai-victor");
+    const forwardStarted = deferred<void>();
+    // Behaves like fetch under an abort: pending until the signal fires, then
+    // rejects with an AbortError.
+    const forward: ForwardOpenAI = async opts => {
+      forwardStarted.resolve();
+      return new Promise<Response>((_resolve, reject) => {
+        opts.signal?.addEventListener("abort", () => {
+          reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+        });
+      });
+    };
+    const { app, activity, openAIPool } = mountWithPool([account], forward);
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({ model: "openai/gpt-5.5", input: [] });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/responses",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await forwardStarted.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+
+      // The user pressed Ctrl-C. Nothing upstream failed, so none of this may
+      // be charged to the account — repeated cancellations would otherwise
+      // walk it to the unhealthy threshold and a cooldown.
+      expect(account.errorCount).toBe(0);
+      expect(account.consecutiveErrors).toBe(0);
+      expect(activity).toHaveLength(0);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   it("records a relay failure after headers were sent as a failure status, not the upstream 200", async () => {
     const forward: ForwardOpenAI = async () => new Response(
       new ReadableStream({

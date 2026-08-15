@@ -8,6 +8,11 @@ export interface CodexRateWindow {
   utilization: number;
   resetAt: number;
   windowMinutes: number;
+  /** Unix ms of the last response that actually reported *this* window — set
+   *  at merge time, never by pure parsing. A response can carry one window of
+   *  a bucket and not the other, so the bucket's own `lastSeenAt` is not an
+   *  answer to "how long since we heard about this window". */
+  lastSeenAt?: number;
 }
 
 export interface CodexLimitBucket {

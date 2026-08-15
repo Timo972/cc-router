@@ -391,6 +391,32 @@ describe("sweepCodexRateLimits", () => {
     expect(bucketForModel(account, "gpt-5.6-sol")?.limitId).toBe("codex_bengalfox");
   });
 
+  it("ages a retained window by its own last report, not the bucket's", () => {
+    const account = createOpenAIAccount(record());
+    // Secondary is exhausted with no reset time, so ageing out is the only
+    // thing that can ever recover it.
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-bengalfox-primary-used-percent": "50",
+      "x-codex-bengalfox-secondary-used-percent": "100",
+      "x-codex-bengalfox-secondary-window-minutes": "60",
+      "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
+    }, NOW_MS), NOW_MS);
+
+    // Upstream keeps reporting this bucket, but only ever its primary — the
+    // secondary is never mentioned again. The bucket's own timestamp advances
+    // with every one of these; the silent window's must not.
+    for (let minute = 10; minute <= 90; minute += 10) {
+      applyCodexRateLimits(account, parseCodexRateLimits({
+        "x-codex-bengalfox-primary-used-percent": "55",
+      }, NOW_MS + minute * 60_000), NOW_MS + minute * 60_000);
+    }
+
+    const recovered = sweepCodexRateLimits(account, NOW_MS + 91 * 60_000);
+
+    expect(recovered).toBe(true);
+    expect(account.rateLimits.buckets.get("codex_bengalfox")?.secondary?.utilization).toBe(0);
+  });
+
   it("reaps a retained bucket once its cooldown ends, not eight days later", () => {
     const account = createOpenAIAccount(record());
     applyCodexRateLimits(account, parseCodexRateLimits({

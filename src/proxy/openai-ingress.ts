@@ -276,6 +276,17 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       signal: clientGone.signal,
     });
   } catch (error) {
+    // A client that hung up mid-forward rejects this call through the abort
+    // above. That is a cancellation, not an upstream failure: the account did
+    // nothing wrong, so counting it would push a healthy account toward the
+    // unhealthy threshold and a cooldown for nothing more than a user pressing
+    // Ctrl-C, and there is no client left to receive a 502 or to whom an
+    // "upstream_error:network" entry would mean anything. Mirrors the
+    // pre-forward disconnect branch above, which also just releases and stops.
+    if (clientGone.signal.aborted || responseTerminated(res)) {
+      selected.release();
+      return;
+    }
     // A rejected forward call (network failure) must produce a local 502,
     // never an unhandled rejection. The lease releases via the response's
     // own finish/close lifecycle once this response is sent.

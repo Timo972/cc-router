@@ -126,6 +126,21 @@ function evictLeastRecentlySeenBucket(limits: CodexRateLimits): void {
   // only lose a still-live cooldown mapping for no benefit.
 }
 
+/**
+ * Pick the window to keep for one slot of a bucket, and record when it was
+ * last actually reported. A freshly reported window is stamped `nowMs`; a
+ * window this response said nothing about keeps both its values and its older
+ * stamp, so its age reflects the last time upstream really mentioned it.
+ */
+function stampWindow(
+  reported: CodexRateWindow | undefined,
+  existing: CodexRateWindow | undefined,
+  nowMs: number,
+): CodexRateWindow | undefined {
+  if (reported) return { ...reported, lastSeenAt: nowMs };
+  return existing;
+}
+
 export function applyCodexRateLimits(
   account: Pick<OpenAIAccount, "rateLimits">,
   update: CodexRateLimitsUpdate,
@@ -143,10 +158,20 @@ export function applyCodexRateLimits(
     const merged: CodexLimitBucket = { limitId: bucket.limitId };
     const limitName = bucket.limitName ?? existing?.limitName;
     if (limitName) merged.limitName = limitName;
-    const primary = bucket.primary ?? existing?.primary;
+    // Each window is stamped only when this response actually reported it. A
+    // retained window has not been heard from, however recently the bucket as
+    // a whole was: an upstream that keeps sending one window and not the other
+    // would otherwise keep resetting the age of the silent one, and an
+    // exhausted window with no reset time recovers *only* by ageing out — so
+    // it would sit at 100% forever, blocking its model on this account with
+    // nothing left to clear it.
+    const primary = stampWindow(bucket.primary, existing?.primary, nowMs);
     if (primary) merged.primary = primary;
-    const secondary = bucket.secondary ?? existing?.secondary;
+    const secondary = stampWindow(bucket.secondary, existing?.secondary, nowMs);
     if (secondary) merged.secondary = secondary;
+    // The bucket's own timestamp still tracks the bucket: it answers "is
+    // upstream still mentioning this bucket at all", which is what the
+    // unmentioned-bucket reap needs.
     merged.lastSeenAt = nowMs;
     limits.buckets.set(bucket.limitId, merged);
   }
@@ -346,7 +371,12 @@ export function sweepCodexRateLimits(
     const windows = [bucket.primary, bucket.secondary];
     const expired = windows.map(window =>
       window !== undefined
-      && ((window.resetAt > 0 && nowSec >= window.resetAt) || isStaleExhaustedWindow(window, bucketSeenAt, nowMs)),
+      && ((window.resetAt > 0 && nowSec >= window.resetAt)
+        // Age each window by when it was last reported, not by when the bucket
+        // was: a window upstream has stopped mentioning is exactly the one
+        // this check exists to recover, and the bucket's timestamp keeps
+        // moving as long as the *other* window is still being sent.
+        || isStaleExhaustedWindow(window, window.lastSeenAt ?? bucketSeenAt, nowMs)),
     );
 
     // Zero each individually-expired window in place — for both the default
