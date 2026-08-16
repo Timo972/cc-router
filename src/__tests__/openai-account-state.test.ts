@@ -391,6 +391,23 @@ describe("sweepCodexRateLimits", () => {
     expect(bucketForModel(account, "gpt-5.6-sol")?.limitId).toBe("codex_bengalfox");
   });
 
+  it("ages out a reset-less window that never reached full utilization", () => {
+    const account = createOpenAIAccount(record());
+    // 60% with no reset time. It excludes the account wherever a user cap
+    // sits below it — and because the account is then skipped, no response
+    // arrives to correct the number, so nothing but age can retire it.
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "60",
+      "x-codex-primary-window-minutes": "60",
+    }, NOW_MS), NOW_MS);
+
+    expect(sweepCodexRateLimits(account, NOW_MS + 59 * 60_000)).toBe(false);
+    expect(account.rateLimits.buckets.get(DEFAULT_CODEX_LIMIT_ID)?.primary?.utilization).toBeCloseTo(0.6);
+
+    sweepCodexRateLimits(account, NOW_MS + 61 * 60_000);
+    expect(account.rateLimits.buckets.get(DEFAULT_CODEX_LIMIT_ID)?.primary?.utilization).toBe(0);
+  });
+
   it("ages a retained window by its own last report, not the bucket's", () => {
     const account = createOpenAIAccount(record());
     // Secondary is exhausted with no reset time, so ageing out is the only

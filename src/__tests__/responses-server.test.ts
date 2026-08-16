@@ -692,6 +692,60 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     }
   });
 
+  it("does not count a client-cancelled relay against the account", async () => {
+    const account = makeRuntimeAccount("openai-victor");
+    const firstChunk = deferred<void>();
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'));
+          firstChunk.resolve();
+          // No terminal event will ever arrive — the client leaves first.
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity, openAIPool } = mountWithPool([account], forward);
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/responses",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await firstChunk.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      // A stream cut short never reaches its terminal event, so the observer
+      // reports a failure and the relay may reject outright — both are the
+      // disconnect's doing, not the account's.
+      expect(account.errorCount).toBe(0);
+      expect(account.consecutiveErrors).toBe(0);
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "route", statusCode: 200 }));
+      expect(activity[0]?.details).toContain("client-cancelled");
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   it("records a relay failure after headers were sent as a failure status, not the upstream 200", async () => {
     const forward: ForwardOpenAI = async () => new Response(
       new ReadableStream({

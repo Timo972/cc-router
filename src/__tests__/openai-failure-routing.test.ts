@@ -166,6 +166,39 @@ describe("applyCodexFailureRouting", () => {
     expect(router.invalidate).toHaveBeenCalledTimes(3);
   });
 
+  it("an overload honors a Retry-After longer than the 30s fallback", () => {
+    const account = makeAccount();
+    const pool = makePool();
+    const router = makeRouter();
+    const route = { account, sessionId: "s1", bindingGeneration: 1 };
+
+    // Coming back after 30s to a service that asked for two minutes just
+    // produces another 503.
+    expect(applyCodexFailureRouting(
+      503, { "retry-after": "120" }, route, undefined, router, pool, () => NOW_MS,
+    ).cooldownSeconds).toBe(120);
+    expect(applyCodexFailureRouting(
+      529, { "retry-after": "120" }, route, undefined, router, pool, () => NOW_MS,
+    ).cooldownSeconds).toBe(120);
+  });
+
+  it("an overload ignores a non-exhausted window's future reset", () => {
+    const account = makeAccount();
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "40",
+      "x-codex-primary-reset-at": String(NOW_SEC + 3 * 60 * 60),
+    }, NOW_MS), NOW_MS);
+    const pool = makePool();
+    const router = makeRouter();
+
+    // An overload is an availability event. A 5h quota window resetting three
+    // hours from now says nothing about how long the blip lasts, and using it
+    // would take a healthy account out for those three hours.
+    expect(applyCodexFailureRouting(
+      503, {}, { account, sessionId: "s1", bindingGeneration: 1 }, undefined, router, pool, () => NOW_MS,
+    ).cooldownSeconds).toBe(30);
+  });
+
   it("an isolated 5xx (e.g. 500) is a no-op: no cooldown, no binding invalidation", () => {
     const account = makeAccount();
     const pool = makePool();

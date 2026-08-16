@@ -339,18 +339,25 @@ export function boundResetlessExhaustedWindows(
 }
 
 /**
- * A window that's fully exhausted (utilization >= 1) but reports resetAt === 0
- * (untrustworthy — past, absent, or malformed, per parseResetAtSeconds) has no
- * trustworthy expiry to wait out. Treat it as expired once the snapshot behind
- * it hasn't been refreshed for longer than its own window length, so the
- * account isn't excluded forever.
+ * A window reporting `resetAt === 0` (untrustworthy — past, absent, or
+ * malformed, per parseResetAtSeconds) has no expiry to wait out, so the only
+ * thing that can retire its number is age. Once it has gone unreported for
+ * longer than its own window length, whatever utilization it claims describes
+ * a window that has since rolled over, and acting on it means acting on
+ * fiction.
+ *
+ * This deliberately does not require full exhaustion. A window stuck at, say,
+ * 80% excludes the account just as durably wherever a user cap sits below
+ * that — and worse, quietly: the account is skipped, so it receives no
+ * response to refresh the snapshot, so the stale number never changes. The
+ * traffic it would have taken goes to whichever accounts are left.
  */
-function isStaleExhaustedWindow(
+function isStaleResetlessWindow(
   window: CodexRateWindow | undefined,
   lastSeenAtMs: number,
   nowMs: number,
 ): boolean {
-  if (!window || window.resetAt !== 0 || window.utilization < 1) return false;
+  if (!window || window.resetAt !== 0 || window.utilization <= 0) return false;
   const staleAfterMs = (window.windowMinutes > 0 ? window.windowMinutes : STALE_DEFAULT_WINDOW_MINUTES) * 60_000;
   return nowMs - lastSeenAtMs > staleAfterMs;
 }
@@ -376,7 +383,7 @@ export function sweepCodexRateLimits(
         // was: a window upstream has stopped mentioning is exactly the one
         // this check exists to recover, and the bucket's timestamp keeps
         // moving as long as the *other* window is still being sent.
-        || isStaleExhaustedWindow(window, window.lastSeenAt ?? bucketSeenAt, nowMs)),
+        || isStaleResetlessWindow(window, window.lastSeenAt ?? bucketSeenAt, nowMs)),
     );
 
     // Zero each individually-expired window in place — for both the default

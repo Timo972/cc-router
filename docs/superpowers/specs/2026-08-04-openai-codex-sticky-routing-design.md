@@ -312,12 +312,17 @@ On a `429`, the cooldown scope comes from `x-codex-active-limit`:
 - the header names the default `codex` bucket, is absent, or is unrecognized
   -> an **account-global** cooldown (the safe default).
 
-On `401` and `5xx` overload the cooldown is always account-global. In every
-case the duration is the greatest trustworthy future value among: numeric
-`Retry-After`, HTTP-date `Retry-After`, the affected bucket's `x-codex-*`
-reset, and the snapshot reset; default 60s for `429` and 30s for overload.
-Negative, non-finite, and absurdly-distant values are rejected. There is no
-ambiguous reconciliation: each cooldown is scoped exactly once, at set time.
+On `401` and `5xx` overload the cooldown is always account-global. For `429`
+and overload alike the duration is the greatest trustworthy future value
+among: numeric `Retry-After`, HTTP-date `Retry-After`, the affected bucket's
+`x-codex-*` reset, and the snapshot reset — counting only windows actually
+reported exhausted. A `429` with nothing exhausted falls back further, to the
+soonest known future window reset, because a quota reset is precisely what it
+is waiting for; an overload does not, because a window resetting hours from
+now says nothing about how long a service blip lasts. Defaults when nothing
+is known: 60s for `429`, 30s for overload; `401` is a flat 30s. Negative,
+non-finite, and absurdly-distant values are rejected. There is no ambiguous
+reconciliation: each cooldown is scoped exactly once, at set time.
 
 ## Account State
 

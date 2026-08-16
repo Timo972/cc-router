@@ -394,12 +394,30 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     }
   }
 
+  // A client that hung up during the relay produces every symptom of a
+  // failure without there being one: the aborted body rejects the reader (so
+  // `relayFailed`), and a stream cut short never reaches its terminal event
+  // (so the observer synthesizes a 502). Neither is the account's doing, and
+  // charging them would let routine Ctrl-C walk a healthy account to the
+  // unhealthy threshold. Only the abort signal can say this — `res` reads as
+  // "terminated" after every normal response too.
+  //
+  // Upstream's own verdict still stands: a 429 is a 429 whether or not the
+  // client stayed to read it.
+  const clientCancelled = clientGone.signal.aborted;
+
   // Activity/stats must reflect what the client actually received, not just
   // the raw upstream signal: the non-streaming collector can synthesize a
   // local 502 from an upstream 200 whose SSE stream ended in
   // `response.failed` (or malformed/incomplete), and a relay failure is
   // always a client-facing failure regardless of the upstream status.
-  const failedFinal = upstreamFailed || relayFailed || finalStatus >= 400;
+  const failedFinal = upstreamFailed || (!clientCancelled && (relayFailed || finalStatus >= 400));
+  if (clientCancelled && !upstreamFailed) {
+    // Record what the client had actually received when it left, not the 502
+    // its own disconnect manufactured.
+    finalStatus = upstream.status;
+    entry.details = details ? `${details} client-cancelled` : "client-cancelled";
+  }
   if (failedFinal) {
     stats.totalErrors++;
     // Upstream classification above only counts 401/429/5xx against the

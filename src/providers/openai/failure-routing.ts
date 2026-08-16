@@ -86,12 +86,12 @@ function bucketWindowCandidates(account: OpenAIAccount, limitId: string, nowMs: 
  *     retries sooner rather than blocking for a week on a guess.
  *  4. Nothing known at all -> the default cooldown.
  */
-function rateLimitCooldownMs(
+function cooldownCandidates(
   headers: Record<string, unknown>,
   account: OpenAIAccount,
   limitId: string,
   nowMs: number,
-): number {
+): { known: number[]; all: number[] } {
   const prefix = `x-${limitId.replace(/_/g, "-")}`;
   const retryAfter = retryAfterExpiry(header(headers, "retry-after"), nowMs);
   const windowCandidates = [
@@ -101,13 +101,46 @@ function rateLimitCooldownMs(
   ];
 
   const exhaustedExpiries = windowCandidates.filter(candidate => candidate.exhausted).map(candidate => candidate.expiry);
-  const knownExpiries = retryAfter !== undefined ? [retryAfter, ...exhaustedExpiries] : exhaustedExpiries;
-  if (knownExpiries.length > 0) return Math.max(...knownExpiries) - nowMs;
+  return {
+    known: retryAfter !== undefined ? [retryAfter, ...exhaustedExpiries] : exhaustedExpiries,
+    all: windowCandidates.map(candidate => candidate.expiry),
+  };
+}
 
-  const allExpiries = windowCandidates.map(candidate => candidate.expiry);
-  if (allExpiries.length > 0) return Math.min(...allExpiries) - nowMs;
-
+function rateLimitCooldownMs(
+  headers: Record<string, unknown>,
+  account: OpenAIAccount,
+  limitId: string,
+  nowMs: number,
+): number {
+  const { known, all } = cooldownCandidates(headers, account, limitId, nowMs);
+  if (known.length > 0) return Math.max(...known) - nowMs;
+  if (all.length > 0) return Math.min(...all) - nowMs;
   return DEFAULT_RATE_LIMIT_COOLDOWN_MS;
+}
+
+/**
+ * How long to keep an account out after a 503/529.
+ *
+ * Upstream asking for a specific backoff is the whole point of `Retry-After`,
+ * and a flat 30s brings the account back early to hit a service that said it
+ * needed longer. An exhausted window counts too — it would keep this account
+ * out regardless, so a shorter overload cooldown would only produce a request
+ * that fails again.
+ *
+ * What is deliberately *not* consulted is the "soonest future reset" fallback
+ * the rate-limit path ends on. An overload is an availability event, not a
+ * quota one: a 5h window resetting three hours from now says nothing about
+ * how long a blip lasts, and treating it as a floor would take a healthy
+ * account out for hours over one 503.
+ */
+function overloadCooldownMs(
+  headers: Record<string, unknown>,
+  account: OpenAIAccount,
+  nowMs: number,
+): number {
+  const { known } = cooldownCandidates(headers, account, DEFAULT_CODEX_LIMIT_ID, nowMs);
+  return known.length > 0 ? Math.max(...known) - nowMs : OVERLOAD_COOLDOWN_MS;
 }
 
 /**
@@ -153,7 +186,9 @@ export function applyCodexFailureRouting(
     return { cooldownSeconds: durationMs / 1_000, limitingScope: "global" };
   }
 
-  const durationMs = status === 401 ? AUTH_FAILURE_COOLDOWN_MS : OVERLOAD_COOLDOWN_MS;
+  const durationMs = status === 401
+    ? AUTH_FAILURE_COOLDOWN_MS
+    : overloadCooldownMs(failureHeaders, route.account, nowMs);
   pool.setGlobalCooldownForAccount(route.account, durationMs);
   return { cooldownSeconds: durationMs / 1_000, limitingScope: "global" };
 }
