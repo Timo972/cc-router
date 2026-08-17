@@ -40,7 +40,14 @@ export function registerAccounts(program: Command): void {
         return;
       }
 
-      console.log(chalk.bold(`\n  Accounts (${stored.length + openAIStored.length} configured)\n`));
+      // The count has to describe the rows printed below it. Taking it from
+      // disk while listing the proxy's live pool made drift invisible — the
+      // header claimed four accounts above six rows.
+      console.log(chalk.bold(
+        liveStats
+          ? `\n  Accounts (${liveStats.length} in the running proxy)\n`
+          : `\n  Accounts (${stored.length + openAIStored.length} configured)\n`,
+      ));
 
       if (liveStats) {
         console.log(chalk.green("  ● Proxy is running — showing live stats\n"));
@@ -63,6 +70,32 @@ export function registerAccounts(program: Command): void {
             `  errors: ${chalk.red(String(s.errorCount).padStart(3))}` +
             `  expires: ${exp}`
           );
+        }
+
+        // The proxy reads accounts.json once at startup, so anything that
+        // rewrites the file afterwards leaves the two out of step. Silence
+        // here is how an account can be routing live while its refresh token
+        // exists nowhere on disk — one restart from having to authenticate it
+        // again.
+        const { unpersisted, unloaded } = accountDrift(
+          liveStats.map(s => s.id),
+          [...stored.map(a => a.id), ...openAIStored.map(a => a.id)],
+        );
+        if (unpersisted.length > 0) {
+          console.log(chalk.red(
+            `\n  ⚠ Not in accounts.json: ${unpersisted.join(", ")}`,
+          ));
+          console.log(chalk.gray(
+            "    These live only in the running proxy. Restarting it loses their\n"
+            + "    credentials — re-add them, or update any one account to make the\n"
+            + "    proxy write its pool back to disk.",
+          ));
+        }
+        if (unloaded.length > 0) {
+          console.log(chalk.yellow(
+            `\n  ⚠ In accounts.json but not loaded: ${unloaded.join(", ")}`,
+          ));
+          console.log(chalk.gray("    Restart the proxy to pick them up: cc-router start"));
         }
       } else {
         console.log(chalk.gray("  (Proxy not running — showing stored configuration)\n"));
@@ -214,10 +247,11 @@ export function registerAccounts(program: Command): void {
 
       const anthropicAccounts = loadAccounts();
       const openAIAccounts = loadOpenAIAccounts();
-      const existingIds = [
-        ...anthropicAccounts.map(a => a.id),
-        ...openAIAccounts.map(a => a.id),
-      ];
+      const { ids: existingIds, openAIIds } = mergeAccountInventory(
+        anthropicAccounts.map(a => a.id),
+        openAIAccounts.map(a => a.id),
+        await fetchLiveStats(),
+      );
 
       if (!existingIds.includes(id)) {
         console.log(chalk.red(`✗ Account "${id}" not found.`));
@@ -232,7 +266,7 @@ export function registerAccounts(program: Command): void {
       });
       if (!sure) { console.log(chalk.gray("Cancelled.")); return; }
 
-      const isOpenAI = openAIAccounts.some(account => account.id === id);
+      const isOpenAI = openAIIds.has(id);
       try {
         await removeAccountRuntimeAware(id);
       } catch (err) {
@@ -260,6 +294,60 @@ function printAddOutcome(mode: "live" | "stored"): void {
       ? chalk.gray("  Loaded into the running proxy — available now, no restart needed.\n")
       : chalk.gray("  Restart the proxy to load the new account: cc-router start\n"),
   );
+}
+
+/** An account as the running proxy reports it in its health payload. */
+export interface LiveAccountSummary {
+  id: string;
+  provider?: string;
+}
+
+/**
+ * Every account this CLI could act on, from both places one can live.
+ *
+ * The proxy loads accounts.json once at startup and holds that snapshot, so
+ * the two sources drift the moment the file changes underneath a running
+ * proxy — and they answer different questions. Removal prefers the live pool
+ * (see `removeAccountRuntimeAware`), so validating an id against disk alone
+ * rejected accounts that existed and were perfectly removable.
+ */
+export function mergeAccountInventory(
+  storedAnthropicIds: string[],
+  storedOpenAIIds: string[],
+  live: LiveAccountSummary[] | null,
+): { ids: string[]; openAIIds: Set<string> } {
+  const openAIIds = new Set(storedOpenAIIds);
+  for (const account of live ?? []) {
+    if (account.provider === "openai_subscription") openAIIds.add(account.id);
+  }
+  return {
+    ids: [...new Set([
+      ...storedAnthropicIds,
+      ...storedOpenAIIds,
+      ...(live ?? []).map(account => account.id),
+    ])],
+    openAIIds,
+  };
+}
+
+/**
+ * Where the running proxy and accounts.json disagree.
+ *
+ * `unpersisted` is the dangerous direction: those accounts exist only in the
+ * proxy's memory, so a restart loses their refresh tokens and they have to be
+ * authenticated again. `unloaded` is merely stale — the records are safe on
+ * disk, the proxy just has not read them.
+ */
+export function accountDrift(
+  liveIds: string[],
+  storedIds: string[],
+): { unpersisted: string[]; unloaded: string[] } {
+  const live = new Set(liveIds);
+  const stored = new Set(storedIds);
+  return {
+    unpersisted: liveIds.filter(id => !stored.has(id)),
+    unloaded: storedIds.filter(id => !live.has(id)),
+  };
 }
 
 export function buildStoredAccountsJson(
