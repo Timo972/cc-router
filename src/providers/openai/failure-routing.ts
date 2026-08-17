@@ -51,12 +51,15 @@ function headerWindowCandidates(
 ): WindowResetCandidate[] {
   const usedPercent = headerNumber(headers, `${prefix}-${kind}-used-percent`);
   const exhausted = usedPercent !== undefined && usedPercent >= 100;
-  return [
-    resetHeaderExpiry(header(headers, `${prefix}-${kind}-reset-at`), nowMs),
-    retryAfterExpiry(header(headers, `${prefix}-${kind}-reset-after-seconds`), nowMs),
-  ]
-    .filter((expiry): expiry is number => expiry !== undefined)
-    .map(expiry => ({ expiry, exhausted }));
+  // One window, one candidate: absolute first, relative only when the absolute
+  // is unusable — the precedence `parseResetAtSeconds` already applies when it
+  // builds the snapshot. Offering both as independent candidates let the
+  // exhausted-window `max` below pick whichever was larger, so a stale
+  // `reset-after-seconds` could outrank the authoritative `reset-at` and hold
+  // the account out long past the moment upstream said it would be free.
+  const expiry = resetHeaderExpiry(header(headers, `${prefix}-${kind}-reset-at`), nowMs)
+    ?? retryAfterExpiry(header(headers, `${prefix}-${kind}-reset-after-seconds`), nowMs);
+  return expiry === undefined ? [] : [{ expiry, exhausted }];
 }
 
 function bucketWindowCandidates(account: OpenAIAccount, limitId: string, nowMs: number): WindowResetCandidate[] {

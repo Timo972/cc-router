@@ -194,7 +194,12 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
           // matching a stream that upstream answered `200` but that ended in
           // a `response.failed`/`error` SSE event instead of completing.
           const synthesized = streamed && observer.failure() !== undefined;
-          return { statusCode: synthesized ? 502 : upstream.status };
+          return {
+            statusCode: synthesized ? 502 : upstream.status,
+            ...(streamed && observer.explicitFailure() !== undefined
+              ? { upstreamReportedFailure: true }
+              : {}),
+          };
         }
 
         const collected = await collectCodexResponseStream(upstream);

@@ -114,6 +114,13 @@ export interface OpenAIIngressRelayResult {
    * non-streaming collector that turns an upstream `response.failed` SSE
    * event, arriving on a 200, into a local 502). */
   statusCode: number;
+  /** Set when that synthesized failure came from upstream stating one — a
+   * `response.failed` or `error` event — rather than from a stream that
+   * merely stopped early. The distinction matters only on disconnect: a
+   * client hanging up truncates the stream, so truncation alone is no
+   * evidence the account did anything wrong, while an explicit failure event
+   * is true no matter when the client left. */
+  upstreamReportedFailure?: boolean;
 }
 
 export interface OpenAIIngressOptions {
@@ -369,9 +376,11 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
 
   let finalStatus = upstream.status;
   let relayFailed = false;
+  let upstreamReportedFailure = false;
   try {
     const result = await relay(upstream, res, entry);
     finalStatus = result.statusCode;
+    upstreamReportedFailure = result.upstreamReportedFailure === true;
   } catch (error) {
     // Never let a relay failure become an unhandled rejection. Only send a
     // local response if no upstream bytes have reached the client yet —
@@ -403,8 +412,11 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   // "terminated" after every normal response too.
   //
   // Upstream's own verdict still stands: a 429 is a 429 whether or not the
-  // client stayed to read it.
-  const clientCancelled = clientGone.signal.aborted;
+  // client stayed to read it, and neither is an explicit `response.failed` on
+  // a 200 stream — the client can truncate a stream, but it cannot make
+  // upstream announce a failure. Only the truncation is the disconnect's to
+  // explain away.
+  const clientCancelled = clientGone.signal.aborted && !upstreamReportedFailure;
 
   // Activity/stats must reflect what the client actually received, not just
   // the raw upstream signal: the non-streaming collector can synthesize a

@@ -166,6 +166,29 @@ describe("applyCodexFailureRouting", () => {
     expect(router.invalidate).toHaveBeenCalledTimes(3);
   });
 
+  it("uses a window's reset-at over its relative fallback when both are present", () => {
+    const account = makeAccount();
+    const pool = makePool();
+    const router = makeRouter();
+
+    // The absolute header is authoritative; the relative one is its fallback,
+    // not a competing candidate. Taking the larger of the two would hold the
+    // account out for an hour on a stale value after upstream said 60s.
+    expect(applyCodexFailureRouting(429, {
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(NOW_SEC + 60),
+      "x-codex-primary-reset-after-seconds": "3600",
+    }, { account }, undefined, router, pool, () => NOW_MS).cooldownSeconds).toBe(60);
+
+    // The relative value still applies when the absolute one is unusable —
+    // here already in the past — matching how the snapshot is parsed.
+    expect(applyCodexFailureRouting(429, {
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(NOW_SEC - 5),
+      "x-codex-primary-reset-after-seconds": "120",
+    }, { account: makeAccount() }, undefined, router, pool, () => NOW_MS).cooldownSeconds).toBe(120);
+  });
+
   it("an overload honors a Retry-After longer than the 30s fallback", () => {
     const account = makeAccount();
     const pool = makePool();

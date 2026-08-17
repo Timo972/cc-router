@@ -746,6 +746,61 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     }
   });
 
+  it("still counts an explicit response.failed when the client disconnects after it", async () => {
+    const account = makeRuntimeAccount("openai-victor");
+    const failureSent = deferred<void>();
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'));
+          controller.enqueue(encoder.encode('data: {"type":"response.failed","response":{"error":{"message":"boom"}}}\n\n'));
+          failureSent.resolve();
+          // Upstream has said the turn failed; the client leaves before EOF.
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity, openAIPool } = mountWithPool([account], forward);
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/responses",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await failureSent.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      // A disconnect can truncate a stream; it cannot make upstream announce
+      // a failure. Reading this as a cancellation would clear the account's
+      // consecutive errors on the strength of a request that actually failed.
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+      expect(account.errorCount).toBe(1);
+      expect(account.consecutiveErrors).toBe(1);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   it("records a relay failure after headers were sent as a failure status, not the upstream 200", async () => {
     const forward: ForwardOpenAI = async () => new Response(
       new ReadableStream({

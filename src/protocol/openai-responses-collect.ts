@@ -191,6 +191,12 @@ export function createCodexUsageObserver(): {
    *  Only meaningful after `finish()` has been called — earlier chunks may
    *  not yet have carried the terminal event. */
   failure(): string | undefined;
+  /** Only the failure upstream stated outright (`response.failed`/`error`),
+   *  never the synthetic "no terminal event" verdict. A client that hangs up
+   *  mid-stream manufactures the latter and cannot manufacture the former, so
+   *  callers deciding whether a disconnect explains a failure need the two
+   *  kept apart. */
+  explicitFailure(): string | undefined;
 } {
   const decoder = new TextDecoder();
   let remainder = "";
@@ -248,6 +254,9 @@ export function createCodexUsageObserver(): {
       // that is reported as a failure too, unless an explicit
       // response.failed/error already said more about what went wrong.
       return failure ?? (completed ? undefined : "Upstream stream ended before any terminal response event");
+    },
+    explicitFailure(): string | undefined {
+      return failure;
     },
   };
 }
