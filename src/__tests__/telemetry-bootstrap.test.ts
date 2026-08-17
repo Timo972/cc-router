@@ -1,6 +1,5 @@
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import {
-  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -16,6 +15,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep, win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi, type MockInstance } from "vitest";
+import { runPnpm as runPnpmCommand } from "../../scripts/ci-pnpm.mjs";
+import { installPackedArtifact } from "../../scripts/install-packed-artifact.mjs";
 import {
   decodeOtlpProtobuf,
   semanticStrings,
@@ -26,7 +27,6 @@ import {
 } from "./telemetry-test-helpers.js";
 
 const PROJECT_ROOT = resolve(import.meta.dirname, "..", "..");
-const PNPM_COMMAND = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 
 function normalizeModulePath(path: string, separator = sep): string {
   return path.split(separator).join("/");
@@ -45,17 +45,7 @@ function removeBootstrapSentinels(repositoryRoot: string): void {
 }
 
 function runPnpm(args: string[], cwd = PROJECT_ROOT): string {
-  try {
-    return execFileSync(PNPM_COMMAND, args, { cwd, encoding: "utf8", stdio: "pipe" });
-  } catch (error) {
-    const failure = error as { stdout?: Buffer | string; stderr?: Buffer | string };
-    const stdout = failure.stdout === undefined ? "" : String(failure.stdout);
-    const stderr = failure.stderr === undefined ? "" : String(failure.stderr);
-    throw new Error(
-      `${PNPM_COMMAND} ${args.join(" ")} failed\nstdout:\n${stdout}\nstderr:\n${stderr}`,
-      { cause: error },
-    );
-  }
+  return runPnpmCommand(args, cwd);
 }
 
 interface RunningPackage {
@@ -246,7 +236,6 @@ async function startBuiltPackage(options: {
   environment?: Record<string, string>;
   binary?: string;
   cwd?: string;
-  launchBinaryDirectly?: boolean;
   config?: Record<string, unknown>;
   readinessTimeoutMs?: number;
   waitForStartup?: () => Promise<void>;
@@ -319,11 +308,12 @@ globalThis.fetch = async (input, init) => {
       "--port", String(options.proxyPort),
       "--accounts", accountsPath,
     ];
-    const executable = options.launchBinaryDirectly ? binary : process.execPath;
-    const childArgs = options.launchBinaryDirectly
-      ? applicationArgs
-      : ["--import", pathToFileURL(preloadPath).href, binary, ...applicationArgs];
-    child = spawn(executable, childArgs, {
+    child = spawn(process.execPath, [
+      "--import",
+      pathToFileURL(preloadPath).href,
+      binary,
+      ...applicationArgs,
+    ], {
       cwd: options.cwd ?? PROJECT_ROOT,
       env: {
         ...process.env,
@@ -337,14 +327,6 @@ globalThis.fetch = async (input, init) => {
           options.testTraceUrl ?? `${options.telemetryCaptureOrigin}/i/v1/traces`,
         CC_ROUTER_TEST_OTLP_LOG_URL:
           options.testLogUrl ?? `${options.telemetryCaptureOrigin}/i/v1/logs`,
-        ...(options.launchBinaryDirectly
-          ? {
-              NODE_OPTIONS: [
-                process.env["NODE_OPTIONS"],
-                `--import=${pathToFileURL(preloadPath).href}`,
-              ].filter(Boolean).join(" "),
-            }
-          : {}),
         NO_UPDATE_NOTIFIER: "1",
         CI: "1",
       },
@@ -404,6 +386,15 @@ function installedPackageJsonForEntry(entry: string): string {
 }
 
 describe("compiled bootstrap harness portability", () => {
+  it("matches service bootstrap paths with either platform separator", () => {
+    for (const unit of [
+      "ExecStart=/package/dist/cli/bootstrap.js start --foreground",
+      "ExecStart=C:\\package\\dist\\cli\\bootstrap.js start --foreground",
+    ]) {
+      expect(unit).toMatch(/ExecStart=.*cli[\\/]bootstrap\.js start --foreground/);
+    }
+  });
+
   it("normalizes Windows module paths before applying the bootstrap allowlist", () => {
     const windowsRelative = win32.relative(
       "C:\\repo",
@@ -560,9 +551,7 @@ describe("compiled ESM telemetry bootstrap", () => {
     const packageRoot = mkdtempSync(join(tmpdir(), "cc-router-packed-artifact-"));
     packedPackageRoot = packageRoot;
     const packDirectory = join(packageRoot, "pack");
-    installedCwd = join(packageRoot, "prefix");
     mkdirSync(packDirectory, { recursive: true });
-    mkdirSync(installedCwd, { recursive: true });
     writeFileSync(
       join(PROJECT_ROOT, "dist", "__stale-prepack-output.js"),
       "throw new Error('stale prepack output must not ship');\n",
@@ -575,29 +564,9 @@ describe("compiled ESM telemetry bootstrap", () => {
       encoding: "utf8",
     })) as { dependencies?: Record<string, string> };
     expect(packedManifest.dependencies?.["posthog-node"]).toBe("5.47.3");
-    copyFileSync(join(PROJECT_ROOT, "package.json"), join(installedCwd, "package.json"));
-    copyFileSync(join(PROJECT_ROOT, "pnpm-lock.yaml"), join(installedCwd, "pnpm-lock.yaml"));
-    runPnpm([
-      "add",
-      "--dir",
-      installedCwd,
-      "--ignore-workspace",
-      "--offline",
-      "--lockfile-only",
-      "--allow-build=protobufjs",
-      tarball,
-    ]);
-    runPnpm([
-      "add",
-      "--dir",
-      installedCwd,
-      "--ignore-workspace",
-      "--offline",
-      "--prod",
-      "--allow-build=protobufjs",
-      tarball,
-    ]);
-    const installedPackage = join(installedCwd, "node_modules", "@timo972", "cc-router");
+    const installed = installPackedArtifact({ repositoryRoot: PROJECT_ROOT, workRoot: packageRoot, tarball });
+    const installedPackage = installed.packageRoot;
+    installedCwd = installed.productionRoot;
     const installedManifest = JSON.parse(readFileSync(join(installedPackage, "package.json"), "utf8")) as {
       dependencies?: Record<string, string>;
     };
@@ -610,12 +579,7 @@ describe("compiled ESM telemetry bootstrap", () => {
     expect(postHogPackage.version).toBe("5.47.3");
     expect(installedVersionForEntry(requireFromPostHog.resolve("@posthog/core"))).toBe("1.46.1");
     expect(installedVersionForEntry(requireFromPostHog.resolve("@posthog/types"))).toBe("1.399.0");
-    installedBinary = join(
-      installedCwd,
-      "node_modules",
-      ".bin",
-      process.platform === "win32" ? "cc-router.cmd" : "cc-router",
-    );
+    installedBinary = installed.binary;
     for (const requiredFile of [
       "dist/cli/bootstrap.js",
       "dist/config/telemetry-state.js",
@@ -637,6 +601,11 @@ describe("compiled ESM telemetry bootstrap", () => {
     ) as { bin?: Record<string, string> };
     expect(installedBinManifest.bin?.["cc-router"]).toBe("dist/cli/bootstrap.js");
     expect(existsSync(installedBinary)).toBe(true);
+    const productionLock = readFileSync(join(installed.productionRoot, "pnpm-lock.yaml"), "utf8");
+    expect(productionLock.includes("fsevents@"), "production lock contains dev-only fsevents").toBe(false);
+    const productionPackages = readdirSync(join(installed.productionRoot, "node_modules", ".pnpm"));
+    expect(productionPackages.some(name => name.startsWith("tsx@"))).toBe(false);
+    expect(productionPackages.some(name => name.startsWith("vitest@"))).toBe(false);
     expect(existsSync(join(installedPackage, "dist", "__stale-build-output.js"))).toBe(false);
     expect(existsSync(join(installedPackage, "dist", "__stale-prepack-output.js"))).toBe(false);
     expect(existsSync(join(installedPackage, "dist", "utils", "telemetry.js"))).toBe(false);
@@ -782,7 +751,6 @@ export async function resolve(specifier, context, nextResolve) {
         environment: mode.environment,
         binary: installedBinary,
         cwd: installedCwd,
-        launchBinaryDirectly: true,
       });
       children.push(running);
       try {
@@ -1009,7 +977,6 @@ export async function resolve(specifier, context, nextResolve) {
         environment: { DO_NOT_TRACK: "0", CC_ROUTER_TELEMETRY: "1" },
         binary: installedBinary,
         cwd: installedCwd,
-        launchBinaryDirectly: true,
       });
       children.push(running);
       const hostileBefore = hostileStatusDescriptions.length;
@@ -1130,7 +1097,6 @@ export async function resolve(specifier, context, nextResolve) {
         }],
         binary: installedBinary,
         cwd: installedCwd,
-        launchBinaryDirectly: true,
       });
       children.push(running);
       const base = `http://127.0.0.1:${proxyPort}/v1/messages`;
@@ -1422,7 +1388,7 @@ export async function resolve(specifier, context, nextResolve) {
     }));
     const started = Date.now();
     try {
-      const result = spawnSync(installedBinary, ["setup", "--not-a-real-option"], {
+      const result = spawnSync(process.execPath, [installedBinary, "setup", "--not-a-real-option"], {
         cwd: installedCwd,
         env: {
           ...process.env,
@@ -1465,7 +1431,7 @@ export async function resolve(specifier, context, nextResolve) {
     const address = held.address();
     if (!address || typeof address === "string") throw new Error("held collector did not bind");
     const origin = `http://127.0.0.1:${address.port}`;
-    const child = spawn(installedBinary, ["setup"], {
+    const child = spawn(process.execPath, [installedBinary, "setup"], {
       cwd: installedCwd,
       env: {
         ...process.env,
@@ -1518,7 +1484,7 @@ export async function resolve(specifier, context, nextResolve) {
       const requestsBefore = requests;
       const started = Date.now();
       try {
-        const child = spawn(installedBinary, ["setup"], {
+        const child = spawn(process.execPath, [installedBinary, "setup"], {
           cwd: installedCwd,
           env: {
             ...process.env,
@@ -1608,7 +1574,7 @@ export async function resolve(specifier, context, nextResolve) {
       auxiliaryServers.push(collector);
       const origin = `http://127.0.0.1:${port}`;
       const started = Date.now();
-      const child = spawn(installedBinary, ["start", "--foreground"], {
+      const child = spawn(process.execPath, [installedBinary, "start", "--foreground"], {
         cwd: installedCwd,
         env: {
           ...process.env,
@@ -2064,7 +2030,9 @@ describe("proxy launch commands", () => {
       platform = "linux";
       await installService(true);
       const unit = writes.at(-1)?.body ?? "";
-      expect(unit).toMatch(/ExecStart=.*cli\/bootstrap\.js start --foreground/);
+      for (const serviceUnit of [unit, "ExecStart=C:\\package\\dist\\cli\\bootstrap.js start --foreground"]) {
+        expect(serviceUnit).toMatch(/ExecStart=.*cli[\\/]bootstrap\.js start --foreground/);
+      }
       expect(unit).toContain("Environment=HOST=0.0.0.0");
       expect(unit).toContain("Environment=CC_ROUTER_SERVICE=1");
 

@@ -3,7 +3,6 @@ import { execFileSync, spawn } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
-  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -19,25 +18,12 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { installPackedArtifact } from "./install-packed-artifact.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const guardPath = join(repositoryRoot, "scripts", "telemetry-eu-network-guard.mjs");
 const syntheticChildPath = join(repositoryRoot, "scripts", "telemetry-eu-synthetic-child.mjs");
 const approvalPhrase = "I_UNDERSTAND_SYNTHETIC_TELEMETRY_WILL_BE_SENT";
-const pnpmCommand = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
-
-function runPnpm(args) {
-  try {
-    return execFileSync(pnpmCommand, args, { cwd: repositoryRoot, encoding: "utf8", stdio: "pipe" });
-  } catch (error) {
-    const stdout = error?.stdout === undefined ? "" : String(error.stdout);
-    const stderr = error?.stderr === undefined ? "" : String(error.stderr);
-    throw new Error(`${pnpmCommand} ${args.join(" ")} failed\nstdout:\n${stdout}\nstderr:\n${stderr}`, {
-      cause: error,
-    });
-  }
-}
-
 const dryRunPlan = `
 CC-Router personal EU telemetry validation
 
@@ -361,31 +347,13 @@ let proxy;
 let provider;
 const workRoot = mkdtempSync(join(tmpdir(), "cc-router-eu-validation-work-"));
 try {
-  const installRoot = join(workRoot, "installed");
-  mkdirSync(installRoot, { recursive: true });
   const packedManifest = JSON.parse(execFileSync("tar", ["-xOf", tarball, "package/package.json"], {
     encoding: "utf8",
   }));
   if (packedManifest.dependencies?.["posthog-node"] !== "5.47.3") {
     throw new Error("packed manifest must exact-pin posthog-node 5.47.3");
   }
-  copyFileSync(join(repositoryRoot, "package.json"), join(installRoot, "package.json"));
-  copyFileSync(join(repositoryRoot, "pnpm-lock.yaml"), join(installRoot, "pnpm-lock.yaml"));
-  runPnpm([
-    "add", "--dir", installRoot, "--ignore-workspace", "--offline", "--lockfile-only",
-    "--allow-build=protobufjs", tarball,
-  ]);
-  runPnpm([
-    "add", "--dir", installRoot, "--ignore-workspace", "--offline", "--prod",
-    "--allow-build=protobufjs", tarball,
-  ]);
-  const packageRoot = join(installRoot, "node_modules", "@timo972", "cc-router");
-  const binary = join(
-    installRoot,
-    "node_modules",
-    ".bin",
-    process.platform === "win32" ? "cc-router.cmd" : "cc-router",
-  );
+  const { packageRoot, binary } = installPackedArtifact({ repositoryRoot, workRoot, tarball });
   scanPackagedArtifact(packageRoot);
   const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
   if (manifest.dependencies?.["posthog-node"] !== "5.47.3") {
@@ -437,7 +405,7 @@ try {
   writeFileSync(configPath, "{}\n", { mode: 0o600 });
   const guarded = guardEnvironment(providerOrigin, networkLog);
   let proxyOutput = "";
-  proxy = spawn(binary, ["start", "--foreground", "--port", String(proxyPort), "--accounts", accountsPath], {
+  proxy = spawn(process.execPath, [binary, "start", "--foreground", "--port", String(proxyPort), "--accounts", accountsPath], {
     cwd: packageRoot,
     env: {
       ...process.env,

@@ -12,6 +12,13 @@ const PROJECT_ROOT = resolve(import.meta.dirname, "..", "..");
 const VALIDATOR = join(PROJECT_ROOT, "scripts", "validate-telemetry-eu.mjs");
 const GUARD = join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs");
 const SYNTHETIC_CHILD = join(PROJECT_ROOT, "scripts", "telemetry-eu-synthetic-child.mjs");
+const CI_PNPM = join(PROJECT_ROOT, "scripts", "ci-pnpm.mjs");
+const INSTALL_PACKED_ARTIFACT = join(PROJECT_ROOT, "scripts", "install-packed-artifact.mjs");
+
+function expectedExistingEvidenceMode(platform: NodeJS.Platform): number | undefined {
+  return platform === "win32" ? undefined : 0o777;
+}
+
 const CAUGHT_NETWORK_ATTEMPTS = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "caught-network-attempts.mjs");
 const NO_TRANSPORT = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network-no-transport-preload.mjs");
 const NAMED_BEFORE = join(PROJECT_ROOT, "src", "__tests__", "fixtures", "network-named-import-before-preload.mjs");
@@ -34,6 +41,11 @@ const SOCKET_CARDINALITY = join(
 );
 
 describe("personal EU telemetry release validator", () => {
+  it("makes the existing evidence target mode contract explicit on Windows", () => {
+    expect(expectedExistingEvidenceMode("darwin")).toBe(0o777);
+    expect(expectedExistingEvidenceMode("win32")).toBeUndefined();
+  });
+
   it("defaults to an offline plan with the complete synthetic matrix", () => {
     const output = execFileSync(process.execPath, [VALIDATOR], {
       cwd: PROJECT_ROOT,
@@ -117,7 +129,12 @@ describe("personal EU telemetry release validator", () => {
       expect(output).toContain("evidence target must not already exist");
       expect(output).not.toContain(sentinel);
       expect(readFileSync(join(evidenceRoot, "evidence.json"), "utf8")).toBe(sentinel);
-      expect(statSync(evidenceRoot).mode & 0o777).toBe(0o777);
+      const directoryStat = statSync(evidenceRoot);
+      const evidenceStat = statSync(join(evidenceRoot, "evidence.json"));
+      expect(directoryStat.isDirectory()).toBe(true);
+      expect(evidenceStat.isFile()).toBe(true);
+      const expectedMode = expectedExistingEvidenceMode(process.platform);
+      if (expectedMode !== undefined) expect(directoryStat.mode & 0o777).toBe(expectedMode);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -129,7 +146,7 @@ describe("personal EU telemetry release validator", () => {
     };
     expect(manifest.files).not.toContain("scripts/");
 
-    const source = [VALIDATOR, GUARD, SYNTHETIC_CHILD]
+    const source = [VALIDATOR, GUARD, SYNTHETIC_CHILD, CI_PNPM, INSTALL_PACKED_ARTIFACT]
       .map(path => readFileSync(path, "utf8"))
       .join("\n");
     expect(source).not.toMatch(/\bph[ctx]_[0-9A-Za-z]+/);
