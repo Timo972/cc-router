@@ -1292,6 +1292,150 @@ describe("mountMessagesCrossProviderRoute crash safety (F1)", () => {
     }
   });
 
+  it("keeps bodyless successful JSON upstream-owned after the client already disconnected", async () => {
+    const privatePrompt = "PRIVATE_BODYLESS_JSON_PROMPT";
+    const account = makeRuntimeAccount("PRIVATE_BODYLESS_JSON_ACCOUNT");
+    const forwardStarted = deferred<void>();
+    const { records, telemetry } = captureIngressTelemetry();
+    const forward: ForwardOpenAI = async opts => {
+      forwardStarted.resolve();
+      await new Promise<void>(resolve => {
+        if (opts.signal?.aborted) resolve();
+        else opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return new Response(null, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const { app, activity, openAIPool } = mountWithPool([account], forward, { telemetry });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({
+        model: "openai/gpt-5.6-luna",
+        max_tokens: 128,
+        messages: [{ role: "user", content: privatePrompt }],
+        stream: false,
+      });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await forwardStarted.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      expect(account.errorCount).toBe(1);
+      expect(account.consecutiveErrors).toBe(1);
+      expect(openAIPool.getGlobalCooldownUntil(account.id)).toBe(0);
+      expect(activity).toEqual([
+        expect.objectContaining({ type: "error", statusCode: 502 }),
+      ]);
+      expect(activity[0]?.details).not.toContain("client-cancelled");
+      expect(records).toContainEqual([
+        "span",
+        "proxy.request",
+        expect.objectContaining({
+          httpStatusCode: 502,
+          outcome: "upstream_error",
+          streamOutcome: "upstream_error",
+        }),
+      ]);
+      expect(records.filter(record => (record as unknown[])[0] === "log")).toEqual([
+        ["log", expect.objectContaining({
+          httpStatusCode: 502,
+          outcome: "upstream_error",
+          reason: "upstream_5xx",
+        })],
+      ]);
+      expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
+      const telemetryWire = JSON.stringify(records);
+      expect(telemetryWire).not.toContain(privatePrompt);
+      expect(telemetryWire).not.toContain(account.id);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  it("keeps bodyless successful text client-owned after the client already disconnected", async () => {
+    const account = makeRuntimeAccount("openai-bodyless-text");
+    const forwardStarted = deferred<void>();
+    const { records, telemetry } = captureIngressTelemetry();
+    const forward: ForwardOpenAI = async opts => {
+      forwardStarted.resolve();
+      await new Promise<void>(resolve => {
+        if (opts.signal?.aborted) resolve();
+        else opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return new Response(null, {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      });
+    };
+    const { app, activity, openAIPool } = mountWithPool([account], forward, { telemetry });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({
+        model: "openai/gpt-5.6-luna",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hi" }],
+        stream: false,
+      });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await forwardStarted.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      expect(account.errorCount).toBe(0);
+      expect(account.consecutiveErrors).toBe(0);
+      expect(activity).toEqual([
+        expect.objectContaining({ type: "route", statusCode: 200 }),
+      ]);
+      expect(activity[0]?.details).toContain("client-cancelled");
+      const telemetryWire = JSON.stringify(records);
+      expect(telemetryWire).toContain('"outcome":"cancelled"');
+      expect(records.filter(record => (record as unknown[])[0] === "log")).toHaveLength(0);
+      expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   it("keeps an explicit response.failed when the client disconnects before EOF", async () => {
     const account = makeRuntimeAccount("openai-victor");
     const failedSent = deferred<void>();

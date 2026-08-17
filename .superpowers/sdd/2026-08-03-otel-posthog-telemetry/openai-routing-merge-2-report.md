@@ -231,3 +231,35 @@ while cancellation cleanup is still joined.
 No unresolved concern. The inherited same-ID refresh-lock observation remains
 outside these final merge-resume rounds. Validation emitted only the existing
 Node `DEP0060` warning.
+
+## Fix Round 4 — bodyless JSON cancellation ownership
+
+Date: 2026-08-17
+
+### RED/GREEN evidence and decision
+
+- RED: the full Messages route/ingress regression observed an already-aborted
+  client before a bodyless 200 `application/json` response arrived; it recorded
+  cancellation and zero account failures. The generic helper and bodyless-text
+  characterizations were already green, locating the fix at the JSON caller.
+- The Messages JSON branch now classifies an absent body as malformed before
+  consulting the transport-neutral cancellation result. It latches upstream
+  ownership and returns the existing safe 502; readable-body abort handling and
+  bodyless text semantics are unchanged.
+- GREEN: all three Round 4 cases passed. The six-file collector/Messages/
+  ingress/telemetry gate passed 174/174 tests.
+
+### Verification and self-review
+
+- `NO_UPDATE_NOTIFIER=1 pnpm test`: 67 files, 1078/1078 tests passed in the one
+  required full-suite run. `pnpm lint`, `pnpm build`, and `git diff --check`
+  passed; the six-file privacy/bootstrap/exporter gate passed 111/111.
+- Self-review confirmed one effective safe 502, one account failure, closed
+  upstream-error activity/telemetry with no raw prompt/account data, no invented
+  cooldown, and no changes to readable-stream cancellation, SSE ownership,
+  bounds/backpressure, terminal parsing, malformed-delta cleanup, or routing.
+
+### Fix Round 4 concerns
+
+No unresolved concern. Validation emitted only the existing Node `DEP0060`
+warning; all network-capable validation remained inside loopback harnesses.

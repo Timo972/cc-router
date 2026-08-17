@@ -210,6 +210,14 @@ async function sendOpenAIAsAnthropic(
     return { statusCode: upstream.status };
   }
 
+  // A successful JSON response with no body is intrinsically malformed. The
+  // generic bounded reader treats a bodyless response observed after abort as
+  // cancellation so bodyless text keeps its existing passthrough ownership;
+  // classify the stricter JSON contract here before that transport-neutral
+  // result can hide the upstream protocol failure.
+  if (!upstream.body) {
+    return sendBoundedUpstreamFailure(res, report, "Malformed upstream JSON body");
+  }
   const read = await readBodyWithinLimit(upstream, MAX_CODEX_COLLECTED_RESPONSE_BYTES, signal);
   if (read.kind === "overflow") return sendBoundedUpstreamFailure(res, report, RESPONSE_SIZE_ERROR);
   if (read.kind === "cancelled") return { statusCode: upstream.status };

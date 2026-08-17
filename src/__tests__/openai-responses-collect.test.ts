@@ -29,6 +29,14 @@ function sseResponse(chunks: string[], init?: ResponseInit): Response {
 }
 
 describe("readBodyWithinLimit", () => {
+  it("keeps an already-aborted bodyless response transport-owned as cancellation", async () => {
+    const abort = new AbortController();
+    abort.abort();
+
+    await expect(readBodyWithinLimit(new Response(null), 1024, abort.signal))
+      .resolves.toEqual({ kind: "cancelled" });
+  });
+
   it("joins a real stream's deferred cancellation after abort resolves the pending read as EOF", async () => {
     const pullStarted = deferred<void>();
     const cancelStarted = deferred<void>();
