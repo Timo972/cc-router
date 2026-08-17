@@ -492,6 +492,31 @@ describe("serialize", () => {
     const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
     expect(parsed[0].provider).toBe("anthropic_subscription");
   });
+
+  it("persists the terminal authExpired flag so a dead account is not retried after a restart", () => {
+    writeAccountsAtomic([sampleRecord]);
+    const [account] = loadAccounts();
+    account.authExpired = true;
+
+    writeAnthropicAccountsPreservingOtherProviders(serialize([account]));
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].authExpired).toBe(true);
+    // And it survives the read back — the restarted process starts with the
+    // account already marked expired.
+    expect(readAccountsFromPath(accountsPath())[0].authExpired).toBe(true);
+  });
+
+  it("leaves authExpired unset for a healthy account and for legacy records", () => {
+    writeAccountsAtomic([sampleRecord]);
+    const [account] = loadAccounts();
+
+    writeAnthropicAccountsPreservingOtherProviders(serialize([account]));
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].authExpired).toBeUndefined();
+    expect(readAccountsFromPath(accountsPath())[0].authExpired).toBe(false);
+  });
 });
 
 describe("loadOpenAIAccounts", () => {

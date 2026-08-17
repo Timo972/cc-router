@@ -327,6 +327,7 @@ function deserialize(records: AccountRecord[]): Account[] {
     lastUsed: 0,
     lastRefresh: 0,
     consecutiveErrors: 0,
+    authExpired: a.authExpired === true,
     rateLimits: { ...DEFAULT_RATE_LIMITS },
     enabled: a.enabled !== false,                         // default true
     sessionLimitPercent: a.sessionLimitPercent !== undefined
@@ -350,5 +351,6 @@ export function serialize(accounts: Account[]): AccountRecord[] {
     enabled: a.enabled,
     sessionLimitPercent: a.sessionLimitPercent,
     weeklyLimitPercent: a.weeklyLimitPercent,
+    ...(a.authExpired ? { authExpired: true } : {}),
   }));
 }
