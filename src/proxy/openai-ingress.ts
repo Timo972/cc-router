@@ -194,6 +194,7 @@ export interface OpenAIIngressOptions {
     res: Response,
     entry: LogEntry,
     report: OpenAIRelayReport,
+    signal: AbortSignal,
   ) => Promise<OpenAIIngressRelayResult>;
   /** Invoked (best-effort, fire-and-forget from the caller's perspective)
    * when a relayed upstream response carries a 401 — lets the caller kick
@@ -541,7 +542,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   let relayFailed = false;
   const relayReport: OpenAIRelayReport = { upstreamReportedFailure: false };
   try {
-    const result = await relay(upstream, res, entry, relayReport);
+    const result = await relay(upstream, res, entry, relayReport, clientGone.signal);
     finalStatus = result.statusCode;
   } catch (error) {
     // Never let a relay failure become an unhandled rejection. Only send a

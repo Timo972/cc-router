@@ -12,6 +12,7 @@ import { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { applyCodexRateLimits, createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
 import { parseCodexRateLimits } from "../providers/openai/usage.js";
 import type { LogEntry } from "../proxy/stats.js";
+import type { OpenAIIngressTelemetry } from "../proxy/openai-ingress.js";
 
 type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean; signal?: AbortSignal }) => Promise<Response>;
 
@@ -70,10 +71,28 @@ function mountWithPool(
   return { app, openAIPool, openAIRouter, activity };
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+function captureIngressTelemetry() {
+  const records: unknown[] = [];
+  const telemetry: OpenAIIngressTelemetry = {
+    annotateActiveSpan: (...values) => { records.push(["span", ...values]); },
+    recordSafeLog: (...values) => { records.push(["log", ...values]); },
+    recordUnexpectedException: (...values) => { records.push(["exception", ...values]); },
+  };
+  return { records, telemetry };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>(done => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
 }
 
 function postMessages(baseUrl: string, body: Record<string, unknown>, headers: Record<string, string> = {}) {
@@ -508,6 +527,121 @@ describe("mountMessagesCrossProviderRoute", () => {
     expect(upstream.cancel).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    ["JSON", "application/json"],
+    ["text", "text/plain"],
+  ])("keeps a client-aborted bounded %s body read owned by the client", async (_name, contentType) => {
+    const account = makeRuntimeAccount("openai-victor");
+    const { records, telemetry } = captureIngressTelemetry();
+    const readStarted = deferred<void>();
+    const pendingRead = deferred<ReadableStreamReadResult<Uint8Array>>();
+    const reader = {
+      read: vi.fn(() => {
+        readStarted.resolve();
+        return pendingRead.promise;
+      }),
+      cancel: vi.fn(async () => undefined),
+    };
+    const forward: ForwardOpenAI = async opts => {
+      opts.signal?.addEventListener("abort", () => {
+        pendingRead.reject(new Error("PRIVATE_CLIENT_ABORT_BODY"));
+      }, { once: true });
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": contentType }),
+        body: { getReader: () => reader },
+      } as unknown as Response;
+    };
+    const { app, activity, openAIPool } = mountWithPool([account], forward, { telemetry });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({
+        model: "openai/gpt-5.5",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hi" }],
+        stream: false,
+      });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await readStarted.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      expect(reader.cancel).toHaveBeenCalledOnce();
+      expect(account.errorCount).toBe(0);
+      expect(account.consecutiveErrors).toBe(0);
+      expect(openAIPool.getGlobalCooldownUntil(account.id)).toBe(0);
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "route", statusCode: 200 }));
+      expect(activity[0]?.details).toContain("client-cancelled");
+      const telemetryWire = JSON.stringify(records);
+      expect(telemetryWire).toContain('"outcome":"cancelled"');
+      expect(records.filter(record => (record as unknown[])[0] === "log")).toHaveLength(0);
+      expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
+      expect(telemetryWire).not.toContain("PRIVATE_CLIENT_ABORT_BODY");
+    } finally {
+      client?.destroy();
+      pendingRead.resolve({ value: undefined, done: true });
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  it("keeps a true bounded body reader rejection as one safe upstream failure", async () => {
+    const privateFailure = "PRIVATE_TRUE_BODY_REJECTION";
+    const reader = {
+      read: vi.fn(async () => { throw new Error(privateFailure); }),
+      cancel: vi.fn(async () => undefined),
+    };
+    const account = makeRuntimeAccount("openai-victor");
+    const { records, telemetry } = captureIngressTelemetry();
+    const { app, activity } = mountWithPool(
+      [account],
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        body: { getReader: () => reader },
+      }) as unknown as Response,
+      { telemetry },
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Malformed upstream stream" },
+      });
+      expect(JSON.stringify(body)).not.toContain(privateFailure);
+    });
+
+    expect(reader.read).toHaveBeenCalledOnce();
+    expect(account.errorCount).toBe(1);
+    expect(account.consecutiveErrors).toBe(1);
+    expect(activity).toEqual([expect.objectContaining({ type: "error", statusCode: 502 })]);
+    expect(records.filter(record => (record as unknown[])[0] === "log")).toHaveLength(1);
+    expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
+    expect(JSON.stringify(records)).not.toContain(privateFailure);
+  });
+
   it("cancels an unterminated collected SSE frame after 64 KiB", async () => {
     const frame = 'data: {"type":"response.output_text.delta","delta":"PRIVATE_FRAME_'
       + "x".repeat(64 * 1024);
@@ -561,6 +695,82 @@ describe("mountMessagesCrossProviderRoute", () => {
       });
     });
     expect(upstream.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["number", 7],
+    ["object", { private: "PRIVATE_OBJECT_DELTA" }],
+    ["array", ["PRIVATE_ARRAY_DELTA"]],
+  ])("safely rejects a collected %s delta and joins reader cancellation before releasing its lease", async (_name, delta) => {
+    const account = makeRuntimeAccount("openai-victor");
+    const { records, telemetry } = captureIngressTelemetry();
+    const cancelFinished = deferred<void>();
+    const cancel = vi.fn(() => cancelFinished.promise);
+    const wire = new TextEncoder().encode(
+      'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'
+      + `data: ${JSON.stringify({ type: "response.output_text.delta", delta })}\n\n`,
+    );
+    let reads = 0;
+    const reader = {
+      read: vi.fn(async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+        if (reads++ === 0) return { value: wire, done: false };
+        return { value: undefined, done: true };
+      }),
+      cancel,
+    };
+    const { app, activity, openAIPool } = mountWithPool(
+      [account],
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body: { getReader: () => reader },
+      }) as unknown as Response,
+      { telemetry },
+    );
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let pendingResponse: Promise<Response> | undefined;
+
+    try {
+      await withServer(app, async baseUrl => {
+        let responseSettled = false;
+        pendingResponse = postMessages(baseUrl, { stream: false });
+        void pendingResponse.finally(() => { responseSettled = true; });
+
+        await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+        expect(responseSettled).toBe(false);
+        expect(activity).toEqual([]);
+        expect(openAIPool.getInFlight(account.id)).toBe(1);
+
+        cancelFinished.resolve();
+        const res = await pendingResponse;
+        expect(res.status).toBe(502);
+        const body = await res.json();
+        expect(body).toEqual({
+          type: "error",
+          error: { type: "upstream_error", message: "Malformed upstream stream" },
+        });
+        expect(JSON.stringify(body)).not.toContain("PRIVATE_");
+      });
+    } finally {
+      cancelFinished.resolve();
+      await pendingResponse?.catch(() => undefined);
+      const consoleWire = JSON.stringify(consoleLog.mock.calls);
+      expect(consoleWire).not.toContain("PRIVATE_OBJECT_DELTA");
+      expect(consoleWire).not.toContain("PRIVATE_ARRAY_DELTA");
+      consoleLog.mockRestore();
+    }
+
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(openAIPool.getInFlight(account.id)).toBe(0);
+    expect(account.errorCount).toBe(1);
+    expect(account.consecutiveErrors).toBe(1);
+    expect(activity).toEqual([expect.objectContaining({ type: "error", statusCode: 502 })]);
+    const telemetryWire = JSON.stringify(records);
+    expect(records.filter(record => (record as unknown[])[0] === "log")).toHaveLength(1);
+    expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
+    expect(telemetryWire).not.toContain("PRIVATE_OBJECT_DELTA");
+    expect(telemetryWire).not.toContain("PRIVATE_ARRAY_DELTA");
   });
 
   it.each([

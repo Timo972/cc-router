@@ -132,3 +132,50 @@ Date: 2026-08-17
 No unresolved round concern. The inherited same-ID refresh-lock observation is
 still separate. Validation emitted only the existing Node `DEP0060` warning;
 no external provider or PostHog traffic was permitted.
+
+## Fix Round 2 — cancellation ownership and collected-delta cleanup
+
+Date: 2026-08-17
+
+### Review decisions
+
+| Finding | Resolution |
+|---|---|
+| Client-aborted bounded JSON/text reads were reported as upstream failures | Threaded the ingress-owned abort signal into the existing single-reader body collector and added a closed `cancelled` result. Abort now cancels and joins the reader once, returns without synthesizing a response, and leaves final cancellation/account ownership with `runOpenAIIngress`; a reader rejection without that signal remains one safe upstream 502. |
+| Non-string collected deltas could throw before reader cleanup | Validate every output-text delta before byte counting or concatenation. Number, object, array, or missing deltas stop collection as a closed malformed-upstream result, use one idempotent awaited cancellation path, and cannot reach response, console, safe-log, or exception fields. Normal string deltas and completed/incomplete/failed terminals retain the landed routing semantics. |
+| Telemetry evidence was not injectable at the Messages composition boundary | Added the same test-only ingress telemetry dependency already supported by `runOpenAIIngress`. Regressions prove client abort emits cancellation annotations with zero failure diagnostics, while true reader/malformed failures emit exactly one closed safe log and zero exception/raw-value records. |
+
+### RED/GREEN evidence
+
+- RED: five mechanism failures before production adaptation: two client-abort
+  cases missed reader cancellation and three non-string delta cases escaped
+  before cancellation. The true-reader-fault control was already green.
+- The five corresponding final-boundary assertions were then RED until the
+  route passed its injected telemetry dependency through to the ingress.
+- GREEN: all six added cases pass (JSON/text abort, true reader fault, and
+  number/object/array deltas), including deferred cancellation join, lease and
+  account/cooldown ownership, exact diagnostics, privacy canaries, and a
+  normal completed string-delta control.
+
+### Verification and audit
+
+- Response/Messages/ingress/cancellation/telemetry focus: 60 suites, 433/433
+  tests passed. Final full gate: 225 suites, 1073/1073 tests passed with
+  `NO_UPDATE_NOTIFIER=1`.
+- One attempted full command forwarded an unintended literal `--`; its JSON
+  pipe exited before tests completed and Vitest ended with `EPIPE`. The corrected
+  direct Vitest invocation above is the completed full-suite evidence.
+- `pnpm lint`, `pnpm build`, and `git diff --check`: passed. Packed offline
+  bootstrap/privacy gate: 6 suites, 32/32 tests passed with literal-loopback
+  guards; no provider or PostHog endpoint was contacted.
+- Self-review reconfirmed one body reader per path; idempotent cancellation and
+  abort-listener cleanup; no read-ahead during backpressure; bodyless and
+  explicit terminal failure ownership; bounded framing/body/output retention;
+  and no changes to sticky routing, Retry-After, cooldown/LRU, refresh
+  durability, persistence, or shutdown ownership.
+
+### Fix Round 2 concerns
+
+No unresolved round concern. The inherited same-ID refresh-lock observation
+remains the separate follow-up required by the review ruling. Validation emitted
+only the existing Node `DEP0060` warning.

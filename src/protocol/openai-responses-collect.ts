@@ -200,16 +200,32 @@ export const RESPONSE_SIZE_ERROR = "Upstream response exceeded size limit";
 export type BoundedBodyRead =
   | { kind: "complete"; body: string }
   | { kind: "overflow" }
+  | { kind: "cancelled" }
   | { kind: "error" };
 
 export async function readBodyWithinLimit(
   upstream: globalThis.Response,
   maxBytes: number,
+  signal?: AbortSignal,
 ): Promise<BoundedBodyRead> {
   const reader = upstream.body?.getReader();
   if (!reader) return { kind: "complete", body: "" };
   const chunks: Buffer[] = [];
   let totalBytes = 0;
+  let cancelPromise: Promise<void> | undefined;
+  const cancelReader = (): Promise<void> => {
+    cancelPromise ??= reader.cancel().catch(() => undefined);
+    return cancelPromise;
+  };
+  const onAbort = (): void => {
+    void cancelReader();
+  };
+
+  if (signal?.aborted) {
+    await cancelReader();
+    return { kind: "cancelled" };
+  }
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -217,13 +233,19 @@ export async function readBodyWithinLimit(
       if (!value) continue;
       totalBytes += value.byteLength;
       if (totalBytes > maxBytes) {
-        void reader.cancel().catch(() => undefined);
+        await cancelReader();
         return { kind: "overflow" };
       }
       chunks.push(Buffer.from(value));
     }
   } catch {
+    if (signal?.aborted) {
+      await cancelReader();
+      return { kind: "cancelled" };
+    }
     return { kind: "error" };
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
   return { kind: "complete", body: Buffer.concat(chunks, totalBytes).toString("utf8") };
 }
@@ -248,6 +270,9 @@ export async function collectCodexResponseStream(
   if (!upstream.ok || contentType.includes("application/json")) {
     const read = await readBodyWithinLimit(upstream, MAX_CODEX_COLLECTED_RESPONSE_BYTES);
     if (read.kind === "overflow") return upstreamError(RESPONSE_SIZE_ERROR);
+    // This collector does not pass an abort signal, so cancellation is not a
+    // reachable result here. Keep the union exhaustive if a caller adds one.
+    if (read.kind === "cancelled") return upstreamError("Malformed upstream stream");
     if (read.kind === "error") return upstreamError("Malformed upstream stream");
     if (!upstream.ok) {
       onUpstreamFailure?.();
