@@ -1,15 +1,20 @@
+import { anthropicStopReasonForResponse } from "./openai-response-to-anthropic.js";
+import { terminalResponsePayload } from "./openai-responses-collect.js";
+
 interface OpenAIStreamEvent {
   type?: string;
   delta?: string;
   response?: {
     id?: string;
     model?: string;
+    incomplete_details?: { reason?: string };
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
     };
   };
 }
+
 
 type AnthropicStreamEvent = Record<string, unknown>;
 
@@ -70,7 +75,21 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
         ];
       }
 
-      if (event.type === "response.completed") {
+      // Both terminal Responses events must close the Anthropic message.
+      // Emitting nothing for `response.incomplete` would end the HTTP stream
+      // without `message_stop`, leaving the client waiting on a turn that is
+      // already over.
+      //
+      // The same predicate the collector and the usage observer use, not the
+      // event type alone: a terminal frame carrying no response object
+      // (`"response":null`, an array, a string) is not a result, and those two
+      // already treat it as a failed stream. Closing the message here anyway
+      // would emit `stop_reason: end_turn` — telling the client a truncated
+      // turn ended normally, the one outcome worse than a truncated stream.
+      // Emitting nothing ends the body without `message_stop`, which is what
+      // a stream that never reached a terminal event looks like, and what
+      // clients already detect and surface as an error.
+      if (terminalResponsePayload(event) !== undefined) {
         const usage = event.response?.usage ?? {};
         const prefix = textBlockStarted
           ? [{ type: "content_block_stop", index: 0 }]
@@ -80,7 +99,9 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
           ...prefix,
           {
             type: "message_delta",
-            delta: { stop_reason: "end_turn", stop_sequence: null },
+            // Same helper the collected-response translator uses, so an
+            // incomplete turn reports the same stop reason on both paths.
+            delta: { stop_reason: anthropicStopReasonForResponse(event.response), stop_sequence: null },
             usage: { output_tokens: usage.output_tokens ?? 0 },
           },
           { type: "message_stop" },

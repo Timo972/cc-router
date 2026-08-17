@@ -8,7 +8,93 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- OpenAI/Codex sticky session routing: sessions pin to one account for prompt-cache
+  locality (`session_id` → `x-claude-code-session-id` → `prompt_cache_key`), with
+  load- and headroom-aware selection for new sessions.
+- Codex usage tracking from `x-codex-*` response headers: default 5h/weekly windows
+  plus dynamically discovered model-scoped metered buckets, credits, and plan.
+- Scoped cooldowns on upstream failures: bucket-scoped via `x-codex-active-limit`,
+  account-global otherwise; local 429/503 responses when no account is eligible.
+- Dashboard: OpenAI accounts now show 5h/weekly bars, per-bucket rows, credits,
+  plan, request/error/in-flight/session counts, and cooldown state.
+
+### Changed
+
+- OpenAI account records persist `scopes`, `sessionLimitPercent`, and
+  `weeklyLimitPercent`.
+- The stateless OpenAI round-robin picker was removed in favor of
+  `OpenAITokenPool`.
+
+### Fixed
+
+- An unexpected failure partway through an OpenAI request — an upstream
+  connection error, a rejected token refresh, a mid-stream abort — no longer
+  takes down the proxy. Both `/v1/responses` and the `/v1/messages` OpenAI
+  branch awaited the upstream call without catching a rejection, so a single
+  network blip could kill the daemon and lose every account's routing state.
+- `/v1/messages` no longer reports an upstream OpenAI failure as a success. A
+  stream ending in `response.failed`, an `error` event, a JSON error body, or
+  no completion event at all — a stream that stopped mid-flight, or an
+  event-stream response with no body — was translated into an empty Anthropic
+  message with HTTP 200; each now surfaces as an error response, so a rate
+  limit reads as a rate limit instead of an empty assistant turn. A non-2xx
+  upstream response (401, 429, 5xx) is now relayed with its real status, error
+  message, and safe headers — `Retry-After` included, so a client can honor the
+  backoff the server asked for — instead of being parsed as an event stream and
+  reported as a success or a generic failure; non-2xx Codex responses also keep
+  their real content type instead of being rewritten to `text/event-stream`.
+- A terminal event that carries no response object is no longer treated as a
+  successful result. `{"type":"response.completed","response":null}` — or any
+  other non-object payload — satisfied the completion check, so a
+  non-streaming request got HTTP 200 with a `null` body, and `/v1/messages` got
+  a fabricated empty assistant turn; a streamed `/v1/messages` turn was closed
+  with `message_stop` and `end_turn`, telling the client a truncated answer had
+  finished normally. The collected paths now report the `502` that a stream
+  ending without a terminal event already did, and the streamed path ends
+  without `message_stop`, which is what clients already surface as a
+  truncation.
+- A client that disconnects mid-response no longer leaves the upstream Codex
+  request running. Nothing propagated the disconnect, so the relay drained the
+  whole upstream body into a closed socket and held that connection open for a
+  response nobody would receive; the request is now cancelled as soon as the
+  client goes away.
+- A single malformed SSE frame no longer truncates a `/v1/messages` stream.
+  Parsing a chunk was all-or-nothing, so one bad frame discarded the valid
+  events beside it and ended the response as a clean `200` the client could
+  not tell apart from a complete answer.
+- OpenAI credentials are written back to the accounts file the proxy was
+  started with. Under `--accounts <path>` accounts were read from that file
+  but every refresh, add, delete, and update wrote the default
+  `accounts.json` — discarding the change and copying OAuth tokens into an
+  unrelated file.
+- OpenAI token refresh survives a malformed token response. A payload missing
+  `expires_in` produced a `NaN` expiry that read as "never needs refreshing",
+  so the account kept presenting a stale token indefinitely — as did a lifetime
+  large enough to overflow into an infinite expiry, while a zero or negative
+  one reported success on a token that was already due for another refresh.
+  Each is now treated as the failed refresh it is; a failure to
+  persist rotated credentials no longer fails the request that triggered the
+  refresh, and the write is now retried on subsequent requests (and the
+  background refresh loop) until it succeeds, so a rotated refresh token
+  still reaches disk.
+- `PATCH /cc-router/accounts/:id` works for OpenAI accounts instead of
+  returning `404`, so a single OpenAI account can be enabled, disabled, or
+  capped without toggling the whole provider. `POST /cc-router/accounts` now
+  rejects an out-of-range percentage cap the same way `PATCH` does, rather
+  than silently coercing it.
+- A Codex response that ends as `response.incomplete` — e.g. hitting the
+  output-token ceiling — is now delivered with its partial content and token
+  usage instead of being discarded. `/v1/responses` treated only
+  `response.completed` as a terminal event, so `response.incomplete` looked
+  identical to a stream that stopped mid-flight and turned a usable partial
+  answer into a `502 upstream_error`. A streamed `/v1/messages` turn that ends
+  incomplete now closes properly too — the Anthropic translation emitted no
+  `message_stop` for it, leaving the client waiting on a turn that was already
+  over. Both `/v1/messages` paths, streamed or collected, now report
+  `max_tokens` as the stop reason when the output-token ceiling was the cause,
+  instead of an `end_turn` that made a truncated answer look deliberate.
 
 ---
 

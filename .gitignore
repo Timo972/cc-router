@@ -47,3 +47,6 @@ coverage/
 
 # Isolated implementation worktrees
 .worktrees/
+
+# Agent scratch space (task briefs, reports, ledgers)
+.superpowers/

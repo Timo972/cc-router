@@ -43,6 +43,20 @@ interface AccountModelLimitView {
   severity: "" | "warning" | "critical" | "unknown";
 }
 
+export interface CodexRateLimitsView {
+  status: "ok" | "rate_limited";
+  plan: string;
+  buckets: Array<{
+    limitId: string;
+    label: string;
+    primary?: { utilization: number; resetAt: number; windowMinutes: number };
+    secondary?: { utilization: number; resetAt: number; windowMinutes: number };
+    cooldownUntilMs: number;
+  }>;
+  credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  lastUpdated: number;
+}
+
 interface AccountStat {
   id: string;
   provider?: "anthropic_subscription" | "openai_subscription";
@@ -61,6 +75,8 @@ interface AccountStat {
   weeklyLimitPercent?: number;
   globalCooldownUntilMs?: number;
   modelCooldowns?: Array<{ modelFamily: string; untilMs: number }>;
+  codexRateLimits?: CodexRateLimitsView;
+  credentialsPendingWrite?: boolean;
 }
 
 const EMPTY_RL: AccountRateLimitsView = {
@@ -165,6 +181,82 @@ export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" |
     rows.push({ label: "cooldown", state: "global", color: "red", resetAt: Math.floor(account.globalCooldownUntilMs / 1_000) });
   }
   return rows;
+}
+
+function codexWindowLabel(windowMinutes: number, fallback: "5h" | "weekly"): string {
+  // 10_080 minutes reads better as "weekly" than the generic "168h"; 300 needs
+  // no special case because the generic branch already renders it as "5h".
+  if (windowMinutes === 10_080) return "weekly";
+  if (windowMinutes > 0) {
+    return windowMinutes % 60 === 0 ? `${windowMinutes / 60}h` : `${windowMinutes}m`;
+  }
+  return fallback;
+}
+
+/** Named Codex metered buckets as compact capacity rows (default bucket renders as bars). */
+export function getCodexCapacityRows(
+  codex: CodexRateLimitsView | undefined,
+  globalCooldownUntilMs: number | undefined,
+  now = Date.now(),
+): AccountCapacityRow[] {
+  const rows: AccountCapacityRow[] = [];
+  for (const bucket of codex?.buckets ?? []) {
+    if (bucket.limitId === "codex") continue;
+    const cooling = bucket.cooldownUntilMs > now;
+    const windows: Array<{ label: string; utilization: number; resetAt: number }> = [];
+    if (bucket.primary) {
+      windows.push({ label: codexWindowLabel(bucket.primary.windowMinutes, "5h"), ...bucket.primary });
+    }
+    if (bucket.secondary) {
+      windows.push({ label: codexWindowLabel(bucket.secondary.windowMinutes, "weekly"), ...bucket.secondary });
+    }
+
+    for (const window of windows) {
+      const exhausted = window.utilization >= 1;
+      // While cooling, the countdown that matters is the cooldown's own expiry
+      // — it can come from Retry-After and outlast (or replace) the window
+      // reset, and a row labeled "bucket cooldown" showing the window's reset
+      // instant, or no time at all when that reset is unknown, tells the
+      // operator the wrong thing about when routing resumes.
+      const resetAt = cooling
+        ? Math.floor(bucket.cooldownUntilMs / 1000)
+        : window.resetAt;
+      rows.push({
+        label: `${bucket.label} ${window.label}`,
+        state: cooling ? "bucket cooldown" : exhausted ? "exhausted" : "available",
+        color: cooling ? "yellow" : exhausted ? "red" : window.utilization >= 0.7 ? "yellow" : "green",
+        utilization: window.utilization,
+        ...(resetAt > 0 ? { resetAt } : {}),
+      });
+    }
+    if (windows.length === 0 && cooling) {
+      rows.push({
+        label: bucket.label,
+        state: "bucket cooldown",
+        color: "yellow",
+        resetAt: Math.floor(bucket.cooldownUntilMs / 1000),
+      });
+    }
+  }
+  if (globalCooldownUntilMs && globalCooldownUntilMs > now) {
+    rows.push({ label: "cooldown", state: "global", color: "red", resetAt: Math.floor(globalCooldownUntilMs / 1000) });
+  }
+  return rows;
+}
+
+/**
+ * True when an OpenAI/Codex account is hard-blocked from routing: the
+ * account-wide status reports `rate_limited`, or the default bucket
+ * (`limitId === "codex"`) has a fully exhausted primary or secondary window.
+ * Named model-scoped buckets exhausting on their own does not count — the
+ * account can still serve other models via those buckets' fallback.
+ */
+export function isCodexLimited(codex: CodexRateLimitsView | undefined): boolean {
+  if (!codex) return false;
+  if (codex.status === "rate_limited") return true;
+  const defaultBucket = codex.buckets.find(bucket => bucket.limitId === "codex");
+  if (!defaultBucket) return false;
+  return (defaultBucket.primary?.utilization ?? 0) >= 1 || (defaultBucket.secondary?.utilization ?? 0) >= 1;
 }
 
 interface HealthData {
@@ -443,10 +535,6 @@ function LiveDashboard({
 
   const doSetLimit = useCallback(async (field: "sessionLimitPercent" | "weeklyLimitPercent", value: number) => {
     if (!selectedAccount) return;
-    if (selectedAccount.provider === "openai_subscription") {
-      showBanner("OpenAI accounts do not use Anthropic caps", "yellow");
-      return;
-    }
     try {
       await api.patch(selectedAccount.id, { [field]: value });
       const label = field === "sessionLimitPercent" ? "5h cap" : "7d cap";
@@ -595,11 +683,9 @@ function LiveDashboard({
       if (input === "a") { void doToggleProvider("anthropic_subscription"); return; }
       if (input === "o") { void doToggleProvider("openai_subscription"); return; }
       if (input === "w") {
-        if (!selectedAccountIsAnthropic) { showBanner("OpenAI accounts do not use Anthropic caps", "yellow"); return; }
         setMode("editWeekly"); setEditBuffer(""); return;
       }
       if (input === "s") {
-        if (!selectedAccountIsAnthropic) { showBanner("OpenAI accounts do not use Anthropic caps", "yellow"); return; }
         setMode("editSession"); setEditBuffer(""); return;
       }
       if (input === "d") {
@@ -956,8 +1042,13 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
   const rl = a.rateLimits ?? EMPTY_RL;
   const usage = rl.usage;
   const globalCapacity = getGlobalCapacityView(rl);
-  const capacityRows = getAccountCapacityRows(a);
-  const isLimited = rl.status === "rate_limited";
+  const isOpenAI = a.provider === "openai_subscription";
+  const codex = a.codexRateLimits;
+  const codexDefaultBucket = codex?.buckets.find(bucket => bucket.limitId === "codex");
+  const capacityRows = isOpenAI
+    ? getCodexCapacityRows(a.codexRateLimits, a.globalCooldownUntilMs)
+    : getAccountCapacityRows(a);
+  const isLimited = isOpenAI ? isCodexLimited(a.codexRateLimits) : rl.status === "rate_limited";
   const isDisabled = a.enabled === false;
 
   const dot = isDisabled ? "⊘" : isLimited ? "⊘" : a.busy ? "◌" : a.healthy ? "●" : "●";
@@ -970,8 +1061,8 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
     : a.expiresInMs < 30 * 60 * 1000 ? "yellow"
     : "white";
 
-  const providerTag = a.provider === "openai_subscription"
-    ? " [OpenAI]"
+  const providerTag = isOpenAI
+    ? ` [OpenAI${codex?.plan ? ` ${codex.plan}` : ""}]`
     : rl.plan ? ` [${rl.plan}]` : "";
 
   // User-defined caps hint
@@ -985,6 +1076,14 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
   const pointer = selected ? "▶" : " ";
   const nameColor = isDisabled ? "gray" : undefined;
 
+  const creditsLabel = codex?.credits
+    ? codex.credits.unlimited
+      ? "∞"
+      : codex.credits.balance !== undefined
+        ? codex.credits.balance
+        : codex.credits.hasCredits ? "yes" : "no"
+    : undefined;
+
   return (
     <Box flexDirection="column">
       <Box>
@@ -992,7 +1091,7 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
         <Text color={dotColor}> {dot} </Text>
         <Text color={nameColor} dimColor={isDisabled}>{a.id.slice(0, 20).padEnd(20)}</Text>
         <Text color={statusColor}>{statusLabel}</Text>
-        {providerTag && <Text color={a.provider === "openai_subscription" ? "cyan" : "magenta"}>{providerTag.padEnd(10)}</Text>}
+        {providerTag && <Text color={isOpenAI ? "cyan" : "magenta"}>{providerTag.padEnd(10)}</Text>}
         {!providerTag && <Text>{"".padEnd(10)}</Text>}
         <Text color="gray"> req </Text>
         <Text color="white">{String(a.requestCount).padStart(5)}</Text>
@@ -1002,10 +1101,13 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
         <Text color={expiryColor}>{expiryLabel.padEnd(8)}</Text>
         <Text color="gray">  last </Text>
         <Text color="gray">{formatAgo(a.lastUsedMs)}</Text>
-        {a.provider !== "openai_subscription" && (
-          <Text color="gray">  {a.activeSessions ?? 0} active / {a.inFlightRequests ?? 0} streams</Text>
-        )}
+        <Text color="gray">  {a.activeSessions ?? 0} active / {a.inFlightRequests ?? 0} streams</Text>
         {capsHint && <Text color="yellow">{capsHint}</Text>}
+        {a.credentialsPendingWrite && (
+          // The account still works — its rotated token is live in memory — but a
+          // restart before the pending write lands would need a re-login.
+          <Text color="yellow">{"  creds unsaved"}</Text>
+        )}
       </Box>
       {(rl.lastUpdated > 0 || usage) && (
         <Box paddingLeft={4}>
@@ -1027,6 +1129,26 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
           {usage && <Text color={globalCapacity.usageFetchStatus === "fresh" ? "gray" : "yellow"}>
             {`  usage ${globalCapacity.usageFetchStatus} ${usage.fetchedAt > 0 ? formatAgo(usage.fetchedAt) : ""}`}
           </Text>}
+        </Box>
+      )}
+      {isOpenAI && codexDefaultBucket && (codexDefaultBucket.primary || codexDefaultBucket.secondary) && (
+        <Box paddingLeft={4}>
+          <UtilBar
+            label="5h"
+            util={codexDefaultBucket.primary?.utilization ?? 0}
+            resetTs={codexDefaultBucket.primary?.resetAt ?? 0}
+            isActive={false}
+            cap={s5}
+          />
+          <Text>   </Text>
+          <UtilBar
+            label="weekly"
+            util={codexDefaultBucket.secondary?.utilization ?? 0}
+            resetTs={codexDefaultBucket.secondary?.resetAt ?? 0}
+            isActive={false}
+            cap={w7}
+          />
+          {creditsLabel !== undefined && <Text color="gray">{`  credits ${creditsLabel}`}</Text>}
         </Box>
       )}
       {capacityRows.map((row, index) => (

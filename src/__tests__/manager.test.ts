@@ -25,6 +25,7 @@ import {
   upsertAccountRecord,
   removeAccountRecordById,
   saveOpenAIAccounts,
+  saveOpenAIAccountsToPath,
   migrateLegacyAccountProviders,
   setProviderAccountsEnabled,
   serialize,
@@ -355,6 +356,81 @@ describe("saveOpenAIAccounts", () => {
   });
 });
 
+describe("saveOpenAIAccountsToPath", () => {
+  it("writes only the given custom path and leaves the default accounts file untouched", () => {
+    // Baseline: something already exists at the default ACCOUNTS_PATH.
+    writeAccountsAtomic([sampleRecord]);
+    const before = fs.readFileSync(accountsPath(), "utf-8");
+
+    const customPath = `${MOCK_DIR}/custom-accounts.json`;
+    saveOpenAIAccountsToPath(
+      [
+        {
+          id: "openai-custom",
+          provider: "openai_subscription",
+          accessToken: "custom-access",
+          refreshToken: "custom-refresh",
+          expiresAt: 1999999999000,
+          enabled: true,
+        },
+      ],
+      customPath,
+    );
+
+    const custom = JSON.parse(fs.readFileSync(customPath, "utf-8"));
+    expect(custom).toEqual([
+      {
+        id: "openai-custom",
+        provider: "openai_subscription",
+        accessToken: "custom-access",
+        refreshToken: "custom-refresh",
+        expiresAt: 1999999999000,
+        scopes: ["openid", "profile", "email", "offline_access"],
+        enabled: true,
+      },
+    ]);
+
+    // The default accounts.json must be byte-identical to before the call —
+    // a custom-path save must never fall through to the default file.
+    expect(fs.readFileSync(accountsPath(), "utf-8")).toBe(before);
+  });
+
+  it("preserves non-OpenAI records already present at the custom path", () => {
+    const customPath = `${MOCK_DIR}/custom-accounts.json`;
+    fs.writeFileSync(customPath, JSON.stringify([sampleRecord]));
+
+    saveOpenAIAccountsToPath(
+      [
+        {
+          id: "openai-custom",
+          provider: "openai_subscription",
+          accessToken: "custom-access",
+          refreshToken: "custom-refresh",
+          expiresAt: 1999999999000,
+          enabled: true,
+        },
+      ],
+      customPath,
+    );
+
+    const parsed = JSON.parse(fs.readFileSync(customPath, "utf-8"));
+    expect(parsed).toEqual([
+      sampleRecord,
+      {
+        id: "openai-custom",
+        provider: "openai_subscription",
+        accessToken: "custom-access",
+        refreshToken: "custom-refresh",
+        expiresAt: 1999999999000,
+        scopes: ["openid", "profile", "email", "offline_access"],
+        enabled: true,
+      },
+    ]);
+    // The default accounts.json was never created by a custom-path save.
+    expect(fs.existsSync(accountsPath())).toBe(false);
+  });
+});
+
 describe("loadAccounts", () => {
   it("returns empty array when file does not exist", () => {
     expect(loadAccounts()).toEqual([]);
@@ -440,9 +516,32 @@ describe("loadOpenAIAccounts", () => {
         accessToken: "openai-access",
         refreshToken: "openai-refresh",
         expiresAt: 1999999999000,
+        scopes: ["openid", "profile", "email", "offline_access"],
         enabled: true,
       },
     ]);
+  });
+
+  it("round-trips scopes and user caps through load and save", () => {
+    writeAccountsAtomic([
+      {
+        id: "openai-a",
+        provider: "openai_subscription",
+        accessToken: "at",
+        refreshToken: "rt",
+        expiresAt: 1234,
+        scopes: ["openid", "profile"],
+        enabled: true,
+        sessionLimitPercent: 80,
+        weeklyLimitPercent: 90,
+      },
+    ]);
+
+    const loaded = loadOpenAIAccounts(accountsPath());
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]?.scopes).toEqual(["openid", "profile"]);
+    expect(loaded[0]?.sessionLimitPercent).toBe(80);
+    expect(loaded[0]?.weeklyLimitPercent).toBe(90);
   });
 });
 

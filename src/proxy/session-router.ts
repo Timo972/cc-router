@@ -1,7 +1,6 @@
-import type { AccountLease } from "./token-pool.js";
-import { TokenPool } from "./token-pool.js";
+import type { AccountLease, AccountPool, PoolAccount } from "./account-pool.js";
 import { normalizeModelFamily } from "../providers/anthropic/usage.js";
-import type { RouteContext } from "./types.js";
+import type { Account, RouteContext } from "./types.js";
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_ENTRIES = 10_000;
@@ -10,21 +9,25 @@ const MAX_SESSION_ID_BYTES = 256;
 export type RouteReason = "sticky" | "new-session" | "unscoped" | "failover";
 export type ScopedRouteReason = Exclude<RouteReason, "unscoped">;
 
-export interface UnscopedRoutedAccountLease extends AccountLease {
+export interface UnscopedRoutedAccountLease<TAccount extends PoolAccount = Account>
+  extends AccountLease<TAccount> {
   readonly reason: "unscoped";
   readonly modelFamily?: string;
   readonly sessionId?: never;
   readonly bindingGeneration?: never;
 }
 
-export interface ScopedRoutedAccountLease extends AccountLease {
+export interface ScopedRoutedAccountLease<TAccount extends PoolAccount = Account>
+  extends AccountLease<TAccount> {
   readonly reason: ScopedRouteReason;
   readonly modelFamily?: string;
   readonly sessionId: string;
   readonly bindingGeneration: number;
 }
 
-export type RoutedAccountLease = UnscopedRoutedAccountLease | ScopedRoutedAccountLease;
+export type RoutedAccountLease<TAccount extends PoolAccount = Account> =
+  | UnscopedRoutedAccountLease<TAccount>
+  | ScopedRoutedAccountLease<TAccount>;
 
 export interface SessionRouterOptions {
   now?: () => number;
@@ -56,7 +59,7 @@ export function normalizeSessionId(value: unknown): string | undefined {
  * are intentionally process-local and are never exposed for persistence or
  * diagnostics.
  */
-export class SessionRouter {
+export class SessionRouter<TAccount extends PoolAccount = Account> {
   private readonly bindings = new Map<string, SessionBinding>();
   private readonly activeSessionCounts = new Map<string, number>();
   private readonly now: () => number;
@@ -65,7 +68,7 @@ export class SessionRouter {
   private nextBindingGeneration = 1;
 
   constructor(
-    private readonly pool: TokenPool,
+    private readonly pool: AccountPool<TAccount>,
     options: SessionRouterOptions = {},
   ) {
     this.now = options.now ?? Date.now;
@@ -80,7 +83,7 @@ export class SessionRouter {
     }
   }
 
-  acquire(sessionHeader: unknown, context?: RouteContext): RoutedAccountLease {
+  acquire(sessionHeader: unknown, context?: RouteContext): RoutedAccountLease<TAccount> {
     const sessionId = normalizeSessionId(sessionHeader);
     const modelFamily = normalizeModelFamily(context?.modelFamily);
     const now = this.now();
@@ -158,7 +161,10 @@ export class SessionRouter {
     return new Map(this.activeSessionCounts);
   }
 
-  private wrapUnscoped(lease: AccountLease, modelFamily?: string): UnscopedRoutedAccountLease {
+  private wrapUnscoped(
+    lease: AccountLease<TAccount>,
+    modelFamily?: string,
+  ): UnscopedRoutedAccountLease<TAccount> {
     return {
       account: lease.account,
       fallback: lease.fallback,
@@ -169,12 +175,12 @@ export class SessionRouter {
   }
 
   private wrapScoped(
-    lease: AccountLease,
+    lease: AccountLease<TAccount>,
     reason: ScopedRouteReason,
     sessionId: string,
     bindingGeneration: number,
     modelFamily?: string,
-  ): ScopedRoutedAccountLease {
+  ): ScopedRoutedAccountLease<TAccount> {
     return {
       account: lease.account,
       fallback: lease.fallback,
