@@ -530,29 +530,27 @@ describe("mountMessagesCrossProviderRoute", () => {
   it.each([
     ["JSON", "application/json"],
     ["text", "text/plain"],
-  ])("keeps a client-aborted bounded %s body read owned by the client", async (_name, contentType) => {
+  ])("joins real-stream cancellation and keeps a client-aborted bounded %s body read owned by the client", async (_name, contentType) => {
     const account = makeRuntimeAccount("openai-victor");
     const { records, telemetry } = captureIngressTelemetry();
     const readStarted = deferred<void>();
-    const pendingRead = deferred<ReadableStreamReadResult<Uint8Array>>();
-    const reader = {
-      read: vi.fn(() => {
+    const cancelStarted = deferred<void>();
+    const cancelFinished = deferred<void>();
+    let cancelCalls = 0;
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      pull() {
         readStarted.resolve();
-        return pendingRead.promise;
-      }),
-      cancel: vi.fn(async () => undefined),
-    };
-    const forward: ForwardOpenAI = async opts => {
-      opts.signal?.addEventListener("abort", () => {
-        pendingRead.reject(new Error("PRIVATE_CLIENT_ABORT_BODY"));
-      }, { once: true });
-      return {
-        ok: true,
-        status: 200,
-        headers: new Headers({ "content-type": contentType }),
-        body: { getReader: () => reader },
-      } as unknown as Response;
-    };
+      },
+      cancel() {
+        cancelCalls++;
+        cancelStarted.resolve();
+        return cancelFinished.promise;
+      },
+    }, { highWaterMark: 0 });
+    const forward: ForwardOpenAI = async () => new Response(upstreamBody as BodyInit, {
+      status: 200,
+      headers: { "content-type": contentType },
+    });
     const { app, activity, openAIPool } = mountWithPool([account], forward, { telemetry });
     const server = createServer(app);
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -582,10 +580,14 @@ describe("mountMessagesCrossProviderRoute", () => {
       await readStarted.promise;
       client!.destroy();
       await clientClosed;
+      await cancelStarted.promise;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(activity).toEqual([]);
+      cancelFinished.resolve();
       await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
       await vi.waitFor(() => expect(activity).toHaveLength(1));
 
-      expect(reader.cancel).toHaveBeenCalledOnce();
+      expect(cancelCalls).toBe(1);
       expect(account.errorCount).toBe(0);
       expect(account.consecutiveErrors).toBe(0);
       expect(openAIPool.getGlobalCooldownUntil(account.id)).toBe(0);
@@ -595,10 +597,9 @@ describe("mountMessagesCrossProviderRoute", () => {
       expect(telemetryWire).toContain('"outcome":"cancelled"');
       expect(records.filter(record => (record as unknown[])[0] === "log")).toHaveLength(0);
       expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
-      expect(telemetryWire).not.toContain("PRIVATE_CLIENT_ABORT_BODY");
     } finally {
       client?.destroy();
-      pendingRead.resolve({ value: undefined, done: true });
+      cancelFinished.resolve();
       await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
     }
   });

@@ -3,8 +3,15 @@ import {
   collectCodexResponseStream,
   createCodexResponseTerminalObserver,
   createCodexUsageObserver,
+  readBodyWithinLimit,
   usageFromResponseBody,
 } from "../protocol/openai-responses-collect.js";
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
 
 function sseResponse(chunks: string[], init?: ResponseInit): Response {
   const encoder = new TextEncoder();
@@ -20,6 +27,58 @@ function sseResponse(chunks: string[], init?: ResponseInit): Response {
     ...init,
   });
 }
+
+describe("readBodyWithinLimit", () => {
+  it("joins a real stream's deferred cancellation after abort resolves the pending read as EOF", async () => {
+    const pullStarted = deferred<void>();
+    const cancelStarted = deferred<void>();
+    const cancelFinished = deferred<void>();
+    let cancelCalls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull() {
+        pullStarted.resolve();
+      },
+      cancel() {
+        cancelCalls++;
+        cancelStarted.resolve();
+        return cancelFinished.promise;
+      },
+    }, { highWaterMark: 0 });
+    const abort = new AbortController();
+    const pending = readBodyWithinLimit(new Response(stream as BodyInit), 1024, abort.signal);
+    let settled = false;
+    void pending.finally(() => { settled = true; });
+
+    await pullStarted.promise;
+    abort.abort();
+    await cancelStarted.promise;
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+    } finally {
+      cancelFinished.resolve();
+    }
+
+    expect(await pending).toEqual({ kind: "cancelled" });
+    expect(cancelCalls).toBe(1);
+  });
+
+  it("keeps an upstream stream failure observed before a same-tick abort upstream-owned", async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(next) {
+        controller = next;
+      },
+    }, { highWaterMark: 0 });
+    const abort = new AbortController();
+    const pending = readBodyWithinLimit(new Response(stream as BodyInit), 1024, abort.signal);
+
+    controller.error(new Error("PRIVATE_UPSTREAM_READ_FAILURE"));
+    abort.abort();
+
+    expect(await pending).toEqual({ kind: "error" });
+  });
+});
 
 describe("collectCodexResponseStream", () => {
   it("returns the verbatim response.completed object as JSON", async () => {

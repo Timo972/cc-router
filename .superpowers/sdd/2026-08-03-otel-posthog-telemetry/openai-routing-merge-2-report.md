@@ -179,3 +179,55 @@ Date: 2026-08-17
 No unresolved round concern. The inherited same-ID refresh-lock observation
 remains the separate follow-up required by the review ruling. Validation emitted
 only the existing Node `DEP0060` warning.
+
+## Fix Round 3 — Web Streams EOF cancellation ownership
+
+Date: 2026-08-17
+
+### Review decision
+
+The remaining mechanism was reproducible with Node's real `ReadableStream`:
+`reader.cancel()` resolved the pending `read()` as `{ done: true }` before the
+underlying deferred cancellation callback completed. The bounded body reader
+therefore published an empty/partial `complete` result, letting JSON synthesize
+an upstream 502 and letting text return before cleanup.
+
+`readBodyWithinLimit` now races the raw read promise against a trusted local
+abort sentinel, resolves that sentinel before starting cancellation, rechecks
+latched abort state after every read and before completion, and awaits one
+contained idempotent cancellation promise. Listener registration closes the
+pre-registration race and is removed in `finally`. Raw error names, codes, and
+messages do not participate in ownership. A reader rejection that settles
+before a same-tick abort wins the raw promise race and remains upstream-owned,
+while cancellation cleanup is still joined.
+
+### RED/GREEN evidence
+
+- RED: three platform-path regressions after correcting the real-stream fixture
+  to disable eager queue pulls: helper completion preceded deferred cleanup,
+  JSON recorded a false 502/account failure, and text returned before cleanup.
+  A fourth RED proved that a stream error observed before a same-tick abort was
+  incorrectly rewritten as cancellation.
+- GREEN: four Round 3 regression instances pass (helper join, JSON route, text
+  route, and upstream-error ordering). The combined targeted slice also kept
+  the true-reader-fault and all three malformed-delta cleanup shields green:
+  8/8.
+
+### Verification and audit
+
+- Messages/collector/ingress/cancellation/telemetry focus: 61 suites, 435/435
+  tests passed. `NO_UPDATE_NOTIFIER=1` full gate: 226 suites, 1075/1075 tests
+  passed in one completed run.
+- `pnpm lint`, `pnpm build`, and `git diff --check`: passed. Packed offline
+  bootstrap/privacy gate: 6 suites, 32/32 tests passed under literal-loopback
+  guards; no external provider or PostHog traffic was permitted.
+- Self-review reconfirmed exactly one body reader, one cancellation start/join,
+  contained cancellation rejection, trusted-signal provenance, listener
+  cleanup, no raw body/error telemetry, and no change to routing, cooldown,
+  terminal-event, persistence, or shutdown ownership.
+
+### Fix Round 3 concerns
+
+No unresolved concern. The inherited same-ID refresh-lock observation remains
+outside these final merge-resume rounds. Validation emitted only the existing
+Node `DEP0060` warning.

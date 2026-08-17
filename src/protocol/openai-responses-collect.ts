@@ -209,26 +209,65 @@ export async function readBodyWithinLimit(
   signal?: AbortSignal,
 ): Promise<BoundedBodyRead> {
   const reader = upstream.body?.getReader();
-  if (!reader) return { kind: "complete", body: "" };
+  if (!reader) return signal?.aborted ? { kind: "cancelled" } : { kind: "complete", body: "" };
   const chunks: Buffer[] = [];
   let totalBytes = 0;
+  let cancellationStarted = false;
   let cancelPromise: Promise<void> | undefined;
   const cancelReader = (): Promise<void> => {
-    cancelPromise ??= reader.cancel().catch(() => undefined);
-    return cancelPromise;
+    if (!cancellationStarted) {
+      cancellationStarted = true;
+      try {
+        cancelPromise = Promise.resolve(reader.cancel()).catch(() => undefined);
+      } catch {
+        cancelPromise = Promise.resolve();
+      }
+    }
+    return cancelPromise!;
   };
+  const abortSentinel = Symbol("body-read-aborted");
+  let resolveAbort!: (value: typeof abortSentinel) => void;
+  const abortPromise = new Promise<typeof abortSentinel>(resolve => {
+    resolveAbort = resolve;
+  });
+  let abortObserved = false;
   const onAbort = (): void => {
+    if (abortObserved) return;
+    abortObserved = true;
+    // Resolve the trusted local sentinel before cancellation can make a
+    // pending Web Streams read look like an ordinary `{ done: true }` EOF.
+    resolveAbort(abortSentinel);
     void cancelReader();
   };
 
-  if (signal?.aborted) {
-    await cancelReader();
-    return { kind: "cancelled" };
-  }
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
+    // Covers an abort that happened before registration or in the narrow gap
+    // between listener registration and this check.
+    if (signal?.aborted) onAbort();
+    if (abortObserved) {
+      await cancelReader();
+      return { kind: "cancelled" };
+    }
+
     while (true) {
-      const { value, done } = await reader.read();
+      let outcome: ReadableStreamReadResult<Uint8Array> | typeof abortSentinel;
+      try {
+        // Race the raw read promise, rather than a mapped derivative, so a
+        // genuine reader rejection that settled before a same-tick abort wins
+        // deterministically and remains upstream-owned.
+        outcome = await Promise.race([reader.read(), abortPromise]);
+      } catch {
+        // A later client abort still has cleanup to join, but cannot rewrite
+        // the upstream read failure that already won the race.
+        if (abortObserved) await cancelReader();
+        return { kind: "error" };
+      }
+      if (outcome === abortSentinel || abortObserved) {
+        await cancelReader();
+        return { kind: "cancelled" };
+      }
+      const { value, done } = outcome;
       if (done) break;
       if (!value) continue;
       totalBytes += value.byteLength;
@@ -238,16 +277,17 @@ export async function readBodyWithinLimit(
       }
       chunks.push(Buffer.from(value));
     }
-  } catch {
-    if (signal?.aborted) {
+    // Web Streams cancellation is allowed to resolve the pending read as EOF;
+    // never publish a partial/empty body until the trusted abort state and its
+    // cleanup promise have both been accounted for.
+    if (abortObserved) {
       await cancelReader();
       return { kind: "cancelled" };
     }
-    return { kind: "error" };
+    return { kind: "complete", body: Buffer.concat(chunks, totalBytes).toString("utf8") };
   } finally {
     signal?.removeEventListener("abort", onAbort);
   }
-  return { kind: "complete", body: Buffer.concat(chunks, totalBytes).toString("utf8") };
 }
 
 /**
