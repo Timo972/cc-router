@@ -689,6 +689,64 @@ describe("mountMessagesCrossProviderRoute crash safety (F1)", () => {
     });
   });
 
+  it("reports a bodyless collected stream as a failure even if the client left first", async () => {
+    const account = makeRuntimeAccount("openai-victor");
+    const forwardStarted = deferred<void>();
+    const forward: ForwardOpenAI = async opts => {
+      forwardStarted.resolve();
+      // Hold the response until the ingress has actually registered the
+      // disconnect — waiting on the client's own close event is not enough,
+      // since the server observes it a tick later. That ordering is the whole
+      // question here: whether a bodyless stream arriving after the hangup
+      // reads as upstream's failure or as ours to ignore.
+      await new Promise<void>(resolve => {
+        if (opts.signal?.aborted) resolve();
+        else opts.signal?.addEventListener("abort", () => resolve());
+      });
+      return new Response(null, { status: 200, headers: { "content-type": "text/event-stream" } });
+    };
+    const { app, activity } = mountWithPool([account], forward);
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({
+        model: "openai/gpt-5.6-luna",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hi" }],
+        stream: false,
+      });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await forwardStarted.promise;
+      client!.destroy();
+      await clientClosed;
+
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+      // An event-stream response with no body is upstream's failure. A client
+      // that happened to leave first does not make it disappear.
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+      expect(account.errorCount).toBe(1);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   it("keeps an explicit response.failed when the client disconnects before EOF", async () => {
     const account = makeRuntimeAccount("openai-victor");
     const failedSent = deferred<void>();

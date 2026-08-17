@@ -188,7 +188,10 @@ async function collectOpenAIStreamAsAnthropicMessage(
   if (!reader) {
     // An event-stream response with no body cannot have reached a terminal
     // event. Reporting it as a failure keeps the caller from fabricating an
-    // empty 200.
+    // empty 200 — and it is upstream's doing, not a truncation a client
+    // disconnect could account for, so the ingress must not write it off as a
+    // cancellation when both happen at once.
+    report.upstreamReportedFailure = true;
     return {
       message: openAIResponseToAnthropicMessage({ id: "", model: "", output: [], usage: {} }),
       usage: undefined,

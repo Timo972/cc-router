@@ -5,7 +5,7 @@ import {
   type AccountPool,
 } from "../../proxy/account-pool.js";
 import type { RouteContext } from "../../proxy/types.js";
-import { bucketForModel, bucketIdForModel, sweepCodexRateLimits, type OpenAIAccount } from "./account-state.js";
+import { bucketForModel, bucketIdForModel, sweepCodexRateLimits, type CodexCooldownCause, type OpenAIAccount } from "./account-state.js";
 import { DEFAULT_CODEX_LIMIT_ID, type CodexLimitBucket, type CodexRateWindow } from "./usage.js";
 
 const MAX_TRUSTED_RATE_LIMIT_RESET_MS = 8 * 24 * 60 * 60 * 1_000;
@@ -15,6 +15,7 @@ const MAX_BUCKET_COOLDOWN_ENTRIES = 16;
 
 interface OpenAICooldowns {
   globalUntil: number;
+  globalCause: CodexCooldownCause;
   bucketUntil: Map<string, number>;
 }
 
@@ -99,10 +100,20 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     return this.inFlight.get(accountId) ?? 0;
   }
 
-  setGlobalCooldownForAccount(account: OpenAIAccount, durationMs: number): void {
+  setGlobalCooldownForAccount(
+    account: OpenAIAccount,
+    durationMs: number,
+    cause: CodexCooldownCause,
+  ): void {
     const expiry = this.proposedExpiry(account, durationMs);
     if (expiry === undefined) return;
     const state = this.cooldownsFor(account);
+    // A live rate-limit cooldown keeps its cause whatever else goes wrong
+    // afterwards: the quota is still spent, and downgrading to "unavailable"
+    // would drop the `Retry-After` a client can actually act on. An expired
+    // one carries nothing forward.
+    const stillRateLimited = state.globalUntil > this.now() && state.globalCause === "rate_limit";
+    state.globalCause = stillRateLimited ? "rate_limit" : cause;
     state.globalUntil = Math.max(state.globalUntil, expiry);
   }
 
@@ -239,11 +250,21 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     const nowMs = this.now();
     const timedBlockers: number[] = [];
     let hasIndefiniteBlocker = false;
+    // Two separate questions. `blocked` decides whether this account can take
+    // the request at all; `rateLimited` decides what a caller is told when no
+    // account can. Every blocker answers the first — only a spent quota
+    // answers the second, because only that is something the caller can wait
+    // out, and only that carries a `Retry-After` worth honouring.
+    let blocked = false;
     let rateLimited = false;
 
     const state = this.cooldowns.get(account);
     if (state !== undefined && state.globalUntil > nowMs) {
-      rateLimited = true;
+      blocked = true;
+      // A 401, a 503/529 overload, or a local refresh failure blocks just as
+      // hard, but answering 429 for quota the caller never spent sends it
+      // looking in entirely the wrong place.
+      if (state.globalCause === "rate_limit") rateLimited = true;
       timedBlockers.push(state.globalUntil);
     }
 
@@ -263,6 +284,8 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     if (modelLimitId !== undefined) {
       const bucketCooldown = state?.bucketUntil.get(modelLimitId) ?? 0;
       if (bucketCooldown > nowMs) {
+        // Bucket cooldowns come only from a 429 naming an active limit.
+        blocked = true;
         rateLimited = true;
         timedBlockers.push(bucketCooldown);
       }
@@ -275,13 +298,16 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     }
 
     for (const window of blockingWindows) {
+      // An exhausted usage window is a spent quota by definition.
+      blocked = true;
       rateLimited = true;
       const resetMs = trustworthyResetMs(window.resetAt, nowMs);
       if (resetMs !== undefined) timedBlockers.push(resetMs);
       else hasIndefiniteBlocker = true;
     }
 
-    if (!rateLimited) return null;
+    if (!blocked) return null;
+    if (!rateLimited) return { reason: "unavailable" };
     const retryAtMs = !hasIndefiniteBlocker && timedBlockers.length > 0
       ? Math.max(...timedBlockers)
       : undefined;
@@ -362,7 +388,7 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
   private cooldownsFor(account: OpenAIAccount): OpenAICooldowns {
     let state = this.cooldowns.get(account);
     if (!state) {
-      state = { globalUntil: 0, bucketUntil: new Map() };
+      state = { globalUntil: 0, globalCause: "rate_limit", bucketUntil: new Map() };
       this.cooldowns.set(account, state);
     }
     return state;

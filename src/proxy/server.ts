@@ -841,7 +841,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         accountIds: isAnthropic
           ? pool.getAll().map(account => account.id)
           : openAIAccounts.map(account => account.id),
-        persist: () => setProviderAccountsEnabled(provider, enabled, accountsPath),
+        // OpenAI accounts are written from the live pool rather than by
+        // rewriting whatever is on disk. A refresh may have rotated
+        // credentials that never reached a file, and re-serializing that
+        // stale record would report this PATCH a success while the only
+        // valid refresh token stayed in memory — one crash from forcing a
+        // re-login. Going through the live persister saves it and clears the
+        // pending marker. Anthropic has no such in-memory rotation to lose.
+        persist: () => (isAnthropic
+          ? setProviderAccountsEnabled(provider, enabled, accountsPath)
+          : persistOpenAIAccounts(openAIAccounts)),
         invalidateAccount: accountId => (isAnthropic ? sessionRouter : openAIRouter)
           .invalidateAccount(accountId),
       });

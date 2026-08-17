@@ -60,6 +60,16 @@ export interface OpenAIAccount extends OpenAISubscriptionAccount {
 }
 
 /**
+ * Why an account is being held out of rotation account-wide.
+ *
+ * `rate_limit` is the only cause that may reach a client as a 429 with a
+ * `Retry-After`: it is the one that means "this account's quota is spent".
+ * A 401, a 503/529 overload, or a local refresh failure blocks just as hard
+ * but for reasons a caller cannot wait out as quota.
+ */
+export type CodexCooldownCause = "rate_limit" | "unavailable";
+
+/**
  * A model→bucket association and the timestamp of the evidence behind it —
  * either a 429's `x-codex-active-limit` or the `lastSeenAt` of a bucket
  * snapshot naming the model. Recency is what lets `bucketIdForModel` decide

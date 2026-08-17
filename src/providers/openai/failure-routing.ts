@@ -5,7 +5,7 @@ import {
   type BindingInvalidator,
   type FailureRoute,
 } from "../../proxy/lease-lifecycle.js";
-import { boundResetlessExhaustedWindows, learnModelBucket, type OpenAIAccount } from "./account-state.js";
+import { boundResetlessExhaustedWindows, learnModelBucket, type CodexCooldownCause, type OpenAIAccount } from "./account-state.js";
 import { DEFAULT_CODEX_LIMIT_ID, resolveActiveLimit } from "./usage.js";
 
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60_000;
@@ -13,7 +13,11 @@ const AUTH_FAILURE_COOLDOWN_MS = 30_000;
 const OVERLOAD_COOLDOWN_MS = 30_000;
 
 export interface CodexCooldownSetter {
-  setGlobalCooldownForAccount(account: OpenAIAccount, durationMs: number): void;
+  setGlobalCooldownForAccount(
+    account: OpenAIAccount,
+    durationMs: number,
+    cause: CodexCooldownCause,
+  ): void;
   setBucketCooldownForAccount(account: OpenAIAccount, limitId: string, durationMs: number): void;
 }
 
@@ -183,7 +187,7 @@ export function applyCodexFailureRouting(
       return { cooldownSeconds: durationMs / 1_000, limitingScope: `bucket:${activeLimit}` };
     }
     const durationMs = rateLimitCooldownMs(failureHeaders, route.account, DEFAULT_CODEX_LIMIT_ID, nowMs);
-    pool.setGlobalCooldownForAccount(route.account, durationMs);
+    pool.setGlobalCooldownForAccount(route.account, durationMs, "rate_limit");
     boundResetlessExhaustedWindows(route.account, DEFAULT_CODEX_LIMIT_ID, nowMs + durationMs);
     route.account.rateLimits.status = "rate_limited";
     return { cooldownSeconds: durationMs / 1_000, limitingScope: "global" };
@@ -192,6 +196,8 @@ export function applyCodexFailureRouting(
   const durationMs = status === 401
     ? AUTH_FAILURE_COOLDOWN_MS
     : overloadCooldownMs(failureHeaders, route.account, nowMs);
-  pool.setGlobalCooldownForAccount(route.account, durationMs);
+  // Neither an auth failure nor an upstream overload is a spent quota, so
+  // neither may surface to a client as a rate limit.
+  pool.setGlobalCooldownForAccount(route.account, durationMs, "unavailable");
   return { cooldownSeconds: durationMs / 1_000, limitingScope: "global" };
 }

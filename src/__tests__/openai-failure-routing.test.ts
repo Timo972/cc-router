@@ -49,7 +49,7 @@ describe("applyCodexFailureRouting", () => {
       "gpt-5.6-sol", router, pool, () => NOW_MS,
     );
     expect(router.invalidate).toHaveBeenCalledWith("s1", "openai-a", 7);
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 60_000);
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 60_000, "rate_limit");
     expect(result).toEqual({ cooldownSeconds: 60, limitingScope: "global" });
     expect(account.rateLimits.status).toBe("rate_limited");
   });
@@ -84,7 +84,7 @@ describe("applyCodexFailureRouting", () => {
     // The primary-reset header carries no accompanying used-percent, so that
     // window isn't known to be exhausted — Retry-After is the only trusted
     // candidate, not the furthest-out reset merely because it was mentioned.
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 120_000);
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 120_000, "rate_limit");
   });
 
   it("waits out only the reset(s) of windows reported exhausted (used-percent >= 100)", () => {
@@ -99,7 +99,7 @@ describe("applyCodexFailureRouting", () => {
       },
       { account }, undefined, makeRouter(), pool, () => NOW_MS,
     );
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 18_000_000);
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 18_000_000, "rate_limit");
   });
 
   it("waits out the later reset when both windows are reported exhausted", () => {
@@ -115,7 +115,7 @@ describe("applyCodexFailureRouting", () => {
       },
       { account }, undefined, makeRouter(), pool, () => NOW_MS,
     );
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 604_800_000);
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 604_800_000, "rate_limit");
   });
 
   it("falls back to the soonest known window reset when nothing is reported exhausted", () => {
@@ -129,7 +129,7 @@ describe("applyCodexFailureRouting", () => {
       },
       { account }, undefined, makeRouter(), pool, () => NOW_MS,
     );
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 18_000_000);
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 18_000_000, "rate_limit");
   });
 
   it("uses the snapshot bucket reset when headers carry none", () => {
@@ -140,7 +140,7 @@ describe("applyCodexFailureRouting", () => {
     }, NOW_MS), NOW_MS);
     const pool = makePool();
     applyCodexFailureRouting(429, {}, { account }, undefined, makeRouter(), pool, () => NOW_MS);
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 300_000);
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 300_000, "rate_limit");
   });
 
   it("rejects absurdly distant and negative evidence, falling back to the default", () => {
@@ -151,7 +151,7 @@ describe("applyCodexFailureRouting", () => {
       { "retry-after": "-5", "x-codex-primary-reset-at": String(NOW_SEC + 365 * 24 * 3600) },
       { account }, undefined, makeRouter(), pool, () => NOW_MS,
     );
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 60_000);
+    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(account, 60_000, "rate_limit");
   });
 
   it("401 and overload (503/529) set short account-global cooldowns and invalidate the binding", () => {
@@ -164,6 +164,10 @@ describe("applyCodexFailureRouting", () => {
     expect(applyCodexFailureRouting(529, {}, route, undefined, router, pool, () => NOW_MS).cooldownSeconds).toBe(30);
     expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledTimes(3);
     expect(router.invalidate).toHaveBeenCalledTimes(3);
+    // None of these is a spent quota, so none may reach a client as a 429.
+    for (const call of pool.setGlobalCooldownForAccount.mock.calls) {
+      expect(call[2]).toBe("unavailable");
+    }
   });
 
   it("uses a window's reset-at over its relative fallback when both are present", () => {

@@ -91,10 +91,50 @@ describe("OpenAITokenPool cooldowns", () => {
     let now = NOW_MS;
     const a = makeAccount("a");
     const pool = new OpenAITokenPool([a], { now: () => now });
-    pool.setGlobalCooldownForAccount(a, 60_000);
+    pool.setGlobalCooldownForAccount(a, 60_000, "rate_limit");
     expect(() => pool.acquireBest(new Map())).toThrow(NoEligibleAccountError);
     now += 61_000;
     expect(pool.acquireBest(new Map()).account.id).toBe("a");
+  });
+
+  it("reports a non-quota cooldown as unavailable, not rate limited", () => {
+    let now = NOW_MS;
+    const a = makeAccount("a");
+    const pool = new OpenAITokenPool([a], { now: () => now });
+    // What a 401, a 503/529 overload, or a failed token refresh sets.
+    pool.setGlobalCooldownForAccount(a, 30_000, "unavailable");
+
+    try {
+      pool.acquireBest(new Map());
+      expect.unreachable("acquireBest should throw");
+    } catch (error) {
+      const typed = error as NoEligibleAccountError;
+      // Still blocked — it just isn't a quota the caller can wait out, so it
+      // must not come back as 429 with a Retry-After.
+      expect(typed.reason).toBe("unavailable");
+      expect(typed.retryAtMs).toBeUndefined();
+    }
+
+    now += 31_000;
+    expect(pool.acquireBest(new Map()).account.id).toBe("a");
+  });
+
+  it("keeps a live rate-limit cause when a non-quota failure follows", () => {
+    const a = makeAccount("a");
+    const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
+    pool.setGlobalCooldownForAccount(a, 60_000, "rate_limit");
+    // The quota is still spent whatever else goes wrong meanwhile; downgrading
+    // would drop the Retry-After the client can act on.
+    pool.setGlobalCooldownForAccount(a, 30_000, "unavailable");
+
+    try {
+      pool.acquireBest(new Map());
+      expect.unreachable("acquireBest should throw");
+    } catch (error) {
+      const typed = error as NoEligibleAccountError;
+      expect(typed.reason).toBe("rate_limited");
+      expect(typed.retryAtMs).toBe(NOW_MS + 60_000);
+    }
   });
 
   it("bucket cooldown excludes only requests for the mapped model", () => {
@@ -296,7 +336,7 @@ describe("OpenAITokenPool cooldowns", () => {
       "x-codex-bengalfox-limit-name": "gpt-5.6-sol",
     });
     const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
-    pool.setGlobalCooldownForAccount(a, 60 * 60_000); // 1h global
+    pool.setGlobalCooldownForAccount(a, 60 * 60_000, "rate_limit"); // 1h global
     pool.setBucketCooldownForAccount(a, "codex_bengalfox", 60_000); // 60s bucket, expires sooner
 
     expect(pool.getGlobalCooldownUntil("a")).toBe(NOW_MS + 60 * 60_000);
@@ -360,7 +400,7 @@ describe("OpenAITokenPool leases", () => {
   it("tryAcquire returns null for disabled, unhealthy, cooling, or capped accounts", () => {
     const a = makeAccount("a");
     const pool = new OpenAITokenPool([a], { now: () => NOW_MS });
-    pool.setGlobalCooldownForAccount(a, 60_000);
+    pool.setGlobalCooldownForAccount(a, 60_000, "rate_limit");
     expect(pool.tryAcquire("a")).toBeNull();
   });
 
@@ -389,7 +429,7 @@ describe("OpenAITokenPool leases", () => {
     const accounts = [a, b];
     const pool = new OpenAITokenPool(accounts, { now: () => NOW_MS });
 
-    pool.setGlobalCooldownForAccount(a, 60_000);
+    pool.setGlobalCooldownForAccount(a, 60_000, "rate_limit");
     expect(pool.getGlobalCooldownUntil("a")).toBeGreaterThan(0);
 
     accounts.splice(0, 1);

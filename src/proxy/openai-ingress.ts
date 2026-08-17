@@ -264,7 +264,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     if (selected.route.sessionId !== undefined && selected.route.bindingGeneration !== undefined) {
       openAIRouter.invalidate(selected.route.sessionId, account.id, selected.route.bindingGeneration);
     }
-    openAIPool.setGlobalCooldownForAccount(account, REFRESH_FAILURE_COOLDOWN_MS);
+    openAIPool.setGlobalCooldownForAccount(account, REFRESH_FAILURE_COOLDOWN_MS, "unavailable");
     recordActivity({
       ts: now(),
       accountId: account.id,
