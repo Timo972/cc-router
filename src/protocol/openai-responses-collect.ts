@@ -195,14 +195,14 @@ export function createCodexResponseTerminalObserver(): CodexResponseTerminalObse
   };
 }
 
-const RESPONSE_SIZE_ERROR = "Upstream response exceeded size limit";
+export const RESPONSE_SIZE_ERROR = "Upstream response exceeded size limit";
 
-type BoundedBodyRead =
+export type BoundedBodyRead =
   | { kind: "complete"; body: string }
   | { kind: "overflow" }
   | { kind: "error" };
 
-async function readBodyWithinLimit(
+export async function readBodyWithinLimit(
   upstream: globalThis.Response,
   maxBytes: number,
 ): Promise<BoundedBodyRead> {

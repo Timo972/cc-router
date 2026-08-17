@@ -82,3 +82,53 @@ Merge commit: this merge commit (see Git metadata)
 No unresolved merge concern. The suite emits Node's existing `DEP0060`
 deprecation warning. No real provider or PostHog endpoint was contacted; all
 network validation used literal-loopback guards as required.
+
+## Fix Round 1 — streaming delivery and bounded Messages translation
+
+Date: 2026-08-17
+
+### Review decisions
+
+| Finding | Resolution |
+|---|---|
+| Native Responses and translated Messages ignored `write() === false` | Added one shared response-write primitive that waits for `drain`, races close/abort/error, removes listeners after settlement, and leaves upstream-reader cancellation with each relay. Both relays now stop reads and writes during backpressure, preserve byte/event order, and cancel once delivery terminates. |
+| Messages retained unbounded non-SSE bodies, SSE remainder, and collected output | Reused the authoritative 10 MiB collected-response and 64 KiB event limits. All body branches use the same single-reader bounded read; Messages SSE now parses bytes incrementally, emits one event at a time, caps total collected bytes and translated output, cancels on overflow, and returns only closed safe failures. Streaming retains one bounded line plus closed terminal/usage state. |
+| Bodyless 2xx Responses SSE could lose upstream ownership to a concurrent disconnect | Latch `upstreamReportedFailure` before either streaming or collected relay starts. Both modes retain an effective 502, increment account failure state once, avoid inventing a generic-502 cooldown, and emit only closed upstream-failure telemetry. |
+| Same-ID OpenAI refresh-lock replacement | Confirmed inherited and intentionally left for its separate follow-up, per the round scope. |
+
+### RED/GREEN evidence
+
+- RED: 13 mechanism failures reproduced before production fixes: four
+  backpressure/read-ahead failures, seven Messages bounds/privacy failures,
+  and two bodyless ownership failures. Three split completed/incomplete/failed
+  terminal shields were already green and remained unchanged.
+- GREEN: all 18 added regressions pass, including drain resume, disconnect
+  cancellation, non-OK/JSON/text bounds, unterminated-frame and collected-
+  output overflow, split terminals, streamed overflow, bodyless streaming and
+  collected accounting, and final telemetry-wire canaries.
+- Complete relay gate: 2 files, 99/99 tests passed.
+- OpenAI ingress/routing/state/response plus telemetry focused gate: 18 files,
+  355/355 tests passed.
+
+### Verification and audit
+
+- `NO_UPDATE_NOTIFIER=1 pnpm test`: final gate passed 67 files and 1067/1067
+  tests; the prior Anthropic staged-timer regression remains green. A prior
+  completion run exposed an arbitrary 20 ms close in the new overflow test
+  double under full-suite contention; replacing it with pull-driven EOF made
+  cancellation deterministic without changing production behavior.
+- `pnpm lint`, `pnpm build`, and `git diff --check`: passed.
+- Packed offline bootstrap and final privacy-boundary audit: 2 files, 32/32
+  tests passed. The installed tarball remains ESM-first, offline-installable,
+  literal-loopback guarded, and free of request/upstream/account canaries.
+- Self-review found one body reader per path, no duplicate translation or
+  persistence/shutdown ownership, no direct relay writes outside the shared
+  helper, no raw SSE/body/header/error/URL/identifier telemetry, and no change
+  to main-owned sticky routing, failure routing, Retry-After, cooldown/LRU,
+  refresh durability, cancellation, or terminal semantics.
+
+### Fix Round 1 concerns
+
+No unresolved round concern. The inherited same-ID refresh-lock observation is
+still separate. Validation emitted only the existing Node `DEP0060` warning;
+no external provider or PostHog traffic was permitted.

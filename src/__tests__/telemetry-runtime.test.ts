@@ -694,6 +694,95 @@ describe("proxy runtime sampling and propagation", () => {
   });
 
   it.each([
+    ["streaming", true],
+    ["collected", false],
+  ])("keeps a bodyless Responses %s disconnect as a privacy-safe upstream failure", async (_name, stream) => {
+    const express = (await import("express")).default;
+    const { createServer, request: httpRequest } = await import("node:http");
+    const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
+    const { flushTelemetryWithin } = await import("../telemetry/facade.js");
+    let markForwardStarted!: () => void;
+    const forwardStarted = new Promise<void>(resolve => { markForwardStarted = resolve; });
+    const app = express();
+    const routing = await createOpenAIRoutingOptions();
+    mountResponsesRoutes(app, {
+      ...routing.options,
+      forwardOpenAI: async opts => {
+        markForwardStarted();
+        await new Promise<void>(resolve => {
+          if (opts.signal?.aborted) resolve();
+          else opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return new Response(null, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("bodyless Responses app did not bind");
+    const started = capture.requests.length;
+    const body = JSON.stringify({
+      model: "openai/gpt-5-codex",
+      input: [{ role: "user", content: TELEMETRY_CANARY.prompt }],
+      stream,
+    });
+    const client = httpRequest({
+      host: "127.0.0.1",
+      port: address.port,
+      path: "/v1/responses",
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+    });
+    const clientClosed = new Promise<void>(resolve => {
+      client.on("error", () => resolve());
+      client.on("close", () => resolve());
+    });
+    client.end(body);
+
+    try {
+      await forwardStarted;
+      client.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(routing.account.errorCount).toBe(1));
+      await flushTelemetryWithin(500);
+      await Promise.all([
+        waitForRequest(capture, "/i/v1/traces", started),
+        waitForRequest(capture, "/i/v1/logs", started),
+      ]);
+
+      const decoded = capture.requests
+        .slice(started)
+        .filter(request => request.url === "/i/v1/traces")
+        .map(request => decodeOtlpProtobuf(request.rawBody, "traces"));
+      const proxySpans = decoded.flatMap(payload => (payload.resourceSpans ?? []).flatMap(resource =>
+        ((resource as { scopeSpans?: Array<{ spans?: Array<Record<string, unknown>> }> }).scopeSpans ?? [])
+          .flatMap(scope => scope.spans ?? [])
+          .filter(span => span.name === "proxy.request")
+      ));
+      const attributes = proxySpans.at(-1)?.attributes as Record<string, unknown>;
+      // The HTTP instrumentation retains the socket's wire status (the
+      // client disconnected before any synthesized response could arrive),
+      // while the closed failure log owns the effective upstream failure
+      // classification.
+      expect(attributes["http.response.status_code"]).toBe(200);
+
+      const wire = wireFor(capture, "/i/v1/traces", started).toString("utf8")
+        + wireFor(capture, "/i/v1/logs", started).toString("utf8");
+      expect(wire).toContain("502");
+      expect(wire).toContain("upstream_error");
+      expect(wire).not.toContain(TELEMETRY_CANARY.prompt);
+      expect(wire).not.toContain(TELEMETRY_CANARY.accountId);
+    } finally {
+      client.destroy();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      server.closeAllConnections();
+    }
+  });
+
+  it.each([
     {
       name: "response.incomplete",
       event: { type: "response.incomplete", response: { id: "private-response-id", status: "incomplete" } },
@@ -867,6 +956,61 @@ describe("proxy runtime sampling and propagation", () => {
       ]) {
         expect(wire).not.toContain(privateValue);
       }
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      server.closeAllConnections();
+    }
+  });
+
+  it("reports a bounded Messages stream overflow without exporting its retained frame", async () => {
+    const express = (await import("express")).default;
+    const { createServer } = await import("node:http");
+    const { mountMessagesCrossProviderRoute } = await import("../proxy/messages-cross-route.js");
+    const { flushTelemetryWithin } = await import("../telemetry/facade.js");
+    const privateFrame = 'data: {"type":"response.output_text.delta","delta":"'
+      + TELEMETRY_CANARY.prompt.repeat(8_192);
+    const app = express();
+    const routing = await createOpenAIRoutingOptions();
+    mountMessagesCrossProviderRoute(app, {
+      ...routing.options,
+      forwardOpenAI: async () => new Response(privateFrame, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("bounded Messages app did not bind");
+    const started = capture.requests.length;
+
+    try {
+      const response = await originalFetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5-codex",
+          messages: [{ role: "user", content: TELEMETRY_CANARY.prompt }],
+          stream: false,
+        }),
+      });
+      expect(response.status).toBe(502);
+      expect(await response.json()).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
+      });
+      await flushTelemetryWithin(500);
+      await Promise.all([
+        waitForRequest(capture, "/i/v1/traces", started),
+        waitForRequest(capture, "/i/v1/logs", started),
+      ]);
+
+      const wire = wireFor(capture, "/i/v1/traces", started).toString("utf8")
+        + wireFor(capture, "/i/v1/logs", started).toString("utf8");
+      expect(wire).toContain("upstream_error");
+      expect(wire).toContain("502");
+      expect(wire).not.toContain(TELEMETRY_CANARY.prompt);
+      expect(wire).not.toContain(TELEMETRY_CANARY.accountId);
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
       server.closeAllConnections();

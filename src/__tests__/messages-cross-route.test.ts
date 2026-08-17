@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, request as httpRequest, type ClientRequest } from "http";
 import type { AddressInfo } from "net";
 import express from "express";
+import type { Response as ExpressResponse } from "express";
 import { ReadableStream } from "stream/web";
 import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.js";
 import type { MessagesCrossProviderRouteOptions } from "../proxy/messages-cross-route.js";
@@ -46,8 +47,10 @@ function mountWithPool(
   accounts: OpenAIAccount[],
   forwardOpenAI: ForwardOpenAI,
   extra: Partial<MessagesCrossProviderRouteOptions> = {},
+  beforeMount?: (app: ReturnType<typeof express>) => void,
 ) {
   const app = express();
+  beforeMount?.(app);
   const openAIPool = new OpenAITokenPool(accounts);
   const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
   const activity: LogEntry[] = [];
@@ -96,6 +99,31 @@ function crossSseResponse(headers: Record<string, string> = {}): Response {
     status: 200,
     headers: { "content-type": "text/event-stream", ...headers },
   });
+}
+
+function cancellableChunkedResponse(
+  chunks: Uint8Array[],
+  init: ResponseInit,
+): { response: Response; cancel: ReturnType<typeof vi.fn> } {
+  let nextChunk = 0;
+  let closeTask: ReturnType<typeof setImmediate> | undefined;
+  const cancel = vi.fn(() => {
+    if (closeTask) clearImmediate(closeTask);
+  });
+  const response = new Response(new ReadableStream({
+    pull(controller) {
+      if (nextChunk < chunks.length) {
+        controller.enqueue(chunks[nextChunk++]);
+        return;
+      }
+      // Schedule EOF only once the consumer has pulled every chunk. An
+      // overflow handler can therefore cancel in the read continuation before
+      // this task runs; an unbounded reader still gets a deterministic EOF.
+      closeTask ??= setImmediate(() => controller.close());
+    },
+    cancel,
+  }) as BodyInit, init);
+  return { response, cancel };
 }
 
 describe("mountMessagesCrossProviderRoute", () => {
@@ -302,6 +330,312 @@ describe("mountMessagesCrossProviderRoute", () => {
         usage: { input_tokens: 4, output_tokens: 2 },
       });
     });
+  });
+
+  it("pauses translated Messages upstream reads while the client response is backpressured", async () => {
+    const encoder = new TextEncoder();
+    const chunks = [
+      encoder.encode('data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'),
+      encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'),
+    ];
+    let nextChunk = 0;
+    const read = vi.fn(async () => nextChunk < chunks.length
+      ? { value: chunks[nextChunk++], done: false as const }
+      : { value: undefined, done: true as const });
+    const cancel = vi.fn(async () => undefined);
+    const upstream = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body: { getReader: () => ({ read, cancel }) },
+    } as unknown as Response;
+    const firstWrite = deferred<ExpressResponse>();
+    let writes = 0;
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream,
+      {},
+      app => app.use((_req, res, next) => {
+        const originalWrite = res.write.bind(res);
+        res.write = ((...args: unknown[]) => {
+          writes++;
+          const accepted = Reflect.apply(originalWrite, res, args) as boolean;
+          if (writes === 1) {
+            firstWrite.resolve(res);
+            return false;
+          }
+          return accepted;
+        }) as ExpressResponse["write"];
+        next();
+      }),
+    );
+
+    await withServer(app, async baseUrl => {
+      const response = postMessages(baseUrl, { stream: true });
+      const serverResponse = await firstWrite.promise;
+      await new Promise(resolve => setImmediate(resolve));
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(writes).toBe(1);
+
+      serverResponse.emit("drain");
+      const body = await (await response).text();
+      expect(body).toContain('"type":"message_start"');
+      expect(body).toContain('"type":"message_stop"');
+      expect(read).toHaveBeenCalledTimes(3);
+      expect(cancel).not.toHaveBeenCalled();
+    });
+  });
+
+  it("cancels the translated Messages reader when the client closes during backpressure", async () => {
+    const encoder = new TextEncoder();
+    const neverRead = deferred<ReadableStreamReadResult<Uint8Array>>();
+    const read = vi.fn()
+      .mockResolvedValueOnce({
+        value: encoder.encode('data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'),
+        done: false,
+      })
+      .mockImplementationOnce(() => neverRead.promise);
+    const cancel = vi.fn(async () => undefined);
+    const upstream = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body: { getReader: () => ({ read, cancel }) },
+    } as unknown as Response;
+    const firstWrite = deferred<void>();
+    let writes = 0;
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream,
+      {},
+      app => app.use((_req, res, next) => {
+        const originalWrite = res.write.bind(res);
+        res.write = ((...args: unknown[]) => {
+          writes++;
+          Reflect.apply(originalWrite, res, args);
+          if (writes === 1) {
+            firstWrite.resolve();
+            return false;
+          }
+          return true;
+        }) as ExpressResponse["write"];
+        next();
+      }),
+    );
+    const abort = new AbortController();
+    await withServer(app, async baseUrl => {
+      const pending = fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        }),
+        signal: abort.signal,
+      }).then(res => res.text()).catch(() => undefined);
+      try {
+        await firstWrite.promise;
+        await new Promise(resolve => setImmediate(resolve));
+        expect(read).toHaveBeenCalledTimes(1);
+        abort.abort();
+        await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+        expect(read).toHaveBeenCalledTimes(1);
+        expect(writes).toBe(1);
+      } finally {
+        neverRead.resolve({ value: undefined, done: true });
+        await pending;
+      }
+    });
+  });
+
+  it("cancels and safely rejects an oversized non-OK upstream body", async () => {
+    const privateBody = "PRIVATE_NON_OK_BODY_" + "x".repeat(10 * 1024 * 1024);
+    const upstream = cancellableChunkedResponse(
+      [new TextEncoder().encode(privateBody)],
+      { status: 429, headers: { "content-type": "application/json" } },
+    );
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
+      });
+      expect(JSON.stringify(body)).not.toContain("PRIVATE_NON_OK_BODY");
+    });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["JSON", "application/json"],
+    ["plain body", "text/plain"],
+  ])("cancels and safely rejects an oversized successful upstream %s", async (_name, contentType) => {
+    const privateBody = contentType === "application/json"
+      ? JSON.stringify({
+        id: "resp_private",
+        model: "gpt-5.5",
+        output: [],
+        private: "PRIVATE_SUCCESS_BODY_" + "x".repeat(10 * 1024 * 1024),
+      })
+      : "PRIVATE_SUCCESS_BODY_" + "x".repeat(10 * 1024 * 1024);
+    const upstream = cancellableChunkedResponse(
+      [new TextEncoder().encode(privateBody)],
+      { status: 200, headers: { "content-type": contentType } },
+    );
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
+      });
+      expect(JSON.stringify(body)).not.toContain("PRIVATE_SUCCESS_BODY");
+    });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+  });
+
+  it("cancels an unterminated collected SSE frame after 64 KiB", async () => {
+    const frame = 'data: {"type":"response.output_text.delta","delta":"PRIVATE_FRAME_'
+      + "x".repeat(64 * 1024);
+    const upstream = cancellableChunkedResponse(
+      [new TextEncoder().encode(frame)],
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: false });
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
+      });
+      expect(JSON.stringify(body)).not.toContain("PRIVATE_FRAME");
+    });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+  });
+
+  it("caps collected translated output at 10 MiB and cancels upstream", async () => {
+    const delta = "x".repeat(60 * 1024);
+    const frames = [
+      'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n',
+      ...Array.from(
+        { length: Math.ceil((10 * 1024 * 1024 + 1) / delta.length) },
+        () => `data: ${JSON.stringify({ type: "response.output_text.delta", delta })}\n\n`,
+      ),
+      'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n',
+    ];
+    const upstream = cancellableChunkedResponse(
+      frames.map(frame => new TextEncoder().encode(frame)),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: false });
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
+      });
+    });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [
+      "response.completed",
+      { type: "response.completed", response: { id: "resp_1", model: "gpt-5.5" } },
+      200,
+      "end_turn",
+    ],
+    [
+      "response.incomplete",
+      {
+        type: "response.incomplete",
+        response: {
+          id: "resp_1",
+          model: "gpt-5.5",
+          incomplete_details: { reason: "max_output_tokens" },
+        },
+      },
+      200,
+      "max_tokens",
+    ],
+    [
+      "response.failed",
+      { type: "response.failed", response: { error: { message: "safe failure" } } },
+      502,
+      undefined,
+    ],
+  ])("preserves a %s terminal split across arbitrary chunks", async (_name, terminal, expectedStatus, stopReason) => {
+    const wire = new TextEncoder().encode(
+      'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'
+      + `data: ${JSON.stringify(terminal)}\n\n`,
+    );
+    const chunks: Uint8Array[] = [];
+    for (let offset = 0; offset < wire.byteLength; offset += 7) {
+      chunks.push(wire.subarray(offset, Math.min(offset + 7, wire.byteLength)));
+    }
+    const upstream = cancellableChunkedResponse(chunks, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: false });
+      expect(res.status).toBe(expectedStatus);
+      const body = await res.json() as { stop_reason?: string; error?: { message?: string } };
+      if (expectedStatus === 200) expect(body.stop_reason).toBe(stopReason);
+      else expect(body.error?.message).toBe("safe failure");
+    });
+    expect(upstream.cancel).not.toHaveBeenCalled();
+  });
+
+  it("cancels a streaming translation whose pending SSE frame exceeds 64 KiB", async () => {
+    const frame = 'data: {"type":"response.output_text.delta","delta":"PRIVATE_STREAM_FRAME_'
+      + "x".repeat(64 * 1024);
+    const upstream = cancellableChunkedResponse(
+      [new TextEncoder().encode(frame)],
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      expect(res.status).toBe(200);
+      expect(await res.text()).not.toContain("PRIVATE_STREAM_FRAME");
+    });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+    expect(activity).toContainEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
   });
 
   it("collapses OpenAI Responses SSE ending in response.incomplete into Anthropic-shaped JSON with its usage, not a 502", async () => {

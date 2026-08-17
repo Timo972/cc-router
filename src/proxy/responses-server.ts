@@ -23,6 +23,7 @@ import {
   type OpenAIIngressEnvelope,
 } from "./openai-ingress.js";
 import { annotateActiveSpan } from "../telemetry/facade.js";
+import { writeResponseChunk } from "./response-write.js";
 
 function requestSource(req: Request): "cli" | "desktop" | "api" {
   if (req.headers["x-claude-code-session-id"] !== undefined) return "cli";
@@ -88,22 +89,38 @@ async function sendUpstreamResponse(
     if (res.destroyed) resolve(DISCONNECTED);
     else res.once("close", () => resolve(DISCONNECTED));
   });
+  let readerFinished = false;
+  let readerCancelled = false;
+  const cancelReader = async (): Promise<void> => {
+    if (readerFinished || readerCancelled) return;
+    readerCancelled = true;
+    await reader.cancel().catch(() => {});
+  };
   try {
     while (true) {
       const next = await Promise.race([reader.read(), disconnected]);
       if (next === DISCONNECTED) {
-        await reader.cancel().catch(() => {});
+        await cancelReader();
         break;
       }
       const { value, done } = next;
-      if (done) break;
+      if (done) {
+        readerFinished = true;
+        break;
+      }
       if (value) {
-        res.write(Buffer.from(value));
         onChunk?.(value);
+        if (!await writeResponseChunk(res, Buffer.from(value))) {
+          await cancelReader();
+          break;
+        }
       }
     }
+  } catch (error) {
+    await cancelReader();
+    throw error;
   } finally {
-    res.end();
+    if (!res.destroyed && !res.writableEnded) res.end();
   }
 }
 
@@ -206,6 +223,13 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       prepareOpenAIAccountOwnsDiagnostics: opts.prepareOpenAIAccountOwnsDiagnostics === true,
       forwardOpenAIOwnsDiagnostics,
       relay: async (upstream, res, entry, report) => {
+        const successfulEventStream = upstream.ok
+          && (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+        // A successful event stream with no body is already an upstream
+        // failure before either relay runs. Latch that ownership now so a
+        // concurrent client hangup cannot rewrite the collector's synthesized
+        // 502 into a benign cancellation and suppress account diagnostics.
+        if (successfulEventStream && !upstream.body) report.upstreamReportedFailure = true;
         if (body.stream === true) {
           const observer = createCodexUsageObserver();
           // Only an upstream that actually promised a successful event stream
@@ -215,8 +239,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
           // `sendUpstreamResponse` has already relayed the real status to the
           // client, so reporting 502 here would log a 502 for a client that
           // received a 429 and hide the actual failure from diagnostics.
-          const streamed = upstream.ok
-            && (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+          const streamed = successfulEventStream;
           // Reported per chunk, not once at the end: this relay can throw
           // (or be cut short) after upstream has already announced a failure,
           // and the verdict has to survive that.

@@ -175,8 +175,10 @@ function mountWithPool(
   accounts: OpenAIAccount[],
   forwardOpenAI?: ForwardOpenAI,
   extra: Partial<ResponsesRoutesOptions> = {},
+  beforeMount?: (app: ReturnType<typeof express>) => void,
 ) {
   const app = express();
+  beforeMount?.(app);
   const openAIPool = new OpenAITokenPool(accounts);
   const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
   const activity: LogEntry[] = [];
@@ -536,6 +538,124 @@ describe("mountResponsesRoutes", () => {
     });
   });
 
+  it("pauses native Responses upstream reads while the client response is backpressured", async () => {
+    const encoder = new TextEncoder();
+    const chunks = [
+      encoder.encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'),
+      encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n'),
+    ];
+    let nextChunk = 0;
+    const read = vi.fn(async () => nextChunk < chunks.length
+      ? { value: chunks[nextChunk++], done: false as const }
+      : { value: undefined, done: true as const });
+    const cancel = vi.fn(async () => undefined);
+    const upstream = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body: { getReader: () => ({ read, cancel }) },
+    } as unknown as Response;
+    const firstWrite = deferred<ExpressResponse>();
+    let writes = 0;
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream,
+      {},
+      app => app.use((_req, res, next) => {
+        const originalWrite = res.write.bind(res);
+        res.write = ((...args: unknown[]) => {
+          writes++;
+          const accepted = Reflect.apply(originalWrite, res, args) as boolean;
+          if (writes === 1) {
+            firstWrite.resolve(res);
+            return false;
+          }
+          return accepted;
+        }) as ExpressResponse["write"];
+        next();
+      }),
+    );
+
+    await withServer(app, async baseUrl => {
+      const response = fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+
+      const serverResponse = await firstWrite.promise;
+      await new Promise(resolve => setImmediate(resolve));
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(writes).toBe(1);
+
+      serverResponse.emit("drain");
+      const body = await (await response).text();
+      expect(body).toBe(Buffer.concat(chunks.map(chunk => Buffer.from(chunk))).toString("utf8"));
+      expect(read).toHaveBeenCalledTimes(3);
+      expect(cancel).not.toHaveBeenCalled();
+    });
+  });
+
+  it("cancels the native Responses reader when the client closes during backpressure", async () => {
+    const encoder = new TextEncoder();
+    const neverRead = deferred<ReadableStreamReadResult<Uint8Array>>();
+    const read = vi.fn()
+      .mockResolvedValueOnce({
+        value: encoder.encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'),
+        done: false,
+      })
+      .mockImplementationOnce(() => neverRead.promise);
+    const cancel = vi.fn(async () => undefined);
+    const upstream = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body: { getReader: () => ({ read, cancel }) },
+    } as unknown as Response;
+    const firstWrite = deferred<void>();
+    let writes = 0;
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream,
+      {},
+      app => app.use((_req, res, next) => {
+        const originalWrite = res.write.bind(res);
+        res.write = ((...args: unknown[]) => {
+          writes++;
+          Reflect.apply(originalWrite, res, args);
+          if (writes === 1) {
+            firstWrite.resolve();
+            return false;
+          }
+          return true;
+        }) as ExpressResponse["write"];
+        next();
+      }),
+    );
+    const abort = new AbortController();
+    const response = withServer(app, async baseUrl => {
+      const pending = fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+        signal: abort.signal,
+      }).then(res => res.text()).catch(() => undefined);
+      try {
+        await firstWrite.promise;
+        await new Promise(resolve => setImmediate(resolve));
+        expect(read).toHaveBeenCalledTimes(1);
+        abort.abort();
+        await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+        expect(read).toHaveBeenCalledTimes(1);
+        expect(writes).toBe(1);
+      } finally {
+        neverRead.resolve({ value: undefined, done: true });
+        await pending;
+      }
+    });
+    await response;
+  });
+
   it("warns on an explicit max_output_tokens, then forwards and reconciles", async () => {
     const forward = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: "resp_1" }), {
@@ -872,6 +992,64 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     }
   });
 
+  it.each([
+    ["streaming", true],
+    ["collected", false],
+  ])("keeps a bodyless successful-SSE %s response owned by upstream after client disconnect", async (_name, stream) => {
+    const account = makeRuntimeAccount("openai-victor");
+    const forwardStarted = deferred<void>();
+    const forward: ForwardOpenAI = async opts => {
+      forwardStarted.resolve();
+      // Make the server observe the disconnect before the bodyless successful
+      // SSE arrives. Upstream's invalid response must still own the outcome.
+      await new Promise<void>(resolve => {
+        if (opts.signal?.aborted) resolve();
+        else opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return new Response(null, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    };
+    const { app, activity, openAIPool } = mountWithPool([account], forward);
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({ model: "openai/gpt-5.5", input: [], stream });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/responses",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await forwardStarted.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+      expect(activity[0]?.details).not.toContain("client-cancelled");
+      expect(account.errorCount).toBe(1);
+      expect(account.consecutiveErrors).toBe(1);
+      // A synthesized generic 502 counts against the account but is not an
+      // overload/rate-limit signal and must not invent a cooldown horizon.
+      expect(openAIPool.getGlobalCooldownUntil(account.id)).toBe(0);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   it("still counts an explicit response.failed when the client disconnects after it", async () => {
     const account = makeRuntimeAccount("openai-victor");
     const failureSent = deferred<void>();
@@ -1200,6 +1378,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
           }
           throw new Error("connection reset mid-stream");
         },
+        cancel: async () => undefined,
       };
       return {
         ok: true,
