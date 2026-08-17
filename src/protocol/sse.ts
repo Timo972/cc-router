@@ -3,7 +3,20 @@ export interface ParsedSse {
   remainder: string;
 }
 
-export function parseSseLines(input: string): ParsedSse {
+export interface ParseSseOptions {
+  /**
+   * Skip individual `data:` lines that are not valid JSON instead of throwing.
+   *
+   * Parsing is per line, so one malformed frame never discards the valid
+   * events that arrived in the same chunk. Use this wherever parsing is
+   * advisory — passive usage observation, or a relay that must keep streaming
+   * whatever else it can. Leave it off where a malformed stream must surface
+   * as an upstream error (e.g. `collectCodexResponseStream`).
+   */
+  tolerant?: boolean;
+}
+
+export function parseSseLines(input: string, options: ParseSseOptions = {}): ParsedSse {
   const lines = input.split("\n");
   const remainder = lines.pop() ?? "";
   const events: unknown[] = [];
@@ -12,6 +25,14 @@ export function parseSseLines(input: string): ParsedSse {
     if (!line.startsWith("data: ")) continue;
     const payload = line.slice(6).trim();
     if (!payload || payload === "[DONE]") continue;
+    if (options.tolerant) {
+      try {
+        events.push(JSON.parse(payload));
+      } catch {
+        // Advisory parse — drop just this frame, keep the rest of the chunk.
+      }
+      continue;
+    }
     events.push(JSON.parse(payload));
   }
 

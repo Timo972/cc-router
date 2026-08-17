@@ -1,4 +1,5 @@
 import type { ProviderAccount } from "../types.js";
+import { decodeOpenAIPlan } from "./usage.js";
 import {
   annotateActiveSpan,
   classifyExpectedRuntimeFailure,
@@ -13,10 +14,9 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 const refreshLocks = new Map<string, Promise<boolean>>();
 const refreshControllers = new Map<string, AbortController>();
-const ownedRefreshLocks = new Set<Promise<boolean>>();
 const rawRefreshOwners = new Map<string, RefreshLifecycle | undefined>();
+const ownedRefreshLocks = new Set<Promise<boolean>>();
 const ownedRefreshOwners = new Map<Promise<boolean>, RefreshLifecycle | undefined>();
-const pendingDurability = new WeakSet<object>();
 
 interface RefreshLifecycle {
   stopping: boolean;
@@ -25,6 +25,68 @@ interface RefreshLifecycle {
 
 let activeRefreshLifecycle: RefreshLifecycle | undefined;
 
+/**
+ * Accounts whose most recently rotated credentials have NOT been confirmed
+ * on disk. Identity-keyed (by object reference, not `account.id`) so a
+ * deleted-then-re-added account can never inherit another object's dirty
+ * state just because it reused the same id, and a `WeakSet` so an account
+ * that's later removed from the pool can't leak here.
+ */
+const pendingCredentialWrites = new WeakSet<OpenAISubscriptionAccount>();
+
+/** True when `account` has a rotated credential that has not yet been durably persisted. */
+export function hasPendingCredentialWrite(account: OpenAISubscriptionAccount): boolean {
+  return pendingCredentialWrites.has(account);
+}
+
+/**
+ * Record that every account in `accounts` has reached disk.
+ *
+ * A whole-pool write makes all of them durable, not just whichever account
+ * prompted it — and those writes do not all come from a refresh. Adding,
+ * patching, or deleting an account rewrites the same file from the same live
+ * array, so a rotation that failed to persist earlier is on disk once any of
+ * those succeed. Without this, health keeps reporting `credentialsPendingWrite`
+ * for an account whose credentials are already saved, and later requests keep
+ * retrying a write that has already landed.
+ *
+ * Call it only after the write has actually returned.
+ */
+export function markOpenAICredentialsPersisted(accounts: OpenAISubscriptionAccount[]): void {
+  for (const account of accounts) pendingCredentialWrites.delete(account);
+}
+
+/**
+ * Centralizes every write of the account pool to disk so every caller shares
+ * the same durability bookkeeping: on success, clears the account's pending
+ * flag; on a throw (e.g. disk full, a bad custom `--accounts` path), (re)sets
+ * it and logs, but never propagates — the caller's fresh in-memory token
+ * remains usable even though it isn't on disk yet.
+ *
+ * Residual risk: if the process crashes before any retry of a dirty account
+ * succeeds, the rotated refresh token is lost from disk — and since OpenAI
+ * already invalidated the old one, that forces re-authentication. The retry
+ * cadence (the very next request via `prepareOpenAIAccountForRequest`, or at
+ * worst the refresh loop's next ≤5-minute tick) bounds how long that window
+ * stays open, but does not close it.
+ */
+function persistCredentials(
+  account: OpenAISubscriptionAccount,
+  allAccounts: OpenAISubscriptionAccount[],
+  saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
+): boolean {
+  try {
+    saveAccounts(allAccounts);
+    markOpenAICredentialsPersisted(allAccounts);
+    pendingCredentialWrites.delete(account);
+    return true;
+  } catch (error) {
+    pendingCredentialWrites.add(account);
+    console.error(error);
+    return false;
+  }
+}
+
 interface OpenAIRefreshResponse {
   access_token: string;
   refresh_token?: string;
@@ -32,29 +94,34 @@ interface OpenAIRefreshResponse {
   token_type: string;
 }
 
-function isOpenAIRefreshResponse(value: unknown): value is OpenAIRefreshResponse {
-  if (typeof value !== "object" || value === null) return false;
-  const response = value as Record<string, unknown>;
-  return typeof response.access_token === "string"
-    && response.access_token.length > 0
-    && typeof response.expires_in === "number"
-    && Number.isFinite(response.expires_in)
-    && response.expires_in > 0
-    && typeof response.token_type === "string"
-    && response.token_type.length > 0
-    && (response.refresh_token === undefined
-      || (typeof response.refresh_token === "string" && response.refresh_token.length > 0));
-}
-
 export type OpenAISubscriptionAccount = ProviderAccount & {
   provider: "openai_subscription";
   accessToken: string;
   refreshToken: string;
   expiresAt: number;
+  scopes?: string[];
+  sessionLimitPercent?: number;
+  weeklyLimitPercent?: number;
+};
+
+/**
+ * Runtime health-tracking fields that live on `OpenAIAccount` (see
+ * `account-state.ts`) but are not part of the persisted `OpenAISubscriptionAccount`
+ * shape. The refresh loop is handed the live `OpenAIAccount[]` array from the pool
+ * (typed here as `OpenAISubscriptionAccount[]` for the persisted-account API), so
+ * these fields are present at runtime even though the static type doesn't declare
+ * them. They're optional here and only written when already present, so refresher
+ * unit tests that construct bare `OpenAISubscriptionAccount` fixtures are unaffected.
+ */
+type OpenAIRuntimeHealthFields = {
+  healthy?: boolean;
+  consecutiveErrors?: number;
+  lastRefresh?: number;
+  rateLimits?: { plan?: string };
 };
 
 export function needsOpenAIRefresh(account: Pick<OpenAISubscriptionAccount, "expiresAt">): boolean {
-  return pendingDurability.has(account) || account.expiresAt - Date.now() < REFRESH_BUFFER_MS;
+  return account.expiresAt - Date.now() < REFRESH_BUFFER_MS;
 }
 
 export async function refreshOpenAISubscriptionToken(
@@ -62,7 +129,6 @@ export async function refreshOpenAISubscriptionToken(
   signal?: AbortSignal,
 ): Promise<boolean> {
   if (activeRefreshLifecycle?.stopping) return false;
-
   const existing = refreshLocks.get(account.id);
   if (existing) {
     const unlink = linkAbortSignal(signal, refreshControllers.get(account.id));
@@ -76,7 +142,11 @@ export async function refreshOpenAISubscriptionToken(
   const controller = new AbortController();
   const owner = activeRefreshLifecycle;
   const unlink = linkAbortSignal(signal, controller);
-  const promise = withTelemetrySpan("oauth.refresh", { provider: "openai" }, () => doRefresh(account, controller.signal));
+  const promise = withTelemetrySpan(
+    "oauth.refresh",
+    { provider: "openai" },
+    () => doRefresh(account, controller.signal),
+  );
   refreshLocks.set(account.id, promise);
   refreshControllers.set(account.id, controller);
   rawRefreshOwners.set(account.id, owner);
@@ -95,24 +165,41 @@ export async function prepareOpenAIAccountForRequest(
   allAccounts: OpenAISubscriptionAccount[],
   saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
 ): Promise<boolean> {
-  if (!needsOpenAIRefresh(account)) return true;
-  if (activeRefreshLifecycle?.stopping) return false;
+  if (!needsOpenAIRefresh(account)) {
+    // No refresh due, but a previous rotation from this account never made it
+    // to disk (e.g. a transient disk-full). This is the retry path: piggyback
+    // on this otherwise-idle request to flush the still-current in-memory
+    // token, without blocking or failing the request either way.
+    if (hasPendingCredentialWrite(account)) persistCredentials(account, allAccounts, saveAccounts);
+    return true;
+  }
 
+  // The refreshed token is already live in memory, so a persistence failure
+  // must not fail this request — it only means the new token isn't on disk
+  // yet. `persistCredentials` marks the account dirty so the write is retried
+  // (here, or by the refresh loop) instead of silently losing the rotation.
+  return refreshAndPersistOpenAIAccount(account, allAccounts, saveAccounts);
+}
+
+/**
+ * Refreshes `account`'s token if needed and persists the pool. Used both by
+ * `prepareOpenAIAccountForRequest`'s refresh-due branch and by callers that
+ * want to force a refresh outside of that gate (e.g. reacting to an upstream
+ * 401). Always returns the refresh outcome — a persistence failure never
+ * turns a successful refresh into a `false` result.
+ */
+export async function refreshAndPersistOpenAIAccount(
+  account: OpenAISubscriptionAccount,
+  allAccounts: OpenAISubscriptionAccount[],
+  saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
+): Promise<boolean> {
+  if (activeRefreshLifecycle?.stopping) return false;
   const owner = activeRefreshLifecycle;
   let operation!: Promise<boolean>;
   operation = (async () => {
     try {
-      if (pendingDurability.has(account)) {
-        saveAccounts(allAccounts);
-        pendingDurability.delete(account);
-        return true;
-      }
       const ok = await refreshOpenAISubscriptionToken(account);
-      if (ok) {
-        pendingDurability.add(account);
-        saveAccounts(allAccounts);
-        pendingDurability.delete(account);
-      }
+      if (ok) persistCredentials(account, allAccounts, saveAccounts);
       return ok;
     } finally {
       ownedRefreshLocks.delete(operation);
@@ -136,21 +223,16 @@ export function startOpenAIRefreshLoop(
   let stopped = false;
   let activePass: Promise<void> | undefined;
   let activeController: AbortController | undefined;
+
   const check = async (signal: AbortSignal) => {
     for (const account of accounts) {
       if (stopped || signal.aborted || activeRefreshLifecycle !== lifecycle) return;
-      if (!needsOpenAIRefresh(account)) continue;
-      if (pendingDurability.has(account)) {
-        saveAccounts(accounts);
-        pendingDurability.delete(account);
-        continue;
-      }
-      const ok = await refreshOpenAISubscriptionToken(account, signal);
-      if (ok) {
-        pendingDurability.add(account);
-        if (activeRefreshLifecycle !== lifecycle) return;
-        saveAccounts(accounts);
-        pendingDurability.delete(account);
+      // One account's refresh throwing must not skip every account after it
+      // in this tick — isolate failures per-account.
+      try {
+        await prepareOpenAIAccountForRequest(account, accounts, saveAccounts);
+      } catch (error) {
+        console.error(error);
       }
     }
   };
@@ -204,6 +286,7 @@ export function startOpenAIRefreshLoop(
         });
       } finally {
         lifecycle.settled = true;
+        if (activeRefreshLifecycle === lifecycle) activeRefreshLifecycle = undefined;
       }
     })();
     return stopPromise;
@@ -226,6 +309,7 @@ async function doRefresh(account: OpenAISubscriptionAccount, signal?: AbortSigna
       signal,
     });
     signal?.throwIfAborted();
+
     const outcome = res.ok ? "complete" : res.status === 429 ? "rate_limited" : "upstream_error";
     annotateActiveSpan("oauth.refresh", {
       httpStatusCode: res.status,
@@ -246,16 +330,38 @@ async function doRefresh(account: OpenAISubscriptionAccount, signal?: AbortSigna
     }
 
     receivedSuccessfulResponse = true;
-    const data: unknown = await res.json();
-    if (!isOpenAIRefreshResponse(data)) {
+    const data = await res.json() as OpenAIRefreshResponse;
+    signal?.throwIfAborted();
+
+    // A 200 with an unusable payload is a failed refresh, not a successful one.
+    if (typeof data?.access_token !== "string" || data.access_token.length === 0) {
       throw new TypeError("Unexpected OpenAI refresh response shape");
     }
-    signal?.throwIfAborted();
+    if (typeof data.expires_in !== "number" || !Number.isFinite(data.expires_in) || data.expires_in <= 0) {
+      throw new TypeError("Unexpected OpenAI refresh response shape");
+    }
+    const expiresAt = Date.now() + data.expires_in * 1000;
+    if (!Number.isFinite(expiresAt)) throw new TypeError("Unexpected OpenAI refresh response shape");
+
     account.accessToken = data.access_token;
     account.refreshToken = data.refresh_token ?? account.refreshToken;
-    account.expiresAt = Date.now() + data.expires_in * 1000;
+    account.expiresAt = expiresAt;
+
+    // A successful refresh recovers an account the pool previously excluded.
+    const runtime = account as OpenAISubscriptionAccount & OpenAIRuntimeHealthFields;
+    if (runtime.healthy !== undefined) runtime.healthy = true;
+    if (runtime.consecutiveErrors !== undefined) runtime.consecutiveErrors = 0;
+    if (runtime.lastRefresh !== undefined) runtime.lastRefresh = Date.now();
+
+    if (runtime.rateLimits) {
+      const plan = decodeOpenAIPlan(account.accessToken);
+      if (plan) runtime.rateLimits.plan = plan;
+    }
+
     return true;
   } catch (error) {
+    // Network failure (or malformed response body) must resolve to `false`,
+    // exactly like a non-ok HTTP response — never propagate as a rejection.
     if (signal?.aborted) return false;
     const expectedReason = classifyExpectedRuntimeFailure(error);
     const reason = expectedReason ?? (receivedSuccessfulResponse ? "unexpected_response_shape" : "other");
@@ -280,7 +386,7 @@ async function doRefresh(account: OpenAISubscriptionAccount, signal?: AbortSigna
         provider: "openai",
       });
     }
-    throw error;
+    return false;
   }
 }
 

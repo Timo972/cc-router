@@ -938,7 +938,7 @@ export async function resolve(specifier, context, nextResolve) {
           stream: false,
         }),
       });
-      expect(response.status).toBe(500);
+      expect(response.status).toBe(502);
       await response.arrayBuffer();
       expect(hostileStatusDescriptions.slice(hostileBefore)).toEqual([
         TELEMETRY_CANARY.exceptionMessage,

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   collectCodexResponseStream,
   createCodexResponseTerminalObserver,
+  createCodexUsageObserver,
+  usageFromResponseBody,
 } from "../protocol/openai-responses-collect.js";
 
 function sseResponse(chunks: string[], init?: ResponseInit): Response {
@@ -20,45 +22,6 @@ function sseResponse(chunks: string[], init?: ResponseInit): Response {
 }
 
 describe("collectCodexResponseStream", () => {
-  it("classifies a split terminal without retaining its payload or mutating chunks", () => {
-    const encoder = new TextEncoder();
-    const first = encoder.encode('data: {"type":"response.com');
-    const second = encoder.encode('pleted","response":{"private":"not retained"}}\n\n');
-    const firstBefore = first.slice();
-    const secondBefore = second.slice();
-    const observer = createCodexResponseTerminalObserver();
-
-    observer.push(first);
-    observer.push(second);
-
-    expect(observer.finish()).toEqual({ kind: "completed" });
-    expect(first).toEqual(firstBefore);
-    expect(second).toEqual(secondBefore);
-  });
-
-  it("classifies response.incomplete without retaining the response object", () => {
-    const observer = createCodexResponseTerminalObserver();
-    observer.push(new TextEncoder().encode(
-      'data: {"type":"response.incomplete","response":{"private":"not retained"}}\n\n',
-    ));
-
-    expect(observer.finish()).toEqual({ kind: "incomplete" });
-  });
-
-  it.each([
-    ["a no-newline data field", `data: ${"x".repeat(64 * 1024 + 1)}`],
-    ["an oversized terminal event", `data: ${JSON.stringify({
-      type: "response.completed",
-      response: { output: "x".repeat(64 * 1024) },
-    })}\n\n`],
-  ])("classifies %s as overflow with bounded framing state", (_name, input) => {
-    const observer = createCodexResponseTerminalObserver();
-
-    observer.push(new TextEncoder().encode(input));
-
-    expect(observer.finish().kind).toBe("overflow");
-  });
-
   it("returns the verbatim response.completed object as JSON", async () => {
     const upstream = sseResponse([
       'data: {"type":"response.created","response":{"id":"resp_1"}}\n\n',
@@ -76,6 +39,28 @@ describe("collectCodexResponseStream", () => {
         model: "gpt-5.5",
         output: [{ type: "message" }],
         usage: { input_tokens: 10, output_tokens: 5 },
+      },
+    });
+  });
+
+  it("returns the verbatim response.incomplete object as JSON, not a 502", async () => {
+    const upstream = sseResponse([
+      'data: {"type":"response.created","response":{"id":"resp_1"}}\n\n',
+      'data: {"type":"response.output_text.delta","delta":"partial answer"}\n\n',
+      'data: {"type":"response.incomplete","response":{"id":"resp_1","model":"gpt-5.5","output":[{"type":"message"}],"usage":{"input_tokens":10,"output_tokens":5},"incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+    ]);
+
+    const result = await collectCodexResponseStream(upstream);
+
+    expect(result).toEqual({
+      kind: "json",
+      status: 200,
+      body: {
+        id: "resp_1",
+        model: "gpt-5.5",
+        output: [{ type: "message" }],
+        usage: { input_tokens: 10, output_tokens: 5 },
+        incomplete_details: { reason: "max_output_tokens" },
       },
     });
   });
@@ -113,8 +98,29 @@ describe("collectCodexResponseStream", () => {
     expect(result).toEqual({
       kind: "json",
       status: 502,
-      body: { error: { type: "upstream_error", message: "Stream ended before response.completed" } },
+      body: { error: { type: "upstream_error", message: "Stream ended before any terminal response event" } },
     });
+  });
+
+  it("maps a terminal event carrying no response object to a 502 upstream_error", async () => {
+    // The event type alone is not a result. Rejecting only `undefined` let
+    // `"response":null` through as a terminal success — a 200 whose body was
+    // literally `null`.
+    // `{}` is the same emptiness wearing an object's clothes: it clears a
+    // bare typeof check and then yields a 200 whose body says nothing.
+    for (const payload of ["null", '"nope"', "42", "[]", "{}", '{"usage":{"input_tokens":3}}']) {
+      const upstream = sseResponse([
+        `data: {"type":"response.incomplete","response":${payload}}\n\n`,
+      ]);
+
+      const result = await collectCodexResponseStream(upstream);
+
+      expect(result).toEqual({
+        kind: "json",
+        status: 502,
+        body: { error: { type: "upstream_error", message: "Stream ended before any terminal response event" } },
+      });
+    }
   });
 
   it("maps a response.failed event to a 502 upstream_error carrying its message", async () => {
@@ -128,25 +134,6 @@ describe("collectCodexResponseStream", () => {
       kind: "json",
       status: 502,
       body: { error: { type: "upstream_error", message: "boom" } },
-    });
-  });
-
-  it("returns response.incomplete as a valid terminal Responses object", async () => {
-    const upstream = sseResponse([
-      'data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}\n\n',
-    ]);
-
-    const result = await collectCodexResponseStream(upstream);
-
-    expect(result).toEqual({
-      kind: "json",
-      status: 200,
-      body: {
-        id: "resp_incomplete",
-        status: "incomplete",
-        incomplete_details: { reason: "max_output_tokens" },
-        output: [],
-      },
     });
   });
 
@@ -220,20 +207,207 @@ describe("collectCodexResponseStream", () => {
     });
   });
 
-  it("bounds a non-streaming terminal response at 10 MiB", async () => {
-    const upstream = sseResponse([
-      `data: ${JSON.stringify({
-        type: "response.completed",
-        response: { output: "x".repeat(10 * 1024 * 1024) },
-      })}\n\n`,
-    ]);
+  it("classifies a split terminal without retaining its payload or mutating chunks", () => {
+    const encoder = new TextEncoder();
+    const first = encoder.encode('data: {"type":"response.com');
+    const second = encoder.encode('pleted","response":{"id":"resp_private","private":"not retained"}}\n\n');
+    const firstBefore = first.slice();
+    const secondBefore = second.slice();
+    const observer = createCodexResponseTerminalObserver();
+
+    observer.push(first);
+    observer.push(second);
+
+    expect(observer.finish()).toEqual({ kind: "completed" });
+    expect(first).toEqual(firstBefore);
+    expect(second).toEqual(secondBefore);
+  });
+
+  it.each([
+    ["a no-newline data field", `data: ${"x".repeat(64 * 1024 + 1)}`],
+    ["an oversized terminal event", `data: ${JSON.stringify({
+      type: "response.completed",
+      response: { id: "oversized", output: "x".repeat(64 * 1024) },
+    })}\n\n`],
+  ])("classifies %s as overflow with bounded framing state", (_name, input) => {
+    const observer = createCodexResponseTerminalObserver();
+    observer.push(new TextEncoder().encode(input));
+    expect(observer.finish().kind).toBe("overflow");
+  });
+
+  it("bounds a collected terminal response at 10 MiB and cancels the reader", async () => {
+    let cancelled = false;
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("x".repeat(10 * 1024 * 1024 + 1)));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const upstream = new Response(stream as BodyInit, {
+      headers: { "content-type": "text/event-stream" },
+    });
 
     const result = await collectCodexResponseStream(upstream);
 
-    expect(result.kind).toBe("json");
-    expect(result.status).toBe(502);
-    expect(result.body).toEqual({
-      error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
+    expect(result).toEqual({
+      kind: "json",
+      status: 502,
+      body: { error: { type: "upstream_error", message: "Upstream response exceeded size limit" } },
     });
+    expect(cancelled).toBe(true);
+  });
+});
+
+describe("createCodexUsageObserver", () => {
+  const encoder = new TextEncoder();
+
+  it("captures usage from a response.completed event split across chunks", () => {
+    const observer = createCodexUsageObserver();
+    const event = `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_1",
+        usage: { input_tokens: 100, output_tokens: 25, input_tokens_details: { cached_tokens: 60 } },
+      },
+    })}\n\n`;
+    const mid = Math.floor(event.length / 2);
+    observer.push(encoder.encode(event.slice(0, mid)));
+    observer.push(encoder.encode(event.slice(mid)));
+    expect(observer.finish()).toEqual({ inputTokens: 100, cachedInputTokens: 60, outputTokens: 25 });
+  });
+
+  it("captures usage from a response.incomplete event and reports no failure", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode(`data: ${JSON.stringify({
+      type: "response.incomplete",
+      response: {
+        id: "resp_1",
+        usage: { input_tokens: 200, output_tokens: 50, input_tokens_details: { cached_tokens: 20 } },
+        incomplete_details: { reason: "max_output_tokens" },
+      },
+    })}\n\n`));
+    expect(observer.finish()).toEqual({ inputTokens: 200, cachedInputTokens: 20, outputTokens: 50 });
+    expect(observer.failure()).toBeUndefined();
+  });
+
+  it("returns undefined when no completed event arrives", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"));
+    expect(observer.finish()).toBeUndefined();
+  });
+
+  it("never throws on a malformed SSE data line — push() and finish() swallow the parse error", () => {
+    const observer = createCodexUsageObserver();
+    expect(() => observer.push(encoder.encode("data: not-json\n\n"))).not.toThrow();
+    expect(() => observer.finish()).not.toThrow();
+    expect(observer.finish()).toBeUndefined();
+  });
+
+  it("still captures usage from a later valid chunk after an earlier chunk had a malformed data line", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode("data: not-json\n\n"));
+    const event = `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: { id: "resp_1", usage: { input_tokens: 8, output_tokens: 3, input_tokens_details: { cached_tokens: 1 } } },
+    })}\n\n`;
+    observer.push(encoder.encode(event));
+    expect(observer.finish()).toEqual({ inputTokens: 8, cachedInputTokens: 1, outputTokens: 3 });
+  });
+
+  it("drops an oversized frame and still observes a later bounded terminal", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode(`data: ${"x".repeat(64 * 1024 + 1)}\n`));
+    observer.push(encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":8,"output_tokens":3}}}\n\n'));
+
+    expect(observer.finish()).toEqual({ inputTokens: 8, cachedInputTokens: 0, outputTokens: 3 });
+    expect(observer.failure()).toBeUndefined();
+  });
+
+  it("reports no failure when the stream completes normally", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBeUndefined();
+  });
+
+  it("reports a synthetic failure when the stream ends without ever observing response.completed", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode('data: {"type":"response.output_text.delta","delta":"partial"}\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBe("Upstream stream ended before any terminal response event");
+  });
+
+  it("reports a synthetic failure when the terminal response.completed frame is malformed", () => {
+    const observer = createCodexUsageObserver();
+    // Tolerant parsing drops the malformed frame instead of throwing, so
+    // without a completion check this would look identical to a clean 200.
+    observer.push(encoder.encode('data: {"type":"response.completed","response":{"id":\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBe("Upstream stream ended before any terminal response event");
+  });
+
+  it("reports a synthetic failure when a terminal frame carries no response object", () => {
+    const observer = createCodexUsageObserver();
+    // Well-formed SSE, so tolerant parsing keeps the frame — the payload
+    // itself is what makes this no result at all.
+    observer.push(encoder.encode('data: {"type":"response.incomplete","response":null}\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBe("Upstream stream ended before any terminal response event");
+  });
+
+  it("records a failure message from a response.failed event without altering usage extraction", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode('data: {"type":"response.failed","response":{"error":{"message":"boom"}}}\n\n'));
+    expect(observer.finish()).toBeUndefined();
+    expect(observer.failure()).toBe("boom");
+  });
+
+  it("records a failure message from a bare error event", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode('data: {"type":"error","error":{"message":"upstream exploded"}}\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBe("upstream exploded");
+  });
+
+  it("falls back to a default failure message when response.failed omits an error message", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode('data: {"type":"response.failed","response":{}}\n\n'));
+    observer.finish();
+    expect(observer.failure()).toBe("Response failed");
+  });
+
+  it("detects a response.failed event split across two push() chunks", () => {
+    const observer = createCodexUsageObserver();
+    const event = 'data: {"type":"response.failed","response":{"error":{"message":"late boom"}}}\n\n';
+    const mid = Math.floor(event.length / 2);
+    observer.push(encoder.encode(event.slice(0, mid)));
+    observer.push(encoder.encode(event.slice(mid)));
+    observer.finish();
+    expect(observer.failure()).toBe("late boom");
+  });
+});
+
+describe("usageFromResponseBody", () => {
+  it("extracts input/output/cached token totals from a valid usage object", () => {
+    const body = {
+      usage: { input_tokens: 10, output_tokens: 5, input_tokens_details: { cached_tokens: 2 } },
+    };
+    expect(usageFromResponseBody(body)).toEqual({ inputTokens: 10, cachedInputTokens: 2, outputTokens: 5 });
+  });
+
+  it("returns undefined when usage is null", () => {
+    expect(usageFromResponseBody({ usage: null })).toBeUndefined();
+  });
+
+  it("returns undefined when usage is missing entirely", () => {
+    expect(usageFromResponseBody({ id: "resp_1" })).toBeUndefined();
+  });
+
+  it("returns undefined for a non-object body", () => {
+    expect(usageFromResponseBody(null)).toBeUndefined();
+    expect(usageFromResponseBody("not an object")).toBeUndefined();
   });
 });

@@ -15,6 +15,9 @@ export interface ForwardOpenAICodexResponseOptions {
   account: OpenAISubscriptionAccount;
   body: OpenAIResponsesRequest;
   stream: boolean;
+  /** Aborted when the client disconnects, so a request nobody is waiting for
+   *  stops occupying an upstream slot on the account. */
+  signal?: AbortSignal;
 }
 
 export async function forwardOpenAICodexResponse(
@@ -37,6 +40,7 @@ export async function forwardOpenAICodexResponse(
           accept: "text/event-stream",
         },
         body: JSON.stringify(body),
+        ...(opts.signal ? { signal: opts.signal } : {}),
       });
       const outcome = responseOutcome(upstream.status);
       annotateActiveSpan("provider.inference", {
@@ -119,9 +123,15 @@ export function toCodexBackendRequest(body: OpenAIResponsesRequest): OpenAIRespo
 }
 
 function ensureEventStreamContentType(upstream: Response): Response {
-  if (!upstream.ok) return upstream;
   const contentType = upstream.headers.get("content-type");
   if (contentType?.includes("text/event-stream")) return upstream;
+
+  // Only a successful response is actually an event stream that lost its
+  // content-type header. A non-OK response (401/429/5xx) is typically a
+  // plain JSON or text error body — rewriting its content-type would make
+  // callers parse it as SSE and misreport a real upstream failure as an
+  // empty success. Let it pass through with whatever content-type it has.
+  if (!upstream.ok) return upstream;
 
   const headers = new Headers(upstream.headers);
   headers.set("content-type", "text/event-stream");

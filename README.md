@@ -273,6 +273,8 @@ See [docs/litellm-setup.md](docs/litellm-setup.md) for details.
 
 CC-Router exposes an OpenAI Responses-compatible endpoint for Codex CLI at `/v1/responses`. This lets Codex use OpenAI ChatGPT/Codex subscription accounts through the same local router that Claude Code uses for Claude subscriptions.
 
+**Features:** Sticky sessions pin each Codex conversation to one account for prompt-cache locality. Load- and headroom-aware account selection spreads new sessions across available capacity. Usage tracking from response headers reports account-level 5-hour and 7-day windows, dynamically discovered model-scoped metered buckets, credits, and plan. User caps (`sessionLimitPercent`/`weeklyLimitPercent`) apply to the default Codex bucket. The dashboard shows per-bucket rows, usage bars, credits, plan, and cooldown state for OpenAI accounts.
+
 Configure Codex:
 
 ```bash

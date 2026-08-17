@@ -60,6 +60,39 @@ async function waitForRequest(
   }, { timeout: 2_000 });
 }
 
+async function createOpenAIRoutingOptions(
+  overrides: Partial<{
+    id: string;
+    accessToken: string;
+    refreshToken: string;
+    expiresAt: number;
+    enabled: boolean;
+  }> = {},
+) {
+  const [{ createOpenAIAccount }, { OpenAITokenPool }, { SessionRouter }] = await Promise.all([
+    import("../providers/openai/account-state.js"),
+    import("../providers/openai/token-pool.js"),
+    import("../proxy/session-router.js"),
+  ]);
+  const account = createOpenAIAccount({
+    id: TELEMETRY_CANARY.accountId,
+    provider: "openai_subscription",
+    accessToken: TELEMETRY_CANARY.bearerToken,
+    refreshToken: "private-refresh",
+    expiresAt: Date.now() + 60 * 60 * 1_000,
+    enabled: true,
+    ...overrides,
+  });
+  const openAIPool = new OpenAITokenPool([account]);
+  return {
+    account,
+    options: {
+      openAIPool,
+      openAIRouter: new SessionRouter(openAIPool),
+    },
+  };
+}
+
 describe("proxy runtime sampling and propagation", () => {
   let capture: TransportCaptureServer;
   let testHome: string;
@@ -541,15 +574,9 @@ describe("proxy runtime sampling and propagation", () => {
     const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
     const { flushTelemetryWithin } = await import("../telemetry/facade.js");
     const app = express();
+    const routing = await createOpenAIRoutingOptions();
     mountResponsesRoutes(app, {
-      getOpenAIAccount: () => ({
-        id: TELEMETRY_CANARY.accountId,
-        provider: "openai_subscription",
-        accessToken: TELEMETRY_CANARY.bearerToken,
-        refreshToken: "private-refresh",
-        expiresAt: Date.now() + 60_000,
-        enabled: true,
-      }),
+      ...routing.options,
       forwardOpenAI: async () => new Response("private upstream response", {
         status: 429,
         headers: { "content-type": "text/plain" },
@@ -617,15 +644,9 @@ describe("proxy runtime sampling and propagation", () => {
     const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
     const { flushTelemetryWithin } = await import("../telemetry/facade.js");
     const app = express();
+    const routing = await createOpenAIRoutingOptions();
     mountResponsesRoutes(app, {
-      getOpenAIAccount: () => ({
-        id: TELEMETRY_CANARY.accountId,
-        provider: "openai_subscription",
-        accessToken: TELEMETRY_CANARY.bearerToken,
-        refreshToken: "private-refresh",
-        expiresAt: Date.now() + 60_000,
-        enabled: true,
-      }),
+      ...routing.options,
       forwardOpenAI: async () => new Response(
         `data: {"type":"response.created","response":{"private":"${TELEMETRY_CANARY.prompt}"}}\n\n`,
         { status: 200, headers: { "content-type": "text/event-stream" } },
@@ -650,7 +671,7 @@ describe("proxy runtime sampling and propagation", () => {
       expect(await response.json()).toEqual({
         error: {
           type: "upstream_error",
-          message: "Stream ended before response.completed",
+          message: "Stream ended before any terminal response event",
         },
       });
       await flushTelemetryWithin(500);
@@ -695,7 +716,7 @@ describe("proxy runtime sampling and propagation", () => {
       name: "premature EOF",
       event: { type: "response.created", response: { id: "private-response-id" } },
       expectedOutcome: "upstream_error",
-      aborts: true,
+      aborts: false,
     },
     {
       name: "oversized terminal event",
@@ -705,7 +726,7 @@ describe("proxy runtime sampling and propagation", () => {
         response: { private: TELEMETRY_CANARY.prompt.repeat(8_192) },
       })}\n\n`,
       expectedOutcome: "upstream_error",
-      aborts: true,
+      aborts: false,
     },
   ])("classifies streaming Responses $name without exporting terminal contents", async testCase => {
     const express = (await import("express")).default;
@@ -716,15 +737,9 @@ describe("proxy runtime sampling and propagation", () => {
       ? testCase.responseBody
       : `data: ${JSON.stringify(testCase.event)}\n\n`;
     const app = express();
+    const routing = await createOpenAIRoutingOptions();
     mountResponsesRoutes(app, {
-      getOpenAIAccount: () => ({
-        id: TELEMETRY_CANARY.accountId,
-        provider: "openai_subscription",
-        accessToken: TELEMETRY_CANARY.bearerToken,
-        refreshToken: "private-refresh",
-        expiresAt: Date.now() + 60_000,
-        enabled: true,
-      }),
+      ...routing.options,
       forwardOpenAI: async () => new Response(responseBody, {
         status: 200,
         headers: { "content-type": "text/event-stream" },
@@ -785,15 +800,9 @@ describe("proxy runtime sampling and propagation", () => {
     const { mountMessagesCrossProviderRoute } = await import("../proxy/messages-cross-route.js");
     const { flushTelemetryWithin } = await import("../telemetry/facade.js");
     const app = express();
+    const routing = await createOpenAIRoutingOptions();
     mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: TELEMETRY_CANARY.accountId,
-        provider: "openai_subscription",
-        accessToken: TELEMETRY_CANARY.bearerToken,
-        refreshToken: "private-refresh",
-        expiresAt: Date.now() + 60_000,
-        enabled: true,
-      }),
+      ...routing.options,
       forwardOpenAI: async () => new Response([
         'data: {"type":"response.created","response":{"id":"private-response-id","model":"gpt-5-codex"}}',
         'data: {"type":"response.output_text.delta","delta":"private translated output"}',
@@ -871,15 +880,9 @@ describe("proxy runtime sampling and propagation", () => {
     const { flushTelemetryWithin } = await import("../telemetry/facade.js");
     let unexpected = false;
     const app = express();
+    const routing = await createOpenAIRoutingOptions();
     mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: TELEMETRY_CANARY.accountId,
-        provider: "openai_subscription",
-        accessToken: TELEMETRY_CANARY.bearerToken,
-        refreshToken: "private-refresh",
-        expiresAt: Date.now() + 60_000,
-        enabled: true,
-      }),
+      ...routing.options,
       forwardOpenAI: async () => {
         if (unexpected) throw new TypeError("PRIVATE_UNEXPECTED_RUNTIME_MESSAGE");
         return new Response("private overloaded body", {
@@ -915,9 +918,13 @@ describe("proxy runtime sampling and propagation", () => {
       expect(expectedLog).not.toContain("private overloaded body");
       expect(posthogBodies).toHaveLength(sdkBeforeExpected);
 
+      // The authoritative failure router cools a 529 account globally. Clear
+      // that request's pool-side state so this test's second request reaches
+      // the injected unexpected transport failure it is meant to exercise.
+      routing.options.openAIPool.forgetAccount(routing.account);
       unexpected = true;
       const sdkBeforeUnexpected = posthogBodies.length;
-      expect((await request()).status).toBe(500);
+      expect((await request()).status).toBe(502);
       await flushTelemetryWithin(500);
       await vi.waitFor(() => expect(posthogBodies.length).toBeGreaterThan(sdkBeforeUnexpected));
       const exceptionWire = posthogBodies.slice(sdkBeforeUnexpected).join("\n");
@@ -946,7 +953,7 @@ describe("proxy runtime sampling and propagation", () => {
         refreshToken: "private-refresh",
         expiresAt: Date.now() + 60_000,
         enabled: true,
-      })).rejects.toBeInstanceOf(SyntaxError);
+      })).resolves.toBe(false);
       await flushTelemetryWithin(500);
       await Promise.all([
         waitForRequest(capture, "/i/v1/traces", started),
@@ -974,15 +981,9 @@ describe("proxy runtime sampling and propagation", () => {
     const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
     const { flushTelemetryWithin } = await import("../telemetry/facade.js");
     const app = express();
+    const routing = await createOpenAIRoutingOptions();
     mountResponsesRoutes(app, {
-      getOpenAIAccount: () => ({
-        id: TELEMETRY_CANARY.accountId,
-        provider: "openai_subscription",
-        accessToken: TELEMETRY_CANARY.bearerToken,
-        refreshToken: "private-refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
+      ...routing.options,
     });
     const server = createServer(app);
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -1023,17 +1024,11 @@ describe("proxy runtime sampling and propagation", () => {
     const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
     const { prepareOpenAIAccountForRequest } = await import("../providers/openai/token-refresher.js");
     const { flushTelemetryWithin } = await import("../telemetry/facade.js");
-    const account = {
-      id: TELEMETRY_CANARY.accountId,
-      provider: "openai_subscription" as const,
-      accessToken: TELEMETRY_CANARY.bearerToken,
-      refreshToken: "private-refresh",
-      expiresAt: Date.now() + 60_000,
-      enabled: true,
-    };
+    const routing = await createOpenAIRoutingOptions({ expiresAt: Date.now() + 60_000 });
+    const { account } = routing;
     const app = express();
     mountResponsesRoutes(app, {
-      getOpenAIAccount: () => account,
+      ...routing.options,
       prepareOpenAIAccount: candidate => prepareOpenAIAccountForRequest(candidate, [account], () => undefined),
       prepareOpenAIAccountOwnsDiagnostics: true,
     });
@@ -1070,15 +1065,9 @@ describe("proxy runtime sampling and propagation", () => {
     const { mountResponsesRoutes } = await import("../proxy/responses-server.js");
     const { flushTelemetryWithin } = await import("../telemetry/facade.js");
     const app = express();
+    const routing = await createOpenAIRoutingOptions();
     mountResponsesRoutes(app, {
-      getOpenAIAccount: () => ({
-        id: TELEMETRY_CANARY.accountId,
-        provider: "openai_subscription",
-        accessToken: TELEMETRY_CANARY.bearerToken,
-        refreshToken: "private-refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
+      ...routing.options,
     });
     app.use((_error: unknown, _req: unknown, res: { status: (code: number) => { end: () => void } }, _next: unknown) => {
       res.status(500).end();
@@ -1096,7 +1085,7 @@ describe("proxy runtime sampling and propagation", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ model: "openai/gpt-5-codex", input: [] }),
       });
-      expect(response.status).toBe(500);
+      expect(response.status).toBe(502);
       await response.arrayBuffer();
       await flushTelemetryWithin(500);
       await vi.waitFor(() => expect(posthogBodies.length).toBeGreaterThan(sdkStarted));
@@ -1159,7 +1148,7 @@ describe("proxy runtime sampling and propagation", () => {
     returnInvalidOpenAIRefresh = true;
 
     try {
-      await expect(refreshOpenAISubscriptionToken(openAIAccount)).rejects.toBeInstanceOf(TypeError);
+      await expect(refreshOpenAISubscriptionToken(openAIAccount)).resolves.toBe(false);
       expect(openAIAccount).toEqual(expect.objectContaining({
         accessToken: TELEMETRY_CANARY.bearerToken,
         refreshToken: "private-refresh",
@@ -1215,15 +1204,9 @@ describe("proxy runtime sampling and propagation", () => {
     const { mountMessagesCrossProviderRoute } = await import("../proxy/messages-cross-route.js");
     const { flushTelemetryWithin } = await import("../telemetry/facade.js");
     const app = express();
+    const routing = await createOpenAIRoutingOptions();
     mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: TELEMETRY_CANARY.accountId,
-        provider: "openai_subscription",
-        accessToken: TELEMETRY_CANARY.bearerToken,
-        refreshToken: "private-refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
+      ...routing.options,
       prepareOpenAIAccount: async () => true,
       prepareOpenAIAccountOwnsDiagnostics: true,
       forwardOpenAI: async () => {

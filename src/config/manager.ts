@@ -117,8 +117,7 @@ function readAccountStateOrThrow(path = ACCOUNTS_PATH): unknown[] {
 }
 
 function readRawFromPath(path: string): unknown[] {
-  const result = readAccountStateDetailed(path);
-  return result.ok ? result.records : [];
+  return readAccountStateOrThrow(path);
 }
 
 /** Deserialize Account[] from an explicit file path */
@@ -233,12 +232,18 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
       refreshToken: a.refreshToken,
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
+      ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
+      ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
+      ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
     }));
 }
 
-export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void {
+/** Persist OpenAI subscription accounts to an explicit accounts file, preserving
+ *  every other provider's records already in that file. Shared by `saveOpenAIAccounts`
+ *  (default path) and any caller bound to a custom `--accounts <path>`. */
+export function saveOpenAIAccountsToPath(accounts: OpenAISubscriptionAccount[], path: string): void {
   ensureConfigDir();
-  const existing = readAccountStateOrThrow() as AccountRecord[];
+  const existing = readAccountStateOrThrow(path) as AccountRecord[];
   const nonOpenAI = existing.filter(a => a.provider !== "openai_subscription");
   const records: AccountRecord[] = accounts.map(a => ({
     id: a.id,
@@ -246,10 +251,16 @@ export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void 
     accessToken: a.accessToken,
     refreshToken: a.refreshToken,
     expiresAt: a.expiresAt,
-    scopes: ["openid", "profile", "email", "offline_access"],
+    scopes: a.scopes ?? ["openid", "profile", "email", "offline_access"],
     enabled: a.enabled,
+    ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
+    ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
   }));
-  writeAccountsAtomicToPath(ACCOUNTS_PATH, [...nonOpenAI, ...records]);
+  writeAccountsAtomicToPath(path, [...nonOpenAI, ...records]);
+}
+
+export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void {
+  saveOpenAIAccountsToPath(accounts, ACCOUNTS_PATH);
 }
 
 // ─── Proxy config (password, future settings) ─────────────────────────────────

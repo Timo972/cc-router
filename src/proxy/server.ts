@@ -7,7 +7,7 @@ import type { Socket } from "net";
 import type { Request } from "express";
 import { TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
-import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccounts, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner } from "../utils/self-update.js";
 import {
   annotateActiveSpan,
@@ -21,12 +21,24 @@ import {
 import { logRoute, logError, logStartup } from "./logger.js";
 import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
-import { PROXY_PORT, LITELLM_URL } from "../config/paths.js";
+import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
 import { writePid, removePid } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
-import { createOpenAIAccountPicker } from "../providers/openai/account-pool.js";
-import { prepareOpenAIAccountForRequest, startOpenAIRefreshLoop } from "../providers/openai/token-refresher.js";
-import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
+import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
+import {
+  hasPendingCredentialWrite,
+  markOpenAICredentialsPersisted,
+  prepareOpenAIAccountForRequest,
+  refreshAndPersistOpenAIAccount,
+  startOpenAIRefreshLoop,
+  type OpenAISubscriptionAccount,
+} from "../providers/openai/token-refresher.js";
+import { createOpenAIAccount } from "../providers/openai/account-state.js";
+import type { OpenAIAccount } from "../providers/openai/account-state.js";
+import { OpenAITokenPool } from "../providers/openai/token-pool.js";
+import type { OpenAICooldownView } from "../providers/openai/token-pool.js";
+import { DEFAULT_CODEX_LIMIT_ID } from "../providers/openai/usage.js";
+import type { CodexLimitBucket, CodexRateWindow } from "../providers/openai/usage.js";
 import { mountResponsesRoutes } from "./responses-server.js";
 import { mountMessagesCrossProviderRoute } from "./messages-cross-route.js";
 import { mountModelsRoute } from "./models-server.js";
@@ -100,6 +112,35 @@ export interface HealthAccountView {
   cooldownUntilMs?: number;
   globalCooldownUntilMs?: number;
   modelCooldowns?: PublicModelCooldown[];
+  codexRateLimits?: PublicCodexRateLimits;
+  /** True while an OpenAI account's rotated credentials are live in memory but
+   *  not yet on disk, because a save failed and is still being retried. The
+   *  account keeps serving traffic — the token works — but a restart before
+   *  the write lands would fall back to the old refresh token, which the
+   *  provider already invalidated, and require re-authentication. */
+  credentialsPendingWrite?: boolean;
+}
+
+export interface PublicCodexWindow {
+  utilization: number;   // clamped 0..1
+  resetAt: number;       // Unix seconds, 0 unknown
+  windowMinutes: number; // 0 unknown
+}
+
+export interface PublicCodexBucket {
+  limitId: string;         // /^[a-z0-9_]{1,64}$/ else "unknown"
+  label: string;           // sanitized limitName, fallback limitId
+  primary?: PublicCodexWindow;
+  secondary?: PublicCodexWindow;
+  cooldownUntilMs: number; // 0 when not cooling
+}
+
+export interface PublicCodexRateLimits {
+  status: "ok" | "rate_limited";
+  plan: string; // sanitized, "" when unknown
+  buckets: PublicCodexBucket[]; // default bucket first, max 8
+  credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  lastUpdated: number;
 }
 
 export interface PublicRateLimitWindow {
@@ -242,14 +283,18 @@ export function createOperationalStatus(opts: {
 
 export function createHealthAccountViews(
   anthropicAccounts: Account[],
-  openAIAccounts: OpenAISubscriptionAccount[],
+  openAIAccounts: OpenAIAccount[],
   resolveRoutingMetrics: RoutingMetricsResolver = zeroRoutingMetrics,
+  resolveOpenAIRouting?: (accountId: string) => { metrics: AccountRoutingMetrics; cooldowns: OpenAICooldownView },
 ): HealthAccountView[] {
   return [
     ...anthropicAccounts.map(account => (
       publicAnthropicAccountView(account, resolveRoutingMetrics(account.id))
     )),
-    ...openAIAccounts.map(publicOpenAIAccountView),
+    ...openAIAccounts.map(account => publicOpenAIAccountView(
+      account,
+      resolveOpenAIRouting?.(account.id) ?? { metrics: zeroRoutingMetrics(account.id), cooldowns: { globalUntilMs: 0, bucketCooldowns: [] } },
+    )),
   ];
 }
 
@@ -373,22 +418,97 @@ function publicRepresentativeClaim(claim: unknown): string {
   return "unknown";
 }
 
-function publicOpenAIAccountView(a: OpenAISubscriptionAccount): HealthAccountView {
+function publicOpenAIAccountView(
+  a: OpenAIAccount,
+  routing: { metrics: AccountRoutingMetrics; cooldowns: OpenAICooldownView },
+): HealthAccountView {
   const expiresInMs = a.expiresAt - Date.now();
   return {
     id: a.id,
     provider: "openai_subscription",
     enabled: a.enabled !== false,
-    healthy: a.enabled !== false && expiresInMs > 0,
-    busy: false,
-    inFlightRequests: 0,
-    activeSessions: 0,
-    requestCount: 0,
-    errorCount: 0,
+    sessionLimitPercent: a.sessionLimitPercent,
+    weeklyLimitPercent: a.weeklyLimitPercent,
+    healthy: a.enabled !== false && a.healthy && expiresInMs > 0,
+    busy: routing.metrics.coolingDown,
+    cooldownUntilMs: routing.metrics.cooldownUntilMs ?? 0,
+    globalCooldownUntilMs: routing.cooldowns.globalUntilMs,
+    inFlightRequests: routing.metrics.inFlightRequests,
+    activeSessions: routing.metrics.activeSessions,
+    requestCount: a.requestCount,
+    errorCount: a.errorCount,
     expiresInMs,
-    lastUsedMs: 0,
-    lastRefreshMs: 0,
+    lastUsedMs: a.lastUsed,
+    lastRefreshMs: a.lastRefresh,
+    codexRateLimits: publicCodexRateLimits(a, routing.cooldowns),
+    ...(hasPendingCredentialWrite(a) ? { credentialsPendingWrite: true } : {}),
   };
+}
+
+function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView): PublicCodexRateLimits {
+  const rl = a.rateLimits;
+  // A bucket cooldown can exist without any snapshot for that bucket: a
+  // header-only 429 (an `x-codex-active-limit` with no accompanying
+  // rate-limit headers) sets a cooldown the pool enforces in `hardBlock`.
+  // Synthesizing a window-less entry for those keeps the health view honest —
+  // otherwise the account renders fully available while it is actually being
+  // skipped for that model.
+  const cooldownOnly: CodexLimitBucket[] = cooldowns.bucketCooldowns
+    .filter(cooldown => !rl.buckets.has(cooldown.limitId))
+    .map(cooldown => ({ limitId: cooldown.limitId }));
+  const buckets = [...rl.buckets.values(), ...cooldownOnly]
+    .sort((left, right) =>
+      left.limitId === DEFAULT_CODEX_LIMIT_ID ? -1
+        : right.limitId === DEFAULT_CODEX_LIMIT_ID ? 1
+        : left.limitId.localeCompare(right.limitId))
+    .slice(0, 8)
+    .map(bucket => ({
+      limitId: publicCodexLimitId(bucket.limitId),
+      label: publicCodexLabel(bucket),
+      ...(bucket.primary ? { primary: publicCodexWindow(bucket.primary) } : {}),
+      ...(bucket.secondary ? { secondary: publicCodexWindow(bucket.secondary) } : {}),
+      cooldownUntilMs: publicTimestamp(
+        cooldowns.bucketCooldowns.find(c => c.limitId === bucket.limitId)?.untilMs ?? 0,
+      ),
+    }));
+  const credits = rl.credits;
+  const balance = typeof credits?.balance === "string"
+    ? credits.balance.replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 32)
+    : "";
+  return {
+    status: rl.status === "rate_limited" ? "rate_limited" : "ok",
+    plan: publicCodexPlan(rl.plan),
+    buckets,
+    ...(credits ? {
+      credits: {
+        hasCredits: credits.hasCredits === true,
+        unlimited: credits.unlimited === true,
+        ...(balance ? { balance } : {}),
+      },
+    } : {}),
+    lastUpdated: publicTimestamp(rl.lastUpdated),
+  };
+}
+
+function publicCodexWindow(window: CodexRateWindow): PublicCodexWindow {
+  return {
+    utilization: publicUtilization(window.utilization),
+    resetAt: publicTimestamp(window.resetAt),
+    windowMinutes: publicNonNegativeInteger(window.windowMinutes),
+  };
+}
+
+function publicCodexLimitId(value: string): string {
+  return /^[a-z0-9_]{1,64}$/.test(value) ? value : "unknown";
+}
+
+function publicCodexLabel(bucket: CodexLimitBucket): string {
+  const name = bucket.limitName?.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 64);
+  return name || publicCodexLimitId(bucket.limitId);
+}
+
+function publicCodexPlan(value: string | undefined): string {
+  return typeof value === "string" && /^[a-z0-9_-]{1,32}$/.test(value) ? value : "";
 }
 
 function providerStatus(accounts: HealthAccountView[]): ProviderOperationalStatus {
@@ -476,6 +596,26 @@ export function applyRateLimitHeaders(
   return true;
 }
 
+/**
+ * Build the single function through which this server writes OpenAI accounts.
+ *
+ * Two things have to be true of every such write, so they live together here
+ * rather than at each call site. It must land in the file the process was
+ * started against — a custom `--accounts <path>` must never silently fall back
+ * to the default accounts.json. And it must report its own durability: an add,
+ * patch, or delete rewrites the same file from the same live array, so it puts
+ * a rotation that failed to persist earlier on disk even though no refresh was
+ * involved, and the pending-write bookkeeping has to clear with it.
+ */
+export function createOpenAIPersister(
+  accountsPath: string | undefined,
+): (accounts: OpenAISubscriptionAccount[]) => void {
+  return (accountsToSave: OpenAISubscriptionAccount[]): void => {
+    saveOpenAIAccountsToPath(accountsToSave, accountsPath ?? ACCOUNTS_PATH);
+    markOpenAICredentialsPersisted(accountsToSave);
+  };
+}
+
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const port = opts.port ?? PROXY_PORT;
 
@@ -486,6 +626,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const mode = litellmUrl ? "litellm" : "standalone";
 
   const accountsPath = opts.accountsPath;
+  const persistOpenAIAccounts = createOpenAIPersister(accountsPath);
 
   if (!accountsFileExists(accountsPath)) {
     console.error(chalk.red("\n✗ accounts.json not found."));
@@ -495,7 +636,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   migrateLegacyAccountProviders(accountsPath);
   const accounts = accountsPath ? readAccountsFromPath(accountsPath) : loadAccounts();
-  const openAIAccounts = loadOpenAIAccounts(accountsPath);
+  const openAIAccounts = loadOpenAIAccounts(accountsPath).map(createOpenAIAccount);
   if (accounts.length === 0 && openAIAccounts.length === 0) {
     console.error(chalk.red("\n✗ No accounts found in accounts.json."));
     console.error(chalk.yellow("  Run: cc-router setup\n"));
@@ -518,7 +659,28 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       };
     };
   };
-  const pickOpenAIAccount = createOpenAIAccountPicker(openAIAccounts);
+  const openAIPool = new OpenAITokenPool(openAIAccounts);
+  const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
+  // Factory, mirroring `createRoutingMetricsResolver`: the active-session
+  // snapshot is taken once per request rather than rebuilt (sweeping every
+  // binding and copying the map) for each account, and the cooldown view is
+  // computed once per account instead of three times.
+  const createOpenAIRoutingResolver = () => {
+    const activeSessionCounts = openAIRouter.getActiveSessionCountsSnapshot();
+    return (accountId: string) => {
+      const cooldowns = openAIPool.getCooldownView(accountId);
+      return {
+        metrics: {
+          inFlightRequests: openAIPool.getInFlight(accountId),
+          activeSessions: activeSessionCounts.get(accountId) ?? 0,
+          coolingDown: cooldowns.globalUntilMs > 0,
+          cooldownUntilMs: cooldowns.globalUntilMs,
+        },
+        cooldowns,
+      };
+    };
+  };
+  const resolveOpenAIRouting = (accountId: string) => createOpenAIRoutingResolver()(accountId);
   const initialConfig = readConfig();
   const modelRouting = initialConfig.modelRouting ?? {};
 
@@ -537,8 +699,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stats.addLog({ ts: Date.now(), accountId: a.id, model: "-", type: "route", details: msg });
   };
 
+  openAIPool.onCapBypass = (a) => {
+    const msg = `all OpenAI accounts capped — routing to ${a.id}`;
+    stats.addLog({ ts: Date.now(), accountId: a.id, model: "-", type: "error", details: msg });
+  };
+  openAIPool.onCooldownExpired = (a) => {
+    stats.addLog({ ts: Date.now(), accountId: a.id, model: "-", type: "route", details: `${a.id} cooldown expired — rate limit cleared` });
+  };
+
   const stopAnthropicRefreshLoop = startRefreshLoop(accounts);
-  const stopOpenAIRefreshLoop = startOpenAIRefreshLoop(openAIAccounts, saveOpenAIAccounts);
+  const stopOpenAIRefreshLoop = startOpenAIRefreshLoop(openAIAccounts, persistOpenAIAccounts);
   const usageRefresher = new AnthropicUsageRefresher(pool);
   usageRefresher.start();
 
@@ -593,11 +763,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // Sweep expired cooldowns on each poll so the dashboard reflects recovery
     // even during idle periods when no /v1 request would trigger getNext().
     pool.sweepExpiredCooldowns();
+    openAIPool.sweepExpiredCooldowns();
     const resolveRoutingMetrics = createRoutingMetricsResolver();
     const accountViews = createHealthAccountViews(
       pool.getAll(),
       openAIAccounts,
       resolveRoutingMetrics,
+      createOpenAIRoutingResolver(),
     );
     const status = accountViews.some(a => a.healthy) ? "ok" : "degraded";
 
@@ -645,6 +817,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         pool.getAll(),
         openAIAccounts,
         resolveRoutingMetrics,
+        createOpenAIRoutingResolver(),
       ),
     });
   });
@@ -693,12 +866,30 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     applyRuntime(enabled);
     try {
+      const isAnthropic = provider === "anthropic_subscription";
       const changed = persistProviderEnabledState({
         provider,
         enabled,
-        accountIds: pool.getAll().map(account => account.id),
-        persist: () => setProviderAccountsEnabled(provider, enabled, accountsPath),
-        invalidateAccount: accountId => sessionRouter.invalidateAccount(accountId),
+        accountIds: isAnthropic
+          ? pool.getAll().map(account => account.id)
+          : openAIAccounts.map(account => account.id),
+        // OpenAI accounts are written from the live pool rather than by
+        // rewriting whatever is on disk. A refresh may have rotated
+        // credentials that never reached a file, and re-serializing that
+        // stale record would report this PATCH a success while the only
+        // valid refresh token stayed in memory — one crash from forcing a
+        // re-login. Going through the live persister saves it and clears the
+        // pending marker. Anthropic has no such in-memory rotation to lose.
+        persist: () => {
+          if (isAnthropic) return setProviderAccountsEnabled(provider, enabled, accountsPath);
+          persistOpenAIAccounts(openAIAccounts);
+          // Same count `setProviderAccountsEnabled` reports, so the response
+          // keeps its shape for both providers: every account of this provider
+          // the write covered, not only those whose flag flipped.
+          return openAIAccounts.length;
+        },
+        invalidateAccount: accountId => (isAnthropic ? sessionRouter : openAIRouter)
+          .invalidateAccount(accountId),
       });
       res.json({ provider, enabled, changed });
     } catch (err) {
@@ -735,52 +926,70 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       weeklyLimitPercent?: unknown;
     };
 
-    const patch: { enabled?: boolean; sessionLimitPercent?: number; weeklyLimitPercent?: number } = {};
-    if (body.enabled !== undefined) {
-      if (typeof body.enabled !== "boolean") {
-        res.status(400).json({ error: "enabled must be boolean" });
-        return;
-      }
-      patch.enabled = body.enabled;
+    const validation = validateAccountPatchBody(body);
+    if (!validation.ok) {
+      res.status(400).json({ error: validation.error });
+      return;
     }
-    for (const key of ["sessionLimitPercent", "weeklyLimitPercent"] as const) {
-      const v = body[key];
-      if (v === undefined) continue;
-      if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 100) {
-        res.status(400).json({ error: `${key} must be a number between 0 and 100` });
-        return;
-      }
-      patch[key] = v;
-    }
+    const patch = validation.patch;
 
     // Snapshot the previous values so we can roll back on persistence failure
     const existing = pool.findById(id);
-    if (!existing) {
+    if (existing) {
+      const prev = {
+        enabled: existing.enabled,
+        sessionLimitPercent: existing.sessionLimitPercent,
+        weeklyLimitPercent: existing.weeklyLimitPercent,
+      };
+
+      const updated = pool.updateAccount(id, patch);
+      if (!updated) {
+        res.status(404).json({ error: `Account "${id}" not found` });
+        return;
+      }
+
+      const result = tryPersist(() => {
+        pool.updateAccount(id, prev);
+      });
+      if (!result.ok) {
+        res.status(500).json({ error: `Failed to persist accounts.json: ${result.message}` });
+        return;
+      }
+      if (patch.enabled === false) sessionRouter.invalidateAccount(id);
+      res.json({
+        account: publicAnthropicAccountView(updated, createRoutingMetricsResolver()(updated.id)),
+      });
+      return;
+    }
+
+    // Not a Claude account — try the OpenAI pool. `OpenAITokenPool` has no
+    // `updateAccount` of its own, so the runtime `OpenAIAccount` is patched
+    // and persisted directly via the same transaction contract used to add
+    // and delete OpenAI accounts.
+    let updatedOpenAI: OpenAIAccount | undefined;
+    try {
+      updatedOpenAI = applyOpenAIAccountPatch({
+        id,
+        patch,
+        accounts: openAIAccounts,
+        persist: persistOpenAIAccounts,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError("accounts", 0, `Failed to persist accounts.json: ${message}`);
+      res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
+      return;
+    }
+    if (!updatedOpenAI) {
       res.status(404).json({ error: `Account "${id}" not found` });
       return;
     }
-    const prev = {
-      enabled: existing.enabled,
-      sessionLimitPercent: existing.sessionLimitPercent,
-      weeklyLimitPercent: existing.weeklyLimitPercent,
-    };
-
-    const updated = pool.updateAccount(id, patch);
-    if (!updated) {
-      res.status(404).json({ error: `Account "${id}" not found` });
-      return;
-    }
-
-    const result = tryPersist(() => {
-      pool.updateAccount(id, prev);
-    });
-    if (!result.ok) {
-      res.status(500).json({ error: `Failed to persist accounts.json: ${result.message}` });
-      return;
-    }
-    if (patch.enabled === false) sessionRouter.invalidateAccount(id);
+    // Same contract as the Anthropic branch above: disabling an account drops
+    // its sticky bindings immediately instead of leaving them (and their
+    // active-session counts) attributed to it until the binding TTL expires.
+    if (patch.enabled === false) openAIRouter.invalidateAccount(id);
     res.json({
-      account: publicAnthropicAccountView(updated, createRoutingMetricsResolver()(updated.id)),
+      account: publicOpenAIAccountView(updatedOpenAI, resolveOpenAIRouting(updatedOpenAI.id)),
     });
   });
 
@@ -798,8 +1007,18 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       res.status(400).json({ error: "Invalid field types on account record" });
       return;
     }
+    // Same cap validation the PATCH endpoint applies, so the two writers of
+    // these fields agree instead of POST silently clamping a bad value to 100.
+    const capValidation = validateAccountPatchBody({
+      sessionLimitPercent: body.sessionLimitPercent,
+      weeklyLimitPercent: body.weeklyLimitPercent,
+    });
+    if (!capValidation.ok) {
+      res.status(400).json({ error: capValidation.error });
+      return;
+    }
     // IDs are unique across providers, so a new account may not collide with an
-    // existing account in either the Claude pool or the OpenAI picker.
+    // existing account in either the Claude pool or the OpenAI pool.
     if (pool.findById(body.id) || openAIAccounts.some(a => a.id === body.id)) {
       res.status(409).json({ error: `Account "${body.id}" already exists` });
       return;
@@ -815,9 +1034,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             refreshToken: body.refreshToken,
             expiresAt: body.expiresAt,
             enabled: body.enabled,
+            sessionLimitPercent: body.sessionLimitPercent,
+            weeklyLimitPercent: body.weeklyLimitPercent,
           },
           accounts: openAIAccounts,
-          persist: saveOpenAIAccounts,
+          persist: persistOpenAIAccounts,
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -825,7 +1046,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
         return;
       }
-      res.status(201).json({ account: publicOpenAIAccountView(addedOpenAI) });
+      res.status(201).json({ account: publicOpenAIAccountView(addedOpenAI, resolveOpenAIRouting(addedOpenAI.id)) });
       return;
     }
 
@@ -871,11 +1092,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     if (openAIExisting && !existing) {
       try {
-        deleteOpenAIAccountTransaction({
+        deleteOpenAIAccountTransaction<OpenAIAccount>({
           id,
           accounts: openAIAccounts,
           otherAccountCount: pool.getAll().length,
-          persist: saveOpenAIAccounts,
+          persist: persistOpenAIAccounts,
+          forgetAccount: account => openAIPool.forgetAccount(account),
+          invalidateAccount: accountId => { openAIRouter.invalidateAccount(accountId); },
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -932,21 +1155,33 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       Object.assign(modelRouting, next);
       writeConfig({ ...readConfig(), modelRouting: next });
     },
-    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
+    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
   });
 
+  // A relayed upstream 401 means the subscription token is stale — kick off a
+  // refresh in the background so the *next* request succeeds without making
+  // this client wait on it. Best-effort: failures are swallowed here since
+  // the ingress lifecycle has already recorded the 401 for this request.
+  const onOpenAIUpstreamAuthFailure = (account: OpenAIAccount): void => {
+    refreshAndPersistOpenAIAccount(account, openAIAccounts, persistOpenAIAccounts).catch(() => {});
+  };
+
   mountResponsesRoutes(app, {
-    getOpenAIAccount: pickOpenAIAccount,
-    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
+    openAIRouter,
+    openAIPool,
+    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     prepareOpenAIAccountOwnsDiagnostics: true,
     modelRouting,
+    onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
   });
 
   mountMessagesCrossProviderRoute(app, {
-    getOpenAIAccount: pickOpenAIAccount,
-    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, saveOpenAIAccounts),
+    openAIRouter,
+    openAIPool,
+    prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     prepareOpenAIAccountOwnsDiagnostics: true,
     modelRouting,
+    onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
   });
 
   // ─── Proxy middleware ──────────────────────────────────────────────────────
@@ -1348,7 +1583,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     },
     persistAccounts: () => saveProviderAccountsOnShutdown(pool.getAll(), openAIAccounts, {
       saveAnthropic: saveAccounts,
-      saveOpenAI: saveOpenAIAccounts,
+      saveOpenAI: persistOpenAIAccounts,
     }),
     shutdownTelemetry: () => shutdownTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS),
   });
