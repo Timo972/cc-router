@@ -137,6 +137,36 @@ describe("OpenAITokenPool cooldowns", () => {
     }
   });
 
+  it("stops reporting a rate limit once the quota clears under a longer block", () => {
+    let now = NOW_MS;
+    const a = makeAccount("a");
+    const pool = new OpenAITokenPool([a], { now: () => now });
+    // Overlapping causes with different lifetimes, which is what concurrent
+    // requests on one account produce.
+    pool.setGlobalCooldownForAccount(a, 120_000, "unavailable");
+    pool.setGlobalCooldownForAccount(a, 30_000, "rate_limit");
+
+    const reasonNow = () => {
+      try {
+        pool.acquireBest(new Map());
+        return "acquired";
+      } catch (error) {
+        return (error as NoEligibleAccountError).reason;
+      }
+    };
+
+    expect(reasonNow()).toBe("rate_limited");
+
+    // The quota has cleared; the overload has not. Folding both into one
+    // horizon kept answering 429 — with a Retry-After 90s out — for a quota
+    // that was already free.
+    now += 31_000;
+    expect(reasonNow()).toBe("unavailable");
+
+    now += 90_000;
+    expect(reasonNow()).toBe("acquired");
+  });
+
   it("bucket cooldown excludes only requests for the mapped model", () => {
     const a = makeAccount("a");
     applyHeaders(a, {

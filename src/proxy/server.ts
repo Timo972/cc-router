@@ -848,9 +848,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // valid refresh token stayed in memory — one crash from forcing a
         // re-login. Going through the live persister saves it and clears the
         // pending marker. Anthropic has no such in-memory rotation to lose.
-        persist: () => (isAnthropic
-          ? setProviderAccountsEnabled(provider, enabled, accountsPath)
-          : persistOpenAIAccounts(openAIAccounts)),
+        persist: () => {
+          if (isAnthropic) return setProviderAccountsEnabled(provider, enabled, accountsPath);
+          persistOpenAIAccounts(openAIAccounts);
+          // Same count `setProviderAccountsEnabled` reports, so the response
+          // keeps its shape for both providers: every account of this provider
+          // the write covered, not only those whose flag flipped.
+          return openAIAccounts.length;
+        },
         invalidateAccount: accountId => (isAnthropic ? sessionRouter : openAIRouter)
           .invalidateAccount(accountId),
       });

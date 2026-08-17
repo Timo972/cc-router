@@ -14,8 +14,13 @@ const MAX_TRUSTED_RATE_LIMIT_RESET_MS = 8 * 24 * 60 * 60 * 1_000;
 const MAX_BUCKET_COOLDOWN_ENTRIES = 16;
 
 interface OpenAICooldowns {
+  /** When the account becomes routable again, whatever the reason. */
   globalUntil: number;
-  globalCause: CodexCooldownCause;
+  /** How much of that is attributable to a spent quota. Tracked apart from
+   *  the total because the two causes overlap freely: a 120s overload and a
+   *  30s rate limit both apply, and folding them into one horizon would keep
+   *  answering 429 for 90 seconds after the quota itself had cleared. */
+  rateLimitedUntil: number;
   bucketUntil: Map<string, number>;
 }
 
@@ -108,13 +113,10 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     const expiry = this.proposedExpiry(account, durationMs);
     if (expiry === undefined) return;
     const state = this.cooldownsFor(account);
-    // A live rate-limit cooldown keeps its cause whatever else goes wrong
-    // afterwards: the quota is still spent, and downgrading to "unavailable"
-    // would drop the `Retry-After` a client can actually act on. An expired
-    // one carries nothing forward.
-    const stillRateLimited = state.globalUntil > this.now() && state.globalCause === "rate_limit";
-    state.globalCause = stillRateLimited ? "rate_limit" : cause;
+    // Each cause extends its own horizon, so neither can misrepresent the
+    // other's duration in either direction.
     state.globalUntil = Math.max(state.globalUntil, expiry);
+    if (cause === "rate_limit") state.rateLimitedUntil = Math.max(state.rateLimitedUntil, expiry);
   }
 
   setBucketCooldownForAccount(account: OpenAIAccount, limitId: string, durationMs: number): void {
@@ -263,9 +265,13 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
       blocked = true;
       // A 401, a 503/529 overload, or a local refresh failure blocks just as
       // hard, but answering 429 for quota the caller never spent sends it
-      // looking in entirely the wrong place.
-      if (state.globalCause === "rate_limit") rateLimited = true;
-      timedBlockers.push(state.globalUntil);
+      // looking in entirely the wrong place. The retry hint follows the quota
+      // horizon rather than the whole block: it is only ever emitted with a
+      // rate-limit answer, and it should say when the quota frees up.
+      if (state.rateLimitedUntil > nowMs) {
+        rateLimited = true;
+        timedBlockers.push(state.rateLimitedUntil);
+      }
     }
 
     const blockingWindows: CodexRateWindow[] = [];
@@ -388,7 +394,7 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
   private cooldownsFor(account: OpenAIAccount): OpenAICooldowns {
     let state = this.cooldowns.get(account);
     if (!state) {
-      state = { globalUntil: 0, globalCause: "rate_limit", bucketUntil: new Map() };
+      state = { globalUntil: 0, rateLimitedUntil: 0, bucketUntil: new Map() };
       this.cooldowns.set(account, state);
     }
     return state;
@@ -400,6 +406,7 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     if (!state) return false;
     const now = this.now();
     let recovered = false;
+    if (state.rateLimitedUntil > 0 && state.rateLimitedUntil <= now) state.rateLimitedUntil = 0;
     if (state.globalUntil > 0 && state.globalUntil <= now) {
       state.globalUntil = 0;
       recovered = true;
