@@ -30,6 +30,7 @@ import {
   type ForwardOpenAI,
   type OpenAIIngressEnvelope,
   type OpenAIIngressRelayResult,
+  type OpenAIRelayReport,
 } from "./openai-ingress.js";
 
 declare module "express-serve-static-core" {
@@ -65,14 +66,6 @@ function isAnthropicMessagesRequest(value: unknown): value is AnthropicMessagesR
 
 /** Longest upstream error snippet echoed back when the body isn't JSON. */
 const MAX_UPSTREAM_ERROR_MESSAGE_LENGTH = 200;
-
-/** How a relayed stream ended. `explicit` distinguishes a failure upstream
- *  stated outright from one inferred from a stream that simply stopped —
- *  which a client hanging up produces just as well. */
-interface StreamFailure {
-  message: string | undefined;
-  explicit: boolean;
-}
 
 /** Anthropic error `type` for a relayed upstream HTTP failure status. */
 function anthropicErrorTypeForStatus(status: number): string {
@@ -114,6 +107,7 @@ async function sendOpenAIAsAnthropic(
   res: Response,
   requestedStream: boolean,
   entry: LogEntry,
+  report: OpenAIRelayReport,
 ): Promise<OpenAIIngressRelayResult> {
   const onUsage = (usage: CodexUsageTotals | undefined) => applyCodexUsage(entry, usage);
 
@@ -140,7 +134,8 @@ async function sendOpenAIAsAnthropic(
         message: extractUpstreamErrorMessage(bodyText, upstream.status),
       },
     });
-    return { statusCode: upstream.status, upstreamReportedFailure: true };
+    report.upstreamReportedFailure = true;
+    return { statusCode: upstream.status };
   }
 
   const contentType = upstream.headers.get("content-type") ?? "";
@@ -149,12 +144,11 @@ async function sendOpenAIAsAnthropic(
       // Headers are already flushed by the time a mid-stream failure surfaces,
       // so the client keeps the partial stream; reporting 502 here keeps the
       // activity log and error totals honest about what happened.
-      const failure = await sendOpenAIStreamAsAnthropic(upstream, res, onUsage);
-      if (failure.message === undefined) return { statusCode: upstream.status };
-      return { statusCode: 502, ...(failure.explicit ? { upstreamReportedFailure: true } : {}) };
+      const failure = await sendOpenAIStreamAsAnthropic(upstream, res, onUsage, report);
+      return { statusCode: failure === undefined ? upstream.status : 502 };
     }
 
-    const collected = await collectOpenAIStreamAsAnthropicMessage(upstream);
+    const collected = await collectOpenAIStreamAsAnthropicMessage(upstream, report);
     onUsage(collected.usage);
     if (collected.failure !== undefined) {
       // Mirrors collectCodexResponseStream on the /v1/responses path: a stream
@@ -163,7 +157,7 @@ async function sendOpenAIAsAnthropic(
         type: "error",
         error: { type: "upstream_error", message: collected.failure },
       });
-      return { statusCode: 502, ...(collected.failureExplicit ? { upstreamReportedFailure: true } : {}) };
+      return { statusCode: 502 };
     }
     res.status(upstream.status).json(collected.message);
     return { statusCode: upstream.status };
@@ -182,11 +176,13 @@ async function sendOpenAIAsAnthropic(
   return { statusCode: upstream.status };
 }
 
-async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Response): Promise<{
+async function collectOpenAIStreamAsAnthropicMessage(
+  upstream: globalThis.Response,
+  report: OpenAIRelayReport,
+): Promise<{
   message: ReturnType<typeof openAIResponseToAnthropicMessage>;
   usage: CodexUsageTotals | undefined;
   failure: string | undefined;
-  failureExplicit: boolean;
 }> {
   const reader = upstream.body?.getReader();
   if (!reader) {
@@ -197,9 +193,6 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
       message: openAIResponseToAnthropicMessage({ id: "", model: "", output: [], usage: {} }),
       usage: undefined,
       failure: "Upstream response had no body",
-      // Upstream's own doing: a body absent before a single byte was read is
-      // not something a client disconnect could have produced.
-      failureExplicit: true,
     };
   }
 
@@ -230,13 +223,18 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
       };
     };
 
+    // Reported the moment it is seen, not when this function returns: the
+    // read after it can be cut short by a client disconnect, and losing the
+    // verdict there turns a real backend failure into a benign cancellation.
     if (openAIEvent.type === "response.failed") {
       failure = openAIEvent.response?.error?.message ?? "Response failed";
+      report.upstreamReportedFailure = true;
       return;
     }
 
     if (openAIEvent.type === "error") {
       failure = openAIEvent.error?.message ?? "Upstream error event";
+      report.upstreamReportedFailure = true;
       return;
     }
 
@@ -302,17 +300,16 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
     // `response.failed`/`error` message wins, since it says more about what
     // went wrong.
     failure: failure ?? (completed ? undefined : "Upstream stream ended without a terminal response event"),
-    failureExplicit: failure !== undefined,
   };
 }
 
-/** Reports how the stream ended: the failure message when it ended in one,
- *  and whether upstream stated that failure outright. */
+/** Returns the upstream failure message when the stream ended in one. */
 async function sendOpenAIStreamAsAnthropic(
   upstream: globalThis.Response,
   res: Response,
-  onUsage?: (usage: CodexUsageTotals | undefined) => void,
-): Promise<StreamFailure> {
+  onUsage: ((usage: CodexUsageTotals | undefined) => void) | undefined,
+  report: OpenAIRelayReport,
+): Promise<string | undefined> {
   res.status(upstream.status);
   res.setHeader("content-type", "text/event-stream");
   res.setHeader("cache-control", "no-cache");
@@ -325,7 +322,8 @@ async function sendOpenAIStreamAsAnthropic(
     // No body means no terminal response event was ever possible either —
     // mirror collectOpenAIStreamAsAnthropicMessage's `!reader` case below
     // rather than reporting an empty stream as a success.
-    return { message: "Upstream response had no body", explicit: true };
+    report.upstreamReportedFailure = true;
+    return "Upstream response had no body";
   }
 
   const decoder = new TextDecoder();
@@ -342,10 +340,14 @@ async function sendOpenAIStreamAsAnthropic(
     totals = usageFromTerminalEvent(event) ?? totals;
     if (typeof event !== "object" || event === null) return;
     const typed = event as { type?: unknown; error?: { message?: string }; response?: { error?: { message?: string } } };
+    // Recorded as observed — an aborted read can reject on the very next
+    // chunk, and this verdict has to outlive that.
     if (typed.type === "response.failed") {
       failure = typed.response?.error?.message ?? "Response failed";
+      report.upstreamReportedFailure = true;
     } else if (typed.type === "error") {
       failure = typed.error?.message ?? "Upstream error event";
+      report.upstreamReportedFailure = true;
     } else if (terminalResponsePayload(event) !== undefined) {
       completed = true;
     }
@@ -394,13 +396,7 @@ async function sendOpenAIStreamAsAnthropic(
   // failure (bytes already relayed to the client are unaffected — only the
   // status used for stats/activity changes). An explicit response.failed/error
   // message wins, since it says more about what went wrong.
-  // `explicit` separates what upstream stated outright from what we inferred
-  // from a stream that stopped: a client disconnect truncates the stream too,
-  // so only the former is evidence the account itself failed.
-  return {
-    message: failure ?? (completed ? undefined : "Upstream stream ended without a terminal response event"),
-    explicit: failure !== undefined,
-  };
+  return failure ?? (completed ? undefined : "Upstream stream ended without a terminal response event");
 }
 
 export function mountMessagesCrossProviderRoute(
@@ -457,7 +453,8 @@ export function mountMessagesCrossProviderRoute(
         now,
         envelope: MESSAGES_ENVELOPE,
         onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
-        relay: (upstream, res, entry) => sendOpenAIAsAnthropic(upstream, res, requestedStream, entry),
+        relay: (upstream, res, entry, report) =>
+          sendOpenAIAsAnthropic(upstream, res, requestedStream, entry, report),
       });
     },
   );

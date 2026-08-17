@@ -105,7 +105,9 @@ describe("collectCodexResponseStream", () => {
     // The event type alone is not a result. Rejecting only `undefined` let
     // `"response":null` through as a terminal success — a 200 whose body was
     // literally `null`.
-    for (const payload of ["null", '"nope"', "42", "[]"]) {
+    // `{}` is the same emptiness wearing an object's clothes: it clears a
+    // bare typeof check and then yields a 200 whose body says nothing.
+    for (const payload of ["null", '"nope"', "42", "[]", "{}", '{"usage":{"input_tokens":3}}']) {
       const upstream = sseResponse([
         `data: {"type":"response.incomplete","response":${payload}}\n\n`,
       ]);

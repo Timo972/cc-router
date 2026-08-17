@@ -51,6 +51,13 @@ const TERMINAL_RESPONSE_EVENT_TYPES: ReadonlySet<string> = new Set([
  * non-streaming caller and mark an observed stream complete, which is exactly
  * what the terminal-event checks exist to prevent. A payload nothing can be
  * read out of is not a result.
+ *
+ * `{}` is the same problem wearing an object's clothes: it satisfies a bare
+ * typeof check and then produces a `200` whose body is `{}`, or an empty
+ * assistant turn on the Messages path. `id` is the field that separates a
+ * Responses object from an empty husk — upstream stamps it from
+ * `response.created` onward — so requiring it is what makes "is this an
+ * object" mean "is this a response".
  */
 export function terminalResponsePayload(event: unknown): unknown {
   if (typeof event !== "object" || event === null) return undefined;
@@ -60,6 +67,8 @@ export function terminalResponsePayload(event: unknown): unknown {
   }
   const payload = typed.response;
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return undefined;
+  const { id } = payload as { id?: unknown };
+  if (typeof id !== "string" || id.length === 0) return undefined;
   return payload;
 }
 
@@ -73,8 +82,14 @@ export function terminalResponsePayload(event: unknown): unknown {
  */
 export async function collectCodexResponseStream(
   upstream: globalThis.Response,
+  /** Invoked the moment upstream announces a failure, so the caller keeps that
+   *  verdict even when the read is later cut short — the catch below turns any
+   *  such interruption into a generic "malformed stream" and would otherwise
+   *  bury it. */
+  onUpstreamFailure?: () => void,
 ): Promise<CollectedCodexResponse> {
   if (!upstream.ok) {
+    onUpstreamFailure?.();
     const contentType = upstream.headers.get("content-type") ?? undefined;
     return { kind: "text", status: upstream.status, contentType, body: await upstream.text() };
   }
@@ -107,8 +122,10 @@ export async function collectCodexResponseStream(
     if (e.type === "response.failed") {
       const err = (e.response as { error?: { message?: string } } | undefined)?.error;
       failure = err?.message ?? "Response failed";
+      onUpstreamFailure?.();
     } else if (e.type === "error") {
       failure = e.error?.message ?? "Upstream error event";
+      onUpstreamFailure?.();
     }
   };
 

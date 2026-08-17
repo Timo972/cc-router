@@ -114,13 +114,23 @@ export interface OpenAIIngressRelayResult {
    * non-streaming collector that turns an upstream `response.failed` SSE
    * event, arriving on a 200, into a local 502). */
   statusCode: number;
-  /** Set when that synthesized failure came from upstream stating one — a
-   * `response.failed` or `error` event — rather than from a stream that
-   * merely stopped early. The distinction matters only on disconnect: a
-   * client hanging up truncates the stream, so truncation alone is no
-   * evidence the account did anything wrong, while an explicit failure event
-   * is true no matter when the client left. */
-  upstreamReportedFailure?: boolean;
+}
+
+/**
+ * Scratch the relay writes to the moment it observes something the ingress
+ * must know even if the relay never returns.
+ *
+ * A relay can throw after learning the answer: aborting the upstream fetch on
+ * disconnect rejects a pending read, and that read may well be the one after
+ * the `response.failed` event was already parsed. Carrying the verdict on the
+ * return value loses it exactly then — precisely the case where getting it
+ * wrong records a real backend failure as a benign cancellation.
+ */
+export interface OpenAIRelayReport {
+  /** Upstream's own doing: it announced a failure (`response.failed`/`error`),
+   * answered non-2xx, or sent no body at all. None of these is something a
+   * client hanging up can manufacture, unlike a truncated stream. */
+  upstreamReportedFailure: boolean;
 }
 
 export interface OpenAIIngressOptions {
@@ -139,7 +149,12 @@ export interface OpenAIIngressOptions {
   /** Route-specific relay: byte-transparent SSE mirror for /v1/responses,
    * Anthropic-shape translation for /v1/messages. Must report the
    * client-facing status, even when it differs from `upstream.status`. */
-  relay: (upstream: globalThis.Response, res: Response, entry: LogEntry) => Promise<OpenAIIngressRelayResult>;
+  relay: (
+    upstream: globalThis.Response,
+    res: Response,
+    entry: LogEntry,
+    report: OpenAIRelayReport,
+  ) => Promise<OpenAIIngressRelayResult>;
   /** Invoked (best-effort, fire-and-forget from the caller's perspective)
    * when a relayed upstream response carries a 401 — lets the caller kick
    * off a background subscription-token refresh outside the request path. */
@@ -376,11 +391,10 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
 
   let finalStatus = upstream.status;
   let relayFailed = false;
-  let upstreamReportedFailure = false;
+  const relayReport: OpenAIRelayReport = { upstreamReportedFailure: false };
   try {
-    const result = await relay(upstream, res, entry);
+    const result = await relay(upstream, res, entry, relayReport);
     finalStatus = result.statusCode;
-    upstreamReportedFailure = result.upstreamReportedFailure === true;
   } catch (error) {
     // Never let a relay failure become an unhandled rejection. Only send a
     // local response if no upstream bytes have reached the client yet —
@@ -416,7 +430,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   // a 200 stream — the client can truncate a stream, but it cannot make
   // upstream announce a failure. Only the truncation is the disconnect's to
   // explain away.
-  const clientCancelled = clientGone.signal.aborted && !upstreamReportedFailure;
+  const clientCancelled = clientGone.signal.aborted && !relayReport.upstreamReportedFailure;
 
   // Activity/stats must reflect what the client actually received, not just
   // the raw upstream signal: the non-streaming collector can synthesize a

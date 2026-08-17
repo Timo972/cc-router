@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createServer } from "http";
+import { createServer, request as httpRequest, type ClientRequest } from "http";
+import type { AddressInfo } from "net";
 import express from "express";
 import { ReadableStream } from "stream/web";
 import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.js";
@@ -11,7 +12,7 @@ import { applyCodexRateLimits, createOpenAIAccount, type OpenAIAccount } from ".
 import { parseCodexRateLimits } from "../providers/openai/usage.js";
 import type { LogEntry } from "../proxy/stats.js";
 
-type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean }) => Promise<Response>;
+type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean; signal?: AbortSignal }) => Promise<Response>;
 
 async function withServer(
   app: ReturnType<typeof express>,
@@ -64,6 +65,12 @@ function mountWithPool(
     res.status(404).json({ notFound: true });
   });
   return { app, openAIPool, openAIRouter, activity };
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
 }
 
 function postMessages(baseUrl: string, body: Record<string, unknown>, headers: Record<string, string> = {}) {
@@ -680,6 +687,67 @@ describe("mountMessagesCrossProviderRoute crash safety (F1)", () => {
         error: { type: "rate_limit_error", message: "rate limit reached" },
       });
     });
+  });
+
+  it("keeps an explicit response.failed when the client disconnects before EOF", async () => {
+    const account = makeRuntimeAccount("openai-victor");
+    const failedSent = deferred<void>();
+    const forward: ForwardOpenAI = async opts => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n"));
+          failedSent.resolve();
+          // Aborting a real fetch errors its body, so the pending read rejects
+          // — which is what loses a verdict carried on the return value.
+          opts.signal?.addEventListener("abort", () => controller.error(new Error("aborted")));
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([account], forward);
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({
+        model: "openai/gpt-5.6-luna",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await failedSent.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      // The relay throws on the aborted read, after upstream had already said
+      // the turn failed. Treating that as a cancellation would clear the
+      // account's consecutive errors on a request that genuinely failed.
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+      expect(account.errorCount).toBe(1);
+      expect(account.consecutiveErrors).toBe(1);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
   });
 
   it("reports a 502 for a streamed response whose terminal frame is malformed, without altering the relayed bytes", async () => {

@@ -175,7 +175,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       now,
       envelope: RESPONSES_ENVELOPE,
       onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
-      relay: async (upstream, res, entry) => {
+      relay: async (upstream, res, entry, report) => {
         if (body.stream === true) {
           const observer = createCodexUsageObserver();
           // Only an upstream that actually promised a successful event stream
@@ -187,22 +187,28 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
           // received a 429 and hide the actual failure from diagnostics.
           const streamed = upstream.ok
             && (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
-          await sendUpstreamResponse(upstream, res, chunk => observer.push(chunk));
+          // Reported per chunk, not once at the end: this relay can throw
+          // (or be cut short) after upstream has already announced a failure,
+          // and the verdict has to survive that.
+          await sendUpstreamResponse(upstream, res, chunk => {
+            observer.push(chunk);
+            if (observer.explicitFailure() !== undefined) report.upstreamReportedFailure = true;
+          });
           applyCodexUsage(entry, observer.finish());
           // Bytes already written to the client are untouched — this only
           // changes the REPORTED status (used for stats/activity/cooldown),
           // matching a stream that upstream answered `200` but that ended in
           // a `response.failed`/`error` SSE event instead of completing.
           const synthesized = streamed && observer.failure() !== undefined;
-          return {
-            statusCode: synthesized ? 502 : upstream.status,
-            ...(streamed && observer.explicitFailure() !== undefined
-              ? { upstreamReportedFailure: true }
-              : {}),
-          };
+          // A non-OK upstream has no SSE events to judge, so anything the
+          // observer saw belongs to a body that was never an event stream.
+          if (!streamed) report.upstreamReportedFailure = !upstream.ok;
+          return { statusCode: synthesized ? 502 : upstream.status };
         }
 
-        const collected = await collectCodexResponseStream(upstream);
+        const collected = await collectCodexResponseStream(upstream, () => {
+          report.upstreamReportedFailure = true;
+        });
         // Mirror upstream headers (e.g. Retry-After, x-codex-*) before sending the
         // collected body, so failure responses reach the client unchanged per the
         // same contract the streaming path already honors via sendUpstreamResponse.
