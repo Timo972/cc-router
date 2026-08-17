@@ -13,7 +13,7 @@ import {
 import { createServer, request, type ClientRequest, type Server } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep, win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi, type MockInstance } from "vitest";
 import {
@@ -27,6 +27,22 @@ import {
 
 const PROJECT_ROOT = resolve(import.meta.dirname, "..", "..");
 const PNPM_COMMAND = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+
+function normalizeModulePath(path: string, separator = sep): string {
+  return path.split(separator).join("/");
+}
+
+function removeBootstrapSentinels(repositoryRoot: string): void {
+  const failures: unknown[] = [];
+  for (const name of ["__stale-build-output.js", "__stale-prepack-output.js"]) {
+    try {
+      rmSync(join(repositoryRoot, "dist", name), { force: true });
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) throw new AggregateError(failures, "bootstrap sentinel cleanup failed");
+}
 
 function runPnpm(args: string[], cwd = PROJECT_ROOT): string {
   try {
@@ -387,6 +403,37 @@ function installedPackageJsonForEntry(entry: string): string {
   throw new Error(`could not resolve package manifest for ${entry}`);
 }
 
+describe("compiled bootstrap harness portability", () => {
+  it("normalizes Windows module paths before applying the bootstrap allowlist", () => {
+    const windowsRelative = win32.relative(
+      "C:\\repo",
+      "C:\\repo\\dist\\cli\\bootstrap.js",
+    );
+
+    expect(windowsRelative).toBe("dist\\cli\\bootstrap.js");
+    expect(normalizeModulePath(windowsRelative, win32.sep)).toBe("dist/cli/bootstrap.js");
+  });
+
+  it("removes both repository sentinels after partial bootstrap setup", () => {
+    const repositoryRoot = mkdtempSync(join(tmpdir(), "cc-router-sentinel-cleanup-"));
+    const dist = join(repositoryRoot, "dist");
+    const buildSentinel = join(dist, "__stale-build-output.js");
+    const prepackSentinel = join(dist, "__stale-prepack-output.js");
+    mkdirSync(dist, { recursive: true });
+    writeFileSync(buildSentinel, "stale build");
+    writeFileSync(prepackSentinel, "stale prepack");
+
+    try {
+      removeBootstrapSentinels(repositoryRoot);
+
+      expect(existsSync(buildSentinel)).toBe(false);
+      expect(existsSync(prepackSentinel)).toBe(false);
+    } finally {
+      rmSync(repositoryRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("compiled ESM telemetry bootstrap", () => {
   let target!: Server;
   let targetOrigin: string;
@@ -614,6 +661,7 @@ describe("compiled ESM telemetry bootstrap", () => {
       ...(target?.listening ? [() => close(target)] : []),
       ...(telemetry ? [() => telemetry.close()] : []),
       ...auxiliaryServers.filter(server => server.listening).map(server => () => close(server)),
+      () => removeBootstrapSentinels(PROJECT_ROOT),
     ];
     const results = await Promise.allSettled(cleanup.map(release => Promise.resolve().then(release)));
     try {
@@ -683,7 +731,7 @@ export async function resolve(specifier, context, nextResolve) {
       const localModulesBeforeHook = imports
         .slice(0, hookIndex)
         .filter(url => url.startsWith(pathToFileURL(join(PROJECT_ROOT, "dist")).href))
-        .map(url => relative(PROJECT_ROOT, fileURLToPath(url)));
+        .map(url => normalizeModulePath(relative(PROJECT_ROOT, fileURLToPath(url))));
       const bootstrapSafeModules = new Set([
         "dist/cli/bootstrap.js",
         "dist/config/telemetry-state.js",
