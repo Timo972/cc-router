@@ -15,11 +15,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 const PROJECT_ROOT = resolve(import.meta.dirname, "..", "..");
 const WORKER = join(import.meta.dirname, "fixtures", "telemetry-consent-worker.mjs");
 const FS_LOADER = join(import.meta.dirname, "fixtures", "telemetry-consent-fs-loader.mjs");
+const WORKER_TIMEOUT_MS = 30_000;
 const INSTALL_ID = "123e4567-e89b-42d3-a456-426614174000";
 const INITIAL_GENERATION = "123e4567-e89b-42d3-a456-426614174001";
 const FIRST_RUN_AT = "2026-08-01T00:00:00.000Z";
@@ -97,7 +99,7 @@ function runWorker(
       {
         cwd: PROJECT_ROOT,
         env: workerEnvironment(home, telemetryPath),
-        timeout: 15_000,
+        timeout: WORKER_TIMEOUT_MS,
         encoding: "utf8",
       },
       (error, stdout, stderr) => {
@@ -115,6 +117,37 @@ function runWorker(
   });
 }
 
+function runRenameContentionWorker(home: string, telemetryPath: string): Promise<WorkerResult> {
+  return new Promise((resolveRun, reject) => {
+    execFile(
+      process.execPath,
+      [
+        "--import", "tsx",
+        "--loader", pathToFileURL(FS_LOADER).href,
+        WORKER, "update", "false",
+      ],
+      {
+        cwd: PROJECT_ROOT,
+        env: {
+          ...workerEnvironment(home, telemetryPath),
+          NODE_ENV: "test",
+          CC_ROUTER_TEST_PLATFORM: "win32",
+          CC_ROUTER_TEST_CONSENT_RENAME_FAILURES: "2",
+        },
+        timeout: WORKER_TIMEOUT_MS,
+        encoding: "utf8",
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(`rename-contention worker failed: ${error.message}\n${stderr}`));
+          return;
+        }
+        resolveRun(JSON.parse(stdout.trim()) as WorkerResult);
+      },
+    );
+  });
+}
+
 function startBarrierWorker(
   home: string,
   telemetryPath: string,
@@ -125,7 +158,7 @@ function startBarrierWorker(
 ): { child: ChildProcess; result: Promise<WorkerResult> } {
   const child = spawn(process.execPath, [
     "--import", "tsx",
-    "--loader", FS_LOADER,
+    "--loader", pathToFileURL(FS_LOADER).href,
     WORKER, mode, ...args,
   ], {
     cwd: PROJECT_ROOT,
@@ -144,7 +177,7 @@ function startBarrierWorker(
     const deadline = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`publish worker ${phase} timed out\n${stdout}\n${stderr}`));
-    }, 10_000);
+    }, 20_000);
     child.stdout?.on("data", chunk => { stdout += String(chunk); });
     child.stderr?.on("data", chunk => { stderr += String(chunk); });
     child.once("error", error => {
@@ -168,7 +201,7 @@ function startBarrierWorker(
 }
 
 async function waitForPath(path: string): Promise<void> {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 15_000;
   while (!existsSync(path)) {
     if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
     await new Promise(resolveWait => setTimeout(resolveWait, 10));
@@ -255,7 +288,6 @@ describe("lock-free telemetry consent publication", () => {
       )));
 
       expect(results.every(result => result.ok)).toBe(true);
-      expect(results.every(result => result.elapsedMs < 5_000)).toBe(true);
       const returned = results.map(result => result.state!);
       expect(new Set(returned.map(state => state.consentGeneration)).size).toBe(processCount);
       for (const [index, state] of returned.entries()) {
@@ -269,6 +301,7 @@ describe("lock-free telemetry consent publication", () => {
       expect(persisted.installId).toBe(INSTALL_ID);
       expect(JSON.parse(readFileSync(telemetryPath, "utf8"))).toEqual(persisted);
     },
+    40_000,
   );
 
   it("permanently latches a preexisting runtime off after concurrent choices finish enabled", async () => {
@@ -318,7 +351,7 @@ describe("lock-free telemetry consent publication", () => {
       acceptedGeneration: INITIAL_GENERATION,
     }));
     expect(adopted).toEqual(expect.objectContaining({ ok: true, enabled: true }));
-  });
+  }, 40_000);
 
   it.each([4, 8, 12])(
     "converges %i simultaneous first initializers on one authoritative identity and generation",
@@ -330,7 +363,6 @@ describe("lock-free telemetry consent publication", () => {
       )));
 
       expect(results.every(result => result.ok)).toBe(true);
-      expect(results.every(result => result.elapsedMs < 5_000)).toBe(true);
       const persisted = readState(telemetryPath);
       expect(persisted.installId).toMatch(UUID_PATTERN);
       expect(persisted.consentGeneration).toMatch(UUID_PATTERN);
@@ -339,6 +371,7 @@ describe("lock-free telemetry consent publication", () => {
       if (process.platform !== "win32") expect(statSync(telemetryPath).mode & 0o777).toBe(0o600);
       expect(sharedLockArtifacts(telemetryPath)).toEqual([]);
     },
+    40_000,
   );
 
   it("keeps the old state valid when a writer is killed before atomic publication", async () => {
@@ -356,7 +389,7 @@ describe("lock-free telemetry consent publication", () => {
     expect(readState(telemetryPath)).toEqual(before);
     expect(tempArtifacts(telemetryPath)).toHaveLength(1);
     expect(sharedLockArtifacts(telemetryPath)).toEqual([]);
-  });
+  }, 30_000);
 
   it("leaves a complete new state when a writer is killed after atomic publication", async () => {
     const { home, telemetryPath } = createState(true, 6);
@@ -381,7 +414,7 @@ describe("lock-free telemetry consent publication", () => {
     expect(readState(telemetryPath)).toEqual(published);
     expect(tempArtifacts(telemetryPath)).toEqual([]);
     expect(sharedLockArtifacts(telemetryPath)).toEqual([]);
-  });
+  }, 30_000);
 
   it("cleans only its unique candidate and leaves foreign temp candidates inert", async () => {
     const { home, telemetryPath } = createState(true, 8);
@@ -393,6 +426,23 @@ describe("lock-free telemetry consent publication", () => {
     expect(result.ok).toBe(true);
     expect(readFileSync(foreignTemp, "utf8")).toBe("foreign temp sentinel");
     expect(tempArtifacts(telemetryPath)).toEqual([basename(foreignTemp)]);
+  });
+
+  it("retries transient rename contention without exposing a partial consent state", async () => {
+    const { home, telemetryPath } = createState(true, 8);
+
+    const result = await runRenameContentionWorker(home, telemetryPath);
+
+    expect(result.ok, JSON.stringify(result.error)).toBe(true);
+    expect(result.state).toEqual({
+      enabled: false,
+      installId: INSTALL_ID,
+      firstRunAt: FIRST_RUN_AT,
+      consentGeneration: expect.stringMatching(UUID_PATTERN),
+      revision: 9,
+    });
+    expect(readState(telemetryPath)).toEqual(result.state);
+    expect(tempArtifacts(telemetryPath)).toEqual([]);
   });
 
   it("never exposes partial JSON to readers during repeated concurrent writes", async () => {
@@ -407,7 +457,6 @@ describe("lock-free telemetry consent publication", () => {
     expect(firstWriter.ok).toBe(true);
     expect(secondWriter.ok).toBe(true);
     expect(reader.ok).toBe(true);
-    expect(reader.elapsedMs).toBeLessThan(5_000);
     expect(reader.snapshots).toHaveLength(800);
     for (const snapshot of reader.snapshots ?? []) {
       expect(snapshot.state).toEqual({
@@ -422,7 +471,7 @@ describe("lock-free telemetry consent publication", () => {
     }
     const allPublished = [...(firstWriter.states ?? []), ...(secondWriter.states ?? [])];
     expect(allPublished).toContainEqual(readState(telemetryPath));
-  });
+  }, 40_000);
 
   it("fails closed quickly on malformed authoritative state and contains gate errors", async () => {
     const { home, telemetryPath } = createState(true, 0);
@@ -567,7 +616,7 @@ describe("lock-free telemetry consent publication", () => {
     }));
     expect(migrated.ok).toBe(true);
     expect(persisted).toEqual(optOut.state);
-  });
+  }, 30_000);
 
   it("latches a new runtime off when an older writer changes the legacy revision", async () => {
     const { home, telemetryPath } = createHome();

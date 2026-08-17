@@ -1,5 +1,6 @@
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -25,6 +26,21 @@ import {
 } from "./telemetry-test-helpers.js";
 
 const PROJECT_ROOT = resolve(import.meta.dirname, "..", "..");
+const PNPM_COMMAND = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+
+function runPnpm(args: string[], cwd = PROJECT_ROOT): string {
+  try {
+    return execFileSync(PNPM_COMMAND, args, { cwd, encoding: "utf8", stdio: "pipe" });
+  } catch (error) {
+    const failure = error as { stdout?: Buffer | string; stderr?: Buffer | string };
+    const stdout = failure.stdout === undefined ? "" : String(failure.stdout);
+    const stderr = failure.stderr === undefined ? "" : String(failure.stderr);
+    throw new Error(
+      `${PNPM_COMMAND} ${args.join(" ")} failed\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+      { cause: error },
+    );
+  }
+}
 
 interface RunningPackage {
   child: ChildProcess;
@@ -372,12 +388,13 @@ function installedPackageJsonForEntry(entry: string): string {
 }
 
 describe("compiled ESM telemetry bootstrap", () => {
-  let target: Server;
+  let target!: Server;
   let targetOrigin: string;
-  let telemetry: TransportCaptureServer;
-  let packedPackageRoot: string;
+  let telemetry!: TransportCaptureServer;
+  let packedPackageRoot: string | undefined;
   let installedBinary: string;
   let installedCwd: string;
+  let setupFailure: unknown;
   const targetHeaders: Array<Record<string, string | string[] | undefined>> = [];
   const targetBodies: Buffer[] = [];
   const targetFlows: Array<{
@@ -393,12 +410,13 @@ describe("compiled ESM telemetry bootstrap", () => {
   const auxiliaryServers: Server[] = [];
 
   beforeAll(async () => {
+    try {
     mkdirSync(join(PROJECT_ROOT, "dist"), { recursive: true });
     writeFileSync(
       join(PROJECT_ROOT, "dist", "__stale-build-output.js"),
       "throw new Error('stale compiler output must not ship');\n",
     );
-    execFileSync("pnpm", ["build"], { cwd: PROJECT_ROOT, stdio: "pipe" });
+    runPnpm(["build"]);
     expect(existsSync(join(PROJECT_ROOT, "dist", "__stale-build-output.js"))).toBe(false);
     expect(existsSync(join(PROJECT_ROOT, "dist", "utils", "telemetry.js"))).toBe(false);
     target = createServer((request, response) => {
@@ -492,19 +510,17 @@ describe("compiled ESM telemetry bootstrap", () => {
     targetOrigin = `http://127.0.0.1:${await listen(target)}`;
     telemetry = await startTransportCaptureServer();
 
-    packedPackageRoot = mkdtempSync(join(tmpdir(), "cc-router-packed-artifact-"));
-    const packDirectory = join(packedPackageRoot, "pack");
-    installedCwd = join(packedPackageRoot, "prefix");
+    const packageRoot = mkdtempSync(join(tmpdir(), "cc-router-packed-artifact-"));
+    packedPackageRoot = packageRoot;
+    const packDirectory = join(packageRoot, "pack");
+    installedCwd = join(packageRoot, "prefix");
     mkdirSync(packDirectory, { recursive: true });
     mkdirSync(installedCwd, { recursive: true });
     writeFileSync(
       join(PROJECT_ROOT, "dist", "__stale-prepack-output.js"),
       "throw new Error('stale prepack output must not ship');\n",
     );
-    execFileSync("pnpm", ["pack", "--pack-destination", packDirectory], {
-      cwd: PROJECT_ROOT,
-      stdio: "pipe",
-    });
+    runPnpm(["pack", "--pack-destination", packDirectory]);
     const tarballs = readdirSync(packDirectory).filter(name => name.endsWith(".tgz"));
     expect(tarballs).toHaveLength(1);
     const tarball = join(packDirectory, tarballs[0]!);
@@ -512,20 +528,28 @@ describe("compiled ESM telemetry bootstrap", () => {
       encoding: "utf8",
     })) as { dependencies?: Record<string, string> };
     expect(packedManifest.dependencies?.["posthog-node"]).toBe("5.47.3");
-    execFileSync("pnpm", [
+    copyFileSync(join(PROJECT_ROOT, "package.json"), join(installedCwd, "package.json"));
+    copyFileSync(join(PROJECT_ROOT, "pnpm-lock.yaml"), join(installedCwd, "pnpm-lock.yaml"));
+    runPnpm([
       "add",
       "--dir",
       installedCwd,
       "--ignore-workspace",
       "--offline",
+      "--lockfile-only",
       "--allow-build=protobufjs",
-      "@posthog/core@1.46.1",
-      "@posthog/types@1.399.0",
-      "@types/node@20.19.43",
-      "ansi-regex@6.2.2",
-      "ws@8.21.1",
       tarball,
-    ], { cwd: PROJECT_ROOT, stdio: "pipe" });
+    ]);
+    runPnpm([
+      "add",
+      "--dir",
+      installedCwd,
+      "--ignore-workspace",
+      "--offline",
+      "--prod",
+      "--allow-build=protobufjs",
+      tarball,
+    ]);
     const installedPackage = join(installedCwd, "node_modules", "@timo972", "cc-router");
     const installedManifest = JSON.parse(readFileSync(join(installedPackage, "package.json"), "utf8")) as {
       dependencies?: Record<string, string>;
@@ -539,7 +563,12 @@ describe("compiled ESM telemetry bootstrap", () => {
     expect(postHogPackage.version).toBe("5.47.3");
     expect(installedVersionForEntry(requireFromPostHog.resolve("@posthog/core"))).toBe("1.46.1");
     expect(installedVersionForEntry(requireFromPostHog.resolve("@posthog/types"))).toBe("1.399.0");
-    installedBinary = join(installedCwd, "node_modules", ".bin", "cc-router");
+    installedBinary = join(
+      installedCwd,
+      "node_modules",
+      ".bin",
+      process.platform === "win32" ? "cc-router.cmd" : "cc-router",
+    );
     for (const requiredFile of [
       "dist/cli/bootstrap.js",
       "dist/config/telemetry-state.js",
@@ -573,12 +602,29 @@ describe("compiled ESM telemetry bootstrap", () => {
       .join("\n");
     expect(packagedJavaScript).not.toContain("eu.aptabase.com");
     expect(packagedJavaScript).not.toContain("APTABASE_");
+    } catch (error) {
+      setupFailure = error;
+      throw error;
+    }
   }, 30_000);
 
   afterAll(async () => {
-    await Promise.all(children.map(child => child.stop()));
-    await Promise.all([close(target), telemetry.close(), ...auxiliaryServers.map(close)]);
-    rmSync(packedPackageRoot, { recursive: true, force: true });
+    const cleanup = [
+      ...children.map(child => () => child.stop()),
+      ...(target?.listening ? [() => close(target)] : []),
+      ...(telemetry ? [() => telemetry.close()] : []),
+      ...auxiliaryServers.filter(server => server.listening).map(server => () => close(server)),
+    ];
+    const results = await Promise.allSettled(cleanup.map(release => Promise.resolve().then(release)));
+    try {
+      if (packedPackageRoot) rmSync(packedPackageRoot, { recursive: true, force: true });
+    } catch (error) {
+      results.push({ status: "rejected", reason: error });
+    }
+    const cleanupFailures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (!setupFailure && cleanupFailures.length > 0) {
+      throw new AggregateError(cleanupFailures, "compiled telemetry bootstrap cleanup failed");
+    }
   });
 
   it("registers the OTel ESM hook before loading any general application module", () => {
@@ -1912,7 +1958,7 @@ describe("proxy launch commands", () => {
         { env: Record<string, string> },
       ];
       expect(args).toEqual([
-        expect.stringMatching(/cli\/bootstrap\.js$/),
+        expect.stringMatching(/cli[\\/]bootstrap\.js$/),
         "start",
         "--foreground",
         "--port",
@@ -1961,7 +2007,7 @@ describe("proxy launch commands", () => {
 
       await installService(true);
       const plist = writes.at(-1)?.body ?? "";
-      expect(plist).toContain("cli/bootstrap.js");
+      expect(plist).toMatch(/cli[\\/]bootstrap\.js/);
       expect(plist).toContain("<string>start</string>");
       expect(plist).toContain("<string>--foreground</string>");
       expect(plist).toContain("<key>HOST</key>");

@@ -25,7 +25,7 @@ function writeEvidence(contents) {
   chmodSync(evidencePath, 0o600);
   writeFileSync(evidencePath, contents, { flag: "w", mode: 0o600 });
   chmodSync(evidencePath, 0o600);
-  if ((lstatSync(evidencePath).mode & 0o777) !== 0o600) {
+  if (process.platform !== "win32" && (lstatSync(evidencePath).mode & 0o777) !== 0o600) {
     throw new Error("evidence file permissions changed during synthetic validation");
   }
 }

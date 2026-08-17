@@ -107,7 +107,13 @@ describe("AnthropicUsageRefresher", () => {
     const accounts = [account("a"), account("b"), account("c")];
     const pool = new TokenPool(accounts);
     const requests = deferred<UsageFetchResult>();
-    const fetchUsage = vi.fn(() => requests.promise);
+    const thirdRequestStarted = deferred<void>();
+    let requestCount = 0;
+    const fetchUsage = vi.fn(() => {
+      requestCount++;
+      if (requestCount === 3) thirdRequestStarted.resolve();
+      return requests.promise;
+    });
     const refresher = new AnthropicUsageRefresher(pool, {
       fetchUsage,
       startupStaggerMs: 10,
@@ -118,8 +124,7 @@ describe("AnthropicUsageRefresher", () => {
     await vi.advanceTimersByTimeAsync(30);
     expect(fetchUsage).toHaveBeenCalledTimes(2);
     requests.resolve(usageResult());
-    await Promise.resolve();
-    await Promise.resolve();
+    await thirdRequestStarted.promise;
     expect(fetchUsage).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(5 * 60_000);
     expect(fetchUsage.mock.calls.length).toBeGreaterThanOrEqual(4);

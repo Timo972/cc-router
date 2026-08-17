@@ -3,6 +3,7 @@ import { execFileSync, spawn } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -16,22 +17,26 @@ import {
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const guardPath = join(repositoryRoot, "scripts", "telemetry-eu-network-guard.mjs");
 const syntheticChildPath = join(repositoryRoot, "scripts", "telemetry-eu-synthetic-child.mjs");
 const approvalPhrase = "I_UNDERSTAND_SYNTHETIC_TELEMETRY_WILL_BE_SENT";
-// Freeze only transitive/offline-cache compatibility edges. posthog-node itself
-// must come exclusively from the packed manifest's exact dependency.
-const offlineTransitiveConstraints = [
-  "@posthog/core@1.46.1",
-  "@posthog/types@1.399.0",
-  "@types/node@20.19.43",
-  "ansi-regex@6.2.2",
-  "ws@8.21.1",
-];
+const pnpmCommand = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+
+function runPnpm(args) {
+  try {
+    return execFileSync(pnpmCommand, args, { cwd: repositoryRoot, encoding: "utf8", stdio: "pipe" });
+  } catch (error) {
+    const stdout = error?.stdout === undefined ? "" : String(error.stdout);
+    const stderr = error?.stderr === undefined ? "" : String(error.stderr);
+    throw new Error(`${pnpmCommand} ${args.join(" ")} failed\nstdout:\n${stdout}\nstderr:\n${stderr}`, {
+      cause: error,
+    });
+  }
+}
 
 const dryRunPlan = `
 CC-Router personal EU telemetry validation
@@ -183,11 +188,11 @@ function guardEnvironment(providerOrigin, networkLog) {
 
 function assertMode(path, expected, kind) {
   const stat = lstatSync(path);
-  if ((stat.mode & 0o777) !== expected) {
-    throw new Error(`${kind} permissions must be ${expected.toString(8)}`);
-  }
   if (kind === "evidence directory" ? !stat.isDirectory() : !stat.isFile()) {
     throw new Error(`${kind} has the wrong filesystem type`);
+  }
+  if (process.platform !== "win32" && (stat.mode & 0o777) !== expected) {
+    throw new Error(`${kind} permissions must be ${expected.toString(8)}`);
   }
 }
 
@@ -322,7 +327,7 @@ if ((process.env.NODE_OPTIONS ?? "").trim() !== "") {
 const tarballArgument = argument("--tarball");
 if (!tarballArgument) throw new Error("live mode requires --tarball /absolute/path/to/package.tgz");
 const tarball = resolve(tarballArgument);
-if (!tarballArgument.startsWith("/") || !existsSync(tarball) || !lstatSync(tarball).isFile() || !tarball.endsWith(".tgz")) {
+if (!isAbsolute(tarballArgument) || !existsSync(tarball) || !lstatSync(tarball).isFile() || !tarball.endsWith(".tgz")) {
   throw new Error("--tarball must name an existing absolute .tgz regular file");
 }
 
@@ -364,12 +369,23 @@ try {
   if (packedManifest.dependencies?.["posthog-node"] !== "5.47.3") {
     throw new Error("packed manifest must exact-pin posthog-node 5.47.3");
   }
-  execFileSync("pnpm", [
-    "add", "--dir", installRoot, "--ignore-workspace", "--offline", "--allow-build=protobufjs",
-    ...offlineTransitiveConstraints, tarball,
-  ], { cwd: repositoryRoot, stdio: "pipe" });
+  copyFileSync(join(repositoryRoot, "package.json"), join(installRoot, "package.json"));
+  copyFileSync(join(repositoryRoot, "pnpm-lock.yaml"), join(installRoot, "pnpm-lock.yaml"));
+  runPnpm([
+    "add", "--dir", installRoot, "--ignore-workspace", "--offline", "--lockfile-only",
+    "--allow-build=protobufjs", tarball,
+  ]);
+  runPnpm([
+    "add", "--dir", installRoot, "--ignore-workspace", "--offline", "--prod",
+    "--allow-build=protobufjs", tarball,
+  ]);
   const packageRoot = join(installRoot, "node_modules", "@timo972", "cc-router");
-  const binary = join(installRoot, "node_modules", ".bin", "cc-router");
+  const binary = join(
+    installRoot,
+    "node_modules",
+    ".bin",
+    process.platform === "win32" ? "cc-router.cmd" : "cc-router",
+  );
   scanPackagedArtifact(packageRoot);
   const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
   if (manifest.dependencies?.["posthog-node"] !== "5.47.3") {

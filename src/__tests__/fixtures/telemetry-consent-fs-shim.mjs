@@ -9,6 +9,7 @@ const telemetryPath = process.env.TELEMETRY_PATH;
 const waitBuffer = new SharedArrayBuffer(4);
 const waitView = new Int32Array(waitBuffer);
 let paused = false;
+let remainingRenameFailures = Number(process.env.CC_ROUTER_TEST_CONSENT_RENAME_FAILURES ?? "0");
 
 function enabled() {
   return process.env.NODE_ENV === "test" && barrier && phase && telemetryPath;
@@ -34,6 +35,14 @@ export function readFileSync(path, ...args) {
 
 export function renameSync(oldPath, newPath) {
   if (enabled() && String(newPath) === telemetryPath && phase === "before-publish") signalAndWait();
+  if (
+    process.env.NODE_ENV === "test"
+    && String(newPath) === telemetryPath
+    && remainingRenameFailures > 0
+  ) {
+    remainingRenameFailures--;
+    throw Object.assign(new Error("simulated transient Windows rename contention"), { code: "EPERM" });
+  }
   const result = fs.renameSync(oldPath, newPath);
   if (enabled() && String(newPath) === telemetryPath && phase === "after-publish") signalAndWait();
   return result;

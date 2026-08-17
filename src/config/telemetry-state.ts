@@ -54,6 +54,8 @@ type StateRead =
 
 let pendingFirstStartInstallId: string | undefined;
 let firstStartClaimedByProcess = false;
+const renameRetryWait = new Int32Array(new SharedArrayBuffer(4));
+const WINDOWS_RENAME_RETRY_MS = 1_000;
 
 function uuid(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -193,12 +195,31 @@ function fsyncConfigDirectoryBestEffort(): void {
   }
 }
 
+function renamePublishedState(candidate: string): void {
+  const retryUntil = Date.now() + WINDOWS_RENAME_RETRY_MS;
+  let retryDelayMs = 0;
+  while (true) {
+    try {
+      renameSync(candidate, TELEMETRY_PATH);
+      return;
+    } catch (error) {
+      const code = errorCode(error);
+      const retryable = process.platform === "win32"
+        && (code === "EACCES" || code === "EPERM" || code === "EBUSY")
+        && Date.now() < retryUntil;
+      if (!retryable) throw error;
+      Atomics.wait(renameRetryWait, 0, 0, retryDelayMs);
+      retryDelayMs = Math.min(100, retryDelayMs + 10);
+    }
+  }
+}
+
 function publishTelemetryState(state: TelemetryState): void {
   ensureConfigDir();
   const candidate = `${TELEMETRY_PATH}.${process.pid}.${randomUUID()}.tmp`;
   writeCandidate(candidate, state);
   try {
-    renameSync(candidate, TELEMETRY_PATH);
+    renamePublishedState(candidate);
     fsyncConfigDirectoryBestEffort();
   } catch (error) {
     try { unlinkSync(candidate); } catch { /* renamed or already absent */ }

@@ -5,6 +5,9 @@ const telemetryPath = process.env.TELEMETRY_PATH;
 
 if (!mode) throw new Error("missing worker mode");
 if (!telemetryPath) throw new Error("missing TELEMETRY_PATH");
+if (process.env.NODE_ENV === "test" && process.env.CC_ROUTER_TEST_PLATFORM === "win32") {
+  Object.defineProperty(process, "platform", { value: "win32" });
+}
 
 const waitBuffer = new SharedArrayBuffer(4);
 const waitView = new Int32Array(waitBuffer);
