@@ -9,11 +9,11 @@ export function pnpmInvocation(
     storeDir = process.env.CC_ROUTER_CI_PNPM_STORE_DIR,
   } = {},
 ) {
-  const invocationArgs = storeDir ? ["--store-dir", storeDir, ...args] : args;
-  if (platform !== "win32") return { file: "pnpm", args: invocationArgs };
+  if (platform !== "win32") return { file: "pnpm", args };
   if (!pnpmHome) {
     throw new Error("PNPM_HOME is required to invoke pnpm safely on Windows");
   }
+  const invocationArgs = storeDir ? [`--config.store-dir=${storeDir}`, ...args] : args;
   return {
     file: "powershell.exe",
     args: [
