@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  accountDrift,
   addAccountRuntimeAware,
   buildStoredAccountsJson,
+  mergeAccountInventory,
   removeAccountRuntimeAware,
   tryAddAccountToRunningProxy,
   tryRemoveAccountFromRunningProxy,
@@ -187,5 +189,51 @@ describe("runtime-aware account add", () => {
 
     await expect(tryAddAccountToRunningProxy(record, { fetch }))
       .rejects.toThrow("HTTP 409: Account \"openai-1\" already exists");
+  });
+});
+
+describe("mergeAccountInventory", () => {
+  it("includes accounts the running proxy has but disk does not", () => {
+    // What a file rewritten after the proxy started looks like: the proxy is
+    // still routing to max-live, but accounts.json no longer mentions it.
+    const inventory = mergeAccountInventory(
+      ["max-on-disk"],
+      ["plus-on-disk"],
+      [{ id: "max-live", provider: "anthropic_subscription" }, { id: "max-on-disk", provider: "anthropic_subscription" }],
+    );
+
+    // Removal prefers the live proxy, so an id it knows must not be rejected.
+    expect(inventory.ids).toContain("max-live");
+    expect(inventory.ids).toEqual(["max-on-disk", "plus-on-disk", "max-live"]);
+  });
+
+  it("recognizes a live-only OpenAI account as OpenAI", () => {
+    const inventory = mergeAccountInventory([], [], [{ id: "plus-live", provider: "openai_subscription" }]);
+    expect(inventory.openAIIds.has("plus-live")).toBe(true);
+  });
+
+  it("falls back to disk alone when no proxy is reachable", () => {
+    const inventory = mergeAccountInventory(["max-a"], ["plus-a"], null);
+    expect(inventory.ids).toEqual(["max-a", "plus-a"]);
+    expect(inventory.openAIIds.has("plus-a")).toBe(true);
+  });
+});
+
+describe("accountDrift", () => {
+  it("separates accounts missing from disk from accounts the proxy has not loaded", () => {
+    const drift = accountDrift(
+      ["max-live-only", "shared"],
+      ["shared", "max-disk-only"],
+    );
+
+    // The first is a credential-loss risk; the second is only staleness.
+    expect(drift.unpersisted).toEqual(["max-live-only"]);
+    expect(drift.unloaded).toEqual(["max-disk-only"]);
+  });
+
+  it("reports no drift when both sources agree", () => {
+    const drift = accountDrift(["a", "b"], ["b", "a"]);
+    expect(drift.unpersisted).toEqual([]);
+    expect(drift.unloaded).toEqual([]);
   });
 });
