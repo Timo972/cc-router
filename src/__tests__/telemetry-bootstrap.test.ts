@@ -424,9 +424,9 @@ describe("compiled bootstrap harness portability", () => {
     const seed = workflow.indexOf("pnpm fetch --prod --frozen-lockfile");
     const test = workflow.indexOf("run: pnpm test");
 
-    expect(install).toBeGreaterThanOrEqual(0);
-    expect(seed).toBeGreaterThan(install);
-    expect(test).toBeGreaterThan(seed);
+    expect(seed).toBeGreaterThanOrEqual(0);
+    expect(install).toBeGreaterThan(seed);
+    expect(test).toBeGreaterThan(install);
   });
 
   it("matches service bootstrap paths with either platform separator", () => {

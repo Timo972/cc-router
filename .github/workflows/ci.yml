@@ -27,11 +27,11 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
       - name: Seed offline production store
         run: pnpm fetch --prod --frozen-lockfile
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Type-check
         run: pnpm lint
