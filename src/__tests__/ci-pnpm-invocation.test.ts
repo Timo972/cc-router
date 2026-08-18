@@ -13,7 +13,11 @@ describe("CI pnpm invocation", () => {
         "--prod",
         "C:\\work & audit\\production;install",
       ],
-      { platform: "win32", pnpmHome: "C:\\pnpm home" },
+      {
+        platform: "win32",
+        pnpmHome: "C:\\pnpm home",
+        storeDir: "D:\\.pnpm-store\\v11",
+      },
     );
 
     expect(invocation).toEqual({
@@ -25,7 +29,9 @@ describe("CI pnpm invocation", () => {
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "C:\\pnpm home\\bin\\pnpm.ps1",
+        "C:\\pnpm home\\pnpm.ps1",
+        "--store-dir",
+        "D:\\.pnpm-store\\v11",
         "--offline",
         "--config.inject-workspace-packages=true",
         "--filter",

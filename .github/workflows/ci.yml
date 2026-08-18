@@ -33,6 +33,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Export pnpm store path for packed Windows test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $storePath = pnpm store path --silent
+          Add-Content -Path $env:GITHUB_ENV -Value "CC_ROUTER_CI_PNPM_STORE_DIR=$storePath" -Encoding utf8
+
       - name: Type-check
         run: pnpm lint
 

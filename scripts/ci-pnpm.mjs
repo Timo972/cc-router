@@ -3,9 +3,14 @@ import { win32 } from "node:path";
 
 export function pnpmInvocation(
   args,
-  { platform = process.platform, pnpmHome = process.env.PNPM_HOME } = {},
+  {
+    platform = process.platform,
+    pnpmHome = process.env.PNPM_HOME,
+    storeDir = process.env.CC_ROUTER_CI_PNPM_STORE_DIR,
+  } = {},
 ) {
-  if (platform !== "win32") return { file: "pnpm", args };
+  const invocationArgs = storeDir ? ["--store-dir", storeDir, ...args] : args;
+  if (platform !== "win32") return { file: "pnpm", args: invocationArgs };
   if (!pnpmHome) {
     throw new Error("PNPM_HOME is required to invoke pnpm safely on Windows");
   }
@@ -18,8 +23,8 @@ export function pnpmInvocation(
       "-ExecutionPolicy",
       "Bypass",
       "-File",
-      win32.join(pnpmHome, "bin", "pnpm.ps1"),
-      ...args,
+      win32.join(pnpmHome, "pnpm.ps1"),
+      ...invocationArgs,
     ],
   };
 }

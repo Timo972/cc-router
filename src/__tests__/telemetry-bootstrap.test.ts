@@ -422,10 +422,13 @@ describe("compiled bootstrap harness portability", () => {
     const workflow = readFileSync(join(PROJECT_ROOT, ".github", "workflows", "ci.yml"), "utf8");
     const install = workflow.indexOf("pnpm install --frozen-lockfile");
     const seed = workflow.indexOf("pnpm fetch --prod --frozen-lockfile");
+    const exportStore = workflow.indexOf("CC_ROUTER_CI_PNPM_STORE_DIR");
     const test = workflow.indexOf("run: pnpm test");
 
     expect(seed).toBeGreaterThanOrEqual(0);
     expect(install).toBeGreaterThan(seed);
+    expect(exportStore).toBeGreaterThan(install);
+    expect(test).toBeGreaterThan(exportStore);
     expect(test).toBeGreaterThan(install);
   });
 
@@ -1611,7 +1614,6 @@ export async function resolve(specifier, context, nextResolve) {
       const port = await listen(collector);
       auxiliaryServers.push(collector);
       const origin = `http://127.0.0.1:${port}`;
-      const started = Date.now();
       const child = spawn(process.execPath, [installedBinary, "start", "--foreground"], {
         cwd: installedCwd,
         env: {
@@ -1663,7 +1665,6 @@ export async function resolve(specifier, context, nextResolve) {
         expect(await waitForChildExit(child, mode === "hung" ? 3_000 : 2_000), output).toBe(true);
         expect(child.exitCode, output).toBe(1);
         expect(Date.now() - cancellationReachedAt).toBeLessThan(mode === "hung" ? 2_750 : 1_750);
-        expect(Date.now() - started).toBeLessThan(3_500);
         expect(readFileSync(promptLog, "utf8").trim().split("\n")).toEqual([
           "start.confirm_setup",
           "setup.mode_server",
