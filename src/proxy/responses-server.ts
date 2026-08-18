@@ -22,11 +22,20 @@ import {
   type ForwardOpenAI,
   type OpenAIIngressEnvelope,
 } from "./openai-ingress.js";
+import { annotateActiveSpan } from "../telemetry/facade.js";
+import { writeResponseChunk } from "./response-write.js";
+
+function requestSource(req: Request): "cli" | "desktop" | "api" {
+  if (req.headers["x-claude-code-session-id"] !== undefined) return "cli";
+  if (req.headers["x-api-key"] !== undefined) return "desktop";
+  return "api";
+}
 
 export interface ResponsesRoutesOptions {
   openAIRouter: SessionRouter<OpenAIAccount>;
   openAIPool: OpenAITokenPool;
   prepareOpenAIAccount?: (account: OpenAIAccount) => Promise<boolean>;
+  prepareOpenAIAccountOwnsDiagnostics?: boolean;
   forwardOpenAI?: ForwardOpenAI;
   modelRouting?: ModelRoutingConfig;
   recordActivity?: (entry: LogEntry) => void;
@@ -80,33 +89,58 @@ async function sendUpstreamResponse(
     if (res.destroyed) resolve(DISCONNECTED);
     else res.once("close", () => resolve(DISCONNECTED));
   });
+  let readerFinished = false;
+  let readerCancelled = false;
+  const cancelReader = async (): Promise<void> => {
+    if (readerFinished || readerCancelled) return;
+    readerCancelled = true;
+    await reader.cancel().catch(() => {});
+  };
   try {
     while (true) {
       const next = await Promise.race([reader.read(), disconnected]);
       if (next === DISCONNECTED) {
-        await reader.cancel().catch(() => {});
+        await cancelReader();
         break;
       }
       const { value, done } = next;
-      if (done) break;
+      if (done) {
+        readerFinished = true;
+        break;
+      }
       if (value) {
-        res.write(Buffer.from(value));
         onChunk?.(value);
+        if (!await writeResponseChunk(res, Buffer.from(value))) {
+          await cancelReader();
+          break;
+        }
       }
     }
+  } catch (error) {
+    await cancelReader();
+    throw error;
   } finally {
-    res.end();
+    if (!res.destroyed && !res.writableEnded) res.end();
   }
 }
 
 export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions): void {
   const forwardOpenAI = opts.forwardOpenAI ?? forwardOpenAICodexResponse;
+  const forwardOpenAIOwnsDiagnostics = opts.forwardOpenAI === undefined;
   const prepareOpenAIAccount = opts.prepareOpenAIAccount ?? (async () => true);
   const recordActivity = opts.recordActivity ?? ((entry: LogEntry) => stats.addLog(entry));
   const now = opts.now ?? Date.now;
 
   app.post("/v1/responses", express.json({ limit: "10mb" }), async (req: Request, res: Response) => {
     if (!isResponsesRequest(req.body)) {
+      annotateActiveSpan("proxy.request", {
+        httpMethod: "POST",
+        provider: "openai",
+        route: "responses",
+        requestSource: requestSource(req),
+        httpStatusCode: 400,
+        outcome: "upstream_error",
+      });
       res.status(400).json({
         error: {
           type: "invalid_request_error",
@@ -117,6 +151,16 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
     }
 
     if (req.body.store === true) {
+      annotateActiveSpan("proxy.request", {
+        httpMethod: "POST",
+        provider: "openai",
+        route: "responses",
+        requestSource: requestSource(req),
+        modelFamily: "codex",
+        streaming: req.body.stream === true,
+        httpStatusCode: 400,
+        outcome: "upstream_error",
+      });
       recordActivity({
         ts: Date.now(),
         accountId: "-",
@@ -166,6 +210,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       sessionKey: extractCodexSessionKey(req, req.body),
       requestedModel: route.upstreamModel,
       path: "/v1/responses",
+      requestSource: requestSource(req),
       method: req.method,
       // Only the Codex CLI speaks the Responses API to this proxy.
       source: "codex",
@@ -178,7 +223,16 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       now,
       envelope: RESPONSES_ENVELOPE,
       onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
+      prepareOpenAIAccountOwnsDiagnostics: opts.prepareOpenAIAccountOwnsDiagnostics === true,
+      forwardOpenAIOwnsDiagnostics,
       relay: async (upstream, res, entry, report) => {
+        const successfulEventStream = upstream.ok
+          && (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+        // A successful event stream with no body is already an upstream
+        // failure before either relay runs. Latch that ownership now so a
+        // concurrent client hangup cannot rewrite the collector's synthesized
+        // 502 into a benign cancellation and suppress account diagnostics.
+        if (successfulEventStream && !upstream.body) report.upstreamReportedFailure = true;
         if (body.stream === true) {
           const observer = createCodexUsageObserver();
           // Only an upstream that actually promised a successful event stream
@@ -188,8 +242,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
           // `sendUpstreamResponse` has already relayed the real status to the
           // client, so reporting 502 here would log a 502 for a client that
           // received a 429 and hide the actual failure from diagnostics.
-          const streamed = upstream.ok
-            && (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+          const streamed = successfulEventStream;
           // Reported per chunk, not once at the end: this relay can throw
           // (or be cut short) after upstream has already announced a failure,
           // and the verdict has to survive that.

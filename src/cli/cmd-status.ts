@@ -2,6 +2,14 @@ import type { Command } from "commander";
 import chalk from "chalk";
 import { PROXY_PORT } from "../config/paths.js";
 import { readConfig } from "../config/manager.js";
+import type { SetupSingleAccountResult } from "./cmd-setup.js";
+import {
+  SetupDiagnosticError,
+  classifyHttpSetupFailure,
+  classifyNetworkSetupFailure,
+  withSetupTelemetryFlush,
+} from "../telemetry/setup-diagnostics.js";
+import { flushTelemetryWithin } from "../telemetry/facade.js";
 
 /**
  * Resolves where the proxy's HTTP API lives and which bearer token to use.
@@ -171,38 +179,75 @@ async function dashboardLoop(port: number): Promise<void> {
  * tokens to /cc-router/accounts on the active target. Returns the new id on
  * success, or null if the user aborted / an error occurred.
  */
-async function runAddAccountFlow(target: StatusTarget): Promise<string | null> {
-  try {
-    const { setupSingleAccount } = await import("./cmd-setup.js");
-    // The index shown in the flow is just for display, pick something neutral.
-    const account = await setupSingleAccount(1);
-    if (!account) return null;
+export interface AddAccountFlowDependencies {
+  setupSingleAccount(): Promise<SetupSingleAccountResult>;
+  fetchImpl: typeof fetch;
+  flush(deadlineMs: number): Promise<void>;
+}
 
-    const res = await fetch(`${target.baseUrl}/cc-router/accounts`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...target.headers,
-      },
-      body: JSON.stringify({
-        id: account.id,
-        accessToken: account.tokens.accessToken,
-        refreshToken: account.tokens.refreshToken,
-        expiresAt: account.tokens.expiresAt,
-        scopes: account.tokens.scopes,
-      }),
-      signal: AbortSignal.timeout(5_000),
-    });
+const defaultAddAccountFlowDependencies: AddAccountFlowDependencies = {
+  setupSingleAccount: async () => {
+    const { setupSingleAccountDetailed } = await import("./cmd-setup.js");
+    return setupSingleAccountDetailed(1);
+  },
+  fetchImpl: (...args) => fetch(...args),
+  flush: flushTelemetryWithin,
+};
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.error(chalk.red(`\n✗ Server rejected account: HTTP ${res.status}`));
-      if (text) console.error(chalk.gray(`  ${text}`));
+export async function runAddAccountFlow(
+  target: StatusTarget,
+  dependencies: AddAccountFlowDependencies = defaultAddAccountFlowDependencies,
+): Promise<string | null> {
+  return withSetupTelemetryFlush(async () => {
+    let setup: SetupSingleAccountResult | undefined;
+    try {
+      // The index shown in the flow is just for display, pick something neutral.
+      setup = await dependencies.setupSingleAccount();
+      const account = setup.account;
+      if (!account) return null;
+
+      const res = await dependencies.fetchImpl(`${target.baseUrl}/cc-router/accounts`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...target.headers,
+        },
+        body: JSON.stringify({
+          id: account.id,
+          accessToken: account.tokens.accessToken,
+          refreshToken: account.tokens.refreshToken,
+          expiresAt: account.tokens.expiresAt,
+          scopes: account.tokens.scopes,
+        }),
+        signal: AbortSignal.timeout(5_000),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        const error = classifyHttpSetupFailure(
+          "persistence",
+          res.status,
+          `Server rejected account with HTTP ${res.status}${text ? `: ${text}` : ""}`,
+        );
+        const outcome = setup.attempt.failed(error, "persistence");
+        console.error(chalk.red(`\n✗ Server rejected account: HTTP ${res.status}`));
+        if (text) console.error(chalk.gray(`  ${text}`));
+        if (outcome.unexpected) console.error(chalk.gray(`  Diagnostic ID: ${outcome.diagnosticId}`));
+        return null;
+      }
+      setup.attempt.stageCompleted("persistence");
+      setup.attempt.succeeded();
+      return account.id;
+    } catch (err) {
+      if (setup) {
+        const error = err instanceof SetupDiagnosticError
+          ? err
+          : classifyNetworkSetupFailure("persistence", err);
+        const outcome = setup.attempt.failed(error, "persistence");
+        if (outcome.unexpected) console.error(chalk.gray(`  Diagnostic ID: ${outcome.diagnosticId}`));
+      }
+      console.error(chalk.red(`\n✗ Failed to add account: ${(err as Error).message}`));
       return null;
     }
-    return account.id;
-  } catch (err) {
-    console.error(chalk.red(`\n✗ Failed to add account: ${(err as Error).message}`));
-    return null;
-  }
+  }, dependencies.flush);
 }

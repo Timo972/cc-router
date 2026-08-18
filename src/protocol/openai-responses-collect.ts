@@ -1,5 +1,3 @@
-import { parseSseLines } from "./sse.js";
-
 export type CollectedCodexResponse =
   | { kind: "json"; status: number; body: unknown }
   | { kind: "text"; status: number; contentType?: string; body: string };
@@ -9,6 +7,32 @@ interface CodexStreamEvent {
   response?: unknown;
   error?: { message?: string };
 }
+
+type CodexResponseTerminalKind =
+  | "completed"
+  | "incomplete"
+  | "failed"
+  | "error"
+  | "missing"
+  | "malformed"
+  | "overflow";
+
+export interface CodexResponseTerminal {
+  kind: CodexResponseTerminalKind;
+}
+
+interface RetainedCodexResponseTerminal extends CodexResponseTerminal {
+  response?: unknown;
+  message?: string;
+}
+
+export interface CodexResponseTerminalObserver {
+  push(chunk: Uint8Array): CodexResponseTerminal | undefined;
+  finish(): CodexResponseTerminal;
+}
+
+export const MAX_CODEX_STREAM_EVENT_BYTES = 64 * 1024;
+export const MAX_CODEX_COLLECTED_RESPONSE_BYTES = 10 * 1024 * 1024;
 
 function upstreamError(message: string): CollectedCodexResponse {
   return { kind: "json", status: 502, body: { error: { type: "upstream_error", message } } };
@@ -72,6 +96,200 @@ export function terminalResponsePayload(event: unknown): unknown {
   return payload;
 }
 
+function createBoundedTerminalObserver(
+  maxEventBytes: number,
+  retainPayload: boolean,
+): {
+  push(chunk: Uint8Array): RetainedCodexResponseTerminal | undefined;
+  finish(): RetainedCodexResponseTerminal;
+} {
+  let lineFragments: Buffer[] = [];
+  let lineBytes = 0;
+  let terminal: RetainedCodexResponseTerminal | undefined;
+
+  const clearLine = (): void => {
+    lineFragments = [];
+    lineBytes = 0;
+  };
+  const close = (next: RetainedCodexResponseTerminal): void => {
+    if (terminal) return;
+    terminal = next;
+    clearLine();
+  };
+  const inspectLine = (line: Buffer): void => {
+    if (terminal) return;
+    const text = line.toString("utf8");
+    if (!text.startsWith("data: ")) return;
+    const payload = text.slice(6).trim();
+    if (!payload || payload === "[DONE]") return;
+
+    let candidate: CodexStreamEvent;
+    try {
+      const parsed = JSON.parse(payload) as unknown;
+      if (typeof parsed !== "object" || parsed === null) return;
+      candidate = parsed as CodexStreamEvent;
+    } catch {
+      close({ kind: "malformed" });
+      return;
+    }
+
+    const response = terminalResponsePayload(candidate);
+    if (response !== undefined) {
+      close(retainPayload
+        ? { kind: candidate.type === "response.completed" ? "completed" : "incomplete", response }
+        : { kind: candidate.type === "response.completed" ? "completed" : "incomplete" });
+    } else if (candidate.type === "response.failed") {
+      const err = (candidate.response as { error?: { message?: string } } | undefined)?.error;
+      close(retainPayload
+        ? { kind: "failed", message: err?.message ?? "Response failed" }
+        : { kind: "failed" });
+    } else if (candidate.type === "error") {
+      close(retainPayload
+        ? { kind: "error", message: candidate.error?.message ?? "Upstream error event" }
+        : { kind: "error" });
+    }
+  };
+
+  return {
+    push(chunk) {
+      if (terminal) return terminal;
+      let offset = 0;
+      while (offset < chunk.byteLength && !terminal) {
+        const newlineAt = chunk.indexOf(0x0a, offset);
+        const fragmentEnd = newlineAt === -1 ? chunk.byteLength : newlineAt;
+        const fragment = chunk.subarray(offset, fragmentEnd);
+        if (lineBytes + fragment.byteLength > maxEventBytes) {
+          close({ kind: "overflow" });
+          break;
+        }
+        if (fragment.byteLength > 0) {
+          lineFragments.push(Buffer.from(fragment));
+          lineBytes += fragment.byteLength;
+        }
+        if (newlineAt === -1) break;
+        inspectLine(Buffer.concat(lineFragments, lineBytes));
+        clearLine();
+        offset = newlineAt + 1;
+      }
+      return terminal;
+    },
+    finish() {
+      if (!terminal && lineBytes > 0) inspectLine(Buffer.concat(lineFragments, lineBytes));
+      if (!terminal) close({ kind: "missing" });
+      return terminal!;
+    },
+  };
+}
+
+/** Observe only bounded framing state and a closed terminal classification. */
+export function createCodexResponseTerminalObserver(): CodexResponseTerminalObserver {
+  const observer = createBoundedTerminalObserver(MAX_CODEX_STREAM_EVENT_BYTES, false);
+  return {
+    push(chunk) {
+      const result = observer.push(chunk);
+      return result ? { kind: result.kind } : undefined;
+    },
+    finish() {
+      return { kind: observer.finish().kind };
+    },
+  };
+}
+
+export const RESPONSE_SIZE_ERROR = "Upstream response exceeded size limit";
+
+export type BoundedBodyRead =
+  | { kind: "complete"; body: string }
+  | { kind: "overflow" }
+  | { kind: "cancelled" }
+  | { kind: "error" };
+
+export async function readBodyWithinLimit(
+  upstream: globalThis.Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<BoundedBodyRead> {
+  const reader = upstream.body?.getReader();
+  if (!reader) return signal?.aborted ? { kind: "cancelled" } : { kind: "complete", body: "" };
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  let cancellationStarted = false;
+  let cancelPromise: Promise<void> | undefined;
+  const cancelReader = (): Promise<void> => {
+    if (!cancellationStarted) {
+      cancellationStarted = true;
+      try {
+        cancelPromise = Promise.resolve(reader.cancel()).catch(() => undefined);
+      } catch {
+        cancelPromise = Promise.resolve();
+      }
+    }
+    return cancelPromise!;
+  };
+  const abortSentinel = Symbol("body-read-aborted");
+  let resolveAbort!: (value: typeof abortSentinel) => void;
+  const abortPromise = new Promise<typeof abortSentinel>(resolve => {
+    resolveAbort = resolve;
+  });
+  let abortObserved = false;
+  const onAbort = (): void => {
+    if (abortObserved) return;
+    abortObserved = true;
+    // Resolve the trusted local sentinel before cancellation can make a
+    // pending Web Streams read look like an ordinary `{ done: true }` EOF.
+    resolveAbort(abortSentinel);
+    void cancelReader();
+  };
+
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    // Covers an abort that happened before registration or in the narrow gap
+    // between listener registration and this check.
+    if (signal?.aborted) onAbort();
+    if (abortObserved) {
+      await cancelReader();
+      return { kind: "cancelled" };
+    }
+
+    while (true) {
+      let outcome: ReadableStreamReadResult<Uint8Array> | typeof abortSentinel;
+      try {
+        // Race the raw read promise, rather than a mapped derivative, so a
+        // genuine reader rejection that settled before a same-tick abort wins
+        // deterministically and remains upstream-owned.
+        outcome = await Promise.race([reader.read(), abortPromise]);
+      } catch {
+        // A later client abort still has cleanup to join, but cannot rewrite
+        // the upstream read failure that already won the race.
+        if (abortObserved) await cancelReader();
+        return { kind: "error" };
+      }
+      if (outcome === abortSentinel || abortObserved) {
+        await cancelReader();
+        return { kind: "cancelled" };
+      }
+      const { value, done } = outcome;
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await cancelReader();
+        return { kind: "overflow" };
+      }
+      chunks.push(Buffer.from(value));
+    }
+    // Web Streams cancellation is allowed to resolve the pending read as EOF;
+    // never publish a partial/empty body until the trusted abort state and its
+    // cleanup promise have both been accounted for.
+    if (abortObserved) {
+      await cancelReader();
+      return { kind: "cancelled" };
+    }
+    return { kind: "complete", body: Buffer.concat(chunks, totalBytes).toString("utf8") };
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 /**
  * Collapse the Codex backend's forced SSE stream into a single Responses
  * object for callers that did not ask to stream. The backend's terminal
@@ -88,16 +306,25 @@ export async function collectCodexResponseStream(
    *  bury it. */
   onUpstreamFailure?: () => void,
 ): Promise<CollectedCodexResponse> {
-  if (!upstream.ok) {
-    onUpstreamFailure?.();
-    const contentType = upstream.headers.get("content-type") ?? undefined;
-    return { kind: "text", status: upstream.status, contentType, body: await upstream.text() };
-  }
-
   const contentType = upstream.headers.get("content-type") ?? "";
-  if (contentType.includes("application/json")) {
+  if (!upstream.ok || contentType.includes("application/json")) {
+    const read = await readBodyWithinLimit(upstream, MAX_CODEX_COLLECTED_RESPONSE_BYTES);
+    if (read.kind === "overflow") return upstreamError(RESPONSE_SIZE_ERROR);
+    // This collector does not pass an abort signal, so cancellation is not a
+    // reachable result here. Keep the union exhaustive if a caller adds one.
+    if (read.kind === "cancelled") return upstreamError("Malformed upstream stream");
+    if (read.kind === "error") return upstreamError("Malformed upstream stream");
+    if (!upstream.ok) {
+      onUpstreamFailure?.();
+      return {
+        kind: "text",
+        status: upstream.status,
+        contentType: contentType || undefined,
+        body: read.body,
+      };
+    }
     try {
-      return { kind: "json", status: upstream.status, body: await upstream.json() };
+      return { kind: "json", status: upstream.status, body: JSON.parse(read.body) as unknown };
     } catch {
       return upstreamError("Malformed upstream JSON body");
     }
@@ -106,48 +333,44 @@ export async function collectCodexResponseStream(
   const reader = upstream.body?.getReader();
   if (!reader) return upstreamError("Empty upstream body");
 
-  const decoder = new TextDecoder();
-  let remainder = "";
-  let terminalResponse: unknown;
-  let failure: string | undefined;
-
-  const applyEvent = (event: unknown): void => {
-    const payload = terminalResponsePayload(event);
-    if (payload !== undefined) {
-      terminalResponse = payload;
-      return;
-    }
-    if (typeof event !== "object" || event === null) return;
-    const e = event as CodexStreamEvent;
-    if (e.type === "response.failed") {
-      const err = (e.response as { error?: { message?: string } } | undefined)?.error;
-      failure = err?.message ?? "Response failed";
-      onUpstreamFailure?.();
-    } else if (e.type === "error") {
-      failure = e.error?.message ?? "Upstream error event";
-      onUpstreamFailure?.();
-    }
-  };
+  const observer = createBoundedTerminalObserver(MAX_CODEX_COLLECTED_RESPONSE_BYTES, true);
+  let totalBytes = 0;
 
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }));
-      remainder = parsed.remainder;
-      for (const event of parsed.events) applyEvent(event);
-    }
-    const tail = remainder + decoder.decode();
-    if (tail.length > 0) {
-      for (const event of parseSseLines(tail + "\n").events) applyEvent(event);
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_CODEX_COLLECTED_RESPONSE_BYTES) {
+        void reader.cancel().catch(() => undefined);
+        return upstreamError(RESPONSE_SIZE_ERROR);
+      }
+      const terminal = observer.push(value);
+      if (terminal?.kind === "overflow") {
+        void reader.cancel().catch(() => undefined);
+        return upstreamError(RESPONSE_SIZE_ERROR);
+      }
+      if (terminal?.kind === "malformed") {
+        void reader.cancel().catch(() => undefined);
+        return upstreamError("Malformed upstream stream");
+      }
     }
   } catch {
     return upstreamError("Malformed upstream stream");
   }
 
-  if (failure !== undefined) return upstreamError(failure);
-  if (terminalResponse === undefined) return upstreamError("Stream ended before any terminal response event");
-  return { kind: "json", status: upstream.status, body: terminalResponse };
+  const terminal = observer.finish();
+  if (terminal.kind === "overflow") return upstreamError(RESPONSE_SIZE_ERROR);
+  if (terminal.kind === "malformed") return upstreamError("Malformed upstream stream");
+  if (terminal.kind === "failed" || terminal.kind === "error") {
+    onUpstreamFailure?.();
+    return upstreamError(terminal.message ?? (terminal.kind === "failed" ? "Response failed" : "Upstream error event"));
+  }
+  if (terminal.kind === "missing" || terminal.response === undefined) {
+    return upstreamError("Stream ended before any terminal response event");
+  }
+  return { kind: "json", status: upstream.status, body: terminal.response };
 }
 
 export interface CodexUsageTotals {
@@ -215,8 +438,9 @@ export function createCodexUsageObserver(): {
    *  kept apart. */
   explicitFailure(): string | undefined;
 } {
-  const decoder = new TextDecoder();
-  let remainder = "";
+  let lineFragments: Buffer[] = [];
+  let lineBytes = 0;
+  let droppingOversizedLine = false;
   let totals: CodexUsageTotals | undefined;
   let failure: string | undefined;
   let completed = false;
@@ -235,6 +459,49 @@ export function createCodexUsageObserver(): {
     }
   };
 
+  const clearLine = (): void => {
+    lineFragments = [];
+    lineBytes = 0;
+  };
+  const inspectLine = (): void => {
+    if (lineBytes === 0) return;
+    const line = Buffer.concat(lineFragments, lineBytes).toString("utf8");
+    if (!line.startsWith("data: ")) return;
+    const payload = line.slice(6).trim();
+    if (!payload || payload === "[DONE]") return;
+    try {
+      applyEvent(JSON.parse(payload) as unknown);
+    } catch {
+      // Passive observer: malformed frames do not alter relayed response bytes.
+    }
+  };
+
+  const pushBounded = (chunk: Uint8Array): void => {
+    let offset = 0;
+    while (offset < chunk.byteLength) {
+      const newlineAt = chunk.indexOf(0x0a, offset);
+      const fragmentEnd = newlineAt === -1 ? chunk.byteLength : newlineAt;
+      const fragment = chunk.subarray(offset, fragmentEnd);
+
+      if (!droppingOversizedLine) {
+        if (lineBytes + fragment.byteLength > MAX_CODEX_STREAM_EVENT_BYTES) {
+          clearLine();
+          droppingOversizedLine = newlineAt === -1;
+        } else if (fragment.byteLength > 0) {
+          lineFragments.push(Buffer.from(fragment));
+          lineBytes += fragment.byteLength;
+        }
+      } else if (newlineAt !== -1) {
+        droppingOversizedLine = false;
+      }
+
+      if (newlineAt === -1) break;
+      if (!droppingOversizedLine) inspectLine();
+      clearLine();
+      offset = newlineAt + 1;
+    }
+  };
+
   return {
     push(chunk: Uint8Array): void {
       // Best-effort: a malformed SSE frame from upstream must never throw
@@ -242,24 +509,14 @@ export function createCodexUsageObserver(): {
       // relayed to the client verbatim — a parse failure just means that one
       // frame goes uncaptured, never that the response breaks. Tolerant
       // parsing keeps the rest of the chunk's valid events.
-      try {
-        const parsed = parseSseLines(remainder + decoder.decode(chunk, { stream: true }), { tolerant: true });
-        remainder = parsed.remainder;
-        parsed.events.forEach(applyEvent);
-      } catch {
-        // swallow — passive observer, see comment above
-      }
+      try { pushBounded(chunk); } catch { /* passive observer */ }
     },
     finish(): CodexUsageTotals | undefined {
       try {
-        const tail = decoder.decode();
-        if (tail || remainder) {
-          parseSseLines(remainder + tail + "\n", { tolerant: true }).events.forEach(applyEvent);
-        }
-      } catch {
-        // swallow — passive observer, see comment above
-      }
-      remainder = "";
+        if (!droppingOversizedLine) inspectLine();
+      } catch { /* passive observer */ }
+      clearLine();
+      droppingOversizedLine = false;
       return totals;
     },
     failure(): string | undefined {

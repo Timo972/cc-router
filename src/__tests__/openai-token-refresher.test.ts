@@ -157,7 +157,7 @@ describe("OpenAI subscription token refresher", () => {
 
     const stop = startOpenAIRefreshLoop([account], save);
     await vi.runOnlyPendingTimersAsync();
-    stop();
+    await stop();
 
     expect(save).toHaveBeenCalled();
     expect(account.accessToken).toBe("new-access");
@@ -243,7 +243,7 @@ describe("OpenAI subscription token refresher", () => {
 
     const stop = startOpenAIRefreshLoop([first, second], save);
     await vi.runOnlyPendingTimersAsync();
-    stop();
+    await stop();
 
     expect(first.accessToken).toBe("new-access");
     expect(second.accessToken).toBe("new-access");
@@ -402,5 +402,109 @@ describe("OpenAI subscription token refresher", () => {
 
     expect(ok).toBe(true);
     expect(account.rateLimits.plan).toBe("pro");
+  });
+
+  it("drains and persists a deferred startup refresh before stopping", async () => {
+    let resolveJson!: (value: object) => void;
+    const json = new Promise<object>(resolve => { resolveJson = resolve; });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => json,
+    } as Response);
+    const account = {
+      id: "openai-deferred",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    };
+    const persistedRefreshTokens: string[] = [];
+    const stop = startOpenAIRefreshLoop([account], accounts => {
+      persistedRefreshTokens.push(accounts[0].refreshToken);
+    });
+    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1));
+
+    let stopped = false;
+    const stopping = stop(100).then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+
+    resolveJson({
+      access_token: "new-access",
+      refresh_token: "new-refresh",
+      expires_in: 3600,
+      token_type: "Bearer",
+    });
+    await stopping;
+
+    expect(persistedRefreshTokens).toEqual(["new-refresh"]);
+  });
+
+  it("aborts a hung startup refresh within the stopper deadline", async () => {
+    let observedSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) => {
+      observedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        observedSignal?.addEventListener("abort", () => {
+          reject(Object.assign(new Error("PRIVATE_ABORT"), { name: "AbortError" }));
+        }, { once: true });
+      });
+    });
+    const account = {
+      id: "openai-hung",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    };
+    const stop = startOpenAIRefreshLoop([account], vi.fn());
+    await vi.waitFor(() => expect(observedSignal).toBeInstanceOf(AbortSignal));
+
+    const startedAt = Date.now();
+    await stop(10);
+
+    expect(Date.now() - startedAt).toBeLessThan(250);
+    expect(observedSignal?.aborted).toBe(true);
+  });
+
+  it("drains a request-triggered rotation and persists it before stopping", async () => {
+    let resolveJson!: (value: object) => void;
+    const json = new Promise<object>(resolve => { resolveJson = resolve; });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => json,
+    } as Response);
+    const account = {
+      id: "openai-request-refresh",
+      provider: "openai_subscription" as const,
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: Date.now() + 60_000,
+      enabled: true,
+    };
+    const persistedRefreshTokens: string[] = [];
+    const save = (accounts: typeof account[]) => {
+      persistedRefreshTokens.push(accounts[0].refreshToken);
+    };
+    const stop = startOpenAIRefreshLoop([], save);
+    await Promise.resolve();
+    const preparing = prepareOpenAIAccountForRequest(account, [account], save);
+    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1));
+
+    const stopping = stop(100);
+    resolveJson({
+      access_token: "new-access",
+      refresh_token: "request-rotated-refresh",
+      expires_in: 3600,
+      token_type: "Bearer",
+    });
+
+    await expect(preparing).resolves.toBe(true);
+    await stopping;
+    expect(persistedRefreshTokens).toEqual(["request-rotated-refresh"]);
   });
 });

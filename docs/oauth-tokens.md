@@ -93,7 +93,7 @@ If a refresh returns a token without `user:inference`, requests will fail with `
 cc-router uses the official Claude Code OAuth client ID to refresh tokens:
 
 ```
-POST https://console.anthropic.com/api/oauth/token
+POST https://claude.ai/v1/oauth/token
 Content-Type: application/json
 
 {

@@ -66,6 +66,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Privacy-safe OpenTelemetry and PostHog EU telemetry: 10% sampled proxy
+  waterfalls, unsampled closed-schema setup/runtime diagnostics, lifecycle
+  analytics, and sanitized Error Tracking with diagnostic IDs. Fresh installs
+  default on; persisted and environment opt-outs gate every signal. See
+  [docs/telemetry.md](docs/telemetry.md) for the exhaustive inventory.
+
 - OpenAI/Codex sticky session routing: sessions pin to one account for prompt-cache
   locality (`session_id` → `x-claude-code-session-id` → `prompt_cache_key`), with
   load- and headroom-aware selection for new sessions.
@@ -84,6 +90,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   other unprefixed model still routes to Claude.
 
 ### Changed
+
+- Aptabase telemetry has been replaced by a reconstructive, closed-schema
+  PostHog EU boundary with no Person profiles, disabled GeoIP enrichment, and
+  immediate late opt-out checks. Existing persisted opt-outs remain disabled.
 
 - OpenAI account records persist `scopes`, `sessionLimitPercent`, and
   `weeklyLimitPercent`.

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, request as httpRequest, type ClientRequest } from "http";
 import type { AddressInfo } from "net";
 import express from "express";
+import type { Response as ExpressResponse } from "express";
 import { ReadableStream } from "stream/web";
 import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.js";
 import type { MessagesCrossProviderRouteOptions } from "../proxy/messages-cross-route.js";
@@ -11,6 +12,7 @@ import { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { applyCodexRateLimits, createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
 import { parseCodexRateLimits } from "../providers/openai/usage.js";
 import type { LogEntry } from "../proxy/stats.js";
+import type { OpenAIIngressTelemetry } from "../proxy/openai-ingress.js";
 
 type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean; signal?: AbortSignal }) => Promise<Response>;
 
@@ -46,8 +48,10 @@ function mountWithPool(
   accounts: OpenAIAccount[],
   forwardOpenAI: ForwardOpenAI,
   extra: Partial<MessagesCrossProviderRouteOptions> = {},
+  beforeMount?: (app: ReturnType<typeof express>) => void,
 ) {
   const app = express();
+  beforeMount?.(app);
   const openAIPool = new OpenAITokenPool(accounts);
   const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
   const activity: LogEntry[] = [];
@@ -67,10 +71,28 @@ function mountWithPool(
   return { app, openAIPool, openAIRouter, activity };
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+function captureIngressTelemetry() {
+  const records: unknown[] = [];
+  const telemetry: OpenAIIngressTelemetry = {
+    annotateActiveSpan: (...values) => { records.push(["span", ...values]); },
+    recordSafeLog: (...values) => { records.push(["log", ...values]); },
+    recordUnexpectedException: (...values) => { records.push(["exception", ...values]); },
+  };
+  return { records, telemetry };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>(done => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
 }
 
 function postMessages(baseUrl: string, body: Record<string, unknown>, headers: Record<string, string> = {}) {
@@ -96,6 +118,31 @@ function crossSseResponse(headers: Record<string, string> = {}): Response {
     status: 200,
     headers: { "content-type": "text/event-stream", ...headers },
   });
+}
+
+function cancellableChunkedResponse(
+  chunks: Uint8Array[],
+  init: ResponseInit,
+): { response: Response; cancel: ReturnType<typeof vi.fn> } {
+  let nextChunk = 0;
+  let closeTask: ReturnType<typeof setImmediate> | undefined;
+  const cancel = vi.fn(() => {
+    if (closeTask) clearImmediate(closeTask);
+  });
+  const response = new Response(new ReadableStream({
+    pull(controller) {
+      if (nextChunk < chunks.length) {
+        controller.enqueue(chunks[nextChunk++]);
+        return;
+      }
+      // Schedule EOF only once the consumer has pulled every chunk. An
+      // overflow handler can therefore cancel in the read continuation before
+      // this task runs; an unbounded reader still gets a deterministic EOF.
+      closeTask ??= setImmediate(() => controller.close());
+    },
+    cancel,
+  }) as BodyInit, init);
+  return { response, cancel };
 }
 
 describe("mountMessagesCrossProviderRoute", () => {
@@ -302,6 +349,504 @@ describe("mountMessagesCrossProviderRoute", () => {
         usage: { input_tokens: 4, output_tokens: 2 },
       });
     });
+  });
+
+  it("pauses translated Messages upstream reads while the client response is backpressured", async () => {
+    const encoder = new TextEncoder();
+    const chunks = [
+      encoder.encode('data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'),
+      encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'),
+    ];
+    let nextChunk = 0;
+    const read = vi.fn(async () => nextChunk < chunks.length
+      ? { value: chunks[nextChunk++], done: false as const }
+      : { value: undefined, done: true as const });
+    const cancel = vi.fn(async () => undefined);
+    const upstream = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body: { getReader: () => ({ read, cancel }) },
+    } as unknown as Response;
+    const firstWrite = deferred<ExpressResponse>();
+    let writes = 0;
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream,
+      {},
+      app => app.use((_req, res, next) => {
+        const originalWrite = res.write.bind(res);
+        res.write = ((...args: unknown[]) => {
+          writes++;
+          const accepted = Reflect.apply(originalWrite, res, args) as boolean;
+          if (writes === 1) {
+            firstWrite.resolve(res);
+            return false;
+          }
+          return accepted;
+        }) as ExpressResponse["write"];
+        next();
+      }),
+    );
+
+    await withServer(app, async baseUrl => {
+      const response = postMessages(baseUrl, { stream: true });
+      const serverResponse = await firstWrite.promise;
+      await new Promise(resolve => setImmediate(resolve));
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(writes).toBe(1);
+
+      serverResponse.emit("drain");
+      const body = await (await response).text();
+      expect(body).toContain('"type":"message_start"');
+      expect(body).toContain('"type":"message_stop"');
+      expect(read).toHaveBeenCalledTimes(3);
+      expect(cancel).not.toHaveBeenCalled();
+    });
+  });
+
+  it("cancels the translated Messages reader when the client closes during backpressure", async () => {
+    const encoder = new TextEncoder();
+    const neverRead = deferred<ReadableStreamReadResult<Uint8Array>>();
+    const read = vi.fn()
+      .mockResolvedValueOnce({
+        value: encoder.encode('data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'),
+        done: false,
+      })
+      .mockImplementationOnce(() => neverRead.promise);
+    const cancel = vi.fn(async () => undefined);
+    const upstream = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body: { getReader: () => ({ read, cancel }) },
+    } as unknown as Response;
+    const firstWrite = deferred<void>();
+    let writes = 0;
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream,
+      {},
+      app => app.use((_req, res, next) => {
+        const originalWrite = res.write.bind(res);
+        res.write = ((...args: unknown[]) => {
+          writes++;
+          Reflect.apply(originalWrite, res, args);
+          if (writes === 1) {
+            firstWrite.resolve();
+            return false;
+          }
+          return true;
+        }) as ExpressResponse["write"];
+        next();
+      }),
+    );
+    const abort = new AbortController();
+    await withServer(app, async baseUrl => {
+      const pending = fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        }),
+        signal: abort.signal,
+      }).then(res => res.text()).catch(() => undefined);
+      try {
+        await firstWrite.promise;
+        await new Promise(resolve => setImmediate(resolve));
+        expect(read).toHaveBeenCalledTimes(1);
+        abort.abort();
+        await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+        expect(read).toHaveBeenCalledTimes(1);
+        expect(writes).toBe(1);
+      } finally {
+        neverRead.resolve({ value: undefined, done: true });
+        await pending;
+      }
+    });
+  });
+
+  it("cancels and safely rejects an oversized non-OK upstream body", async () => {
+    const privateBody = "PRIVATE_NON_OK_BODY_" + "x".repeat(10 * 1024 * 1024);
+    const upstream = cancellableChunkedResponse(
+      [new TextEncoder().encode(privateBody)],
+      { status: 429, headers: { "content-type": "application/json" } },
+    );
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
+      });
+      expect(JSON.stringify(body)).not.toContain("PRIVATE_NON_OK_BODY");
+    });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["JSON", "application/json"],
+    ["plain body", "text/plain"],
+  ])("cancels and safely rejects an oversized successful upstream %s", async (_name, contentType) => {
+    const privateBody = contentType === "application/json"
+      ? JSON.stringify({
+        id: "resp_private",
+        model: "gpt-5.5",
+        output: [],
+        private: "PRIVATE_SUCCESS_BODY_" + "x".repeat(10 * 1024 * 1024),
+      })
+      : "PRIVATE_SUCCESS_BODY_" + "x".repeat(10 * 1024 * 1024);
+    const upstream = cancellableChunkedResponse(
+      [new TextEncoder().encode(privateBody)],
+      { status: 200, headers: { "content-type": contentType } },
+    );
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
+      });
+      expect(JSON.stringify(body)).not.toContain("PRIVATE_SUCCESS_BODY");
+    });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["JSON", "application/json"],
+    ["text", "text/plain"],
+  ])("joins real-stream cancellation and keeps a client-aborted bounded %s body read owned by the client", async (_name, contentType) => {
+    const account = makeRuntimeAccount("openai-victor");
+    const { records, telemetry } = captureIngressTelemetry();
+    const readStarted = deferred<void>();
+    const cancelStarted = deferred<void>();
+    const cancelFinished = deferred<void>();
+    let cancelCalls = 0;
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      pull() {
+        readStarted.resolve();
+      },
+      cancel() {
+        cancelCalls++;
+        cancelStarted.resolve();
+        return cancelFinished.promise;
+      },
+    }, { highWaterMark: 0 });
+    const forward: ForwardOpenAI = async () => new Response(upstreamBody as BodyInit, {
+      status: 200,
+      headers: { "content-type": contentType },
+    });
+    const { app, activity, openAIPool } = mountWithPool([account], forward, { telemetry });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({
+        model: "openai/gpt-5.5",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hi" }],
+        stream: false,
+      });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await readStarted.promise;
+      client!.destroy();
+      await clientClosed;
+      await cancelStarted.promise;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(activity).toEqual([]);
+      cancelFinished.resolve();
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      expect(cancelCalls).toBe(1);
+      expect(account.errorCount).toBe(0);
+      expect(account.consecutiveErrors).toBe(0);
+      expect(openAIPool.getGlobalCooldownUntil(account.id)).toBe(0);
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "route", statusCode: 200 }));
+      expect(activity[0]?.details).toContain("client-cancelled");
+      const telemetryWire = JSON.stringify(records);
+      expect(telemetryWire).toContain('"outcome":"cancelled"');
+      expect(records.filter(record => (record as unknown[])[0] === "log")).toHaveLength(0);
+      expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
+    } finally {
+      client?.destroy();
+      cancelFinished.resolve();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  it("keeps a true bounded body reader rejection as one safe upstream failure", async () => {
+    const privateFailure = "PRIVATE_TRUE_BODY_REJECTION";
+    const reader = {
+      read: vi.fn(async () => { throw new Error(privateFailure); }),
+      cancel: vi.fn(async () => undefined),
+    };
+    const account = makeRuntimeAccount("openai-victor");
+    const { records, telemetry } = captureIngressTelemetry();
+    const { app, activity } = mountWithPool(
+      [account],
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        body: { getReader: () => reader },
+      }) as unknown as Response,
+      { telemetry },
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Malformed upstream stream" },
+      });
+      expect(JSON.stringify(body)).not.toContain(privateFailure);
+    });
+
+    expect(reader.read).toHaveBeenCalledOnce();
+    expect(account.errorCount).toBe(1);
+    expect(account.consecutiveErrors).toBe(1);
+    expect(activity).toEqual([expect.objectContaining({ type: "error", statusCode: 502 })]);
+    expect(records.filter(record => (record as unknown[])[0] === "log")).toHaveLength(1);
+    expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
+    expect(JSON.stringify(records)).not.toContain(privateFailure);
+  });
+
+  it("cancels an unterminated collected SSE frame after 64 KiB", async () => {
+    const frame = 'data: {"type":"response.output_text.delta","delta":"PRIVATE_FRAME_'
+      + "x".repeat(64 * 1024);
+    const upstream = cancellableChunkedResponse(
+      [new TextEncoder().encode(frame)],
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: false });
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
+      });
+      expect(JSON.stringify(body)).not.toContain("PRIVATE_FRAME");
+    });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+  });
+
+  it("caps collected translated output at 10 MiB and cancels upstream", async () => {
+    const delta = "x".repeat(60 * 1024);
+    const frames = [
+      'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n',
+      ...Array.from(
+        { length: Math.ceil((10 * 1024 * 1024 + 1) / delta.length) },
+        () => `data: ${JSON.stringify({ type: "response.output_text.delta", delta })}\n\n`,
+      ),
+      'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n',
+    ];
+    const upstream = cancellableChunkedResponse(
+      frames.map(frame => new TextEncoder().encode(frame)),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: false });
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Upstream response exceeded size limit" },
+      });
+    });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["number", 7],
+    ["object", { private: "PRIVATE_OBJECT_DELTA" }],
+    ["array", ["PRIVATE_ARRAY_DELTA"]],
+  ])("safely rejects a collected %s delta and joins reader cancellation before releasing its lease", async (_name, delta) => {
+    const account = makeRuntimeAccount("openai-victor");
+    const { records, telemetry } = captureIngressTelemetry();
+    const cancelFinished = deferred<void>();
+    const cancel = vi.fn(() => cancelFinished.promise);
+    const wire = new TextEncoder().encode(
+      'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'
+      + `data: ${JSON.stringify({ type: "response.output_text.delta", delta })}\n\n`,
+    );
+    let reads = 0;
+    const reader = {
+      read: vi.fn(async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+        if (reads++ === 0) return { value: wire, done: false };
+        return { value: undefined, done: true };
+      }),
+      cancel,
+    };
+    const { app, activity, openAIPool } = mountWithPool(
+      [account],
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body: { getReader: () => reader },
+      }) as unknown as Response,
+      { telemetry },
+    );
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let pendingResponse: Promise<Response> | undefined;
+
+    try {
+      await withServer(app, async baseUrl => {
+        let responseSettled = false;
+        pendingResponse = postMessages(baseUrl, { stream: false });
+        void pendingResponse.finally(() => { responseSettled = true; });
+
+        await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+        expect(responseSettled).toBe(false);
+        expect(activity).toEqual([]);
+        expect(openAIPool.getInFlight(account.id)).toBe(1);
+
+        cancelFinished.resolve();
+        const res = await pendingResponse;
+        expect(res.status).toBe(502);
+        const body = await res.json();
+        expect(body).toEqual({
+          type: "error",
+          error: { type: "upstream_error", message: "Malformed upstream stream" },
+        });
+        expect(JSON.stringify(body)).not.toContain("PRIVATE_");
+      });
+    } finally {
+      cancelFinished.resolve();
+      await pendingResponse?.catch(() => undefined);
+      const consoleWire = JSON.stringify(consoleLog.mock.calls);
+      expect(consoleWire).not.toContain("PRIVATE_OBJECT_DELTA");
+      expect(consoleWire).not.toContain("PRIVATE_ARRAY_DELTA");
+      consoleLog.mockRestore();
+    }
+
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(openAIPool.getInFlight(account.id)).toBe(0);
+    expect(account.errorCount).toBe(1);
+    expect(account.consecutiveErrors).toBe(1);
+    expect(activity).toEqual([expect.objectContaining({ type: "error", statusCode: 502 })]);
+    const telemetryWire = JSON.stringify(records);
+    expect(records.filter(record => (record as unknown[])[0] === "log")).toHaveLength(1);
+    expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
+    expect(telemetryWire).not.toContain("PRIVATE_OBJECT_DELTA");
+    expect(telemetryWire).not.toContain("PRIVATE_ARRAY_DELTA");
+  });
+
+  it.each([
+    [
+      "response.completed",
+      { type: "response.completed", response: { id: "resp_1", model: "gpt-5.5" } },
+      200,
+      "end_turn",
+    ],
+    [
+      "response.incomplete",
+      {
+        type: "response.incomplete",
+        response: {
+          id: "resp_1",
+          model: "gpt-5.5",
+          incomplete_details: { reason: "max_output_tokens" },
+        },
+      },
+      200,
+      "max_tokens",
+    ],
+    [
+      "response.failed",
+      { type: "response.failed", response: { error: { message: "safe failure" } } },
+      502,
+      undefined,
+    ],
+  ])("preserves a %s terminal split across arbitrary chunks", async (_name, terminal, expectedStatus, stopReason) => {
+    const wire = new TextEncoder().encode(
+      'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'
+      + `data: ${JSON.stringify(terminal)}\n\n`,
+    );
+    const chunks: Uint8Array[] = [];
+    for (let offset = 0; offset < wire.byteLength; offset += 7) {
+      chunks.push(wire.subarray(offset, Math.min(offset + 7, wire.byteLength)));
+    }
+    const upstream = cancellableChunkedResponse(chunks, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: false });
+      expect(res.status).toBe(expectedStatus);
+      const body = await res.json() as { stop_reason?: string; error?: { message?: string } };
+      if (expectedStatus === 200) expect(body.stop_reason).toBe(stopReason);
+      else expect(body.error?.message).toBe("safe failure");
+    });
+    expect(upstream.cancel).not.toHaveBeenCalled();
+  });
+
+  it("cancels a streaming translation whose pending SSE frame exceeds 64 KiB", async () => {
+    const frame = 'data: {"type":"response.output_text.delta","delta":"PRIVATE_STREAM_FRAME_'
+      + "x".repeat(64 * 1024);
+    const upstream = cancellableChunkedResponse(
+      [new TextEncoder().encode(frame)],
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      expect(res.status).toBe(200);
+      expect(await res.text()).not.toContain("PRIVATE_STREAM_FRAME");
+    });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+    expect(activity).toContainEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
   });
 
   it("collapses OpenAI Responses SSE ending in response.incomplete into Anthropic-shaped JSON with its usage, not a 502", async () => {
@@ -741,6 +1286,150 @@ describe("mountMessagesCrossProviderRoute crash safety (F1)", () => {
       // that happened to leave first does not make it disappear.
       expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
       expect(account.errorCount).toBe(1);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  it("keeps bodyless successful JSON upstream-owned after the client already disconnected", async () => {
+    const privatePrompt = "PRIVATE_BODYLESS_JSON_PROMPT";
+    const account = makeRuntimeAccount("PRIVATE_BODYLESS_JSON_ACCOUNT");
+    const forwardStarted = deferred<void>();
+    const { records, telemetry } = captureIngressTelemetry();
+    const forward: ForwardOpenAI = async opts => {
+      forwardStarted.resolve();
+      await new Promise<void>(resolve => {
+        if (opts.signal?.aborted) resolve();
+        else opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return new Response(null, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const { app, activity, openAIPool } = mountWithPool([account], forward, { telemetry });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({
+        model: "openai/gpt-5.6-luna",
+        max_tokens: 128,
+        messages: [{ role: "user", content: privatePrompt }],
+        stream: false,
+      });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await forwardStarted.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      expect(account.errorCount).toBe(1);
+      expect(account.consecutiveErrors).toBe(1);
+      expect(openAIPool.getGlobalCooldownUntil(account.id)).toBe(0);
+      expect(activity).toEqual([
+        expect.objectContaining({ type: "error", statusCode: 502 }),
+      ]);
+      expect(activity[0]?.details).not.toContain("client-cancelled");
+      expect(records).toContainEqual([
+        "span",
+        "proxy.request",
+        expect.objectContaining({
+          httpStatusCode: 502,
+          outcome: "upstream_error",
+          streamOutcome: "upstream_error",
+        }),
+      ]);
+      expect(records.filter(record => (record as unknown[])[0] === "log")).toEqual([
+        ["log", expect.objectContaining({
+          httpStatusCode: 502,
+          outcome: "upstream_error",
+          reason: "upstream_5xx",
+        })],
+      ]);
+      expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
+      const telemetryWire = JSON.stringify(records);
+      expect(telemetryWire).not.toContain(privatePrompt);
+      expect(telemetryWire).not.toContain(account.id);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  it("keeps bodyless successful text client-owned after the client already disconnected", async () => {
+    const account = makeRuntimeAccount("openai-bodyless-text");
+    const forwardStarted = deferred<void>();
+    const { records, telemetry } = captureIngressTelemetry();
+    const forward: ForwardOpenAI = async opts => {
+      forwardStarted.resolve();
+      await new Promise<void>(resolve => {
+        if (opts.signal?.aborted) resolve();
+        else opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return new Response(null, {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      });
+    };
+    const { app, activity, openAIPool } = mountWithPool([account], forward, { telemetry });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({
+        model: "openai/gpt-5.6-luna",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hi" }],
+        stream: false,
+      });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await forwardStarted.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      expect(account.errorCount).toBe(0);
+      expect(account.consecutiveErrors).toBe(0);
+      expect(activity).toEqual([
+        expect.objectContaining({ type: "route", statusCode: 200 }),
+      ]);
+      expect(activity[0]?.details).toContain("client-cancelled");
+      const telemetryWire = JSON.stringify(records);
+      expect(telemetryWire).toContain('"outcome":"cancelled"');
+      expect(records.filter(record => (record as unknown[])[0] === "log")).toHaveLength(0);
+      expect(records.filter(record => (record as unknown[])[0] === "exception")).toHaveLength(0);
     } finally {
       client?.destroy();
       await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));

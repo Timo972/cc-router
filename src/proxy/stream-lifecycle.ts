@@ -19,12 +19,18 @@ export interface StreamLifecycleTracker {
   attach(upstream: LifecycleEmitter, downstream: LifecycleEmitter): void;
 }
 
+export interface StreamTerminalTelemetry {
+  outcome: "complete" | "upstream_error" | "cancelled" | "other";
+  durationMs: number;
+}
+
 export const MAX_RETAINED_SSE_LINE_BYTES = 64 * 1024;
 
 export function createStreamLifecycleTracker(
   startedAt: number,
   inspectSse: boolean,
   now: () => number = Date.now,
+  onTerminal?: (terminal: StreamTerminalTelemetry) => void,
 ): StreamLifecycleTracker {
   const state: StreamLifecycleState = {
     sawMessageStop: false,
@@ -36,6 +42,7 @@ export function createStreamLifecycleTracker(
   };
   let lineBuffer = Buffer.alloc(0);
   let discardingOversizedLine = false;
+  let terminalReported = false;
   const clearParserState = () => {
     lineBuffer = Buffer.alloc(0);
     discardingOversizedLine = false;
@@ -53,9 +60,18 @@ export function createStreamLifecycleTracker(
       // Complete non-JSON data lines are irrelevant to terminal tracking.
     }
   };
-  const terminal = () => {
+  const terminal = (
+    outcome?: StreamTerminalTelemetry["outcome"],
+  ) => {
     clearParserState();
     state.bodyDurationMs = Math.max(0, now() - startedAt);
+    if (!outcome || terminalReported) return;
+    terminalReported = true;
+    try {
+      onTerminal?.({ outcome, durationMs: state.bodyDurationMs });
+    } catch {
+      // Observability callbacks cannot change streaming lifecycle behavior.
+    }
   };
   return {
     state,
@@ -98,10 +114,22 @@ export function createStreamLifecycleTracker(
     },
     attach(upstream, downstream) {
       upstream.once("end", () => { state.upstreamEnd = true; terminal(); });
-      upstream.once("aborted", () => { state.upstreamAborted = true; terminal(); });
-      upstream.once("close", () => { state.upstreamClose = true; terminal(); });
-      downstream.once("finish", () => { state.downstreamFinish = true; terminal(); });
-      downstream.once("close", () => { state.downstreamClose = true; terminal(); });
+      upstream.once("aborted", () => {
+        state.upstreamAborted = true;
+        terminal("upstream_error");
+      });
+      upstream.once("close", () => {
+        state.upstreamClose = true;
+        terminal();
+      });
+      downstream.once("finish", () => {
+        state.downstreamFinish = true;
+        terminal(inspectSse && !state.sawMessageStop ? "other" : "complete");
+      });
+      downstream.once("close", () => {
+        state.downstreamClose = true;
+        terminal(state.downstreamFinish ? undefined : "cancelled");
+      });
     },
   };
 }

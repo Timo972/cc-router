@@ -15,6 +15,8 @@ import { stats, type LogEntry } from "../proxy/stats.js";
 
 type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean }) => Promise<Response>;
 
+const networkFetch = globalThis.fetch;
+
 async function withServer(
   app: ReturnType<typeof express>,
   fn: (baseUrl: string) => Promise<void>,
@@ -26,6 +28,7 @@ async function withServer(
     if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
     await fn(`http://127.0.0.1:${address.port}`);
   } finally {
+    server.closeAllConnections();
     await new Promise<void>((resolve, reject) => {
       server.close(err => err ? reject(err) : resolve());
     });
@@ -170,17 +173,19 @@ function makeRuntimeAccount(id: string): OpenAIAccount {
 
 function mountWithPool(
   accounts: OpenAIAccount[],
-  forwardOpenAI: ForwardOpenAI,
+  forwardOpenAI?: ForwardOpenAI,
   extra: Partial<ResponsesRoutesOptions> = {},
+  beforeMount?: (app: ReturnType<typeof express>) => void,
 ) {
   const app = express();
+  beforeMount?.(app);
   const openAIPool = new OpenAITokenPool(accounts);
   const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
   const activity: LogEntry[] = [];
   mountResponsesRoutes(app, {
     openAIRouter,
     openAIPool,
-    forwardOpenAI,
+    ...(forwardOpenAI ? { forwardOpenAI } : {}),
     recordActivity: entry => activity.push(entry),
     ...extra,
   });
@@ -189,6 +194,129 @@ function mountWithPool(
 
 describe("mountResponsesRoutes", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it.each([false, true])(
+    "preserves default-forwarder JSON errors and only forwards safe response headers (stream=%s)",
+    async stream => {
+      const privateBody = JSON.stringify({ error: { message: "private upstream detail" } });
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        if (url.hostname === "chatgpt.com") {
+          return new Response(privateBody, {
+            status: 429,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": "17",
+              "set-cookie": "private_session=secret",
+              "x-upstream-secret": "do-not-forward",
+            },
+          });
+        }
+        return networkFetch(input, init);
+      });
+
+      const { app } = mountWithPool([makeRuntimeAccount("openai-victor")]);
+
+      await withServer(app, async baseUrl => {
+        const res = await networkFetch(`${baseUrl}/v1/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream }),
+        });
+
+        expect(res.status).toBe(429);
+        expect(res.headers.get("content-type")).toContain("application/json");
+        expect(res.headers.get("retry-after")).toBe("17");
+        expect(res.headers.get("set-cookie")).toBeNull();
+        expect(res.headers.get("x-upstream-secret")).toBeNull();
+        expect(await res.text()).toBe(privateBody);
+      });
+    },
+  );
+
+  it("reports premature EOF without mutating bytes already relayed to the client", async () => {
+    const body = 'data: {"type":"response.created","response":{"id":"resp_cut_off"}}\n\n';
+    const { app, activity } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => new Response(
+        body,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(body);
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+    });
+  });
+
+  it("relays an oversized frame byte-for-byte while the bounded observer recovers for a later terminal", async () => {
+    let upstreamCancelled = false;
+    const oversized = `data: ${"x".repeat(64 * 1024 + 1)}\n`;
+    const terminal = 'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n';
+    const { app, activity } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(oversized));
+          controller.enqueue(new TextEncoder().encode(terminal));
+          controller.close();
+        },
+        cancel() {
+          upstreamCancelled = true;
+        },
+      }) as BodyInit, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+      expect(await res.text()).toBe(oversized + terminal);
+      expect(upstreamCancelled).toBe(false);
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "route", statusCode: 200 }));
+    });
+  });
+
+  it.each([
+    ["response.incomplete", { type: "response.incomplete", response: { id: "resp_1", status: "incomplete" } }],
+    ["response.failed", { type: "response.failed", response: { error: { message: "failed" } } }],
+    ["error", { type: "error", error: { message: "errored" } }],
+  ])("relays a %s terminal event exactly once before closing", async (_name, event) => {
+    const body = `data: ${JSON.stringify(event)}\n\n`;
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(body);
+    });
+  });
 
   it("rejects an explicit store:true with 400 and records exactly one warn entry", async () => {
     const forward = vi.fn();
@@ -408,6 +536,124 @@ describe("mountResponsesRoutes", () => {
       expect(new TextDecoder().decode(firstChunk.value)).toContain("response.created");
       await reader.cancel();
     });
+  });
+
+  it("pauses native Responses upstream reads while the client response is backpressured", async () => {
+    const encoder = new TextEncoder();
+    const chunks = [
+      encoder.encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'),
+      encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n'),
+    ];
+    let nextChunk = 0;
+    const read = vi.fn(async () => nextChunk < chunks.length
+      ? { value: chunks[nextChunk++], done: false as const }
+      : { value: undefined, done: true as const });
+    const cancel = vi.fn(async () => undefined);
+    const upstream = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body: { getReader: () => ({ read, cancel }) },
+    } as unknown as Response;
+    const firstWrite = deferred<ExpressResponse>();
+    let writes = 0;
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream,
+      {},
+      app => app.use((_req, res, next) => {
+        const originalWrite = res.write.bind(res);
+        res.write = ((...args: unknown[]) => {
+          writes++;
+          const accepted = Reflect.apply(originalWrite, res, args) as boolean;
+          if (writes === 1) {
+            firstWrite.resolve(res);
+            return false;
+          }
+          return accepted;
+        }) as ExpressResponse["write"];
+        next();
+      }),
+    );
+
+    await withServer(app, async baseUrl => {
+      const response = fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+      });
+
+      const serverResponse = await firstWrite.promise;
+      await new Promise(resolve => setImmediate(resolve));
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(writes).toBe(1);
+
+      serverResponse.emit("drain");
+      const body = await (await response).text();
+      expect(body).toBe(Buffer.concat(chunks.map(chunk => Buffer.from(chunk))).toString("utf8"));
+      expect(read).toHaveBeenCalledTimes(3);
+      expect(cancel).not.toHaveBeenCalled();
+    });
+  });
+
+  it("cancels the native Responses reader when the client closes during backpressure", async () => {
+    const encoder = new TextEncoder();
+    const neverRead = deferred<ReadableStreamReadResult<Uint8Array>>();
+    const read = vi.fn()
+      .mockResolvedValueOnce({
+        value: encoder.encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'),
+        done: false,
+      })
+      .mockImplementationOnce(() => neverRead.promise);
+    const cancel = vi.fn(async () => undefined);
+    const upstream = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body: { getReader: () => ({ read, cancel }) },
+    } as unknown as Response;
+    const firstWrite = deferred<void>();
+    let writes = 0;
+    const { app } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream,
+      {},
+      app => app.use((_req, res, next) => {
+        const originalWrite = res.write.bind(res);
+        res.write = ((...args: unknown[]) => {
+          writes++;
+          Reflect.apply(originalWrite, res, args);
+          if (writes === 1) {
+            firstWrite.resolve();
+            return false;
+          }
+          return true;
+        }) as ExpressResponse["write"];
+        next();
+      }),
+    );
+    const abort = new AbortController();
+    const response = withServer(app, async baseUrl => {
+      const pending = fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
+        signal: abort.signal,
+      }).then(res => res.text()).catch(() => undefined);
+      try {
+        await firstWrite.promise;
+        await new Promise(resolve => setImmediate(resolve));
+        expect(read).toHaveBeenCalledTimes(1);
+        abort.abort();
+        await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+        expect(read).toHaveBeenCalledTimes(1);
+        expect(writes).toBe(1);
+      } finally {
+        neverRead.resolve({ value: undefined, done: true });
+        await pending;
+      }
+    });
+    await response;
   });
 
   it("warns on an explicit max_output_tokens, then forwards and reconciles", async () => {
@@ -746,6 +992,64 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     }
   });
 
+  it.each([
+    ["streaming", true],
+    ["collected", false],
+  ])("keeps a bodyless successful-SSE %s response owned by upstream after client disconnect", async (_name, stream) => {
+    const account = makeRuntimeAccount("openai-victor");
+    const forwardStarted = deferred<void>();
+    const forward: ForwardOpenAI = async opts => {
+      forwardStarted.resolve();
+      // Make the server observe the disconnect before the bodyless successful
+      // SSE arrives. Upstream's invalid response must still own the outcome.
+      await new Promise<void>(resolve => {
+        if (opts.signal?.aborted) resolve();
+        else opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return new Response(null, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    };
+    const { app, activity, openAIPool } = mountWithPool([account], forward);
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({ model: "openai/gpt-5.5", input: [], stream });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/responses",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await forwardStarted.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+      expect(activity[0]?.details).not.toContain("client-cancelled");
+      expect(account.errorCount).toBe(1);
+      expect(account.consecutiveErrors).toBe(1);
+      // A synthesized generic 502 counts against the account but is not an
+      // overload/rate-limit signal and must not invent a cooldown horizon.
+      expect(openAIPool.getGlobalCooldownUntil(account.id)).toBe(0);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   it("still counts an explicit response.failed when the client disconnects after it", async () => {
     const account = makeRuntimeAccount("openai-victor");
     const failureSent = deferred<void>();
@@ -1023,7 +1327,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
   it("returns a local 502 when the relay throws before any bytes reach the client (F1d)", async () => {
     const forward: ForwardOpenAI = async () => new Response("data: x\n\n", {
       status: 200,
-      headers: { "content-type": "text/event-stream", "x-boom": "1" },
+      headers: { "content-type": "text/event-stream", "retry-after": "1" },
     });
     const app = express();
     // Force the relay's header-mirroring loop to throw for one specific
@@ -1032,7 +1336,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     app.use((_req, res: ExpressResponse, next) => {
       const original = res.setHeader.bind(res);
       res.setHeader = ((name: string, value: unknown) => {
-        if (String(name).toLowerCase() === "x-boom") throw new Error("setHeader boom");
+        if (String(name).toLowerCase() === "retry-after") throw new Error("setHeader boom");
         return original(name, value);
       }) as typeof res.setHeader;
       next();
@@ -1074,6 +1378,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
           }
           throw new Error("connection reset mid-stream");
         },
+        cancel: async () => undefined,
       };
       return {
         ok: true,

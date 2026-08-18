@@ -20,6 +20,8 @@ vi.mock("../config/paths.js", () => ({
 import {
   ensureConfigDir,
   accountsFileExists,
+  AccountStateReadError,
+  readAccountStateDetailed,
   writeAccountsAtomic,
   writeAnthropicAccountsPreservingOtherProviders,
   upsertAccountRecord,
@@ -81,6 +83,62 @@ describe("accountsFileExists", () => {
     expect(accountsFileExists(customPath)).toBe(false);
     fs.writeFileSync(customPath, "[]");
     expect(accountsFileExists(customPath)).toBe(true);
+  });
+});
+
+describe("detailed account-state reads", () => {
+  it("distinguishes malformed JSON and propagates the typed read failure", () => {
+    fs.writeFileSync(accountsPath(), "{PRIVATE malformed json");
+
+    const result = readAccountStateDetailed();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(AccountStateReadError);
+      expect(result.error.kind).toBe("malformed_json");
+      expect(result.error.cause).toBeInstanceOf(SyntaxError);
+    }
+    expect(() => loadAccounts()).toThrowError(AccountStateReadError);
+  });
+
+  it("distinguishes a non-array account-state shape", () => {
+    fs.writeFileSync(accountsPath(), JSON.stringify({ PRIVATE: "not-an-array" }));
+
+    const result = readAccountStateDetailed();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("invalid_shape");
+  });
+
+  it("distinguishes malformed entries inside an account-state array", () => {
+    fs.writeFileSync(accountsPath(), JSON.stringify([sampleRecord, {}]));
+
+    const result = readAccountStateDetailed();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("invalid_shape");
+    expect(() => loadAccounts()).toThrowError(AccountStateReadError);
+  });
+
+  it("does not overwrite malformed state during account upsert", () => {
+    const corrupted = "{PRIVATE malformed json";
+    fs.writeFileSync(accountsPath(), corrupted);
+
+    expect(() => upsertAccountRecord({
+      ...sampleRecord,
+      provider: "anthropic_subscription",
+    })).toThrowError(AccountStateReadError);
+    expect(fs.readFileSync(accountsPath(), "utf-8")).toBe(corrupted);
+  });
+
+  it("returns a typed unreadable-state failure", () => {
+    fs.rmSync(accountsPath(), { force: true });
+    fs.mkdirSync(accountsPath());
+
+    const result = readAccountStateDetailed();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("read_failure");
   });
 });
 
@@ -229,6 +287,25 @@ describe("writeAnthropicAccountsPreservingOtherProviders", () => {
     ]);
     expect(parsed[1].provider).toBe("openai_subscription");
   });
+
+  it("rejects an Anthropic ID already owned by OpenAI without overwriting storage", () => {
+    writeAccountsAtomic([{
+      id: "shared-account",
+      provider: "openai_subscription",
+      accessToken: "openai-access",
+      refreshToken: "openai-refresh",
+      expiresAt: 1999999999000,
+      scopes: ["openid"],
+    }]);
+    const before = fs.readFileSync(accountsPath(), "utf-8");
+
+    expect(() => writeAnthropicAccountsPreservingOtherProviders([{
+      ...sampleRecord,
+      id: "shared-account",
+      provider: "anthropic_subscription",
+    }])).toThrow("Account IDs must be unique across providers");
+    expect(fs.readFileSync(accountsPath(), "utf-8")).toBe(before);
+  });
 });
 
 describe("upsertAccountRecord", () => {
@@ -259,6 +336,22 @@ describe("upsertAccountRecord", () => {
     expect(parsed).toHaveLength(2);
     expect(parsed[0].id).toBe("max-account-1");
     expect(parsed[1].accessToken).toBe("openai-access-updated");
+  });
+
+  it("rejects an OpenAI ID already owned by a legacy Anthropic record without overwriting storage", () => {
+    writeAccountsAtomic([{ ...sampleRecord, id: "shared-account" }]);
+    const before = fs.readFileSync(accountsPath(), "utf-8");
+
+    expect(() => upsertAccountRecord({
+      id: "shared-account",
+      provider: "openai_subscription",
+      accessToken: "openai-access",
+      refreshToken: "openai-refresh",
+      expiresAt: 1999999999000,
+      scopes: ["openid"],
+      enabled: true,
+    })).toThrow("Account IDs must be unique across providers");
+    expect(fs.readFileSync(accountsPath(), "utf-8")).toBe(before);
   });
 });
 

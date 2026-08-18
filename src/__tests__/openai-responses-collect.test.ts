@@ -1,9 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   collectCodexResponseStream,
+  createCodexResponseTerminalObserver,
   createCodexUsageObserver,
+  readBodyWithinLimit,
   usageFromResponseBody,
 } from "../protocol/openai-responses-collect.js";
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
 
 function sseResponse(chunks: string[], init?: ResponseInit): Response {
   const encoder = new TextEncoder();
@@ -19,6 +27,66 @@ function sseResponse(chunks: string[], init?: ResponseInit): Response {
     ...init,
   });
 }
+
+describe("readBodyWithinLimit", () => {
+  it("keeps an already-aborted bodyless response transport-owned as cancellation", async () => {
+    const abort = new AbortController();
+    abort.abort();
+
+    await expect(readBodyWithinLimit(new Response(null), 1024, abort.signal))
+      .resolves.toEqual({ kind: "cancelled" });
+  });
+
+  it("joins a real stream's deferred cancellation after abort resolves the pending read as EOF", async () => {
+    const pullStarted = deferred<void>();
+    const cancelStarted = deferred<void>();
+    const cancelFinished = deferred<void>();
+    let cancelCalls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull() {
+        pullStarted.resolve();
+      },
+      cancel() {
+        cancelCalls++;
+        cancelStarted.resolve();
+        return cancelFinished.promise;
+      },
+    }, { highWaterMark: 0 });
+    const abort = new AbortController();
+    const pending = readBodyWithinLimit(new Response(stream as BodyInit), 1024, abort.signal);
+    let settled = false;
+    void pending.finally(() => { settled = true; });
+
+    await pullStarted.promise;
+    abort.abort();
+    await cancelStarted.promise;
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+    } finally {
+      cancelFinished.resolve();
+    }
+
+    expect(await pending).toEqual({ kind: "cancelled" });
+    expect(cancelCalls).toBe(1);
+  });
+
+  it("keeps an upstream stream failure observed before a same-tick abort upstream-owned", async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(next) {
+        controller = next;
+      },
+    }, { highWaterMark: 0 });
+    const abort = new AbortController();
+    const pending = readBodyWithinLimit(new Response(stream as BodyInit), 1024, abort.signal);
+
+    controller.error(new Error("PRIVATE_UPSTREAM_READ_FAILURE"));
+    abort.abort();
+
+    expect(await pending).toEqual({ kind: "error" });
+  });
+});
 
 describe("collectCodexResponseStream", () => {
   it("returns the verbatim response.completed object as JSON", async () => {
@@ -205,6 +273,59 @@ describe("collectCodexResponseStream", () => {
       body: { error: { type: "upstream_error", message: "Malformed upstream JSON body" } },
     });
   });
+
+  it("classifies a split terminal without retaining its payload or mutating chunks", () => {
+    const encoder = new TextEncoder();
+    const first = encoder.encode('data: {"type":"response.com');
+    const second = encoder.encode('pleted","response":{"id":"resp_private","private":"not retained"}}\n\n');
+    const firstBefore = first.slice();
+    const secondBefore = second.slice();
+    const observer = createCodexResponseTerminalObserver();
+
+    observer.push(first);
+    observer.push(second);
+
+    expect(observer.finish()).toEqual({ kind: "completed" });
+    expect(first).toEqual(firstBefore);
+    expect(second).toEqual(secondBefore);
+  });
+
+  it.each([
+    ["a no-newline data field", `data: ${"x".repeat(64 * 1024 + 1)}`],
+    ["an oversized terminal event", `data: ${JSON.stringify({
+      type: "response.completed",
+      response: { id: "oversized", output: "x".repeat(64 * 1024) },
+    })}\n\n`],
+  ])("classifies %s as overflow with bounded framing state", (_name, input) => {
+    const observer = createCodexResponseTerminalObserver();
+    observer.push(new TextEncoder().encode(input));
+    expect(observer.finish().kind).toBe("overflow");
+  });
+
+  it("bounds a collected terminal response at 10 MiB and cancels the reader", async () => {
+    let cancelled = false;
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("x".repeat(10 * 1024 * 1024 + 1)));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const upstream = new Response(stream as BodyInit, {
+      headers: { "content-type": "text/event-stream" },
+    });
+
+    const result = await collectCodexResponseStream(upstream);
+
+    expect(result).toEqual({
+      kind: "json",
+      status: 502,
+      body: { error: { type: "upstream_error", message: "Upstream response exceeded size limit" } },
+    });
+    expect(cancelled).toBe(true);
+  });
 });
 
 describe("createCodexUsageObserver", () => {
@@ -261,6 +382,15 @@ describe("createCodexUsageObserver", () => {
     })}\n\n`;
     observer.push(encoder.encode(event));
     expect(observer.finish()).toEqual({ inputTokens: 8, cachedInputTokens: 1, outputTokens: 3 });
+  });
+
+  it("drops an oversized frame and still observes a later bounded terminal", () => {
+    const observer = createCodexUsageObserver();
+    observer.push(encoder.encode(`data: ${"x".repeat(64 * 1024 + 1)}\n`));
+    observer.push(encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":8,"output_tokens":3}}}\n\n'));
+
+    expect(observer.finish()).toEqual({ inputTokens: 8, cachedInputTokens: 0, outputTokens: 3 });
+    expect(observer.failure()).toBeUndefined();
   });
 
   it("reports no failure when the stream completes normally", () => {

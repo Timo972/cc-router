@@ -12,6 +12,13 @@ import { logError } from "./logger.js";
 import { EmptyPoolError, NoEligibleAccountError } from "./account-pool.js";
 import type { SessionRouter, RoutedAccountLease } from "./session-router.js";
 import { acquireRequestRoute, routeReasonDetails, routeFailureDetails } from "./lease-lifecycle.js";
+import {
+  annotateActiveSpan,
+  classifyExpectedRuntimeFailure,
+  recordSafeLog,
+  recordUnexpectedException,
+} from "../telemetry/facade.js";
+import type { RequestSource, SafeExceptionContext, SafeSpanAttributes } from "../telemetry/contracts.js";
 
 /**
  * Mirrors `anthropic-routing.ts`'s `requestTerminated` check. This ingress
@@ -64,6 +71,13 @@ export const EXCLUDED_UPSTREAM_RELAY_HEADERS = new Set([
   "set-cookie",
 ]);
 
+const SAFE_UPSTREAM_RELAY_HEADERS = new Set(["content-type", "retry-after"]);
+const SAFE_CODEX_RELAY_HEADER = /^x-codex(?:-[a-z0-9]{1,64})*-(?:active-limit|limit-name|primary-(?:used-percent|window-minutes|reset-at|reset-after-seconds)|secondary-(?:used-percent|window-minutes|reset-at|reset-after-seconds)|credits-(?:has-credits|unlimited|balance))$/;
+
+function safeUpstreamRelayHeader(name: string): boolean {
+  return SAFE_UPSTREAM_RELAY_HEADERS.has(name) || SAFE_CODEX_RELAY_HEADER.test(name);
+}
+
 /**
  * The `Connection` header can nominate additional header names as hop-by-hop
  * for this specific response (RFC 7230 §6.1), beyond the fixed set above —
@@ -93,6 +107,7 @@ export function mirrorUpstreamHeaders(source: Headers, apply: (name: string, val
   const nominated = connectionNominatedHeaders(source);
   source.forEach((value, key) => {
     const lower = key.toLowerCase();
+    if (!safeUpstreamRelayHeader(lower)) return;
     if (EXCLUDED_UPSTREAM_RELAY_HEADERS.has(lower)) return;
     if (nominated.has(lower)) return;
     apply(key, value);
@@ -133,11 +148,36 @@ export interface OpenAIRelayReport {
   upstreamReportedFailure: boolean;
 }
 
+/** Narrow observer contract keeps routing independent from telemetry runtime ownership. */
+export interface OpenAIIngressTelemetry {
+  annotateActiveSpan(operation: "proxy.request", attributes: SafeSpanAttributes): void;
+  recordSafeLog(input: Parameters<typeof recordSafeLog>[0]): void;
+  recordUnexpectedException(error: unknown, context: SafeExceptionContext): void;
+}
+
+const DEFAULT_OPENAI_INGRESS_TELEMETRY: OpenAIIngressTelemetry = {
+  annotateActiveSpan,
+  recordSafeLog,
+  recordUnexpectedException,
+};
+
+function observeTelemetry(observer: () => void): void {
+  try { observer(); } catch { /* telemetry must never alter routing */ }
+}
+
+function openAIModelFamily(model: string): "codex" | "other" {
+  const normalized = model.toLowerCase();
+  return normalized.includes("codex") || normalized.startsWith("gpt-") || normalized.startsWith("openai/gpt-")
+    ? "codex"
+    : "other";
+}
+
 export interface OpenAIIngressOptions {
   res: Response;
   sessionKey: unknown;
   requestedModel: string;
   path: string;
+  requestSource: RequestSource;
   /** HTTP method and client, recorded so an OpenAI activity row carries the same
    *  columns as a Claude one — the dashboard needs both `method` and `path` to
    *  render the request, and blanks the client column without `source`. */
@@ -159,11 +199,18 @@ export interface OpenAIIngressOptions {
     res: Response,
     entry: LogEntry,
     report: OpenAIRelayReport,
+    signal: AbortSignal,
   ) => Promise<OpenAIIngressRelayResult>;
   /** Invoked (best-effort, fire-and-forget from the caller's perspective)
    * when a relayed upstream response carries a 401 — lets the caller kick
    * off a background subscription-token refresh outside the request path. */
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
+  /** True when the concrete token refresher already emitted its leaf diagnostic. */
+  prepareOpenAIAccountOwnsDiagnostics?: boolean;
+  /** True when the concrete transport already emitted its leaf diagnostic. */
+  forwardOpenAIOwnsDiagnostics?: boolean;
+  /** Injectable only for deterministic composition/privacy tests. */
+  telemetry?: OpenAIIngressTelemetry;
 }
 
 /**
@@ -180,6 +227,8 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     res, sessionKey, path, openAIRouter, openAIPool,
     prepareOpenAIAccount, forwardOpenAI, forwardBody, recordActivity, now,
     envelope, relay, onUpstreamAuthFailure,
+    prepareOpenAIAccountOwnsDiagnostics = false,
+    forwardOpenAIOwnsDiagnostics = false,
   } = opts;
   // The model comes from a client-controlled body and is retained in the
   // activity ring buffer below. Bound it once, here, so every activity entry,
@@ -187,6 +236,31 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   // cannot grow with the request. The body forwarded upstream is untouched —
   // it still carries whatever model the caller asked for.
   const requestedModel = boundModelId(opts.requestedModel);
+  const telemetry = opts.telemetry ?? DEFAULT_OPENAI_INGRESS_TELEMETRY;
+  const requestStartedAt = now();
+  const telemetryBase: SafeSpanAttributes = {
+    httpMethod: "POST",
+    provider: "openai",
+    route: path === "/v1/messages" ? "messages" : "responses",
+    modelFamily: openAIModelFamily(requestedModel),
+    requestSource: opts.requestSource,
+    streaming: forwardBody.stream === true,
+    accountPoolSize: openAIPool.getAll().length,
+  };
+  const finishTelemetry = (
+    httpStatusCode: number,
+    outcome: "complete" | "rate_limited" | "upstream_error" | "cancelled",
+    extra: SafeSpanAttributes = {},
+  ): void => {
+    observeTelemetry(() => telemetry.annotateActiveSpan("proxy.request", {
+      ...telemetryBase,
+      ...extra,
+      httpStatusCode,
+      outcome,
+      operationDurationMs: now() - requestStartedAt,
+    }));
+  };
+  observeTelemetry(() => telemetry.annotateActiveSpan("proxy.request", telemetryBase));
 
   // A client that hangs up must take the upstream request with it. Releasing
   // the lease (which the response's own close listener does) only returns the
@@ -210,6 +284,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     if (error instanceof EmptyPoolError) {
       stats.totalErrors++;
       res.status(503).json(envelope.wrap("no_accounts", "No OpenAI subscription accounts are configured"));
+      finishTelemetry(503, "upstream_error");
       return;
     }
     if (error instanceof NoEligibleAccountError) {
@@ -219,6 +294,8 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       stats.totalErrors++;
       recordActivity(createLocalRoutingErrorLog(error.reason, requestedModel));
       envelope.sendNoEligible(error, res, now());
+      finishTelemetry(error.reason === "rate_limited" ? 429 : 503,
+        error.reason === "rate_limited" ? "rate_limited" : "upstream_error");
       return;
     }
     // Never let an unexpected routing failure crash the daemon or reject
@@ -236,7 +313,14 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       path,
       details: "proxy_error:acquire",
     });
+    observeTelemetry(() => telemetry.recordUnexpectedException(error, {
+      category: "runtime",
+      reason: "other",
+      operation: "proxy.request",
+      provider: "openai",
+    }));
     res.status(500).json(envelope.wrap("proxy_error", "Unexpected routing error"));
+    finishTelemetry(500, "upstream_error");
     return;
   }
 
@@ -251,6 +335,14 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     // crash the request (or the daemon).
     const message = error instanceof Error ? error.message : String(error);
     logError(account.id, 401, `openai token refresh threw: ${message}`);
+    if (!prepareOpenAIAccountOwnsDiagnostics) {
+      observeTelemetry(() => telemetry.recordUnexpectedException(error, {
+        category: "runtime",
+        reason: "other",
+        operation: "oauth.refresh",
+        provider: "openai",
+      }));
+    }
     ready = false;
   }
   if (!ready) {
@@ -279,7 +371,19 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       path,
       details: "openai token refresh failed",
     });
+    if (!prepareOpenAIAccountOwnsDiagnostics) {
+      observeTelemetry(() => telemetry.recordSafeLog({
+        operation: "oauth.refresh",
+        provider: "openai",
+        reason: "unauthorized",
+        outcome: "upstream_error",
+        httpStatusCode: 401,
+        operationDurationMs: now() - startedAt,
+        severity: "warn",
+      }));
+    }
     res.status(401).json(envelope.wrap("authentication_error", "OpenAI subscription token refresh failed"));
+    finishTelemetry(401, "upstream_error");
     return;
   }
   if (responseTerminated(res)) {
@@ -289,6 +393,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     // release again even if the response's own close/finish listener already
     // did so (`attachLeaseLifecycle`'s release() is idempotent).
     selected.release();
+    finishTelemetry(499, "cancelled", { streamOutcome: "cancelled" });
     return;
   }
   account.healthy = true;
@@ -312,6 +417,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     // pre-forward disconnect branch above, which also just releases and stops.
     if (clientGone.signal.aborted || responseTerminated(res)) {
       selected.release();
+      finishTelemetry(499, "cancelled", { streamOutcome: "cancelled" });
       return;
     }
     // A rejected forward call (network failure) must produce a local 502,
@@ -331,7 +437,28 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       details: "upstream_error:network",
       durationMs: now() - startedAt,
     });
+    if (!forwardOpenAIOwnsDiagnostics) {
+      const reason = classifyExpectedRuntimeFailure(error);
+      if (reason) {
+        observeTelemetry(() => telemetry.recordSafeLog({
+          operation: "provider.inference",
+          provider: "openai",
+          reason,
+          outcome: reason === "timeout" ? "timeout" : "upstream_error",
+          operationDurationMs: now() - startedAt,
+          severity: "error",
+        }));
+      } else {
+        observeTelemetry(() => telemetry.recordUnexpectedException(error, {
+          category: "runtime",
+          reason: "other",
+          operation: "provider.inference",
+          provider: "openai",
+        }));
+      }
+    }
     res.status(502).json(envelope.wrap("upstream_error", `OpenAI request failed: ${message}`));
+    finishTelemetry(502, "upstream_error");
     return;
   }
 
@@ -379,10 +506,32 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
         applied.limitingScope,
       );
       if (upstream.status === 401) onUpstreamAuthFailure?.(account);
+      if (!forwardOpenAIOwnsDiagnostics) {
+        const reason = upstream.status === 401 ? "unauthorized"
+          : upstream.status === 403 ? "forbidden"
+          : upstream.status === 429 ? "rate_limited"
+          : upstream.status >= 500 ? "upstream_5xx"
+          : "upstream_4xx";
+        observeTelemetry(() => telemetry.recordSafeLog({
+          operation: "provider.inference",
+          provider: "openai",
+          reason,
+          outcome: upstream.status === 429 ? "rate_limited" : "upstream_error",
+          httpStatusCode: upstream.status,
+          operationDurationMs: now() - startedAt,
+          severity: "warn",
+        }));
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logError(account.id, upstream.status, `openai response classification failed: ${message}`);
+    observeTelemetry(() => telemetry.recordUnexpectedException(error, {
+      category: "runtime",
+      reason: "other",
+      operation: "proxy.request",
+      provider: "openai",
+    }));
   }
 
   const entry: LogEntry = {
@@ -400,7 +549,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   let relayFailed = false;
   const relayReport: OpenAIRelayReport = { upstreamReportedFailure: false };
   try {
-    const result = await relay(upstream, res, entry, relayReport);
+    const result = await relay(upstream, res, entry, relayReport, clientGone.signal);
     finalStatus = result.statusCode;
   } catch (error) {
     // Never let a relay failure become an unhandled rejection. Only send a
@@ -410,6 +559,12 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     relayFailed = true;
     const message = error instanceof Error ? error.message : String(error);
     logError(account.id, 502, `openai response relay failed: ${message}`);
+    observeTelemetry(() => telemetry.recordUnexpectedException(error, {
+      category: "runtime",
+      reason: "other",
+      operation: "proxy.request",
+      provider: "openai",
+    }));
     // The recorded status is what this request *became*, which is a failure
     // whether or not another HTTP response can still be sent. Leaving it at
     // the upstream's 200 in the headers-already-sent case produced an
@@ -462,6 +617,17 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       account.errorCount++;
       account.consecutiveErrors++;
     }
+    if (!upstreamFailed && !relayFailed) {
+      observeTelemetry(() => telemetry.recordSafeLog({
+        operation: "proxy.request",
+        provider: "openai",
+        reason: "upstream_5xx",
+        outcome: "upstream_error",
+        httpStatusCode: finalStatus,
+        operationDurationMs: now() - startedAt,
+        severity: "warn",
+      }));
+    }
   } else {
     account.consecutiveErrors = 0;
     stats.totalRequests++;
@@ -470,4 +636,17 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   entry.statusCode = finalStatus;
   entry.durationMs = now() - startedAt;
   recordActivity(entry);
+  finishTelemetry(
+    finalStatus,
+    clientCancelled ? "cancelled"
+      : finalStatus === 429 ? "rate_limited"
+      : failedFinal ? "upstream_error"
+      : "complete",
+    {
+      streamOutcome: clientCancelled ? "cancelled" : failedFinal ? "upstream_error" : "complete",
+      ...(entry.inputTokens !== undefined ? { inputTokens: entry.inputTokens } : {}),
+      ...(entry.outputTokens !== undefined ? { outputTokens: entry.outputTokens } : {}),
+      concurrency: openAIPool.getInFlight(account.id),
+    },
+  );
 }

@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, chmodSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, copyFileSync, chmodSync } from "fs";
 import { randomBytes } from "crypto";
-import { CONFIG_DIR, ACCOUNTS_PATH, CONFIG_PATH } from "./paths.js";
+import { ACCOUNTS_PATH, CONFIG_PATH } from "./paths.js";
+import { ensureConfigDir } from "./directory.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
@@ -8,18 +9,9 @@ import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 
 export const DEFAULT_PROXY_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
-/** Owner-only permissions for files/dirs that hold OAuth tokens or the proxy secret. */
+/** Owner-only permissions for files that hold OAuth tokens or the proxy secret. */
 const SECRET_FILE_MODE = 0o600;
-const SECRET_DIR_MODE = 0o700;
-
-export function ensureConfigDir(): void {
-  if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true, mode: SECRET_DIR_MODE });
-    return;
-  }
-  // Tighten an existing dir that may predate this hardening. No-op on Windows.
-  try { chmodSync(CONFIG_DIR, SECRET_DIR_MODE); } catch { /* best effort */ }
-}
+export { ensureConfigDir };
 
 /**
  * Atomic + private write for credential files: write tmp as 0600 (umask can
@@ -44,13 +36,88 @@ export function readAccountsRaw(): unknown[] {
   return readRawFromPath(ACCOUNTS_PATH);
 }
 
-function readRawFromPath(path: string): unknown[] {
-  if (!existsSync(path)) return [];
-  try {
-    return JSON.parse(readFileSync(path, "utf-8"));
-  } catch {
-    return [];
+export type AccountStateReadFailureKind = "malformed_json" | "invalid_shape" | "permission_denied" | "read_failure";
+
+export class AccountStateReadError extends Error {
+  readonly kind: AccountStateReadFailureKind;
+
+  constructor(kind: AccountStateReadFailureKind, path: string, cause?: unknown) {
+    super(`Could not read account state at ${path} (${kind})`, cause === undefined ? undefined : { cause });
+    this.name = "AccountStateReadError";
+    this.kind = kind;
   }
+}
+
+export type AccountStateReadResult =
+  | { ok: true; records: unknown[] }
+  | { ok: false; error: AccountStateReadError };
+
+function isAccountRecordShape(value: unknown): value is AccountRecord {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const provider = record["provider"];
+  const scopes = record["scopes"];
+  return typeof record["id"] === "string"
+    && record["id"].length > 0
+    && (provider === undefined
+      || provider === "anthropic_subscription"
+      || provider === "openai_subscription"
+      || provider === "openai_api_key")
+    && typeof record["accessToken"] === "string"
+    && record["accessToken"].length > 0
+    && typeof record["refreshToken"] === "string"
+    && typeof record["expiresAt"] === "number"
+    && Number.isFinite(record["expiresAt"])
+    && (scopes === undefined || (Array.isArray(scopes) && scopes.every(scope => typeof scope === "string")))
+    && (record["enabled"] === undefined || typeof record["enabled"] === "boolean")
+    && (record["sessionLimitPercent"] === undefined || (typeof record["sessionLimitPercent"] === "number" && Number.isFinite(record["sessionLimitPercent"])))
+    && (record["weeklyLimitPercent"] === undefined || (typeof record["weeklyLimitPercent"] === "number" && Number.isFinite(record["weeklyLimitPercent"])));
+}
+
+function ownSystemCode(cause: unknown): string | undefined {
+  if ((typeof cause !== "object" && typeof cause !== "function") || cause === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(cause, "code");
+  return descriptor && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : undefined;
+}
+
+export function readAccountStateDetailed(path = ACCOUNTS_PATH): AccountStateReadResult {
+  if (!existsSync(path)) return { ok: true, records: [] };
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (cause) {
+    const code = ownSystemCode(cause);
+    return {
+      ok: false,
+      error: new AccountStateReadError(
+        code === "EACCES" || code === "EPERM" ? "permission_denied" : "read_failure",
+        path,
+        cause,
+      ),
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (cause) {
+    return { ok: false, error: new AccountStateReadError("malformed_json", path, cause) };
+  }
+  if (!Array.isArray(parsed) || !parsed.every(isAccountRecordShape)) {
+    return { ok: false, error: new AccountStateReadError("invalid_shape", path) };
+  }
+  return { ok: true, records: parsed };
+}
+
+function readAccountStateOrThrow(path = ACCOUNTS_PATH): unknown[] {
+  const result = readAccountStateDetailed(path);
+  if (!result.ok) throw result.error;
+  return result.records;
+}
+
+function readRawFromPath(path: string): unknown[] {
+  return readAccountStateOrThrow(path);
 }
 
 /** Deserialize Account[] from an explicit file path */
@@ -65,13 +132,26 @@ export function writeAccountsAtomic(data: unknown[]): void {
 }
 
 function writeAccountsAtomicToPath(path: string, data: unknown[]): void {
+  assertUniqueAccountIds(data);
   // accounts.json holds plaintext OAuth access + refresh tokens — owner-only.
   writeFileSecureSync(path, JSON.stringify(data, null, 2));
 }
 
+function assertUniqueAccountIds(data: unknown[]): void {
+  const owners = new Map<string, AccountProvider>();
+  for (const candidate of data) {
+    if (!isAccountRecordShape(candidate)) continue;
+    const provider = normalizeAccountProvider(candidate);
+    if (owners.has(candidate.id)) {
+      throw new Error("Account IDs must be unique across providers");
+    }
+    owners.set(candidate.id, provider);
+  }
+}
+
 export function writeAnthropicAccountsPreservingOtherProviders(data: AccountRecord[]): void {
   ensureConfigDir();
-  const existing = readAccountsRaw() as AccountRecord[];
+  const existing = readAccountStateOrThrow() as AccountRecord[];
   const nonAnthropic = existing.filter(a =>
     a.provider !== undefined && a.provider !== "anthropic_subscription"
   );
@@ -80,9 +160,10 @@ export function writeAnthropicAccountsPreservingOtherProviders(data: AccountReco
 
 export function upsertAccountRecord(record: AccountRecord): void {
   ensureConfigDir();
-  const existing = readAccountsRaw() as AccountRecord[];
+  const existing = readAccountStateOrThrow() as AccountRecord[];
   const next = [
-    ...existing.filter(a => !(a.id === record.id && a.provider === record.provider)),
+    ...existing.filter(a => !(a.id === record.id
+      && normalizeAccountProvider(a) === normalizeAccountProvider(record))),
     record,
   ];
   writeAccountsAtomicToPath(ACCOUNTS_PATH, next);
@@ -162,7 +243,7 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
  *  (default path) and any caller bound to a custom `--accounts <path>`. */
 export function saveOpenAIAccountsToPath(accounts: OpenAISubscriptionAccount[], path: string): void {
   ensureConfigDir();
-  const existing = readRawFromPath(path) as AccountRecord[];
+  const existing = readAccountStateOrThrow(path) as AccountRecord[];
   const nonOpenAI = existing.filter(a => a.provider !== "openai_subscription");
   const records: AccountRecord[] = accounts.map(a => ({
     id: a.id,
