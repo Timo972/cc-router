@@ -233,12 +233,12 @@ function requestBuiltPackageShutdown(
   signal: "SIGTERM" | "SIGINT",
   platform: NodeJS.Platform = process.platform,
 ): void {
-  if (platform === "win32" && child.connected) {
+  if (platform === "win32" && child.stdin?.writable) {
     try {
-      child.send({ type: TEST_SHUTDOWN_MESSAGE, signal });
+      child.stdin.end(`${JSON.stringify({ type: TEST_SHUTDOWN_MESSAGE, signal })}\n`);
       return;
     } catch {
-      // If the test IPC channel already closed, fall through to cleanup kill.
+      // If the test control pipe already closed, fall through to cleanup kill.
     }
   }
   child.kill(signal);
@@ -310,13 +310,21 @@ import { ServerResponse } from "node:http";
 const realFetch = globalThis.fetch;
 const targetOrigin = ${JSON.stringify(options.targetOrigin)};
 const telemetryOrigin = ${JSON.stringify(options.telemetryCaptureOrigin)};
-process.on("message", message => {
-  if (
-    message &&
-    message.type === ${JSON.stringify(TEST_SHUTDOWN_MESSAGE)} &&
-    (message.signal === "SIGTERM" || message.signal === "SIGINT")
-  ) {
-    process.emit(message.signal);
+process.stdin.setEncoding("utf8");
+let testControlBuffer = "";
+process.stdin.on("data", chunk => {
+  testControlBuffer += chunk;
+  const lines = testControlBuffer.split("\\n");
+  testControlBuffer = lines.pop() ?? "";
+  for (const line of lines) {
+    let message;
+    try { message = JSON.parse(line); } catch { continue; }
+    if (
+      message?.type === ${JSON.stringify(TEST_SHUTDOWN_MESSAGE)} &&
+      (message.signal === "SIGTERM" || message.signal === "SIGINT")
+    ) {
+      setImmediate(() => process.emit(message.signal));
+    }
   }
 });
 const originalWriteHead = ServerResponse.prototype.writeHead;
@@ -376,7 +384,7 @@ globalThis.fetch = async (input, init) => {
         NO_UPDATE_NOTIFIER: "1",
         CI: "1",
       },
-      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     let startupError: Error | undefined;
     child.once("error", error => {
@@ -432,13 +440,16 @@ function installedPackageJsonForEntry(entry: string): string {
 }
 
 describe("compiled bootstrap harness portability", () => {
-  it("uses test IPC for graceful Windows shutdown instead of force-killing the child", () => {
-    const send = vi.fn();
+  it("uses the test control pipe for graceful Windows shutdown instead of force-killing the child", () => {
+    const end = vi.fn();
     const kill = vi.fn();
-    const child = { connected: true, send, kill } as unknown as ChildProcess;
+    const child = { stdin: { writable: true, end }, kill } as unknown as ChildProcess;
 
     requestBuiltPackageShutdown(child, "SIGTERM", "win32");
-    expect(send).toHaveBeenCalledWith({ type: TEST_SHUTDOWN_MESSAGE, signal: "SIGTERM" });
+    expect(end).toHaveBeenCalledWith(`${JSON.stringify({
+      type: TEST_SHUTDOWN_MESSAGE,
+      signal: "SIGTERM",
+    })}\n`);
     expect(kill).not.toHaveBeenCalled();
 
     requestBuiltPackageShutdown(child, "SIGINT", "linux");
@@ -750,7 +761,7 @@ describe("compiled ESM telemetry bootstrap", () => {
     if (!setupFailure && cleanupFailures.length > 0) {
       throw new AggregateError(cleanupFailures, "compiled telemetry bootstrap cleanup failed");
     }
-  });
+  }, compiledBootstrapHookTimeout());
 
   it("registers the OTel ESM hook before loading any general application module", () => {
     const testHome = mkdtempSync(join(tmpdir(), "cc-router-import-order-"));
