@@ -116,7 +116,8 @@ export async function stopDaemon(port = PROXY_PORT): Promise<boolean> {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async function waitForHealth(port: number, timeoutMs: number): Promise<boolean> {
+/** Poll the proxy's health endpoint until it answers or the budget runs out. */
+export async function waitForHealth(port: number, timeoutMs: number): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
@@ -139,31 +140,91 @@ async function waitForDeath(pid: number, timeoutMs: number): Promise<boolean> {
   return false;
 }
 
+export interface PortKillDeps {
+  listPids: (port: number) => Promise<number[]>;
+  kill: (pid: number, signal: NodeJS.Signals) => void;
+  isAlive: (pid: number) => boolean;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+}
+
+/**
+ * Terminate whatever holds `port` and wait until it is actually gone.
+ *
+ * The previous implementation returned `true` as soon as SIGTERM was sent, so
+ * `cc-router stop` reported "✓ Proxy process stopped" while the process was
+ * still shutting down. A `start` issued immediately afterwards then raced that
+ * teardown. The PID-based path already waited (`waitForDeath`); this is the
+ * fallback taken when no PID file exists, and it now waits too.
+ */
+export async function killPortAndWait(
+  port: number,
+  deps: PortKillDeps,
+  timeoutMs = 5_000,
+): Promise<boolean> {
+  const pids = await deps.listPids(port);
+  if (pids.length === 0) return false;
+
+  for (const pid of pids) deps.kill(pid, "SIGTERM");
+
+  const deadline = deps.now() + timeoutMs;
+  const anyAlive = () => pids.some(pid => deps.isAlive(pid));
+
+  while (anyAlive()) {
+    if (deps.now() >= deadline) {
+      for (const pid of pids) {
+        if (deps.isAlive(pid)) deps.kill(pid, "SIGKILL");
+      }
+      await deps.sleep(POST_KILL_GRACE_MS);
+      return !anyAlive();
+    }
+    await deps.sleep(DEATH_POLL_MS);
+  }
+  return true;
+}
+
+const DEATH_POLL_MS = 200;
+const POST_KILL_GRACE_MS = 500;
+
 async function killByPort(port: number): Promise<boolean> {
   const { execFile } = await import("child_process");
   const { promisify } = await import("util");
   const execFileAsync = promisify(execFile);
 
-  try {
-    if (isWindows()) {
-      const { stdout } = await execFileAsync("netstat", ["-ano"]);
-      const match = stdout
-        .split("\n")
-        .find(line => line.includes(`:${port}`) && line.includes("LISTENING"));
-      if (!match) return false;
-      const pid = match.trim().split(/\s+/).at(-1);
-      if (!pid || isNaN(Number(pid))) return false;
-      await execFileAsync("taskkill", ["/PID", pid, "/F"]);
-      return true;
-    } else {
-      const { stdout } = await execFileAsync("lsof", ["-ti", `:${port}`]);
-      const pids = stdout.trim().split("\n").filter(Boolean);
-      if (pids.length === 0) return false;
-      for (const p of pids) {
-        await execFileAsync("kill", ["-TERM", p]);
+  const listPids = async (p: number): Promise<number[]> => {
+    try {
+      if (isWindows()) {
+        const { stdout } = await execFileAsync("netstat", ["-ano"]);
+        const match = stdout
+          .split("\n")
+          .find(line => line.includes(`:${p}`) && line.includes("LISTENING"));
+        if (!match) return [];
+        const pid = Number(match.trim().split(/\s+/).at(-1));
+        return Number.isNaN(pid) ? [] : [pid];
       }
-      return true;
+      const { stdout } = await execFileAsync("lsof", ["-ti", `:${p}`]);
+      return stdout.trim().split("\n").filter(Boolean).map(Number).filter(n => !Number.isNaN(n));
+    } catch {
+      return [];
     }
+  };
+
+  try {
+    return await killPortAndWait(port, {
+      listPids,
+      // Windows has no signals: taskkill /F is the only lever, so both the
+      // graceful and forced step map onto it.
+      kill: (pid, signal) => {
+        if (isWindows()) {
+          void execFileAsync("taskkill", ["/PID", String(pid), "/F"]).catch(() => {});
+          return;
+        }
+        try { process.kill(pid, signal); } catch { /* already gone */ }
+      },
+      isAlive: isProcessAlive,
+      sleep,
+      now: Date.now,
+    });
   } catch {
     return false;
   }

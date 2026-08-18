@@ -2,6 +2,21 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { PID_PATH, PROXY_PORT } from "../config/paths.js";
 import { ensureConfigDir } from "../config/manager.js";
 
+/**
+ * Whether this process owns the PID file — i.e. its lifetime is what `cc-router
+ * stop` should act on.
+ *
+ * Both the background daemon (`CC_ROUTER_DAEMON`) and the OS service manager
+ * (`CC_ROUTER_SERVICE`, set by the LaunchAgent/systemd unit) qualify. A service
+ * instance used to leave no PID file, so `stop` fell through to killing by
+ * port, which does not wait for the process to exit. A plain `--foreground` run
+ * in a terminal owns nothing: it is the user's to Ctrl+C, and writing its PID
+ * would let `stop` target the wrong process.
+ */
+export function managesPidFile(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env["CC_ROUTER_DAEMON"] === "1" || env["CC_ROUTER_SERVICE"] === "1";
+}
+
 /** Write the current process PID to the PID file. */
 export function writePid(pid: number): void {
   try {
