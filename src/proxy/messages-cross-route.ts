@@ -25,7 +25,7 @@ import { stats, applyCodexUsage } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import type { SessionRouter } from "./session-router.js";
 import { extractCodexSessionKey } from "./openai-routing.js";
-import { sendAnthropicNoEligibleResponse } from "./anthropic-routing.js";
+import { sendAnthropicNoEligibleResponse, detectAnthropicClientSource } from "./anthropic-routing.js";
 import type { OpenAIAccount } from "../providers/openai/account-state.js";
 import type { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import {
@@ -621,6 +621,10 @@ export function mountMessagesCrossProviderRoute(
         requestedModel: route.upstreamModel,
         path: "/v1/messages",
         requestSource: requestSource(req),
+        method: req.method,
+        // A Claude-shaped client that happens to route to an OpenAI backend is
+        // still that client — classify it the way the Claude path does.
+        source: detectAnthropicClientSource(req.headers),
         openAIRouter: opts.openAIRouter,
         openAIPool: opts.openAIPool,
         prepareOpenAIAccount,

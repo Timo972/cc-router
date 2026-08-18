@@ -178,6 +178,11 @@ export interface OpenAIIngressOptions {
   requestedModel: string;
   path: string;
   requestSource: RequestSource;
+  /** HTTP method and client, recorded so an OpenAI activity row carries the same
+   *  columns as a Claude one — the dashboard needs both `method` and `path` to
+   *  render the request, and blanks the client column without `source`. */
+  method?: string;
+  source?: LogEntry["source"];
   openAIRouter: SessionRouter<OpenAIAccount>;
   openAIPool: OpenAITokenPool;
   prepareOpenAIAccount: (account: OpenAIAccount) => Promise<boolean>;
@@ -535,6 +540,8 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     model: requestedModel,
     type: "route",
     path,
+    ...(opts.method !== undefined ? { method: opts.method } : {}),
+    ...(opts.source !== undefined ? { source: opts.source } : {}),
     details,
   };
 

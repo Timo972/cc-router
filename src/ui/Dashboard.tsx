@@ -193,6 +193,58 @@ function codexWindowLabel(windowMinutes: number, fallback: "5h" | "weekly"): str
   return fallback;
 }
 
+type CodexWindow = { utilization: number; resetAt: number; windowMinutes: number };
+
+/**
+ * Whether a reported window carries real data.
+ *
+ * Codex sends absent windows as all-zero placeholders rather than omitting the
+ * field, so a truthiness check treats "no such window" as a window with no
+ * duration — which then renders under a guessed label.
+ */
+function hasWindow(window: CodexWindow | undefined): window is CodexWindow {
+  return window !== undefined && window.windowMinutes > 0;
+}
+
+export interface CodexDefaultWindow {
+  label: string;
+  utilization: number;
+  resetAt: number;
+  /** Which user-configured cap applies: the 5h cap or the 7d cap. */
+  kind: "session" | "weekly";
+}
+
+/**
+ * The default (`codex`) bucket's windows, each labelled from its own duration.
+ *
+ * These used to be read positionally — `primary` as the 5h window, `secondary`
+ * as the weekly one. Codex reports the weekly window in `primary` and leaves
+ * `secondary` empty, so an account at 100% of its weekly quota displayed as
+ * "5h 100%" beside a "weekly 0%" bar that was really the empty slot. The reset
+ * countdown gave it away: a 5h window cannot reset five days out.
+ */
+export function getCodexDefaultWindows(
+  codex: CodexRateLimitsView | undefined,
+): CodexDefaultWindow[] {
+  const bucket = codex?.buckets.find(b => b.limitId === "codex");
+  if (!bucket) return [];
+
+  const windows: CodexDefaultWindow[] = [];
+  for (const [window, fallback] of [
+    [bucket.primary, "5h"] as const,
+    [bucket.secondary, "weekly"] as const,
+  ]) {
+    if (!hasWindow(window)) continue;
+    windows.push({
+      label: codexWindowLabel(window.windowMinutes, fallback),
+      utilization: window.utilization,
+      resetAt: window.resetAt,
+      kind: window.windowMinutes >= 10_080 ? "weekly" : "session",
+    });
+  }
+  return windows;
+}
+
 /** Named Codex metered buckets as compact capacity rows (default bucket renders as bars). */
 export function getCodexCapacityRows(
   codex: CodexRateLimitsView | undefined,
@@ -204,10 +256,14 @@ export function getCodexCapacityRows(
     if (bucket.limitId === "codex") continue;
     const cooling = bucket.cooldownUntilMs > now;
     const windows: Array<{ label: string; utilization: number; resetAt: number }> = [];
-    if (bucket.primary) {
+    // A zero-width window is Codex's placeholder for "this bucket has no such
+    // window", not a real one — it arrives as an all-zero object rather than
+    // being omitted. Rendering it duplicated the bucket, and both rows carried
+    // the same label because codexWindowLabel(0) falls through to its fallback.
+    if (hasWindow(bucket.primary)) {
       windows.push({ label: codexWindowLabel(bucket.primary.windowMinutes, "5h"), ...bucket.primary });
     }
-    if (bucket.secondary) {
+    if (hasWindow(bucket.secondary)) {
       windows.push({ label: codexWindowLabel(bucket.secondary.windowMinutes, "weekly"), ...bucket.secondary });
     }
 
@@ -1044,7 +1100,7 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
   const globalCapacity = getGlobalCapacityView(rl);
   const isOpenAI = a.provider === "openai_subscription";
   const codex = a.codexRateLimits;
-  const codexDefaultBucket = codex?.buckets.find(bucket => bucket.limitId === "codex");
+  const codexDefaultWindows = getCodexDefaultWindows(codex);
   const capacityRows = isOpenAI
     ? getCodexCapacityRows(a.codexRateLimits, a.globalCooldownUntilMs)
     : getAccountCapacityRows(a);
@@ -1089,7 +1145,10 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
       <Box>
         <Text color={selected ? "cyan" : undefined}>{pointer}</Text>
         <Text color={dotColor}> {dot} </Text>
-        <Text color={nameColor} dimColor={isDisabled}>{a.id.slice(0, 20).padEnd(20)}</Text>
+        {/* Pad one wider than the truncation so an id of exactly the cut length
+            still leaves a separator — `plus-developer-droidrun` rendered as
+            `plus-developer-droidLIMITED`. */}
+        <Text color={nameColor} dimColor={isDisabled}>{a.id.slice(0, 20).padEnd(21)}</Text>
         <Text color={statusColor}>{statusLabel}</Text>
         {providerTag && <Text color={isOpenAI ? "cyan" : "magenta"}>{providerTag.padEnd(10)}</Text>}
         {!providerTag && <Text>{"".padEnd(10)}</Text>}
@@ -1131,23 +1190,20 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
           </Text>}
         </Box>
       )}
-      {isOpenAI && codexDefaultBucket && (codexDefaultBucket.primary || codexDefaultBucket.secondary) && (
+      {isOpenAI && codexDefaultWindows.length > 0 && (
         <Box paddingLeft={4}>
-          <UtilBar
-            label="5h"
-            util={codexDefaultBucket.primary?.utilization ?? 0}
-            resetTs={codexDefaultBucket.primary?.resetAt ?? 0}
-            isActive={false}
-            cap={s5}
-          />
-          <Text>   </Text>
-          <UtilBar
-            label="weekly"
-            util={codexDefaultBucket.secondary?.utilization ?? 0}
-            resetTs={codexDefaultBucket.secondary?.resetAt ?? 0}
-            isActive={false}
-            cap={w7}
-          />
+          {codexDefaultWindows.map((window, index) => (
+            <React.Fragment key={window.label}>
+              {index > 0 && <Text>   </Text>}
+              <UtilBar
+                label={window.label}
+                util={window.utilization}
+                resetTs={window.resetAt}
+                isActive={false}
+                cap={window.kind === "weekly" ? w7 : s5}
+              />
+            </React.Fragment>
+          ))}
           {creditsLabel !== undefined && <Text color="gray">{`  credits ${creditsLabel}`}</Text>}
         </Box>
       )}
@@ -1222,9 +1278,11 @@ function LogRow({ log, selected }: { log: LogEntry; selected: boolean }) {
   const sourceLabel = log.source === "cli" ? "cli"
     : log.source === "desktop" ? "dsk"
     : log.source === "api" ? "api"
+    : log.source === "codex" ? "cdx"
     : "   ";
   const sourceColor = log.source === "cli" ? "blue"
     : log.source === "desktop" ? "magenta"
+    : log.source === "codex" ? "cyan"
     : "gray";
 
   // Per-request token stats
@@ -1421,6 +1479,7 @@ function fmtTok(n: number): string {
 function sourceFullLabel(source: LogEntry["source"]): string {
   if (source === "cli") return "Claude Code";
   if (source === "desktop") return "Claude Desktop";
+  if (source === "codex") return "Codex CLI";
   if (source === "api") return "API";
   return "—";
 }
