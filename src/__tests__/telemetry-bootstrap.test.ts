@@ -28,6 +28,10 @@ import {
 
 const PROJECT_ROOT = resolve(import.meta.dirname, "..", "..");
 
+function compiledBootstrapHookTimeout(platform: NodeJS.Platform = process.platform): number {
+  return platform === "win32" ? 90_000 : 30_000;
+}
+
 function normalizeModulePath(path: string, separator = sep): string {
   return path.split(separator).join("/");
 }
@@ -401,6 +405,11 @@ function installedPackageJsonForEntry(entry: string): string {
 }
 
 describe("compiled bootstrap harness portability", () => {
+  it("allows the Windows packed-artifact setup to finish its offline deploy", () => {
+    expect(compiledBootstrapHookTimeout("win32")).toBe(90_000);
+    expect(compiledBootstrapHookTimeout("linux")).toBe(30_000);
+  });
+
   it("waits for the environment target operations instead of any trace batch", () => {
     const unrelated = [{ url: "/i/v1/traces", rawBody: Buffer.from("startup.span") }];
     const classified = [{
@@ -668,7 +677,7 @@ describe("compiled ESM telemetry bootstrap", () => {
       setupFailure = error;
       throw error;
     }
-  }, 30_000);
+  }, compiledBootstrapHookTimeout());
 
   afterAll(async () => {
     const cleanup = [
