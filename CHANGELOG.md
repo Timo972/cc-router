@@ -6,6 +6,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- Unprefixed `gpt-*` models route to OpenAI. The Codex CLI writes the bare slug
+  from its own registry — `model = "gpt-5.6-sol"` in `config.toml`, or whatever
+  its `/model` picker selects — and an unprefixed name went to the Claude path,
+  where `/v1/responses` answers `501 Not Implemented`. No configuration could
+  redirect it, because `openAIAliases` is only consulted for names that are
+  already prefixed; those aliases now apply to the bare form as well. Every
+  other unprefixed model still routes to Claude.
+
+---
+
 ## [0.10.0] — 2026-08-17
 
 ### Added
