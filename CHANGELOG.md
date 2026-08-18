@@ -8,19 +8,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-
-- Unprefixed `gpt-*` models route to OpenAI. The Codex CLI writes the bare slug
-  from its own registry — `model = "gpt-5.6-sol"` in `config.toml`, or whatever
-  its `/model` picker selects — and an unprefixed name went to the Claude path,
-  where `/v1/responses` answers `501 Not Implemented`. No configuration could
-  redirect it, because `openAIAliases` is only consulted for names that are
-  already prefixed; those aliases now apply to the bare form as well. Every
-  other unprefixed model still routes to Claude.
+Nothing yet.
 
 ---
 
-## [0.10.0] — 2026-08-17
+## [0.10.0] — 2026-08-18
 
 ### Added
 
@@ -33,6 +25,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   account-global otherwise; local 429/503 responses when no account is eligible.
 - Dashboard: OpenAI accounts now show 5h/weekly bars, per-bucket rows, credits,
   plan, request/error/in-flight/session counts, and cooldown state.
+- Unprefixed `gpt-*` models route to OpenAI. The Codex CLI writes the bare slug
+  from its own registry — `model = "gpt-5.6-sol"` in `config.toml`, or whatever
+  its `/model` picker selects — and an unprefixed name went to the Claude path,
+  where `/v1/responses` answers `501 Not Implemented`. No configuration could
+  redirect it, because `openAIAliases` is only consulted for names that are
+  already prefixed; those aliases now apply to the bare form as well. Every
+  other unprefixed model still routes to Claude.
 
 ### Changed
 
@@ -43,6 +42,32 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A refresh token the OAuth server rejects as terminally expired
+  (`400 invalid_grant`) is no longer retried forever. Every rejection was
+  treated as transient, so the five-minute refresh loop kept re-POSTing a token
+  that could never succeed — one account issued roughly 2000 futile requests
+  over three weeks on the shared Claude Code `client_id`, and nothing marked it
+  as needing re-authentication. Such an account is now flagged, dropped from the
+  refresh loop, and reported once to the operator; the flag is persisted, so a
+  restart neither resumes the futile traffic nor returns the dead account to the
+  routing pool, where it would have answered every request with a `401`. Any
+  other rejection — a different 400, 401, 429, 5xx, a network error — is still
+  retried. Thanks to @ethanhawkes-gif.
+- `accounts list` no longer prints a count that contradicts the rows beneath it.
+  The proxy reads `accounts.json` once at startup and holds that snapshot, so
+  the two sources diverge the moment anything rewrites the file underneath it;
+  the count came from disk while the rows came from the live pool, and a real
+  drift surfaced only as "Accounts (4 configured)" above six rows. An account
+  could be routing live while its refresh token existed nowhere on disk — one
+  restart from needing re-authentication — with nothing to indicate it. The
+  count now describes the rows it sits above, and both directions of drift are
+  named: accounts missing from disk (a credential-loss risk, with the recovery)
+  and accounts on disk the proxy has not loaded (merely stale).
+- `accounts remove` accepts an account that exists only in the running proxy.
+  The guard validated the id against disk while the removal it guards prefers
+  the live pool — the same pool `list` displays — so an account you could see
+  and the code could remove was rejected as "not found". The inventory is now
+  the union of both sources.
 - An unexpected failure partway through an OpenAI request — an upstream
   connection error, a rejected token refresh, a mid-stream abort — no longer
   takes down the proxy. Both `/v1/responses` and the `/v1/messages` OpenAI
