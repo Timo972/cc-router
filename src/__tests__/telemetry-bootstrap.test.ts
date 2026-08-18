@@ -135,6 +135,21 @@ function countOccurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
 }
 
+function traceWire(requests: Array<{ url: string; rawBody: Buffer }>): string {
+  return Buffer.concat(
+    requests
+      .filter(request => request.url === "/i/v1/traces")
+      .map(request => request.rawBody),
+  ).toString("utf8");
+}
+
+function hasEnvironmentTargetOperations(requests: Array<{ url: string; rawBody: Buffer }>): boolean {
+  const wire = traceWire(requests);
+  return countOccurrences(wire, "proxy.request") >= 2
+    && wire.includes("provider.inference")
+    && countOccurrences(wire, "@opentelemetry/instrumentation-http") >= 2;
+}
+
 interface HttpObservation {
   status: number;
   headers: Record<string, string | string[] | undefined>;
@@ -386,6 +401,34 @@ function installedPackageJsonForEntry(entry: string): string {
 }
 
 describe("compiled bootstrap harness portability", () => {
+  it("waits for the environment target operations instead of any trace batch", () => {
+    const unrelated = [{ url: "/i/v1/traces", rawBody: Buffer.from("startup.span") }];
+    const classified = [{
+      url: "/i/v1/traces",
+      rawBody: Buffer.from([
+        "proxy.request",
+        "proxy.request",
+        "provider.inference",
+        "@opentelemetry/instrumentation-http",
+        "@opentelemetry/instrumentation-http",
+      ].join("\0")),
+    }];
+
+    expect(hasEnvironmentTargetOperations(unrelated)).toBe(false);
+    expect(hasEnvironmentTargetOperations(classified)).toBe(true);
+  });
+
+  it("seeds locked production tarballs before entering the offline artifact test", () => {
+    const workflow = readFileSync(join(PROJECT_ROOT, ".github", "workflows", "ci.yml"), "utf8");
+    const install = workflow.indexOf("pnpm install --frozen-lockfile");
+    const seed = workflow.indexOf("pnpm fetch --prod --frozen-lockfile");
+    const test = workflow.indexOf("run: pnpm test");
+
+    expect(install).toBeGreaterThanOrEqual(0);
+    expect(seed).toBeGreaterThan(install);
+    expect(test).toBeGreaterThan(seed);
+  });
+
   it("matches service bootstrap paths with either platform separator", () => {
     for (const unit of [
       "ExecStart=/package/dist/cli/bootstrap.js start --foreground",
@@ -1273,16 +1316,11 @@ export async function resolve(specifier, context, nextResolve) {
       await response.arrayBuffer();
 
       await waitUntil(
-        () => telemetry.requests.slice(before).some(request => request.url === "/i/v1/traces"),
+        () => hasEnvironmentTargetOperations(telemetry.requests.slice(before)),
         8_000,
-        () => `environment LiteLLM target exported no trace\n${running.output()}`,
+        () => `environment LiteLLM target exported no classified trace\n${running.output()}`,
       );
-      const wire = Buffer.concat(
-        telemetry.requests
-          .slice(before)
-          .filter(request => request.url === "/i/v1/traces")
-          .map(request => request.rawBody),
-      ).toString("utf8");
+      const wire = traceWire(telemetry.requests.slice(before));
       expect(environmentTargetPaths).toContain("/v1/messages");
       expect(countOccurrences(wire, "proxy.request")).toBeGreaterThanOrEqual(2);
       expect(wire).toContain("provider.inference");

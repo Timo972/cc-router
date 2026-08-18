@@ -30,6 +30,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Seed offline production store
+        run: pnpm fetch --prod --frozen-lockfile
+
       - name: Type-check
         run: pnpm lint
 
