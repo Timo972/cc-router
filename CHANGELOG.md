@@ -8,6 +8,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- The status dashboard can enable, disable, and remove OpenAI accounts. Three
+  guards still sent the operator to the CLI for operations the management
+  endpoints had already gained: `e` answered "OpenAI accounts are managed from
+  the CLI", and delete refused both at the keypress and again inside the
+  confirmation, so the second gate would have caught anyone who got past the
+  first. The cap keys (`w`/`s`) never had such a check, which is what made the
+  inconsistency visible.
+
 Nothing yet.
 
 ---
