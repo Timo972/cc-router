@@ -58,6 +58,8 @@ interface RunningPackage {
   stop(signal?: "SIGTERM" | "SIGINT"): Promise<void>;
 }
 
+const TEST_SHUTDOWN_MESSAGE = "cc-router:test-shutdown";
+
 function listen(server: Server): Promise<number> {
   return new Promise((resolvePort, reject) => {
     server.once("error", reject);
@@ -226,6 +228,22 @@ function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boole
   });
 }
 
+function requestBuiltPackageShutdown(
+  child: ChildProcess,
+  signal: "SIGTERM" | "SIGINT",
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (platform === "win32" && child.connected) {
+    try {
+      child.send({ type: TEST_SHUTDOWN_MESSAGE, signal });
+      return;
+    } catch {
+      // If the test IPC channel already closed, fall through to cleanup kill.
+    }
+  }
+  child.kill(signal);
+}
+
 async function cleanupBuiltPackage(
   child: ChildProcess | undefined,
   testHome: string,
@@ -233,7 +251,7 @@ async function cleanupBuiltPackage(
 ): Promise<void> {
   try {
     if (!child || child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
-    child.kill(signal);
+    requestBuiltPackageShutdown(child, signal);
     if (await waitForChildExit(child, 2_000)) return;
     child.kill("SIGKILL");
     if (!await waitForChildExit(child, 2_000)) {
@@ -292,6 +310,15 @@ import { ServerResponse } from "node:http";
 const realFetch = globalThis.fetch;
 const targetOrigin = ${JSON.stringify(options.targetOrigin)};
 const telemetryOrigin = ${JSON.stringify(options.telemetryCaptureOrigin)};
+process.on("message", message => {
+  if (
+    message &&
+    message.type === ${JSON.stringify(TEST_SHUTDOWN_MESSAGE)} &&
+    (message.signal === "SIGTERM" || message.signal === "SIGINT")
+  ) {
+    process.emit(message.signal);
+  }
+});
 const originalWriteHead = ServerResponse.prototype.writeHead;
 ServerResponse.prototype.writeHead = function (...args) {
   if (!this.hasHeader("date")) this.setHeader("date", "Thu, 01 Jan 1970 00:00:00 GMT");
@@ -349,7 +376,7 @@ globalThis.fetch = async (input, init) => {
         NO_UPDATE_NOTIFIER: "1",
         CI: "1",
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
     });
     let startupError: Error | undefined;
     child.once("error", error => {
@@ -405,6 +432,19 @@ function installedPackageJsonForEntry(entry: string): string {
 }
 
 describe("compiled bootstrap harness portability", () => {
+  it("uses test IPC for graceful Windows shutdown instead of force-killing the child", () => {
+    const send = vi.fn();
+    const kill = vi.fn();
+    const child = { connected: true, send, kill } as unknown as ChildProcess;
+
+    requestBuiltPackageShutdown(child, "SIGTERM", "win32");
+    expect(send).toHaveBeenCalledWith({ type: TEST_SHUTDOWN_MESSAGE, signal: "SIGTERM" });
+    expect(kill).not.toHaveBeenCalled();
+
+    requestBuiltPackageShutdown(child, "SIGINT", "linux");
+    expect(kill).toHaveBeenCalledWith("SIGINT");
+  });
+
   it("allows the Windows packed-artifact setup to finish its offline deploy", () => {
     expect(compiledBootstrapHookTimeout("win32")).toBe(90_000);
     expect(compiledBootstrapHookTimeout("linux")).toBe(30_000);
@@ -1582,7 +1622,10 @@ export async function resolve(specifier, context, nextResolve) {
         // The setup wrapper has a 1.5 s bound and bootstrap combined shutdown
         // has a 0.5 s bound; neither may inherit the transport's lifetime.
         expect(Date.now() - cancelledAt).toBeLessThan(2_250);
-        expect(Date.now() - started).toBeLessThan(3_000);
+        // Windows process startup is materially slower on hosted runners. Keep
+        // the cancellation-specific bound above strict while allowing that
+        // startup overhead in the end-to-end duration.
+        expect(Date.now() - started).toBeLessThan(process.platform === "win32" ? 4_000 : 3_000);
         const audit = existsSync(networkLog) ? readFileSync(networkLog, "utf8") : "";
         if (disabled) {
           expect(requests).toBe(requestsBefore);
