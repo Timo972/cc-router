@@ -18,7 +18,7 @@ export function pnpmInvocation(
       "-ExecutionPolicy",
       "Bypass",
       "-File",
-      win32.join(pnpmHome, "pnpm.ps1"),
+      win32.join(pnpmHome, "bin", "pnpm.ps1"),
       ...args,
     ],
   };

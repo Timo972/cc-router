@@ -25,7 +25,7 @@ describe("CI pnpm invocation", () => {
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "C:\\pnpm home\\pnpm.ps1",
+        "C:\\pnpm home\\bin\\pnpm.ps1",
         "--offline",
         "--config.inject-workspace-packages=true",
         "--filter",
