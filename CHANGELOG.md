@@ -10,6 +10,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The status dashboard can enable, disable, and remove OpenAI accounts. Three
+  guards still sent the operator to the CLI for operations the management
+  endpoints had already gained: `e` answered "OpenAI accounts are managed from
+  the CLI", and delete refused both at the keypress and again inside the
+  confirmation, so the second gate would have caught anyone who got past the
+  first. The cap keys (`w`/`s`) never had such a check, which is what made the
+  inconsistency visible.
 - `cc-router start` no longer has to be run twice. In service mode it wrote the
   LaunchAgent plist and immediately bootstrapped it, but `launchctl bootout`
   returns as soon as launchd accepts the request — not once the job is gone.
