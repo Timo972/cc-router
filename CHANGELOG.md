@@ -10,6 +10,26 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- OpenAI activity rows carry the same columns as Claude ones. The OpenAI ingress
+  recorded a path but no method and no client, and the dashboard needs both
+  `method` and `path` to render the request — so those rows fell back to the
+  bare entry type and read `route` under a blank client column, beside
+  `POST /messages` and `cli` on the Claude rows. Codex CLI traffic now reports
+  a `codex` source of its own rather than borrowing `cli`, which the detail
+  panel spells out as "Claude Code"; a `/v1/messages` request that cross-routes
+  to an OpenAI backend is still classified by the client that sent it.
+- An OpenAI account's usage bars are labelled from each window's own duration
+  instead of by position. Codex reports its weekly window in the `primary` slot
+  and leaves `secondary` empty, but the bars assumed primary meant 5h and
+  secondary meant weekly — so an account at 100% of its weekly quota displayed
+  as `5h 100%` next to a `weekly 0%` bar that was really the empty slot. The
+  countdown gave it away: a 5h window cannot reset five days out.
+- A named Codex bucket no longer renders twice. Codex sends an absent window as
+  an all-zero placeholder rather than omitting it, so the empty `secondary` was
+  treated as real and emitted a second row — carrying the same label as the
+  first, because a zero-length window falls through to a guessed one.
+- An account id exactly as long as its column no longer runs into the status
+  next to it (`plus-developer-droidLIMITED`).
 - The status dashboard can enable, disable, and remove OpenAI accounts. Three
   guards still sent the operator to the CLI for operations the management
   endpoints had already gained: `e` answered "OpenAI accounts are managed from

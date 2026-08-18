@@ -11,7 +11,9 @@ export interface LogEntry {
   durationMs?: number;
   method?: string;
   path?: string;
-  source?: "cli" | "desktop" | "api";
+  /** Which client sent the request. `codex` is the Codex CLI on `/v1/responses`;
+   *  a Claude-shaped client whose model routes to OpenAI stays `cli`/`desktop`/`api`. */
+  source?: "cli" | "desktop" | "api" | "codex";
   // Token usage from Anthropic response (message_start + message_delta events)
   cacheReadTokens?: number;
   cacheCreationTokens?: number;

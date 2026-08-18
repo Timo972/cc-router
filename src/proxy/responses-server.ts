@@ -166,6 +166,9 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       sessionKey: extractCodexSessionKey(req, req.body),
       requestedModel: route.upstreamModel,
       path: "/v1/responses",
+      method: req.method,
+      // Only the Codex CLI speaks the Responses API to this proxy.
+      source: "codex",
       openAIRouter: opts.openAIRouter,
       openAIPool: opts.openAIPool,
       prepareOpenAIAccount,

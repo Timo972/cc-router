@@ -7,6 +7,22 @@ import type { Account } from "./types.js";
 
 const SESSION_HEADER = "x-claude-code-session-id";
 
+/**
+ * Classify which Anthropic-shaped client sent a request, for the activity log.
+ *
+ * Mirrors the precedence the direct Claude proxy path applies: a Claude Code
+ * session header wins, an `x-api-key` means Claude Desktop, anything else is a
+ * raw API caller. Shared so a `/v1/messages` request that cross-routes to an
+ * OpenAI backend is still labelled by the client that sent it.
+ */
+export function detectAnthropicClientSource(
+  headers: Record<string, unknown>,
+): "cli" | "desktop" | "api" {
+  if (headers[SESSION_HEADER] !== undefined) return "cli";
+  if (headers["x-api-key"] !== undefined) return "desktop";
+  return "api";
+}
+
 type RoutedRequest = Request & {
   _ccAccount?: Account;
   _ccRoute?: RoutedAccountLease;
