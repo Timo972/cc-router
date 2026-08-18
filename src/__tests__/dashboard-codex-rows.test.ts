@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getCodexCapacityRows, isCodexLimited, type CodexRateLimitsView } from "../ui/Dashboard.js";
+import { getCodexCapacityRows, getCodexDefaultWindows, isCodexLimited, type CodexRateLimitsView } from "../ui/Dashboard.js";
 
 const NOW = 1_754_000_000_000;
 
@@ -105,5 +105,62 @@ describe("isCodexLimited", () => {
       buckets: [{ limitId: "codex", label: "codex", cooldownUntilMs: 0, primary: { utilization: 0.4, resetAt: 0, windowMinutes: 300 } }],
     }))).toBe(false);
     expect(isCodexLimited(undefined)).toBe(false);
+  });
+});
+
+describe("empty window placeholders", () => {
+  it("ignores a zero-width window instead of emitting a duplicate row", () => {
+    // Codex sends `secondary` as an all-zero placeholder rather than omitting
+    // it, so `if (bucket.secondary)` was truthy and the same bucket rendered
+    // twice — both labelled "weekly", because codexWindowLabel(0) falls through
+    // to its fallback.
+    const rows = getCodexCapacityRows(codexView({
+      buckets: [{
+        limitId: "codex_bengalfox", label: "GPT-5.3-Codex-Spark", cooldownUntilMs: 0,
+        primary: { utilization: 0, resetAt: Math.floor(NOW / 1000) + 600_000, windowMinutes: 10080 },
+        secondary: { utilization: 0, resetAt: 0, windowMinutes: 0 },
+      }],
+    }), 0, NOW);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ label: "GPT-5.3-Codex-Spark weekly" });
+  });
+});
+
+describe("getCodexDefaultWindows", () => {
+  it("labels each window from its own duration rather than by position", () => {
+    // Codex reports the weekly window in the `primary` slot. Labelling
+    // positionally (primary→5h, secondary→weekly) showed a 100% weekly
+    // utilization as "5h 100%" and an empty slot as "weekly 0%".
+    const windows = getCodexDefaultWindows(codexView({
+      buckets: [{
+        limitId: "codex", label: "codex", cooldownUntilMs: 0,
+        primary: { utilization: 1, resetAt: Math.floor(NOW / 1000) + 500_000, windowMinutes: 10080 },
+        secondary: { utilization: 0, resetAt: 0, windowMinutes: 0 },
+      }],
+    }));
+
+    expect(windows).toHaveLength(1);
+    expect(windows[0]).toMatchObject({ label: "weekly", utilization: 1, kind: "weekly" });
+  });
+
+  it("keeps both windows when the account really reports two", () => {
+    const windows = getCodexDefaultWindows(codexView({
+      buckets: [{
+        limitId: "codex", label: "codex", cooldownUntilMs: 0,
+        primary: { utilization: 0.5, resetAt: 10, windowMinutes: 300 },
+        secondary: { utilization: 0.2, resetAt: 20, windowMinutes: 10080 },
+      }],
+    }));
+
+    expect(windows.map(w => [w.label, w.kind])).toEqual([["5h", "session"], ["weekly", "weekly"]]);
+  });
+
+  it("returns nothing when there is no default bucket or no window data", () => {
+    expect(getCodexDefaultWindows(codexView({ buckets: [] }))).toEqual([]);
+    expect(getCodexDefaultWindows(undefined)).toEqual([]);
+    expect(getCodexDefaultWindows(codexView({
+      buckets: [{ limitId: "codex", label: "codex", cooldownUntilMs: 0 }],
+    }))).toEqual([]);
   });
 });

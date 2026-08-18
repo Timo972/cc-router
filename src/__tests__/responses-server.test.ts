@@ -1608,3 +1608,33 @@ describe("mountResponsesRoutes sticky routing", () => {
     });
   });
 });
+
+describe("activity entries are shaped like the Claude path's", () => {
+  it("records the request method and a codex source so the dashboard renders a full row", async () => {
+    // The dashboard needs BOTH method and path to print "POST /v1/responses"
+    // (Dashboard.tsx), otherwise it falls back to the bare entry type and the
+    // row reads "route"; an absent source blanks the client column. The Claude
+    // path sets all three, so Codex rows looked different for no good reason.
+    const forward: ForwardOpenAI = async () => new Response(
+      JSON.stringify({ id: "resp_1", object: "response", status: "completed", output: [] }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: false }),
+      });
+    });
+
+    const routed = activity.find(e => e.type === "route");
+    expect(routed).toBeDefined();
+    expect(routed).toEqual(expect.objectContaining({
+      method: "POST",
+      path: "/v1/responses",
+      source: "codex",
+    }));
+  });
+});
