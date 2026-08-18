@@ -159,6 +159,58 @@ describe("refreshAccountToken", () => {
     expect(account.healthy).toBe(false);
   });
 
+  it("stops retrying a token the server rejected as invalid_grant", async () => {
+    // An already-expired token the refresh loop would keep picking up.
+    const account = makeAccount(Date.now() - 60 * 60 * 1000);
+    expect(needsRefresh(account)).toBe(true);
+
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: 400,
+      text: async () => '{"error":"invalid_grant","error_description":"Refresh token expired"}',
+    } as Response);
+
+    await refreshAccountToken(account);
+
+    // A terminal rejection takes the account out of the refresh loop, so the
+    // dead token is never POSTed to the OAuth endpoint again.
+    expect(account.authExpired).toBe(true);
+    expect(account.healthy).toBe(false);
+    expect(needsRefresh(account)).toBe(false);
+  });
+
+  it("keeps retrying a transient server error (not terminal)", async () => {
+    const account = makeAccount(Date.now() - 60 * 60 * 1000);
+
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: 503,
+      text: async () => "Service Unavailable",
+    } as Response);
+
+    await refreshAccountToken(account);
+
+    // A 5xx is transient: the account stays unhealthy but eligible for retry.
+    expect(account.authExpired).toBeFalsy();
+    expect(needsRefresh(account)).toBe(true);
+  });
+
+  it("treats a different 400 error as transient, not terminal", async () => {
+    const account = makeAccount(Date.now() - 60 * 60 * 1000);
+
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: 400,
+      text: async () => '{"error":"invalid_request","error_description":"missing parameter"}',
+    } as Response);
+
+    await refreshAccountToken(account);
+
+    // Only invalid_grant is terminal; other 400s stay eligible for retry.
+    expect(account.authExpired).toBeFalsy();
+    expect(needsRefresh(account)).toBe(true);
+  });
+
   it("marks account unhealthy after 3 consecutive errors", async () => {
     const account = makeAccount(Date.now() + 5 * 60 * 1000);
 

@@ -82,6 +82,11 @@ export interface Account {
   lastUsed: number;      // Unix timestamp in ms
   lastRefresh: number;   // Unix timestamp in ms
   consecutiveErrors: number;
+  /** Set when a refresh is rejected with a terminal `invalid_grant`
+   *  ("refresh token expired"). Such a token can never be refreshed again, so
+   *  the refresh loop stops retrying it and the account needs re-authentication.
+   *  Persisted so the dead state survives a restart. Default: unset (false). */
+  authExpired?: boolean;
   rateLimits: AccountRateLimits;
   /** When false, the pool skips this account entirely. Default: true. */
   enabled: boolean;
@@ -115,6 +120,9 @@ export interface AccountRecord {
   enabled?: boolean;
   sessionLimitPercent?: number;
   weeklyLimitPercent?: number;
+  /** Set once a refresh is rejected as terminal `invalid_grant`; persisted so a
+   *  dead account is not hammered again after a restart. */
+  authExpired?: boolean;
 }
 
 /**
