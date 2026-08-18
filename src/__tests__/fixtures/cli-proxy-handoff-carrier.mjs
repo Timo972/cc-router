@@ -1,13 +1,17 @@
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
 const installRoot = process.env.CC_ROUTER_COMPILED_PACKAGE_ROOT;
 const packageRoot = installRoot
-  ? `${installRoot}/node_modules/@timo972/cc-router`
+  ? join(installRoot, "node_modules", "@timo972", "cc-router")
   : process.argv[2];
 if (!packageRoot) throw new Error("compiled package root is required");
+const importFromPackage = relative => import(pathToFileURL(join(packageRoot, relative)).href);
 
-const cliRuntime = await import(`${packageRoot}/dist/telemetry/cli-runtime.js`);
-const proxyRuntime = await import(`${packageRoot}/dist/telemetry/runtime.js`);
-const diagnostics = await import(`${packageRoot}/dist/telemetry/setup-diagnostics.js`);
-const facade = await import(`${packageRoot}/dist/telemetry/facade.js`);
+const cliRuntime = await importFromPackage("dist/telemetry/cli-runtime.js");
+const proxyRuntime = await importFromPackage("dist/telemetry/runtime.js");
+const diagnostics = await importFromPackage("dist/telemetry/setup-diagnostics.js");
+const facade = await importFromPackage("dist/telemetry/facade.js");
 const { trace } = await import("@opentelemetry/api");
 const tracerProviderBefore = trace.getTracerProvider();
 

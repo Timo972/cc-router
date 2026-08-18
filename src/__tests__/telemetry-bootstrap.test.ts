@@ -410,6 +410,19 @@ describe("compiled bootstrap harness portability", () => {
     expect(compiledBootstrapHookTimeout("linux")).toBe(30_000);
   });
 
+  it("converts compiled-package fixture imports to file URLs", () => {
+    for (const fixture of [
+      "cli-proxy-handoff-carrier.mjs",
+      "cli-setup-telemetry-carrier.mjs",
+      "cli-start-cancellation-preload.mjs",
+    ]) {
+      const source = readFileSync(join(PROJECT_ROOT, "src", "__tests__", "fixtures", fixture), "utf8");
+      expect(source, fixture).toContain("pathToFileURL");
+      expect(source, fixture).not.toContain("import(`${packageRoot}/");
+      expect(source, fixture).not.toContain("import(`${installRoot}/");
+    }
+  });
+
   it("waits for the environment target operations instead of any trace batch", () => {
     const unrelated = [{ url: "/i/v1/traces", rawBody: Buffer.from("startup.span") }];
     const classified = [{

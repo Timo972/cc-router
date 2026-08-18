@@ -1,10 +1,14 @@
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
 const installRoot = process.env.CC_ROUTER_COMPILED_PACKAGE_ROOT;
 const packageRoot = process.argv[2]
-  ?? (installRoot ? `${installRoot}/node_modules/@timo972/cc-router` : undefined);
+  ?? (installRoot ? join(installRoot, "node_modules", "@timo972", "cc-router") : undefined);
 if (!packageRoot) throw new Error("compiled package root is required");
+const importFromPackage = relative => import(pathToFileURL(join(packageRoot, relative)).href);
 
-const runtime = await import(`${packageRoot}/dist/telemetry/cli-runtime.js`);
-const diagnostics = await import(`${packageRoot}/dist/telemetry/setup-diagnostics.js`);
+const runtime = await importFromPackage("dist/telemetry/cli-runtime.js");
+const diagnostics = await importFromPackage("dist/telemetry/setup-diagnostics.js");
 
 if (!runtime.startCliTelemetry("foreground")) {
   if (process.env.CC_ROUTER_EXPECT_TELEMETRY_DISABLED === "1") process.exit(0);
