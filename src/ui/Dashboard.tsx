@@ -458,7 +458,6 @@ function LiveDashboard({
     ? Math.max(0, data.accounts.findIndex(a => a.id === selectedAccountId))
     : 0;
   const selectedAccount = data.accounts[selectedAccountIndex] ?? null;
-  const selectedAccountIsAnthropic = selectedAccount?.provider !== "openai_subscription";
 
   const [modelsStatus, setModelsStatus] = useState<ModelsStatus | null>(null);
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
@@ -499,12 +498,13 @@ function LiveDashboard({
   };
 
   // ── Async helpers (fire-and-forget with error → banner) ──────────────────
+  // Provider-agnostic: `PATCH /cc-router/accounts/:id` applies `enabled` to
+  // OpenAI accounts through the same transaction contract as Claude ones, and
+  // drops their sticky bindings on disable. The cap keys below never had a
+  // provider check; this one was left behind after the endpoint gained OpenAI
+  // support, so the dashboard was refusing an operation the server had.
   const doToggleEnabled = useCallback(async () => {
     if (!selectedAccount) return;
-    if (selectedAccount.provider === "openai_subscription") {
-      showBanner("OpenAI accounts are managed from the CLI", "yellow");
-      return;
-    }
     const newValue = !(selectedAccount.enabled !== false);
     try {
       await api.patch(selectedAccount.id, { enabled: newValue });
@@ -546,10 +546,6 @@ function LiveDashboard({
 
   const doDelete = useCallback(async () => {
     if (!selectedAccount) return;
-    if (selectedAccount.provider === "openai_subscription") {
-      showBanner("Use cc-router accounts remove for OpenAI accounts", "yellow");
-      return;
-    }
     try {
       await api.remove(selectedAccount.id);
       showBanner(`Removed ${selectedAccount.id}`, "yellow");
@@ -688,8 +684,12 @@ function LiveDashboard({
       if (input === "s") {
         setMode("editSession"); setEditBuffer(""); return;
       }
+      // Also provider-agnostic: `DELETE /cc-router/accounts/:id` removes an
+      // OpenAI account through `deleteOpenAIAccountTransaction`, which is the
+      // same path `cc-router accounts remove` reaches. Sending the operator to
+      // the CLI for something the dashboard can do was left over from before
+      // that existed.
       if (input === "d") {
-        if (!selectedAccountIsAnthropic) { showBanner("Use cc-router accounts remove for OpenAI accounts", "yellow"); return; }
         setMode("confirmDelete"); return;
       }
     }

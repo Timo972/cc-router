@@ -18,7 +18,7 @@ Distribute Claude Code requests across Claude subscriptions, and expose an OpenA
 ### Features
 
 - **Cache-aware session routing** — keep each Claude Code session on one account while distributing new sessions across 2-20 Claude Max accounts
-- **Multi-provider routing** — route `openai/*` models to OpenAI ChatGPT/Codex subscription accounts and Claude models to Claude subscriptions
+- **Multi-provider routing** — route `openai/*` and unprefixed `gpt-*` models to OpenAI ChatGPT/Codex subscription accounts and Claude models to Claude subscriptions
 - **Transparent Claude proxy** — Claude Code works normally; streaming, thinking, tool use, prompt caching all pass through
 - **Codex CLI support** — configure Codex to use CC-Router as a Responses-compatible provider
 - **Automatic token refresh** — OAuth tokens are refreshed before they expire, saved atomically to disk
@@ -320,11 +320,20 @@ CC_ROUTER_TOKEN=cc-rtr-your-secret codex -m openai/gpt-5.5
 
 Model prefixes:
 
-| Prefix | Upstream |
+| Model | Upstream |
 |--------|----------|
 | `openai/*` | OpenAI ChatGPT/Codex subscription route |
+| `gpt-*` (no prefix) | OpenAI ChatGPT/Codex subscription route |
 | `claude/*` | Claude subscription route |
 | `anthropic/*` | Claude subscription route |
+| anything else with no prefix | Claude subscription route |
+
+The unprefixed `gpt-*` rule exists for clients that do not speak this
+convention. The Codex CLI writes the bare slug from its own registry — either
+`model = "gpt-5.6-sol"` in `~/.codex/config.toml` or whatever its `/model`
+picker selects — so those names arrive without a prefix and would otherwise be
+routed to Claude, where `/v1/responses` answers `501`. Configured
+`openAIAliases` apply to the bare form too.
 
 Examples after the configuration above:
 

@@ -11,7 +11,7 @@ import {
 } from "../config/manager.js";
 import { writeClaudeSettings } from "../utils/claude-config.js";
 import { checkForUpdate, performUpdate, PKG_NAME } from "../utils/self-update.js";
-import { launchDaemon } from "../daemon/launcher.js";
+import { launchDaemon, waitForHealth } from "../daemon/launcher.js";
 import { isProxyRunning } from "../daemon/pid.js";
 import { installService } from "../daemon/service.js";
 import { getLocalIPs } from "../utils/network.js";
@@ -110,6 +110,18 @@ export function registerStart(program: Command): void {
 
       if (prefs.mode === "service") {
         await installService(prefs.serverMode);
+        // Installing the service is not the same as the proxy being up: if
+        // launchd rejects the load, `installService` only warns. Verify, so a
+        // failed start is not reported as a success.
+        if (await waitForHealth(port, 10_000)) {
+          console.log(chalk.green(`✓ CC-Router running on port ${port}`));
+        } else {
+          console.log(chalk.yellow(`\n⚠ Service configured, but nothing is answering on port ${port}.`));
+          console.log(chalk.gray(`  Check the logs: cc-router logs`));
+          console.log(chalk.gray(`  Then try again: cc-router start`));
+          process.exitCode = 1;
+          return;
+        }
       } else {
         // background mode
         await launchDaemon({

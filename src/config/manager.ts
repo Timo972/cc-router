@@ -401,13 +401,18 @@ function deserialize(records: AccountRecord[]): Account[] {
       expiresAt: a.expiresAt,
       scopes: a.scopes ?? ["user:inference", "user:profile"],
     },
-    healthy: true,
+    // An authExpired account must come back unhealthy. `needsRefresh()` skips
+    // it, so the startup refresh that would otherwise fail and clear `healthy`
+    // never runs — and TokenPool.hardBlock() gates only on `enabled && healthy`,
+    // so defaulting to true here would route live traffic to a dead token.
+    healthy: a.authExpired !== true,
     busy: false,
     requestCount: 0,
     errorCount: 0,
     lastUsed: 0,
     lastRefresh: 0,
     consecutiveErrors: 0,
+    authExpired: a.authExpired === true,
     rateLimits: { ...DEFAULT_RATE_LIMITS },
     enabled: a.enabled !== false,                         // default true
     sessionLimitPercent: a.sessionLimitPercent !== undefined
@@ -431,5 +436,6 @@ export function serialize(accounts: Account[]): AccountRecord[] {
     enabled: a.enabled,
     sessionLimitPercent: a.sessionLimitPercent,
     weeklyLimitPercent: a.weeklyLimitPercent,
+    ...(a.authExpired ? { authExpired: true } : {}),
   }));
 }

@@ -573,6 +573,21 @@ describe("loadAccounts", () => {
 
     expect(loadAccounts().map(a => a.id)).toEqual(["max-account-1"]);
   });
+
+  it("restores an authExpired account as unhealthy so the pool does not route to it", () => {
+    // An account whose refresh token the server rejected as terminally expired,
+    // then persisted and read back by a restarted process. `authExpired` keeps
+    // it out of the refresh loop, so the startup refresh that used to mark it
+    // unhealthy never runs — `healthy` must therefore come from disk state, or
+    // TokenPool.hardBlock() (which gates only on `enabled && healthy`) routes
+    // live traffic to an account whose access token is long dead.
+    writeAccountsAtomic([{ ...sampleRecord, authExpired: true }]);
+
+    const [account] = loadAccounts();
+
+    expect(account.authExpired).toBe(true);
+    expect(account.healthy).toBe(false);
+  });
 });
 
 describe("serialize", () => {
@@ -584,6 +599,31 @@ describe("serialize", () => {
 
     const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
     expect(parsed[0].provider).toBe("anthropic_subscription");
+  });
+
+  it("persists the terminal authExpired flag so a dead account is not retried after a restart", () => {
+    writeAccountsAtomic([sampleRecord]);
+    const [account] = loadAccounts();
+    account.authExpired = true;
+
+    writeAnthropicAccountsPreservingOtherProviders(serialize([account]));
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].authExpired).toBe(true);
+    // And it survives the read back — the restarted process starts with the
+    // account already marked expired.
+    expect(readAccountsFromPath(accountsPath())[0].authExpired).toBe(true);
+  });
+
+  it("leaves authExpired unset for a healthy account and for legacy records", () => {
+    writeAccountsAtomic([sampleRecord]);
+    const [account] = loadAccounts();
+
+    writeAnthropicAccountsPreservingOtherProviders(serialize([account]));
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].authExpired).toBeUndefined();
+    expect(readAccountsFromPath(accountsPath())[0].authExpired).toBe(false);
   });
 });
 

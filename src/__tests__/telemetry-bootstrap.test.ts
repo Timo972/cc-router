@@ -2039,8 +2039,12 @@ describe("proxy launch commands", () => {
     let platform: "macos" | "linux" | "windows" = "macos";
     const writes: Array<{ path: string; body: string }> = [];
     const execCalls: Array<{ file: string; args: string[] }> = [];
-    const execFileMock = (file: string, args: string[], callback: (error: null, stdout: string, stderr: string) => void): void => {
+    const execFileMock = (file: string, args: string[], callback: (error: Error | null, stdout: string, stderr: string) => void): void => {
       execCalls.push({ file, args });
+      if (file === "launchctl" && args[0] === "print") {
+        callback(new Error("service is not loaded"), "", "");
+        return;
+      }
       callback(null, "", "");
     };
     vi.doMock("node:child_process", () => ({

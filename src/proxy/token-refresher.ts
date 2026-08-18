@@ -53,7 +53,32 @@ function isReservedForDeletion(account: Account): boolean {
   return (deletionReservations.get(account) ?? 0) > 0;
 }
 
+/**
+ * A refresh rejection is terminal when the OAuth server reports `invalid_grant`
+ * (HTTP 400, "refresh token expired"). Such a token can never be refreshed
+ * again, so it must not be retried. Every other rejection — a different 400
+ * error code, 401, 429, 5xx, a network error — is treated as transient and
+ * remains eligible for retry.
+ *
+ * The structured `error` field is checked first so a different 400 (e.g.
+ * `invalid_request`) is not misread as terminal; a non-JSON body falls back to
+ * a substring check for older/plain-text responses.
+ */
+function isTerminalAuthFailure(status: number, body: string): boolean {
+  if (status !== 400) return false;
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown };
+    if (typeof parsed?.error === "string") return parsed.error === "invalid_grant";
+  } catch {
+    // Not JSON — fall through to the plain-text check below.
+  }
+  return /invalid_grant/i.test(body);
+}
+
 export function needsRefresh(account: Account): boolean {
+  // A token the server rejected as terminally expired can never succeed; keep
+  // it out of the loop so it is not POSTed to the OAuth endpoint forever.
+  if (account.authExpired) return false;
   return ownedRefreshLocks.has(account) ||
     pendingDurability.has(account) ||
     (account.tokens.expiresAt - Date.now()) < REFRESH_BUFFER_MS;
@@ -237,6 +262,15 @@ async function _doRefresh(account: Account, signal?: AbortSignal): Promise<boole
       console.error(`  Status: ${res.status} — ${body}`);
       account.consecutiveErrors++;
       account.healthy = false;
+      if (isTerminalAuthFailure(res.status, body) && !account.authExpired) {
+        // Permanent rejection: retrying can only fail and hammers the OAuth
+        // endpoint (thousands of dead POSTs on one client_id). Take the account
+        // out of the refresh loop and tell the operator once.
+        account.authExpired = true;
+        console.error(
+          `  Account ${account.id} needs re-authentication: its refresh token was rejected as expired (invalid_grant). Re-add the account to resume routing.`,
+        );
+      }
       return false;
     }
 
@@ -251,6 +285,7 @@ async function _doRefresh(account: Account, signal?: AbortSignal): Promise<boole
     account.tokens.scopes = data.scope.split(" ");
     account.healthy = true;
     account.consecutiveErrors = 0;
+    account.authExpired = false;
     account.lastRefresh = Date.now();
     annotateActiveSpan("oauth.refresh", {
       outcome: "complete",
