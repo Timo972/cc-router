@@ -15,7 +15,7 @@ import { logRoute, logError, logStartup } from "./logger.js";
 import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
-import { writePid, removePid } from "../daemon/pid.js";
+import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
 import {
@@ -1447,7 +1447,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     console.log(chalk.yellow("\nShutting down — saving tokens..."));
     usageRefresher.stop();
     saveAccounts(pool.getAll());
-    if (process.env["CC_ROUTER_DAEMON"] === "1") {
+    if (managesPidFile()) {
       removePid();
     }
     process.exit(0);
@@ -1519,7 +1519,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   app.listen(port, host, () => {
     // Write PID for daemon/service process management
-    if (process.env["CC_ROUTER_DAEMON"] === "1") {
+    if (managesPidFile()) {
       writePid(process.pid);
     }
 
