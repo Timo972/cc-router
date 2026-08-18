@@ -17,8 +17,28 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   confirmation, so the second gate would have caught anyone who got past the
   first. The cap keys (`w`/`s`) never had such a check, which is what made the
   inconsistency visible.
-
-Nothing yet.
+- `cc-router start` no longer has to be run twice. In service mode it wrote the
+  LaunchAgent plist and immediately bootstrapped it, but `launchctl bootout`
+  returns as soon as launchd accepts the request — not once the job is gone.
+  Bootstrapping the same label during that window fails with
+  `Bootstrap failed: 5: Input/output error`, and the legacy `launchctl load`
+  fallback fails identically, so the command printed a warning and exited
+  successfully with nothing running. It now waits for launchd to release the
+  label before loading, and retries the bootstrap until a deadline.
+- A failed start is no longer reported as a success. Service mode installed the
+  service and returned without checking that anything was listening — the
+  background path already health-checked, the service path did not. It now
+  polls the health endpoint and exits non-zero with the log location if the
+  proxy never answers.
+- `cc-router stop` waits for the proxy to actually exit before reporting
+  success. With no PID file the stop fell through to killing by port, which
+  returned as soon as SIGTERM was sent; a `start` issued straight afterwards
+  then raced the still-running process. The port path now waits for the
+  process to die and escalates to SIGKILL, matching the PID path.
+- A service-managed proxy writes a PID file. `writePid`/`removePid` were gated
+  on `CC_ROUTER_DAEMON`, which the LaunchAgent and systemd unit never set —
+  they set `CC_ROUTER_SERVICE` — so every service-managed instance left no PID
+  behind and took the weaker port-based stop path.
 
 ---
 
