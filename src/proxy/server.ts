@@ -69,6 +69,7 @@ import {
 import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
 import {
   createProxyExitCoordinator,
+  scheduleProcessExit,
   saveProviderAccountsOnShutdown,
 } from "./shutdown-persistence.js";
 
@@ -1588,7 +1589,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     shutdownTelemetry: () => shutdownTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS),
   });
   const shutdown = () => {
-    void exitCoordinator.finish(() => process.exit(0));
+    void exitCoordinator.finish(() => scheduleProcessExit(0));
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);

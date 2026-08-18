@@ -19,6 +19,30 @@ export interface ProxyExitCoordinator {
   finish(finalAction: () => void): Promise<void>;
 }
 
+export interface ProcessExitDependencies {
+  setExitCode(code: number): void;
+  forceExit(code: number): void;
+  setTimeout(callback: () => void, delayMs: number): { unref?: () => void };
+}
+
+const PROCESS_EXIT_GRACE_MS = 250;
+
+const DEFAULT_PROCESS_EXIT_DEPENDENCIES: ProcessExitDependencies = {
+  setExitCode: code => { process.exitCode = code; },
+  forceExit: code => process.exit(code),
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+};
+
+/** Prefer a natural exit so completed async transports can release native resources. */
+export function scheduleProcessExit(
+  code: number,
+  dependencies: ProcessExitDependencies = DEFAULT_PROCESS_EXIT_DEPENDENCIES,
+): void {
+  dependencies.setExitCode(code);
+  const fallback = dependencies.setTimeout(() => dependencies.forceExit(code), PROCESS_EXIT_GRACE_MS);
+  fallback.unref?.();
+}
+
 /** Run bounded proxy quiescence once, then invoke the first requested exit action. */
 export function createProxyExitCoordinator(
   dependencies: ProxyExitDependencies,
