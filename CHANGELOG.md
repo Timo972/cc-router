@@ -10,6 +10,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- OpenAI/Codex account usage is fetched proactively, so `cc-router status`
+  shows the 5h/weekly bars immediately after a restart — matching how
+  Anthropic accounts already behaved. Codex usage previously arrived only on
+  `x-codex-*` response headers, so a freshly restarted daemon rendered empty
+  OpenAI bars until the first request happened to route there. The daemon now
+  polls the usage endpoint the Codex CLI itself reads
+  (`GET chatgpt.com/backend-api/wham/usage`) on the same bounded scheduler the
+  Anthropic usage refresher uses (staggered startup, 5-minute cadence, failure
+  backoff, identity-owned application), feeding the JSON — the payload twin of
+  the response headers, parsed under the same trust rules — through the exact
+  merge the headers go through. A failed poll keeps whatever the account
+  already knew; an expired access token is refreshed before the first fetch
+  rather than 401-ing until traffic happens to fix it.
 - `cc-router accounts rename <id> <new-id>`. An account's id is the key its
   routing state hangs off — in-flight counters and sticky session bindings are
   both id-keyed — so on a running proxy the rename runs as a transaction

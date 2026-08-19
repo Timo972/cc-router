@@ -42,6 +42,7 @@ import { SessionRouter } from "./session-router.js";
 import type { RoutedAccountLease } from "./session-router.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
+import { OpenAIUsageRefresher } from "../providers/openai/usage-fetch.js";
 import { canUseExtraUsage } from "../providers/anthropic/usage.js";
 import {
   applyUpstreamFailureRoutingDetailed,
@@ -680,6 +681,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   startOpenAIRefreshLoop(openAIAccounts, persistOpenAIAccounts);
   const usageRefresher = new AnthropicUsageRefresher(pool);
   usageRefresher.start();
+  // Codex usage otherwise arrives only on response headers, so a freshly
+  // restarted daemon showed empty OpenAI bars until the first request
+  // happened to route there. Poll the usage endpoint the Codex CLI itself
+  // uses, so `cc-router status` is populated immediately — mirroring the
+  // Anthropic refresher above.
+  const openAIUsageRefresher = new OpenAIUsageRefresher(openAIPool, {
+    prepare: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
+  });
+  openAIUsageRefresher.start();
 
   const app = express();
   const proxyRequestTimeoutMs = getProxyRequestTimeoutMs();
@@ -1499,6 +1509,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const shutdown = () => {
     console.log(chalk.yellow("\nShutting down — saving tokens..."));
     usageRefresher.stop();
+    openAIUsageRefresher.stop();
     saveAccounts(pool.getAll());
     if (managesPidFile()) {
       removePid();
