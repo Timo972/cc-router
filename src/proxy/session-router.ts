@@ -145,6 +145,28 @@ export class SessionRouter<TAccount extends PoolAccount = Account> {
     return removed;
   }
 
+  /**
+   * Re-point every binding (and the aggregate session count) at an account's
+   * new id after a rename. Without this the sticky re-acquire looks the old
+   * id up in the pool, finds nothing, and silently fails the session over —
+   * a rename must not break prompt-cache affinity. Returns bindings moved.
+   */
+  renameAccount(oldId: string, newId: string): number {
+    if (newId === oldId) return 0;
+    let moved = 0;
+    for (const binding of this.bindings.values()) {
+      if (binding.accountId !== oldId) continue;
+      binding.accountId = newId;
+      moved++;
+    }
+    const count = this.activeSessionCounts.get(oldId);
+    if (count !== undefined) {
+      this.activeSessionCounts.delete(oldId);
+      this.activeSessionCounts.set(newId, count);
+    }
+    return moved;
+  }
+
   getActiveSessionCount(accountId: string): number {
     this.sweepExpiredBindings(this.now());
     return this.getRawActiveSessionCount(accountId);

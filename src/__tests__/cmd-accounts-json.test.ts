@@ -5,8 +5,10 @@ import {
   buildStoredAccountsJson,
   mergeAccountInventory,
   removeAccountRuntimeAware,
+  renameAccountRuntimeAware,
   tryAddAccountToRunningProxy,
   tryRemoveAccountFromRunningProxy,
+  tryRenameAccountOnRunningProxy,
 } from "../cli/cmd-accounts.js";
 import type { AccountRecord } from "../proxy/types.js";
 import type { Account } from "../proxy/types.js";
@@ -235,5 +237,96 @@ describe("accountDrift", () => {
     const drift = accountDrift(["a", "b"], ["b", "a"]);
     expect(drift.unpersisted).toEqual([]);
     expect(drift.unloaded).toEqual([]);
+  });
+});
+
+describe("runtime-aware account rename", () => {
+  it("renames through the running proxy without editing storage a second time", async () => {
+    const tryRenameLive = vi.fn(async () => true);
+    const renameStored = vi.fn();
+
+    await expect(renameAccountRuntimeAware("max-1", "max-eu", { tryRenameLive, renameStored }))
+      .resolves.toEqual({ mode: "live" });
+    expect(tryRenameLive).toHaveBeenCalledWith("max-1", "max-eu");
+    expect(renameStored).not.toHaveBeenCalled();
+  });
+
+  it("falls back to stored configuration only when no proxy is reachable", async () => {
+    const record: AccountRecord = {
+      id: "max-eu",
+      provider: "anthropic_subscription",
+      accessToken: "access",
+      refreshToken: "refresh",
+      expiresAt: 1,
+      scopes: [],
+    };
+    const renameStored = vi.fn(() => record);
+
+    await expect(renameAccountRuntimeAware("max-1", "max-eu", {
+      tryRenameLive: async () => false,
+      renameStored,
+    })).resolves.toEqual({ mode: "stored", renamed: record });
+    expect(renameStored).toHaveBeenCalledWith("max-1", "max-eu");
+  });
+
+  it("does not edit stored configuration when the running proxy rejects the rename", async () => {
+    const renameStored = vi.fn();
+
+    await expect(renameAccountRuntimeAware("max-1", "taken", {
+      tryRenameLive: async () => { throw new Error("HTTP 409: already exists"); },
+      renameStored,
+    })).rejects.toThrow("HTTP 409: already exists");
+    expect(renameStored).not.toHaveBeenCalled();
+  });
+});
+
+describe("tryRenameAccountOnRunningProxy", () => {
+  it("sends an authenticated encoded PATCH and confirms the returned id", async () => {
+    const fetch = vi.fn(async () => new Response(
+      JSON.stringify({ account: { id: "max-eu" } }),
+      { status: 200 },
+    ));
+
+    await expect(tryRenameAccountOnRunningProxy("max/1", "max-eu", {
+      baseUrl: "http://router.local/",
+      authToken: "secret",
+      fetch,
+    })).resolves.toBe(true);
+
+    expect(fetch).toHaveBeenCalledWith(
+      "http://router.local/cc-router/accounts/max%2F1",
+      expect.objectContaining({
+        method: "PATCH",
+        headers: expect.objectContaining({ authorization: "Bearer secret" }),
+        body: JSON.stringify({ id: "max-eu" }),
+      }),
+    );
+  });
+
+  it("resolves false when no proxy answers", async () => {
+    await expect(tryRenameAccountOnRunningProxy("a", "b", {
+      fetch: vi.fn(async () => { throw new Error("ECONNREFUSED"); }),
+    })).resolves.toBe(false);
+  });
+
+  it("throws on an HTTP error with the server's detail", async () => {
+    await expect(tryRenameAccountOnRunningProxy("a", "b", {
+      fetch: vi.fn(async () => new Response(
+        JSON.stringify({ error: 'An account named "b" already exists' }),
+        { status: 409 },
+      )),
+    })).rejects.toThrow('HTTP 409: An account named "b" already exists');
+  });
+
+  it("throws when the proxy answers 200 but silently kept the old id", async () => {
+    // A daemon from before rename support validates unknown fields away and
+    // reports success without doing anything — that must not be reported as
+    // a completed rename.
+    await expect(tryRenameAccountOnRunningProxy("a", "b", {
+      fetch: vi.fn(async () => new Response(
+        JSON.stringify({ account: { id: "a" } }),
+        { status: 200 },
+      )),
+    })).rejects.toThrow(/does not support rename/);
   });
 });

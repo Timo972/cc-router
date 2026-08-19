@@ -469,3 +469,29 @@ describe("OpenAITokenPool leases", () => {
     expect(pool.getCooldownView("a")).toEqual({ globalUntilMs: 0, bucketCooldowns: [] });
   });
 });
+
+describe("renameAccount", () => {
+  it("carries in-flight load to the new id and releases against it", () => {
+    const pool = new OpenAITokenPool([makeAccount("old-name"), makeAccount("other")], { now: () => NOW_MS });
+    const lease = pool.tryAcquire("old-name");
+    expect(lease).not.toBeNull();
+    expect(pool.getInFlight("old-name")).toBe(1);
+
+    const renamed = pool.renameAccount("old-name", "new-name");
+
+    expect(renamed?.id).toBe("new-name");
+    expect(pool.findById("old-name")).toBeNull();
+    expect(pool.findById("new-name")).toBe(renamed);
+    expect(pool.getInFlight("new-name")).toBe(1);
+    expect(pool.getInFlight("old-name")).toBe(0);
+
+    lease!.release();
+    expect(pool.getInFlight("new-name")).toBe(0);
+  });
+
+  it("returns null for an unknown id and changes nothing", () => {
+    const pool = new OpenAITokenPool([makeAccount("a")], { now: () => NOW_MS });
+    expect(pool.renameAccount("missing", "b")).toBeNull();
+    expect(pool.findById("a")).not.toBeNull();
+  });
+});
