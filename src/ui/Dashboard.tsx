@@ -577,30 +577,56 @@ function LiveDashboard({
 
   // ── Viewport fitting ──────────────────────────────────────────────────────
   // The frame must fit the terminal or Ink cannot erase it between polls (see
-  // LOG_VISIBLE above). After each commit the chrome above and below the
-  // activity list is measured and the list absorbs the deficit; if even the
-  // chrome alone exceeds the viewport, the frame is clipped at the BOTTOM —
-  // the header and operations panel always win over the detail panel.
+  // LOG_VISIBLE above). Two mechanisms cooperate:
+  //
+  // 1. A HARD bound applied synchronously from the terminal height on the
+  //    outer box — every commit is clipped at the bottom, so no settling
+  //    step, resize, or content growth can ever emit an oversized frame.
+  //    (One row of slack: a frame of exactly `rows` lines still scrolls by
+  //    one when the cursor advances past the last line.)
+  // 2. A post-render controller that measures the natural content height and
+  //    reallocates the two windowed lists so the clip normally has nothing to
+  //    cut: the activity list shrinks first (to MIN_LOG_VISIBLE), then the
+  //    accounts window (to one account). Growth is stepped and hysteretic so
+  //    variable-height rows cannot oscillate the layout.
   const terminalRows = useTerminalRows();
+  const frameBound = terminalRows > 0 ? terminalRows - 1 : undefined;
   const [logVisible, setLogVisible] = useState(MIN_LOG_VISIBLE);
-  const [clipHeight, setClipHeight] = useState<number | undefined>(undefined);
-  const aboveLogsRef = useRef<DOMElement>(null);
-  const belowLogsRef = useRef<DOMElement>(null);
+  const [accountsVisible, setAccountsVisible] = useState(Number.MAX_SAFE_INTEGER);
+  const shownAccounts = Math.max(1, Math.min(accountsVisible, data.accounts.length));
   const contentRef = useRef<DOMElement>(null);
+  const accountRowsRef = useRef<DOMElement>(null);
   useEffect(() => {
-    // One row of slack: a frame of exactly `rows` lines still scrolls by one
-    // when the cursor advances past the last line.
-    const budget = terminalRows > 0 ? terminalRows - 1 : Number.POSITIVE_INFINITY;
-    const aboveH = aboveLogsRef.current ? measureElement(aboveLogsRef.current).height : 0;
-    const belowH = belowLogsRef.current ? measureElement(belowLogsRef.current).height : 0;
-    const idealRaw = Number.isFinite(budget) ? budget - aboveH - belowH : LOG_VISIBLE;
-    const ideal = Math.max(MIN_LOG_VISIBLE, Math.min(LOG_VISIBLE, idealRaw));
-    if (ideal !== logVisible) setLogVisible(ideal);
-    // `contentRef` measures the NATURAL height (flexShrink 0 inside the
-    // clipped box), so this also detects when clipping can be lifted again.
+    if (frameBound === undefined) {
+      if (logVisible !== LOG_VISIBLE) setLogVisible(LOG_VISIBLE);
+      if (accountsVisible !== Number.MAX_SAFE_INTEGER) setAccountsVisible(Number.MAX_SAFE_INTEGER);
+      return;
+    }
     const contentH = contentRef.current ? measureElement(contentRef.current).height : 0;
-    const clip = Number.isFinite(budget) && contentH > budget ? budget : undefined;
-    if (clip !== clipHeight) setClipHeight(clip);
+    const accountsH = accountRowsRef.current ? measureElement(accountRowsRef.current).height : 0;
+    const avgAccountRow = shownAccounts > 0 ? Math.max(1, accountsH / shownAccounts) : 2;
+    const excess = contentH - frameBound;
+    if (excess > 0) {
+      const logDrop = Math.min(logVisible - MIN_LOG_VISIBLE, excess);
+      if (logDrop > 0) setLogVisible(logVisible - logDrop);
+      const remaining = excess - Math.max(0, logDrop);
+      if (remaining > 0 && shownAccounts > 1) {
+        const accountDrop = Math.min(shownAccounts - 1, Math.ceil(remaining / avgAccountRow));
+        if (accountDrop > 0) setAccountsVisible(shownAccounts - accountDrop);
+      }
+      return;
+    }
+    const slack = -excess;
+    // Grow accounts before activity rows (they carry routing state the
+    // operator acts on), one account per commit so a taller-than-average
+    // row cannot overshoot into another shrink.
+    if (shownAccounts < data.accounts.length && slack >= Math.ceil(avgAccountRow) + 1) {
+      setAccountsVisible(shownAccounts + 1);
+      return;
+    }
+    if (logVisible < LOG_VISIBLE && slack >= 2) {
+      setLogVisible(Math.min(LOG_VISIBLE, logVisible + Math.max(1, slack - 1)));
+    }
   });
 
   // First visible activity row. The stored position only moves on navigation;
@@ -610,12 +636,20 @@ function LiveDashboard({
   const [logScrollTop, setLogScrollTop] = useState(0);
   const logWindowTop = followScrollWindow(logScrollTop, selectedLogIndex, logs.length, logVisible);
 
+
   // Selected account by id
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const selectedAccountIndex = selectedAccountId !== null
     ? Math.max(0, data.accounts.findIndex(a => a.id === selectedAccountId))
     : 0;
   const selectedAccount = data.accounts[selectedAccountIndex] ?? null;
+
+  // Same follow-scroll for the accounts window: when the fitting controller
+  // shrinks the list below the fleet size, the selected account must stay on
+  // screen — account actions (caps, toggle, delete confirmation) target the
+  // selection, and acting on an invisible account is how a wrong one dies.
+  const [accountScrollTop, setAccountScrollTop] = useState(0);
+  const accountWindowTop = followScrollWindow(accountScrollTop, selectedAccountIndex, data.accounts.length, shownAccounts);
 
   const [modelsStatus, setModelsStatus] = useState<ModelsStatus | null>(null);
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
@@ -828,10 +862,12 @@ function LiveDashboard({
       if (key.upArrow) {
         const next = Math.max(0, selectedAccountIndex - 1);
         setSelectedAccountId(data.accounts[next]?.id ?? null);
+        setAccountScrollTop(followScrollWindow(accountWindowTop, next, data.accounts.length, shownAccounts));
       }
       if (key.downArrow) {
         const next = Math.min(data.accounts.length - 1, selectedAccountIndex + 1);
         setSelectedAccountId(data.accounts[next]?.id ?? null);
+        setAccountScrollTop(followScrollWindow(accountWindowTop, next, data.accounts.length, shownAccounts));
       }
 
       // Account actions (only when focus = accounts)
@@ -886,9 +922,9 @@ function LiveDashboard({
   const visibleLogs = logs.slice(logWindowTop, logWindowTop + logVisible);
 
   return (
-    <Box flexDirection="column" height={clipHeight} overflowY="hidden">
+    <Box flexDirection="column" height={frameBound} overflowY="hidden">
     <Box flexDirection="column" flexShrink={0} ref={contentRef}>
-    <Box flexDirection="column" ref={aboveLogsRef}>
+    <Box flexDirection="column">
 
       {/* ── Header bar ── */}
       <Box>
@@ -959,18 +995,23 @@ function LiveDashboard({
               {healthyCount}/{data.accounts.length} healthy
             </Text>
           </Text>
+          {shownAccounts < data.accounts.length && (
+            <Text color="gray">
+              {"  ·  showing "}{accountWindowTop + 1}–{accountWindowTop + shownAccounts}
+            </Text>
+          )}
           <Text color="gray">{"   "}</Text>
           <Text color={focus === "accounts" ? "white" : "gray"}>
             [Tab] focus  [e] toggle  [a] Claude all  [o] OpenAI all  [w] 7d cap  [s] 5h cap  [n] add  [d] delete
           </Text>
         </Box>
 
-        <Box marginTop={1} flexDirection="column">
-          {data.accounts.map((a, i) => (
+        <Box marginTop={1} flexDirection="column" ref={accountRowsRef}>
+          {data.accounts.slice(accountWindowTop, accountWindowTop + shownAccounts).map((a, i) => (
             <AccountRow
               key={a.id}
               account={a}
-              selected={focus === "accounts" && i === selectedAccountIndex}
+              selected={focus === "accounts" && accountWindowTop + i === selectedAccountIndex}
             />
           ))}
         </Box>
@@ -1054,7 +1095,7 @@ function LiveDashboard({
 
       {/* ── Detail panel ── */}
       {focus === "logs" && selectedLog && (
-        <Box flexDirection="column" ref={belowLogsRef}>
+        <Box flexDirection="column">
           <Box marginTop={1} />
           <DetailPanel log={selectedLog} />
         </Box>

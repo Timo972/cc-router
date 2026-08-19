@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { renderDashboard } from "./helpers/dashboard-harness.js";
+import { KEY_DOWN, renderDashboard } from "./helpers/dashboard-harness.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -177,6 +177,72 @@ describe("dashboard viewport fitting", () => {
       await dash.cleanup();
     }
   });
+
+  it("never emits an unbounded frame while settling after a shrink", async () => {
+    // The viewport bound must hold on EVERY React commit, not just the
+    // settled one: a shrink that waits for the passive measurement effect
+    // emits the old, now-oversized layout first — and one oversized frame is
+    // all it takes for the terminal to scroll the header away.
+    const dash = renderDashboard(tallHealth(), {}, { rows: 120, columns: 220 });
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("row20");
+      });
+
+      vi.stubGlobal("fetch", vi.fn(() => new Promise(() => { /* hang */ })));
+      const before = dash.frames().length;
+      dash.resize({ rows: 35, columns: 90 });
+
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("CC-Router");
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(35);
+      });
+      // Ink itself synchronously repaints the PREVIOUS commit's tree inside
+      // the resize event, before React can deliver the new bound — that one
+      // transient cannot be intercepted, but it is capped by the previous
+      // viewport's bound. Everything React emits afterwards must carry the
+      // new bound. Without the synchronous bound, the narrower wrapping
+      // produced fully unbounded (~144-line) frames here.
+      const heights = dash.frames().slice(before).map(frameHeight);
+      for (const height of heights) {
+        expect(height).toBeLessThanOrEqual(120 - 1); // never unbounded
+      }
+      expect(heights.filter(h => h > 35).length).toBeLessThanOrEqual(1);
+    } finally {
+      await dash.cleanup();
+    }
+  });
+
+  it("keeps the selected account and its delete confirmation visible in a short pane", async () => {
+    // Blind whole-frame clipping let keyboard navigation select an account
+    // that was below the clip — and the delete confirmation rendered below
+    // it too, so a user could confirm a deletion without seeing the target
+    // or the prompt. The accounts list must follow its selection like the
+    // activity list does.
+    const dash = renderDashboard(tallHealth(), {}, { rows: 25, columns: 220 });
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("ACCOUNTS");
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(25);
+      });
+
+      await dash.press("\t");        // focus the accounts panel
+      await dash.press(KEY_DOWN, 8); // walk to the last account
+
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("account-09");
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(25);
+      });
+
+      await dash.press("d");
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain('Delete "account-09"');
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(25);
+      });
+    } finally {
+      await dash.cleanup();
+    }
+  }, 20_000);
 
   it("still shows the full 20 activity rows when the terminal is tall enough", async () => {
     const dash = renderDashboard(tallHealth(), {}, { rows: 120, columns: 220 });
