@@ -10,6 +10,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The health endpoint reports the daemon's version, and the dashboard shows a
+  version-mismatch banner when the daemon runs a different build than the CLI
+  rendering it. A service manager can keep an old build alive long after an
+  upgrade — launchd pins the versioned pnpm store path in its plist, so the
+  daemon silently stays on the old version across upgrades and even reboots —
+  and every log row and account view on the dashboard comes from that build.
+  Until now nothing surfaced this: a fix could ship, the package could update,
+  and the dashboard would still render the old daemon's output as if the new
+  version were broken. A daemon that reports no version at all predates the
+  field, which is itself proof it is outdated, and banners the same way.
 - The activity list scrolls to follow its selection. The dashboard renders the
   newest 20 of up to 50 entries, but the arrow keys would walk the selection
   through all 50 — past row 20 the highlight left the screen while the detail

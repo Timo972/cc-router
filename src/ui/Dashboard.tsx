@@ -5,10 +5,15 @@ import { createAccountsApi } from "./accountsApi.js";
 import type { AccountsApi } from "./accountsApi.js";
 import { createModelsApi } from "./modelsApi.js";
 import type { ModelEntry, ModelsApi, ModelsStatus } from "./modelsApi.js";
+import { getCurrentVersion } from "../utils/self-update.js";
 
 const POLL_INTERVAL_MS = 2_000;
 const LOG_VISIBLE = 20;
 const MODEL_VISIBLE_ROWS = 16;
+const DASHBOARD_VERSION = getCurrentVersion();
+// Distinguishes "this machine's daemon" (restartable from this shell) from a
+// remote router the dashboard is merely pointed at.
+const LOCAL_TARGET_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -339,6 +344,9 @@ export function followScrollWindow(
 
 interface HealthData {
   status: "ok" | "degraded";
+  /** Version of the code the daemon is running. Absent on daemons built
+   *  before the field existed — which itself proves they are outdated. */
+  version?: string;
   mode: string;
   target: string;
   operational?: OperationalStatus;
@@ -824,6 +832,36 @@ function LiveDashboard({
         <Text>up {formatUptime(data.uptime)}</Text>
         <Text color="gray">  ·  updated {updatedAgo}s ago  ·  [q] quit</Text>
       </Box>
+
+      {/* A daemon left running by a service manager can be a different build
+          than the CLI rendering this dashboard — launchd keeps the old
+          versioned install path alive across package upgrades. Every log row
+          and account view below comes from THAT build, so any "still broken"
+          reading of this screen is wrong until the daemon is restarted.
+          `--keep-config` keeps the stop non-interactive (a bare stop prompts
+          about auto-start mid-chain); the following start re-installs the
+          service definition, which is what actually drops the pinned path. */}
+      {data.version !== DASHBOARD_VERSION && (
+        <Box>
+          <Text bold color="yellow"> ⚠ VERSION MISMATCH  </Text>
+          <Text color="yellow">
+            {data.version !== undefined
+              ? `daemon v${data.version}`
+              : "daemon version unreported (older build)"}
+            {` · dashboard v${DASHBOARD_VERSION}`}
+          </Text>
+          {LOCAL_TARGET_RE.test(baseUrl) ? (
+            <>
+              <Text color="gray">  —  restart: </Text>
+              <Text color="cyan">cc-router stop --keep-config && cc-router start</Text>
+            </>
+          ) : (
+            // A remote router can only be restarted where it runs; printing a
+            // local restart command here would never clear the banner.
+            <Text color="gray">  —  update and restart the daemon on {baseUrl}</Text>
+          )}
+        </Box>
+      )}
 
       <Box marginTop={1} />
 
