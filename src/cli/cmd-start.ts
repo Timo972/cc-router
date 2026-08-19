@@ -16,6 +16,17 @@ import { isProxyRunning } from "../daemon/pid.js";
 import { installService } from "../daemon/service.js";
 import { getLocalIPs } from "../utils/network.js";
 
+/**
+ * How long service-mode start waits for the proxy to answer after the
+ * LaunchAgent/systemd unit is loaded. This must outlast more than daemon
+ * startup: a stop→start restart re-bootstraps a label whose process exited
+ * moments earlier, and launchd throttles that spawn by up to ~10s (default
+ * ThrottleInterval) before the daemon even begins booting. The previous 10s
+ * budget ended right as throttled spawns typically landed, reporting
+ * "nothing answering" for a service that came up seconds later.
+ */
+export const SERVICE_HEALTH_TIMEOUT_MS = 30_000;
+
 export function registerStart(program: Command): void {
   program
     .command("start")
@@ -108,12 +119,13 @@ export function registerStart(program: Command): void {
         // Installing the service is not the same as the proxy being up: if
         // launchd rejects the load, `installService` only warns. Verify, so a
         // failed start is not reported as a success.
-        if (await waitForHealth(port, 10_000)) {
+        console.log(chalk.gray(`  Waiting for the proxy on port ${port} (a quick restart can be throttled by the service manager)...`));
+        if (await waitForHealth(port, SERVICE_HEALTH_TIMEOUT_MS)) {
           console.log(chalk.green(`✓ CC-Router running on port ${port}`));
         } else {
-          console.log(chalk.yellow(`\n⚠ Service configured, but nothing is answering on port ${port}.`));
-          console.log(chalk.gray(`  Check the logs: cc-router logs`));
-          console.log(chalk.gray(`  Then try again: cc-router start`));
+          console.log(chalk.yellow(`\n⚠ Service configured, but nothing answered on port ${port} within ${Math.round(SERVICE_HEALTH_TIMEOUT_MS / 1000)}s.`));
+          console.log(chalk.gray(`  It may still come up — check: cc-router status`));
+          console.log(chalk.gray(`  If it does not: cc-router logs, then try again: cc-router start`));
           process.exitCode = 1;
           return;
         }

@@ -42,6 +42,24 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `cc-router stop` no longer terminates itself — or your editor sessions —
+  when it falls back to killing by port. The fallback listed every process
+  with a socket on the proxy port (`lsof -ti :port` reports both ends of
+  every connection), which included the stop CLI itself (its health-check
+  fetch leaves a keep-alive socket open) and any live Claude Code or Codex
+  session talking to the proxy. All of them received SIGTERM alongside the
+  daemon; the shell reported the stop command as `zsh: terminated`. The
+  listing now selects only the process LISTENING on the port, and killing by
+  port additionally never targets the process doing the killing.
+- Service-mode `cc-router start` no longer reports "nothing is answering" for
+  a service that comes up moments later. The post-bootstrap health wait was
+  10 seconds, but a stop→start restart re-bootstraps a label whose process
+  exited moments earlier, and launchd throttles that spawn by up to ~10s
+  (default ThrottleInterval) before the daemon even begins booting — so the
+  window regularly closed right as throttled spawns landed, and the very
+  next `cc-router status` connected fine. The wait now outlasts the throttle
+  (30s), says what it is waiting for, and a genuine timeout points to
+  `cc-router status` before suggesting the logs.
 - OpenAI activity rows carry the same columns as Claude ones. The OpenAI ingress
   recorded a path but no method and no client, and the dashboard needs both
   `method` and `path` to render the request — so those rows fell back to the
