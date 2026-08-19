@@ -696,6 +696,27 @@ export class TokenPool implements AccountPool<Account> {
   }
 
   /**
+   * Change an account's id in place. The in-flight counter is keyed by id and
+   * must move with it: an open lease's release() re-reads `account.id`, so
+   * after a rename it decrements the NEW key — which would never have been
+   * incremented, leaving the old key stuck at its count forever. Cooldowns
+   * are keyed by the Account object and follow the rename untouched.
+   * Returns the renamed account, or null if the id was not found. Callers
+   * are responsible for id-uniqueness and for session-binding migration.
+   */
+  renameAccount(oldId: string, newId: string): Account | null {
+    const account = this.findById(oldId);
+    if (!account) return null;
+    if (newId !== oldId) {
+      const load = this.inFlight.get(oldId);
+      this.inFlight.delete(oldId);
+      if (load !== undefined) this.inFlight.set(newId, load);
+      account.id = newId;
+    }
+    return account;
+  }
+
+  /**
    * Append a new account built from a persisted AccountRecord.
    * Rejects duplicates by id — callers should pre-check with findById().
    */

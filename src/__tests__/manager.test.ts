@@ -24,6 +24,7 @@ import {
   writeAnthropicAccountsPreservingOtherProviders,
   upsertAccountRecord,
   removeAccountRecordById,
+  renameAccountRecordById,
   saveOpenAIAccounts,
   saveOpenAIAccountsToPath,
   migrateLegacyAccountProviders,
@@ -651,5 +652,58 @@ describe("getProxyRequestTimeoutMs", () => {
       anthropicAliases: { "claude/sonnet": "claude-sonnet-4-6" },
       openAIAliases: { codex: "gpt-5-codex" },
     });
+  });
+});
+
+describe("renameAccountRecordById", () => {
+  it("renames a record in place, preserving every other field and record", () => {
+    writeAccountsAtomic([
+      sampleRecord,
+      {
+        id: "openai-primary",
+        provider: "openai_subscription",
+        accessToken: "openai-access",
+        refreshToken: "openai-refresh",
+        expiresAt: 1999999999000,
+        scopes: ["openid"],
+        enabled: true,
+      },
+    ]);
+
+    const renamed = renameAccountRecordById("max-account-1", "max-renamed");
+
+    expect(renamed?.id).toBe("max-renamed");
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0].id).toBe("max-renamed");
+    expect(parsed[0].accessToken).toBe(sampleRecord.accessToken);
+    expect(parsed[1].id).toBe("openai-primary");
+  });
+
+  it("returns null for an unknown id without touching the file", () => {
+    writeAccountsAtomic([sampleRecord]);
+    expect(renameAccountRecordById("missing", "whatever")).toBeNull();
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].id).toBe("max-account-1");
+  });
+
+  it("refuses a new id that any record already uses, across providers", () => {
+    writeAccountsAtomic([
+      sampleRecord,
+      {
+        id: "openai-primary",
+        provider: "openai_subscription",
+        accessToken: "openai-access",
+        refreshToken: "openai-refresh",
+        expiresAt: 1999999999000,
+        scopes: ["openid"],
+        enabled: true,
+      },
+    ]);
+
+    expect(() => renameAccountRecordById("max-account-1", "openai-primary"))
+      .toThrow(/already exists/);
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].id).toBe("max-account-1");
   });
 });

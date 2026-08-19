@@ -10,6 +10,18 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `cc-router accounts rename <id> <new-id>`. An account's id is the key its
+  routing state hangs off — in-flight counters and sticky session bindings are
+  both id-keyed — so on a running proxy the rename runs as a transaction
+  (`PATCH /cc-router/accounts/:id` with `{"id": ...}`): pool, session router,
+  and accounts.json move together, and are rolled back together if persistence
+  fails. Sticky sessions keep their prompt-cache affinity through the rename.
+  With no proxy running the record is renamed on disk. A proxy from before
+  this feature answers the PATCH with 200 having silently ignored the field —
+  that is detected and reported as an error rather than falling back to a disk
+  write its refresh loop would overwrite. The id namespace is shared across
+  both providers, so a rename onto any existing account name is refused (409).
+
 - The health endpoint reports the daemon's version, and the dashboard shows a
   version-mismatch banner when the daemon runs a different build than the CLI
   rendering it. A service manager can keep an old build alive long after an

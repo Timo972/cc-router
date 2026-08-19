@@ -1,11 +1,12 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { loadAccounts, loadOpenAIAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById, readConfig, serialize } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById, renameAccountRecordById, readConfig, serialize } from "../config/manager.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
 import { formatExpiry, redactToken } from "../utils/token-extractor.js";
 import { PROXY_PORT } from "../config/paths.js";
 import { createOpenAIAccountRecord } from "../providers/openai/account-record.js";
 import { loginOpenAIWithDeviceCode } from "../providers/openai/device-oauth.js";
+import { isValidAccountId } from "../proxy/account-rename.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 
@@ -283,6 +284,56 @@ export function registerAccounts(program: Command): void {
         console.log(chalk.yellow("  No accounts left. Run: cc-router setup"));
       }
     });
+
+  accounts
+    .command("rename <id> <new-id>")
+    .description("Rename an account — its routing state and sticky sessions follow the new name")
+    .action(async (id: string, newId: string) => {
+      if (!accountsFileExists()) {
+        console.log(chalk.yellow("No accounts configured."));
+        return;
+      }
+      if (!isValidAccountId(newId)) {
+        console.log(chalk.red(`✗ "${newId}" is not a valid account name.`));
+        console.log(chalk.gray("  1-64 characters: alphanumeric start, then letters, digits, dots, underscores, or dashes."));
+        process.exit(1);
+      }
+
+      const { ids: existingIds } = mergeAccountInventory(
+        loadAccounts().map(a => a.id),
+        loadOpenAIAccounts().map(a => a.id),
+        await fetchLiveStats(),
+      );
+      if (!existingIds.includes(id)) {
+        console.log(chalk.red(`✗ Account "${id}" not found.`));
+        console.log(chalk.gray(`  Available: ${existingIds.join(", ")}`));
+        process.exit(1);
+      }
+      if (id === newId) {
+        console.log(chalk.gray(`Account is already named "${newId}".`));
+        return;
+      }
+      if (existingIds.includes(newId)) {
+        console.log(chalk.red(`✗ An account named "${newId}" already exists.`));
+        process.exit(1);
+      }
+
+      let result: Awaited<ReturnType<typeof renameAccountRuntimeAware>>;
+      try {
+        result = await renameAccountRuntimeAware(id, newId);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.log(chalk.red(`✗ Could not rename "${id}": ${message}`));
+        process.exit(1);
+      }
+
+      console.log(chalk.green(`✓ Renamed "${id}" → "${newId}".`));
+      console.log(
+        result.mode === "live"
+          ? chalk.gray("  Applied to the running proxy — in-flight requests and sticky sessions follow the new name.")
+          : chalk.gray("  Saved to accounts.json — loads on next start: cc-router start"),
+      );
+    });
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -410,6 +461,77 @@ export async function tryRemoveAccountFromRunningProxy(
     throw new Error(`HTTP ${response.status}${detail}`);
   }
   return true;
+}
+
+/**
+ * Rename an account on a running proxy. Returns false only when no proxy can
+ * be reached (the caller then renames on disk); HTTP errors are authoritative
+ * and thrown. A 200 whose returned account still carries the old id means the
+ * proxy predates rename support — its patch validation drops unknown fields
+ * and reports success having done nothing — and MUST be an error, not a
+ * fallthrough to disk: that proxy's refresh loop persists its own snapshot
+ * over accounts.json and would silently undo a disk-side rename.
+ */
+export async function tryRenameAccountOnRunningProxy(
+  id: string,
+  newId: string,
+  options: LiveAccountRemovalOptions = {},
+): Promise<boolean> {
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  const baseUrl = (options.baseUrl ?? `http://localhost:${PROXY_PORT}`).replace(/\/+$/, "");
+  const authToken = options.authToken ?? readConfig().proxySecret;
+  let response: Response;
+  try {
+    response = await fetchImpl(`${baseUrl}/cc-router/accounts/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json",
+        ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+      },
+      body: JSON.stringify({ id: newId }),
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch {
+    return false;
+  }
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const payload = await response.json() as { error?: unknown };
+      if (typeof payload.error === "string") detail = `: ${payload.error}`;
+    } catch { /* best effort */ }
+    throw new Error(`HTTP ${response.status}${detail}`);
+  }
+  let renamedId: unknown;
+  try {
+    const payload = await response.json() as { account?: { id?: unknown } };
+    renamedId = payload.account?.id;
+  } catch { /* fall through to the mismatch error below */ }
+  if (renamedId !== newId) {
+    throw new Error(
+      "the running proxy does not support rename (older version) — update and restart it first: cc-router stop --keep-config && cc-router start",
+    );
+  }
+  return true;
+}
+
+export interface RuntimeAwareRenameDependencies {
+  tryRenameLive(id: string, newId: string): Promise<boolean>;
+  renameStored(id: string, newId: string): AccountRecord | null;
+}
+
+export async function renameAccountRuntimeAware(
+  id: string,
+  newId: string,
+  dependencies: RuntimeAwareRenameDependencies = {
+    tryRenameLive: tryRenameAccountOnRunningProxy,
+    renameStored: renameAccountRecordById,
+  },
+): Promise<{ mode: "live" } | { mode: "stored"; renamed: AccountRecord }> {
+  if (await dependencies.tryRenameLive(id, newId)) return { mode: "live" };
+  const renamed = dependencies.renameStored(id, newId);
+  if (!renamed) throw new Error(`Account "${id}" disappeared before it could be renamed`);
+  return { mode: "stored", renamed };
 }
 
 export interface RuntimeAwareRemovalDependencies {

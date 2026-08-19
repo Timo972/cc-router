@@ -114,3 +114,23 @@ describe("applyOpenAIAccountPatch", () => {
     expect(account.weeklyLimitPercent).toBe(100);
   });
 });
+
+describe("validateAccountPatchBody id (rename)", () => {
+  it("accepts a valid new id on its own", () => {
+    expect(validateAccountPatchBody({ id: "renamed-account" }))
+      .toEqual({ ok: true, patch: { id: "renamed-account" } });
+  });
+
+  it("rejects a malformed id", () => {
+    expect(validateAccountPatchBody({ id: "has space" }).ok).toBe(false);
+    expect(validateAccountPatchBody({ id: "" }).ok).toBe(false);
+    expect(validateAccountPatchBody({ id: 42 }).ok).toBe(false);
+  });
+
+  it("rejects combining a rename with other fields", () => {
+    // A rename re-keys routing state; a combined patch would need a single
+    // rollback across two transaction styles. Keep the operations separate.
+    const result = validateAccountPatchBody({ id: "renamed", enabled: false });
+    expect(result.ok).toBe(false);
+  });
+});

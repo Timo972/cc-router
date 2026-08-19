@@ -18,6 +18,7 @@ import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
+import { AccountRenameConflictError, renameAccountTransaction } from "./account-rename.js";
 import {
   hasPendingCredentialWrite,
   markOpenAICredentialsPersisted,
@@ -905,6 +906,53 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       return;
     }
     const patch = validation.patch;
+
+    // A rename is a transaction over pool + session router + disk, not a
+    // field write (see account-rename.ts) — validation already guarantees it
+    // arrives alone. The two pools share one id namespace, so uniqueness is
+    // checked across both regardless of which provider owns the account.
+    if (patch.id !== undefined) {
+      const newId = patch.id;
+      const takenIds = new Set([
+        ...pool.getAll().map(a => a.id),
+        ...openAIAccounts.map(a => a.id),
+      ]);
+      const inAnthropic = pool.findById(id) !== null;
+      if (!inAnthropic && !openAIAccounts.some(a => a.id === id)) {
+        res.status(404).json({ error: `Account "${id}" not found` });
+        return;
+      }
+      try {
+        renameAccountTransaction(id, newId, takenIds, inAnthropic
+          ? {
+              rename: (oldId, nextId) => pool.renameAccount(oldId, nextId) !== null,
+              renameSessions: (oldId, nextId) => { sessionRouter.renameAccount(oldId, nextId); },
+              persist: () => saveAccounts(pool.getAll()),
+            }
+          : {
+              rename: (oldId, nextId) => openAIPool.renameAccount(oldId, nextId) !== null,
+              renameSessions: (oldId, nextId) => { openAIRouter.renameAccount(oldId, nextId); },
+              persist: () => persistOpenAIAccounts(openAIAccounts),
+            });
+      } catch (err) {
+        if (err instanceof AccountRenameConflictError) {
+          res.status(409).json({ error: err.message });
+          return;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        logError("accounts", 0, `Failed to persist accounts.json: ${message}`);
+        res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
+        return;
+      }
+      if (inAnthropic) {
+        const account = pool.findById(newId)!;
+        res.json({ account: publicAnthropicAccountView(account, createRoutingMetricsResolver()(account.id)) });
+      } else {
+        const account = openAIAccounts.find(a => a.id === newId)!;
+        res.json({ account: publicOpenAIAccountView(account, resolveOpenAIRouting(account.id)) });
+      }
+      return;
+    }
 
     // Snapshot the previous values so we can roll back on persistence failure
     const existing = pool.findById(id);

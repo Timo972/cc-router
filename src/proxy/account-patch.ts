@@ -1,7 +1,12 @@
 import type { OpenAIAccount } from "../providers/openai/account-state.js";
+import { isValidAccountId } from "./account-rename.js";
 import { clampPercent } from "./types.js";
 
 export interface AccountPatch {
+  /** New id for the account — a rename. Exclusive with every other field:
+   *  a rename re-keys routing state (see account-rename.ts) and runs as its
+   *  own transaction, not as a field write. */
+  id?: string;
   enabled?: boolean;
   sessionLimitPercent?: number;
   weeklyLimitPercent?: number;
@@ -18,11 +23,21 @@ export type AccountPatchValidation =
  * way, before either pool is even consulted.
  */
 export function validateAccountPatchBody(body: {
+  id?: unknown;
   enabled?: unknown;
   sessionLimitPercent?: unknown;
   weeklyLimitPercent?: unknown;
 }): AccountPatchValidation {
   const patch: AccountPatch = {};
+  if (body.id !== undefined) {
+    if (!isValidAccountId(body.id)) {
+      return { ok: false, error: "id must be 1-64 characters: alphanumeric start, then letters, digits, dots, underscores, or dashes" };
+    }
+    if (body.enabled !== undefined || body.sessionLimitPercent !== undefined || body.weeklyLimitPercent !== undefined) {
+      return { ok: false, error: "id (rename) cannot be combined with other fields" };
+    }
+    patch.id = body.id;
+  }
   if (body.enabled !== undefined) {
     if (typeof body.enabled !== "boolean") {
       return { ok: false, error: "enabled must be boolean" };

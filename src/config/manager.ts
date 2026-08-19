@@ -98,6 +98,26 @@ export function removeAccountRecordById(id: string): AccountRecord | null {
   return removed;
 }
 
+/**
+ * Rename a stored account record in place, keeping every other field. The
+ * uniqueness check spans ALL providers — both live in one accounts.json and
+ * one URL namespace, so two records sharing an id would be unaddressable.
+ * Returns the renamed record, or null if no record has `oldId`.
+ */
+export function renameAccountRecordById(oldId: string, newId: string): AccountRecord | null {
+  ensureConfigDir();
+  const existing = readAccountsRaw() as AccountRecord[];
+  const target = existing.find(a => a.id === oldId) ?? null;
+  if (!target) return null;
+  if (newId !== oldId && existing.some(a => a.id === newId)) {
+    throw new Error(`An account named "${newId}" already exists`);
+  }
+
+  target.id = newId;
+  writeAccountsAtomicToPath(ACCOUNTS_PATH, existing);
+  return target;
+}
+
 export type AccountProvider = "anthropic_subscription" | "openai_subscription";
 
 function normalizeAccountProvider(record: AccountRecord): AccountProvider {
