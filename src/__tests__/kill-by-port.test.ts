@@ -75,3 +75,48 @@ describe("killPortAndWait", () => {
     expect(signals.filter(s => s.signal === "SIGTERM").map(s => s.pid)).toEqual([1, 2, 3]);
   });
 });
+
+describe("listListeningPids", () => {
+  it.skipIf(process.platform === "win32")(
+    "lists only the process LISTENING on the port, never connected clients",
+    async () => {
+      const { spawn } = await import("node:child_process");
+      const net = await import("node:net");
+      const { listListeningPids } = await import("../daemon/launcher.js");
+
+      // A child process owns the listener; this test process connects to it
+      // as a client — exactly the shape of `cc-router stop` after its own
+      // health-check fetch left a keep-alive socket open. Killing by port
+      // must target the daemon, not the CLI (or any other connected client,
+      // e.g. a live Claude Code / Codex session).
+      const child = spawn(process.execPath, ["-e", `
+        const net = require("net");
+        const srv = net.createServer(() => {});
+        srv.listen(0, "127.0.0.1", () => console.log(srv.address().port));
+      `], { stdio: ["ignore", "pipe", "ignore"] });
+      try {
+        const port = await new Promise<number>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("listener never reported its port")), 5_000);
+          child.stdout.once("data", chunk => { clearTimeout(timer); resolve(Number(String(chunk).trim())); });
+          child.once("exit", () => { clearTimeout(timer); reject(new Error("listener exited early")); });
+        });
+
+        const client = net.connect({ port, host: "127.0.0.1" });
+        await new Promise<void>((resolve, reject) => {
+          client.once("connect", () => resolve());
+          client.once("error", reject);
+        });
+        try {
+          const pids = await listListeningPids(port);
+          expect(pids).toContain(child.pid);
+          expect(pids).not.toContain(process.pid);
+        } finally {
+          client.destroy();
+        }
+      } finally {
+        child.kill();
+      }
+    },
+    15_000,
+  );
+});
