@@ -3,6 +3,7 @@ import React from "react";
 import { render } from "ink";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Dashboard } from "../ui/Dashboard.js";
+import { getCurrentVersion } from "../utils/self-update.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -12,6 +13,9 @@ describe("Dashboard rendering", () => {
   it("renders a model capacity row whose reset timestamp is zero", async () => {
     const health = {
       status: "ok",
+      // Matching the dashboard's own version keeps these renders on the
+      // pre-banner layout; drift is dashboard-version-banner.test.ts's job.
+      version: getCurrentVersion(),
       mode: "direct",
       target: "api.anthropic.com",
       uptime: 60_000,
@@ -93,7 +97,9 @@ describe("Dashboard rendering", () => {
       recentLogs: [],
     };
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(health)));
+    // A fresh Response per poll — a body is single-use, and a shared one
+    // would flip the dashboard's second poll into the error screen.
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(Response.json(health))));
 
     const stdin = Object.assign(new PassThrough(), {
       isTTY: true,
@@ -139,6 +145,9 @@ describe("Dashboard rendering", () => {
   it("renders a warn activity row with the warn glyph and details", async () => {
     const health = {
       status: "ok",
+      // Matching the dashboard's own version keeps these renders on the
+      // pre-banner layout; drift is dashboard-version-banner.test.ts's job.
+      version: getCurrentVersion(),
       mode: "direct",
       target: "chatgpt.com",
       uptime: 60_000,
@@ -181,7 +190,9 @@ describe("Dashboard rendering", () => {
       }],
     };
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(health)));
+    // A fresh Response per poll — a body is single-use, and a shared one
+    // would flip the dashboard's second poll into the error screen.
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(Response.json(health))));
 
     const stdin = Object.assign(new PassThrough(), {
       isTTY: true,
@@ -230,6 +241,9 @@ describe("Dashboard rendering", () => {
   it("toggles an OpenAI account with the same PATCH the Claude path uses", async () => {
     const health = {
       status: "ok",
+      // Matching the dashboard's own version keeps these renders on the
+      // pre-banner layout; drift is dashboard-version-banner.test.ts's job.
+      version: getCurrentVersion(),
       mode: "direct",
       target: "api.anthropic.com",
       uptime: 60_000,
