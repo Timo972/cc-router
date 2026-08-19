@@ -55,6 +55,17 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The dashboard fits the terminal. The frame had a fixed shape — 20 activity
+  rows, a detail panel, and every account expanded — which with a real fleet
+  of accounts rendered ~70 lines. Ink can only erase as many lines as the
+  viewport holds, so on any shorter terminal every 2-second poll re-appended
+  the frame and scrolled the header and OPERATIONS panel permanently out of
+  view (the "jumps back down" effect, especially in split panes). The layout
+  is now height-aware: the activity list absorbs the deficit first (down to 3
+  rows), and if the chrome alone still exceeds the viewport the frame is
+  clipped at the bottom — the header always wins over the detail panel. The
+  fit tracks terminal resizes.
+
 - Anthropic activity rows show their cache rate and token counts. The proxy
   captures usage by passively parsing the response body, but skipped any
   compressed response — and since the proxy is byte-transparent, the client's

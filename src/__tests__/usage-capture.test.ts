@@ -32,19 +32,21 @@ function feed(capture: { write(chunk: Buffer): void; end(): void }, body: Buffer
   capture.end();
 }
 
-async function settle(): Promise<void> {
-  // Decompression is stream-based and asynchronous; give it a few ticks.
-  await new Promise(resolve => setTimeout(resolve, 20));
+/** Decompression is stream-based and asynchronous — poll rather than sleep
+ *  a fixed interval, which flaked on slow CI runners. */
+async function settled(assertion: () => void): Promise<void> {
+  await vi.waitFor(assertion, { timeout: 5_000, interval: 10 });
 }
 
 describe("createAnthropicUsageCapture", () => {
   it("parses usage from an uncompressed SSE stream split across chunks", async () => {
     const { capture, onInputUsage, onOutputUsage } = harness("text/event-stream", "");
     feed(capture!, sseBody());
-    await settle();
 
-    expect(onInputUsage).toHaveBeenCalledWith(INPUT_USAGE);
-    expect(onOutputUsage).toHaveBeenCalledWith(OUTPUT_USAGE);
+    await settled(() => {
+      expect(onInputUsage).toHaveBeenCalledWith(INPUT_USAGE);
+      expect(onOutputUsage).toHaveBeenCalledWith(OUTPUT_USAGE);
+    });
   });
 
   it("parses usage from a gzip-compressed SSE stream", async () => {
@@ -54,10 +56,11 @@ describe("createAnthropicUsageCapture", () => {
     // (no cache rate on any Anthropic activity row).
     const { capture, onInputUsage, onOutputUsage } = harness("text/event-stream; charset=utf-8", "gzip");
     feed(capture!, gzipSync(sseBody()));
-    await settle();
 
-    expect(onInputUsage).toHaveBeenCalledWith(INPUT_USAGE);
-    expect(onOutputUsage).toHaveBeenCalledWith(OUTPUT_USAGE);
+    await settled(() => {
+      expect(onInputUsage).toHaveBeenCalledWith(INPUT_USAGE);
+      expect(onOutputUsage).toHaveBeenCalledWith(OUTPUT_USAGE);
+    });
   });
 
   it("parses usage from a brotli-compressed JSON body", async () => {
@@ -66,18 +69,20 @@ describe("createAnthropicUsageCapture", () => {
       id: "msg_1",
       usage: { ...INPUT_USAGE, ...OUTPUT_USAGE },
     }))));
-    await settle();
 
-    expect(onInputUsage).toHaveBeenCalledWith({ ...INPUT_USAGE, ...OUTPUT_USAGE });
-    expect(onOutputUsage).toHaveBeenCalledWith({ ...INPUT_USAGE, ...OUTPUT_USAGE });
+    await settled(() => {
+      expect(onInputUsage).toHaveBeenCalledWith({ ...INPUT_USAGE, ...OUTPUT_USAGE });
+      expect(onOutputUsage).toHaveBeenCalledWith({ ...INPUT_USAGE, ...OUTPUT_USAGE });
+    });
   });
 
   it("parses usage from a deflate-compressed JSON body", async () => {
     const { capture, onInputUsage } = harness("application/json", "deflate");
     feed(capture!, deflateSync(Buffer.from(JSON.stringify({ usage: INPUT_USAGE }))));
-    await settle();
 
-    expect(onInputUsage).toHaveBeenCalledWith(INPUT_USAGE);
+    await settled(() => {
+      expect(onInputUsage).toHaveBeenCalledWith(INPUT_USAGE);
+    });
   });
 
   it("returns null for content types and encodings it cannot parse", () => {
@@ -94,7 +99,9 @@ describe("createAnthropicUsageCapture", () => {
   it("survives corrupt compressed bytes without throwing or reporting usage", async () => {
     const { capture, onInputUsage, onOutputUsage } = harness("text/event-stream", "gzip");
     feed(capture!, Buffer.from("definitely not gzip"));
-    await settle();
+    // Absence cannot be polled for — give the decoder ample time to have
+    // errored before judging that nothing was reported.
+    await new Promise(resolve => setTimeout(resolve, 100));
 
     expect(onInputUsage).not.toHaveBeenCalled();
     expect(onOutputUsage).not.toHaveBeenCalled();

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Box, Text, useInput, useApp } from "ink";
+import { Box, Text, useInput, useApp, useStdout, measureElement } from "ink";
+import type { DOMElement } from "ink";
 import type { LogEntry } from "../proxy/stats.js";
 import { createAccountsApi } from "./accountsApi.js";
 import type { AccountsApi } from "./accountsApi.js";
@@ -8,7 +9,17 @@ import type { ModelEntry, ModelsApi, ModelsStatus } from "./modelsApi.js";
 import { getCurrentVersion } from "../utils/self-update.js";
 
 const POLL_INTERVAL_MS = 2_000;
+/** Most activity rows the dashboard will show — the list shrinks below this
+ *  (down to MIN_LOG_VISIBLE) when the terminal is too short for the full
+ *  frame. Ink can only erase as many lines as the viewport holds, so a frame
+ *  taller than the terminal makes every poll re-append it — scrolling the
+ *  header and OPERATIONS panel permanently out of view. */
 const LOG_VISIBLE = 20;
+const MIN_LOG_VISIBLE = 3;
+/** The model window may shrink to a single row: it follows its selection, so
+ *  one visible row IS the selected row — while a larger minimum rendered
+ *  rows below the clip that the selection could land on invisibly. */
+const MIN_MODELS_VISIBLE = 1;
 const MODEL_VISIBLE_ROWS = 16;
 const DASHBOARD_VERSION = getCurrentVersion();
 // Distinguishes "this machine's daemon" (restartable from this shell) from a
@@ -342,6 +353,196 @@ export function followScrollWindow(
   return Math.min(Math.max(0, top), maxTop);
 }
 
+// ─── Viewport fit planner ─────────────────────────────────────────────────────
+
+/** One windowed list the viewport fitting controller may resize. Order in
+ *  the `lists` array is SHRINK priority (first shrinks first); growth walks
+ *  the array in reverse, so the last list is the most protected. */
+export interface FitList {
+  key: string;
+  /** Currently rendered row count. */
+  current: number;
+  min: number;
+  max: number;
+  /** MEASURED average lines per rendered row (≥ 1). Every amount the planner
+   *  computes is converted through this — treating a row as one line is
+   *  exactly the assumption that made each list oscillate in turn (tall
+   *  accounts, wrapped activity details, wrapped model ids). */
+  avgRow: number;
+  /** Grow one row per step instead of filling the slack — for lists whose
+   *  row heights vary so wildly that even the average misleads. */
+  growOne?: boolean;
+}
+
+export interface FitAttempt { to: number; slack: number; expiresAt?: number; count?: number }
+
+/** Cross-commit memory: the growth attempted last step, and growths that
+ *  overflowed (denied) together with the slack they would actually need. */
+export interface FitMemory {
+  attempts: Record<string, FitAttempt | undefined>;
+  denials: Record<string, FitAttempt | undefined>;
+}
+
+/**
+ * How long a denied growth stays denied. A denial is measured against
+ * concrete rendered row heights, and those can change through ordinary data
+ * updates the reset key cannot enumerate (an account gaining or losing
+ * capacity rows, a scrolled window showing different entries). Expiry is the
+ * general cure: a stale denial costs at most one clipped grow/shrink pair
+ * per TTL — invisible under the frame bound — instead of a list that stays
+ * collapsed until an unrelated resize.
+ */
+export const FIT_DENIAL_TTL_MS = 2_500;
+
+/**
+ * One reallocation step for the height-fitting controller. `excess` is the
+ * measured content height minus the viewport budget: positive shrinks lists
+ * in array order until covered; negative (slack) grows exactly ONE list —
+ * the last eligible in the array — so a single mispredicted growth can be
+ * attributed, denied, and refined rather than compounding.
+ *
+ * Denial rule: a growth whose commit overflows is remembered with the slack
+ * it actually needs (the slack it had plus the overflow it caused) and is
+ * not retried below that; the next attempt steps DOWN from the denied
+ * target. Targets only ever decrease under denial, so refinement
+ * terminates. Callers reset the memory whenever row heights may have
+ * changed (viewport, fleet, or data identity).
+ */
+export function planViewportFit(
+  excess: number,
+  lists: FitList[],
+  memory: FitMemory,
+  now = 0,
+): Record<string, number> {
+  const targets: Record<string, number> = {};
+  // An expired denial stops CLAMPING but is not forgotten: its retry count
+  // must survive the lapse, or the escalating backoff restarts at the base
+  // TTL on every re-denial and a permanently tall hidden row gets probed
+  // every few seconds forever. The record is deleted only when a retried
+  // growth finally fits (geometry improved) or the caller resets the memory.
+  const activeDenial = (key: string): FitAttempt | undefined => {
+    const denied = memory.denials[key];
+    return denied && (denied.expiresAt === undefined || denied.expiresAt > now) ? denied : undefined;
+  };
+
+  if (excess > 0) {
+    for (const list of lists) {
+      const attempt = memory.attempts[list.key];
+      if (attempt && attempt.to === list.current) {
+        // Re-denials escalate the TTL (capped at a minute): a hidden row that
+        // stays tall would otherwise be probed every TTL forever, while one
+        // that changed shape is picked up on the next expiry. The count
+        // continues from ANY prior denial of this list — including a lapsed
+        // one, and regardless of the target (the frontier is monotone while
+        // active, so a different target means a lapse happened in between).
+        const count = (memory.denials[list.key]?.count ?? 0) + 1;
+        memory.denials[list.key] = {
+          to: attempt.to,
+          slack: attempt.slack + excess,
+          count,
+          expiresAt: now + Math.min(60_000, FIT_DENIAL_TTL_MS * 2 ** (count - 1)),
+        };
+      }
+      delete memory.attempts[list.key];
+    }
+    let remaining = excess;
+    for (const list of lists) {
+      if (remaining <= 0) break;
+      const drop = Math.min(list.current - list.min, Math.ceil(remaining / list.avgRow));
+      if (drop > 0) {
+        targets[list.key] = list.current - drop;
+        remaining = Math.max(0, remaining - drop * list.avgRow);
+      }
+    }
+    return targets;
+  }
+
+  for (const list of lists) {
+    // A standing attempt in the fitting branch means last commit's growth
+    // fit. That disproves a denial only when the growth reached the denied
+    // target — a smaller growth fitting says nothing about the larger one,
+    // and resetting on it would let the denied target be retried in a loop.
+    const attempt = memory.attempts[list.key];
+    const denied = memory.denials[list.key];
+    if (attempt && denied && attempt.to >= denied.to) delete memory.denials[list.key];
+    delete memory.attempts[list.key];
+  }
+  const slack = -excess;
+  for (let i = lists.length - 1; i >= 0; i--) {
+    const list = lists[i];
+    if (list.current >= list.max) continue;
+    // The slack alone may not cover this list's growth gate after a
+    // lower-priority list absorbed it (e.g. logs grew while an account
+    // growth was denied). A higher-priority growth may RECLAIM budget by
+    // shrinking lower-priority lists in the same step — without this, an
+    // expired denial finds no slack left and the list stays collapsed.
+    const unitCost = Math.max(1, Math.ceil(list.avgRow));
+    const gate = list.growOne ? unitCost + 1 : 2;
+    let usable = slack;
+    const funding: Array<{ key: string; to: number }> = [];
+    if (usable < gate) {
+      if (i === 0) continue; // no lower-priority lists to fund from — the gate stands
+      // Fund one row's ACTUAL cost, not the gate: the +1 hysteresis margin
+      // applies only to free-slack growth — a funded growth is protected
+      // from flapping by the denial memory, and demanding the margin here
+      // made a growth permanently unfundable when lower-priority lists
+      // could yield exactly the row's height and nothing more.
+      let deficit = unitCost - usable;
+      for (let j = 0; j < i && deficit > 0; j++) {
+        const funder = lists[j];
+        const dropMax = funder.current - funder.min;
+        if (dropMax <= 0) continue;
+        const drop = Math.min(dropMax, Math.ceil(deficit / funder.avgRow));
+        funding.push({ key: funder.key, to: funder.current - drop });
+        deficit -= drop * funder.avgRow;
+      }
+      if (deficit > 0) continue; // cannot fund this growth — try lower priority
+      usable = Math.max(usable, unitCost);
+    }
+    let target = list.growOne
+      ? list.current + 1
+      : Math.min(list.max, list.current + Math.max(1, Math.floor((usable - 1) / list.avgRow)));
+    const denied = activeDenial(list.key);
+    if (denied && usable < denied.slack) target = Math.min(target, denied.to - 1);
+    if (target <= list.current) continue; // denied or no room — funding is discarded
+    for (const fund of funding) targets[fund.key] = fund.to;
+    memory.attempts[list.key] = { to: target, slack: usable };
+    targets[list.key] = target;
+    break;
+  }
+  return targets;
+}
+
+/**
+ * Current terminal size, tracking resizes. rows/columns are 0 when unknown.
+ *
+ * Columns matter even where only rows is consumed: a width-only resize
+ * re-wraps text and changes the RENDERED height without changing the row
+ * count, and the fitting effect only runs on a React commit. Bailing out
+ * when rows is unchanged would leave the freshly wrapped, taller frame
+ * unmeasured until the next poll — reintroducing the scroll jump this hook
+ * exists to prevent.
+ */
+function useTerminalViewport(): { rows: number; columns: number } {
+  const { stdout } = useStdout();
+  const [viewport, setViewport] = useState({
+    rows: stdout?.rows ?? 0,
+    columns: stdout?.columns ?? 0,
+  });
+  useEffect(() => {
+    if (!stdout) return;
+    const onResize = () => setViewport(prev => {
+      const rows = stdout.rows ?? 0;
+      const columns = stdout.columns ?? 0;
+      return prev.rows === rows && prev.columns === columns ? prev : { rows, columns };
+    });
+    stdout.on("resize", onResize);
+    onResize();
+    return () => { stdout.off("resize", onResize); };
+  }, [stdout]);
+  return viewport;
+}
+
 interface HealthData {
   status: "ok" | "degraded";
   /** Version of the code the daemon is running. Absent on daemons built
@@ -538,12 +739,102 @@ function LiveDashboard({
     ? Math.max(0, logs.findIndex(l => l.ts === selectedTs))
     : 0;
 
+  // ── Viewport fitting ──────────────────────────────────────────────────────
+  // The frame must fit the terminal or Ink cannot erase it between polls (see
+  // LOG_VISIBLE above). Two mechanisms cooperate:
+  //
+  // 1. A HARD bound applied synchronously from the terminal height on the
+  //    outer box — every commit is clipped at the bottom, so no settling
+  //    step, resize, or content growth can ever emit an oversized frame.
+  //    (One row of slack: a frame of exactly `rows` lines still scrolls by
+  //    one when the cursor advances past the last line.)
+  // 2. A post-render controller that measures the natural content height and
+  //    reallocates the two windowed lists so the clip normally has nothing to
+  //    cut: the activity list shrinks first (to MIN_LOG_VISIBLE), then the
+  //    accounts window (to one account). Growth is stepped and hysteretic so
+  //    variable-height rows cannot oscillate the layout.
+  const { rows: terminalRows, columns: terminalColumns } = useTerminalViewport();
+  const frameBound = terminalRows > 0 ? terminalRows - 1 : undefined;
+  const [logVisible, setLogVisible] = useState(MIN_LOG_VISIBLE);
+  const [accountsVisible, setAccountsVisible] = useState(Number.MAX_SAFE_INTEGER);
+  const [modelsVisible, setModelsVisible] = useState(MODEL_VISIBLE_ROWS);
+  const shownAccounts = Math.max(1, Math.min(accountsVisible, data.accounts.length));
+  const contentRef = useRef<DOMElement>(null);
+  const accountRowsRef = useRef<DOMElement>(null);
+  const logRowsRef = useRef<DOMElement>(null);
+  const modelRowsRef = useRef<DOMElement>(null);
+  // Growing the accounts window estimates the NEXT (hidden, unmeasurable)
+  // row's height from the average of the visible ones. When that account is
+  // much taller than average, the growth overflows and is removed again —
+  // and without memory the same growth is retried every commit, forever
+  // (hundreds of repaints per second). A denied growth is remembered with
+  // the slack it would actually need (the slack it had plus the overflow it
+  // caused) and not retried below that; the memory resets when the
+  // viewport or the fleet changes, since either can change row heights.
+  const fitMemoryRef = useRef<FitMemory>({ attempts: {}, denials: {} });
+  const fitKeyRef = useRef("");
+  useEffect(() => {
+    // Denials are measured against concrete row heights, so the memory
+    // resets whenever those visibly change: viewport size, fleet size, model
+    // count, or the newest activity entry (new rows wrap differently).
+    // Deliberately NOT part of the key: the window offsets. They derive from
+    // the visible counts, so with a selection at the end of a list a
+    // controller-driven grow/shrink shifts them — keying on them wiped the
+    // pending attempt on the very commit that should have recorded the
+    // denial, re-enabling the grow/shrink oscillation. Geometry drift from
+    // scrolling (like every other content mutation the key cannot see) is
+    // covered by the denial TTL instead.
+    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}`;
+    if (fitKeyRef.current !== fitKey) {
+      fitKeyRef.current = fitKey;
+      fitMemoryRef.current = { attempts: {}, denials: {} };
+    }
+    if (frameBound === undefined) {
+      if (logVisible !== LOG_VISIBLE) setLogVisible(LOG_VISIBLE);
+      if (accountsVisible !== Number.MAX_SAFE_INTEGER) setAccountsVisible(Number.MAX_SAFE_INTEGER);
+      if (modelsVisible !== MODEL_VISIBLE_ROWS) setModelsVisible(MODEL_VISIBLE_ROWS);
+      return;
+    }
+    const modelsPanelOpen = focus === "models" || modelsStatus !== null;
+    const contentH = contentRef.current ? measureElement(contentRef.current).height : 0;
+    const accountsH = accountRowsRef.current ? measureElement(accountRowsRef.current).height : 0;
+    const logsH = logRowsRef.current ? measureElement(logRowsRef.current).height : 0;
+    const modelsH = modelRowsRef.current ? measureElement(modelRowsRef.current).height : 0;
+    const shownLogs = Math.min(logVisible, logs.length);
+    const shownModels = Math.min(modelsVisible, modelsStatus?.models.length ?? 0);
+
+    // Shrink priority order; growth walks it in reverse, so the models panel
+    // (the active surface while open) regrows first and the activity list
+    // last. Every list goes through the same measured-average + denial
+    // mechanics — each list got its own oscillation bug while the paths were
+    // separate (tall accounts, wrapped activity details, wrapped model ids).
+    const lists: FitList[] = [
+      {
+        key: "logs", current: logVisible, min: MIN_LOG_VISIBLE, max: LOG_VISIBLE,
+        avgRow: shownLogs > 0 ? Math.max(1, logsH / shownLogs) : 1,
+      },
+      {
+        key: "accounts", current: shownAccounts, min: 1, max: data.accounts.length, growOne: true,
+        avgRow: shownAccounts > 0 ? Math.max(1, accountsH / shownAccounts) : 2,
+      },
+      ...(modelsPanelOpen ? [{
+        key: "models", current: modelsVisible, min: MIN_MODELS_VISIBLE, max: MODEL_VISIBLE_ROWS,
+        avgRow: shownModels > 0 ? Math.max(1, modelsH / shownModels) : 1,
+      }] : []),
+    ];
+    const targets = planViewportFit(contentH - frameBound, lists, fitMemoryRef.current, Date.now());
+    if (targets["logs"] !== undefined) setLogVisible(targets["logs"]);
+    if (targets["accounts"] !== undefined) setAccountsVisible(targets["accounts"]);
+    if (targets["models"] !== undefined) setModelsVisible(targets["models"]);
+  });
+
   // First visible activity row. The stored position only moves on navigation;
   // the derived value re-clamps every render because the selection is
   // timestamp-anchored — new entries arriving between keypresses can push the
   // selected row out of the stored window, and it must stay visible anyway.
   const [logScrollTop, setLogScrollTop] = useState(0);
-  const logWindowTop = followScrollWindow(logScrollTop, selectedLogIndex, logs.length, LOG_VISIBLE);
+  const logWindowTop = followScrollWindow(logScrollTop, selectedLogIndex, logs.length, logVisible);
+
 
   // Selected account by id
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
@@ -551,6 +842,13 @@ function LiveDashboard({
     ? Math.max(0, data.accounts.findIndex(a => a.id === selectedAccountId))
     : 0;
   const selectedAccount = data.accounts[selectedAccountIndex] ?? null;
+
+  // Same follow-scroll for the accounts window: when the fitting controller
+  // shrinks the list below the fleet size, the selected account must stay on
+  // screen — account actions (caps, toggle, delete confirmation) target the
+  // selection, and acting on an invisible account is how a wrong one dies.
+  const [accountScrollTop, setAccountScrollTop] = useState(0);
+  const accountWindowTop = followScrollWindow(accountScrollTop, selectedAccountIndex, data.accounts.length, shownAccounts);
 
   const [modelsStatus, setModelsStatus] = useState<ModelsStatus | null>(null);
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
@@ -750,12 +1048,12 @@ function LiveDashboard({
       if (key.upArrow) {
         const next = Math.max(0, selectedLogIndex - 1);
         setSelectedTs(logs[next]?.ts ?? null);
-        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, LOG_VISIBLE));
+        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, logVisible));
       }
       if (key.downArrow) {
         const next = Math.min(logs.length - 1, selectedLogIndex + 1);
         setSelectedTs(logs[next]?.ts ?? null);
-        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, LOG_VISIBLE));
+        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, logVisible));
       }
     }
 
@@ -763,10 +1061,12 @@ function LiveDashboard({
       if (key.upArrow) {
         const next = Math.max(0, selectedAccountIndex - 1);
         setSelectedAccountId(data.accounts[next]?.id ?? null);
+        setAccountScrollTop(followScrollWindow(accountWindowTop, next, data.accounts.length, shownAccounts));
       }
       if (key.downArrow) {
         const next = Math.min(data.accounts.length - 1, selectedAccountIndex + 1);
         setSelectedAccountId(data.accounts[next]?.id ?? null);
+        setAccountScrollTop(followScrollWindow(accountWindowTop, next, data.accounts.length, shownAccounts));
       }
 
       // Account actions (only when focus = accounts)
@@ -818,9 +1118,11 @@ function LiveDashboard({
   });
 
   const selectedLog = logs[selectedLogIndex] ?? null;
-  const visibleLogs = logs.slice(logWindowTop, logWindowTop + LOG_VISIBLE);
+  const visibleLogs = logs.slice(logWindowTop, logWindowTop + logVisible);
 
   return (
+    <Box flexDirection="column" height={frameBound} overflowY="hidden">
+    <Box flexDirection="column" flexShrink={0} ref={contentRef}>
     <Box flexDirection="column">
 
       {/* ── Header bar ── */}
@@ -832,6 +1134,36 @@ function LiveDashboard({
         <Text>up {formatUptime(data.uptime)}</Text>
         <Text color="gray">  ·  updated {updatedAgo}s ago  ·  [q] quit</Text>
       </Box>
+
+      {/* ── Inline prompt (edit / confirm) ──
+          Directly under the header bar, above EVERYTHING else: these prompts
+          arm keyboard input (`y` deletes), and any placement further down
+          can end up below the viewport clip in a short pane — an armed,
+          invisible destructive confirmation. Here they are visible in any
+          pane of three rows or more. */}
+      {mode === "editWeekly" && selectedAccount && (
+        <Box paddingLeft={2}>
+          <Text color="cyan">Set 7d cap for </Text>
+          <Text color="white" bold>{selectedAccount.id}</Text>
+          <Text color="cyan"> (0–100%): </Text>
+          <Text color="white" bold>{editBuffer}</Text>
+          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
+        </Box>
+      )}
+      {mode === "editSession" && selectedAccount && (
+        <Box paddingLeft={2}>
+          <Text color="cyan">Set 5h cap for </Text>
+          <Text color="white" bold>{selectedAccount.id}</Text>
+          <Text color="cyan"> (0–100%): </Text>
+          <Text color="white" bold>{editBuffer}</Text>
+          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
+        </Box>
+      )}
+      {mode === "confirmDelete" && selectedAccount && (
+        <Box paddingLeft={2}>
+          <Text color="red" bold>Delete "{selectedAccount.id}"?  [y] yes  [n/Esc] cancel</Text>
+        </Box>
+      )}
 
       {/* A daemon left running by a service manager can be a different build
           than the CLI rendering this dashboard — launchd keeps the old
@@ -878,6 +1210,8 @@ function LiveDashboard({
             status={modelsStatus}
             selectedIndex={selectedModelIndex}
             focused={focus === "models"}
+            visibleRows={modelsVisible}
+            rowsRef={modelRowsRef}
           />
           <Box marginTop={1} />
         </>
@@ -892,47 +1226,27 @@ function LiveDashboard({
               {healthyCount}/{data.accounts.length} healthy
             </Text>
           </Text>
+          {shownAccounts < data.accounts.length && (
+            <Text color="gray">
+              {"  ·  showing "}{accountWindowTop + 1}–{accountWindowTop + shownAccounts}
+            </Text>
+          )}
           <Text color="gray">{"   "}</Text>
           <Text color={focus === "accounts" ? "white" : "gray"}>
             [Tab] focus  [e] toggle  [a] Claude all  [o] OpenAI all  [w] 7d cap  [s] 5h cap  [n] add  [d] delete
           </Text>
         </Box>
 
-        <Box marginTop={1} flexDirection="column">
-          {data.accounts.map((a, i) => (
+        <Box marginTop={1} flexDirection="column" ref={accountRowsRef}>
+          {data.accounts.slice(accountWindowTop, accountWindowTop + shownAccounts).map((a, i) => (
             <AccountRow
               key={a.id}
               account={a}
-              selected={focus === "accounts" && i === selectedAccountIndex}
+              selected={focus === "accounts" && accountWindowTop + i === selectedAccountIndex}
             />
           ))}
         </Box>
       </Box>
-
-      {/* ── Inline prompt (edit / confirm) ── */}
-      {mode === "editWeekly" && selectedAccount && (
-        <Box marginTop={1} paddingLeft={2}>
-          <Text color="cyan">Set 7d cap for </Text>
-          <Text color="white" bold>{selectedAccount.id}</Text>
-          <Text color="cyan"> (0–100%): </Text>
-          <Text color="white" bold>{editBuffer}</Text>
-          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
-        </Box>
-      )}
-      {mode === "editSession" && selectedAccount && (
-        <Box marginTop={1} paddingLeft={2}>
-          <Text color="cyan">Set 5h cap for </Text>
-          <Text color="white" bold>{selectedAccount.id}</Text>
-          <Text color="cyan"> (0–100%): </Text>
-          <Text color="white" bold>{editBuffer}</Text>
-          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
-        </Box>
-      )}
-      {mode === "confirmDelete" && selectedAccount && (
-        <Box marginTop={1} paddingLeft={2}>
-          <Text color="red" bold>Delete "{selectedAccount.id}"?  [y] yes  [n/Esc] cancel</Text>
-        </Box>
-      )}
 
       {/* ── Banner (transient action feedback) ── */}
       {banner && (
@@ -971,27 +1285,29 @@ function LiveDashboard({
 
       <Box marginTop={1} />
 
-      {/* ── Recent activity ── */}
-      <Box flexDirection="column">
-        <Text bold> RECENT ACTIVITY</Text>
-        <Box marginTop={1} flexDirection="column">
-          {visibleLogs.length === 0
-            ? <Text color="gray">  No activity yet</Text>
-            : visibleLogs.map((log, i) => (
-                <LogRow key={`${log.ts}-${i}`} log={log} selected={focus === "logs" && logWindowTop + i === selectedLogIndex} />
-              ))
-          }
-        </Box>
+      {/* ── Recent activity (title measures as "above", rows flex) ── */}
+      <Text bold> RECENT ACTIVITY</Text>
+      <Box marginTop={1} />
+    </Box>
+
+      <Box flexDirection="column" ref={logRowsRef}>
+        {visibleLogs.length === 0
+          ? <Text color="gray">  No activity yet</Text>
+          : visibleLogs.map((log, i) => (
+              <LogRow key={`${log.ts}-${i}`} log={log} selected={focus === "logs" && logWindowTop + i === selectedLogIndex} />
+            ))
+        }
       </Box>
 
       {/* ── Detail panel ── */}
       {focus === "logs" && selectedLog && (
-        <>
+        <Box flexDirection="column">
           <Box marginTop={1} />
           <DetailPanel log={selectedLog} />
-        </>
+        </Box>
       )}
 
+    </Box>
     </Box>
   );
 }
@@ -1054,13 +1370,22 @@ function ModelsPanel({
   status,
   selectedIndex,
   focused,
+  visibleRows = MODEL_VISIBLE_ROWS,
+  rowsRef,
 }: {
   status: ModelsStatus | null;
   selectedIndex: number;
   focused: boolean;
+  /** Height-aware row budget from the fitting controller — the fixed
+   *  MODEL_VISIBLE_ROWS window could extend below the viewport clip while
+   *  [c]/[o] still applied the invisible selection. */
+  visibleRows?: number;
+  /** Measured by the fitting controller: wrapped model ids make a row taller
+   *  than one line, and unmeasured growth is how lists oscillate. */
+  rowsRef?: React.Ref<DOMElement>;
 }) {
   const models = status?.models ?? [];
-  const visible = getVisibleModelWindow(models, selectedIndex, MODEL_VISIBLE_ROWS);
+  const visible = getVisibleModelWindow(models, selectedIndex, Math.max(1, visibleRows));
 
   return (
     <Box flexDirection="column">
@@ -1082,15 +1407,17 @@ function ModelsPanel({
             : (
                 <>
                   <Text color="gray">  showing {visible.start + 1}-{visible.end} of {models.length}</Text>
-                  {visible.rows.map((model, i) => (
-                    <ModelRow
-                      key={model.id}
-                      model={model}
-                      selected={focused && visible.start + i === selectedIndex}
-                      currentClaude={status.routing.anthropicDefaultModel}
-                      currentOpenAI={status.routing.openAIDefaultModel}
-                    />
-                  ))}
+                  <Box flexDirection="column" ref={rowsRef}>
+                    {visible.rows.map((model, i) => (
+                      <ModelRow
+                        key={model.id}
+                        model={model}
+                        selected={focused && visible.start + i === selectedIndex}
+                        currentClaude={status.routing.anthropicDefaultModel}
+                        currentOpenAI={status.routing.openAIDefaultModel}
+                      />
+                    ))}
+                  </Box>
                 </>
               )}
       </Box>

@@ -12,6 +12,11 @@ export interface DashboardHarness {
   stdin: NodeJS.ReadStream;
   /** The most recent full frame Ink wrote (debug mode re-renders whole frames). */
   lastFrame(): string;
+  /** Every frame written so far, oldest first. */
+  frames(): readonly string[];
+  /** Change the fake terminal's dimensions and emit a `resize` event, exactly
+   *  as a real TTY would on a pane resize. */
+  resize(viewport: { columns?: number; rows?: number }): void;
   /** Push a key `times` times, waiting for a render commit between presses —
    *  `useInput` captures state per render, so two keys in one tick would both
    *  run against the same closure. */
@@ -29,9 +34,15 @@ export interface DashboardHarness {
  * the dashboard polls — a shared Response would flip the second poll into the
  * error screen.
  */
-export function renderDashboard(health: unknown, props: Partial<DashboardProps> = {}): DashboardHarness {
+export function renderDashboard(
+  health: unknown,
+  props: Partial<DashboardProps> = {},
+  viewport: { columns?: number; rows?: number } = {},
+): DashboardHarness {
   vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(Response.json(health))));
 
+  const columns = viewport.columns ?? 240;
+  const rows = viewport.rows ?? 100;
   const stdin = Object.assign(new PassThrough(), {
     isTTY: true,
     setRawMode: vi.fn(),
@@ -39,12 +50,12 @@ export function renderDashboard(health: unknown, props: Partial<DashboardProps> 
     unref: vi.fn(),
   }) as unknown as NodeJS.ReadStream;
   const stdout = Object.assign(new PassThrough(), {
-    columns: 240,
-    rows: 100,
+    columns,
+    rows,
   }) as unknown as NodeJS.WriteStream;
   const stderr = Object.assign(new PassThrough(), {
-    columns: 240,
-    rows: 100,
+    columns,
+    rows,
   }) as unknown as NodeJS.WriteStream;
 
   const frames: string[] = [];
@@ -62,6 +73,13 @@ export function renderDashboard(health: unknown, props: Partial<DashboardProps> 
   return {
     stdin,
     lastFrame: () => frames[frames.length - 1] ?? "",
+    frames: () => frames,
+    resize: (viewport) => {
+      const mutable = stdout as unknown as { columns: number; rows: number; emit(event: string): void };
+      if (viewport.columns !== undefined) mutable.columns = viewport.columns;
+      if (viewport.rows !== undefined) mutable.rows = viewport.rows;
+      mutable.emit("resize");
+    },
     press: async (sequence, times = 1) => {
       for (let i = 0; i < times; i++) {
         (stdin as unknown as PassThrough).push(sequence);
