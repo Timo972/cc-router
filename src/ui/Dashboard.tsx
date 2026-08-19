@@ -315,6 +315,28 @@ export function isCodexLimited(codex: CodexRateLimitsView | undefined): boolean 
   return (defaultBucket.primary?.utilization ?? 0) >= 1 || (defaultBucket.secondary?.utilization ?? 0) >= 1;
 }
 
+/**
+ * First visible row of a scrolling list window that follows its selection.
+ *
+ * The window stays where it is while the selection moves inside it, and
+ * shifts just far enough to contain the selection when it crosses an edge —
+ * one row per one-row step, but any distance when the selection jumps (it is
+ * timestamp-anchored, so a burst of new entries can move it many rows at
+ * once). A stale `scrollTop` from a longer list clamps back into range.
+ */
+export function followScrollWindow(
+  scrollTop: number,
+  selectedIndex: number,
+  total: number,
+  visible: number,
+): number {
+  const maxTop = Math.max(0, total - visible);
+  let top = Math.min(Math.max(0, scrollTop), maxTop);
+  if (selectedIndex < top) top = selectedIndex;
+  else if (selectedIndex > top + visible - 1) top = selectedIndex - visible + 1;
+  return Math.min(Math.max(0, top), maxTop);
+}
+
 interface HealthData {
   status: "ok" | "degraded";
   mode: string;
@@ -507,6 +529,13 @@ function LiveDashboard({
   const selectedLogIndex = selectedTs !== null
     ? Math.max(0, logs.findIndex(l => l.ts === selectedTs))
     : 0;
+
+  // First visible activity row. The stored position only moves on navigation;
+  // the derived value re-clamps every render because the selection is
+  // timestamp-anchored — new entries arriving between keypresses can push the
+  // selected row out of the stored window, and it must stay visible anyway.
+  const [logScrollTop, setLogScrollTop] = useState(0);
+  const logWindowTop = followScrollWindow(logScrollTop, selectedLogIndex, logs.length, LOG_VISIBLE);
 
   // Selected account by id
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
@@ -713,10 +742,12 @@ function LiveDashboard({
       if (key.upArrow) {
         const next = Math.max(0, selectedLogIndex - 1);
         setSelectedTs(logs[next]?.ts ?? null);
+        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, LOG_VISIBLE));
       }
       if (key.downArrow) {
         const next = Math.min(logs.length - 1, selectedLogIndex + 1);
         setSelectedTs(logs[next]?.ts ?? null);
+        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, LOG_VISIBLE));
       }
     }
 
@@ -779,7 +810,7 @@ function LiveDashboard({
   });
 
   const selectedLog = logs[selectedLogIndex] ?? null;
-  const visibleLogs = logs.slice(0, LOG_VISIBLE);
+  const visibleLogs = logs.slice(logWindowTop, logWindowTop + LOG_VISIBLE);
 
   return (
     <Box flexDirection="column">
@@ -909,7 +940,7 @@ function LiveDashboard({
           {visibleLogs.length === 0
             ? <Text color="gray">  No activity yet</Text>
             : visibleLogs.map((log, i) => (
-                <LogRow key={`${log.ts}-${i}`} log={log} selected={focus === "logs" && i === selectedLogIndex} />
+                <LogRow key={`${log.ts}-${i}`} log={log} selected={focus === "logs" && logWindowTop + i === selectedLogIndex} />
               ))
           }
         </Box>

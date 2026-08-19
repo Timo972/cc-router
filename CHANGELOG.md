@@ -8,6 +8,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- The activity list scrolls to follow its selection. The dashboard renders the
+  newest 20 of up to 50 entries, but the arrow keys would walk the selection
+  through all 50 — past row 20 the highlight left the screen while the detail
+  panel kept updating for rows that were not visible. The window now shifts by
+  one row when the selection steps past its bottom or top edge, stays put while
+  the selection moves inside it, and re-clamps when new entries push the
+  selected row (which is timestamp-anchored) out of the stored window.
+
 ### Fixed
 
 - OpenAI activity rows carry the same columns as Claude ones. The OpenAI ingress
