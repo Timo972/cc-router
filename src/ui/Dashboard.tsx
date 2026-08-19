@@ -350,6 +350,100 @@ export function followScrollWindow(
   return Math.min(Math.max(0, top), maxTop);
 }
 
+// ─── Viewport fit planner ─────────────────────────────────────────────────────
+
+/** One windowed list the viewport fitting controller may resize. Order in
+ *  the `lists` array is SHRINK priority (first shrinks first); growth walks
+ *  the array in reverse, so the last list is the most protected. */
+export interface FitList {
+  key: string;
+  /** Currently rendered row count. */
+  current: number;
+  min: number;
+  max: number;
+  /** MEASURED average lines per rendered row (≥ 1). Every amount the planner
+   *  computes is converted through this — treating a row as one line is
+   *  exactly the assumption that made each list oscillate in turn (tall
+   *  accounts, wrapped activity details, wrapped model ids). */
+  avgRow: number;
+  /** Grow one row per step instead of filling the slack — for lists whose
+   *  row heights vary so wildly that even the average misleads. */
+  growOne?: boolean;
+}
+
+export interface FitAttempt { to: number; slack: number }
+
+/** Cross-commit memory: the growth attempted last step, and growths that
+ *  overflowed (denied) together with the slack they would actually need. */
+export interface FitMemory {
+  attempts: Record<string, FitAttempt | undefined>;
+  denials: Record<string, FitAttempt | undefined>;
+}
+
+/**
+ * One reallocation step for the height-fitting controller. `excess` is the
+ * measured content height minus the viewport budget: positive shrinks lists
+ * in array order until covered; negative (slack) grows exactly ONE list —
+ * the last eligible in the array — so a single mispredicted growth can be
+ * attributed, denied, and refined rather than compounding.
+ *
+ * Denial rule: a growth whose commit overflows is remembered with the slack
+ * it actually needs (the slack it had plus the overflow it caused) and is
+ * not retried below that; the next attempt steps DOWN from the denied
+ * target. Targets only ever decrease under denial, so refinement
+ * terminates. Callers reset the memory whenever row heights may have
+ * changed (viewport, fleet, or data identity).
+ */
+export function planViewportFit(
+  excess: number,
+  lists: FitList[],
+  memory: FitMemory,
+): Record<string, number> {
+  const targets: Record<string, number> = {};
+
+  if (excess > 0) {
+    for (const list of lists) {
+      const attempt = memory.attempts[list.key];
+      if (attempt && attempt.to === list.current) {
+        memory.denials[list.key] = { to: attempt.to, slack: attempt.slack + excess };
+      }
+      delete memory.attempts[list.key];
+    }
+    let remaining = excess;
+    for (const list of lists) {
+      if (remaining <= 0) break;
+      const drop = Math.min(list.current - list.min, Math.ceil(remaining / list.avgRow));
+      if (drop > 0) {
+        targets[list.key] = list.current - drop;
+        remaining = Math.max(0, remaining - drop * list.avgRow);
+      }
+    }
+    return targets;
+  }
+
+  for (const list of lists) delete memory.attempts[list.key];
+  const slack = -excess;
+  for (let i = lists.length - 1; i >= 0; i--) {
+    const list = lists[i];
+    if (list.current >= list.max) continue;
+    let target: number;
+    if (list.growOne) {
+      if (slack < Math.ceil(list.avgRow) + 1) continue;
+      target = list.current + 1;
+    } else {
+      if (slack < 2) continue;
+      target = Math.min(list.max, list.current + Math.max(1, Math.floor((slack - 1) / list.avgRow)));
+    }
+    const denied = memory.denials[list.key];
+    if (denied && slack < denied.slack) target = Math.min(target, denied.to - 1);
+    if (target <= list.current) continue;
+    memory.attempts[list.key] = { to: target, slack };
+    targets[list.key] = target;
+    break;
+  }
+  return targets;
+}
+
 /**
  * Current terminal size, tracking resizes. rows/columns are 0 when unknown.
  *
@@ -599,6 +693,7 @@ function LiveDashboard({
   const contentRef = useRef<DOMElement>(null);
   const accountRowsRef = useRef<DOMElement>(null);
   const logRowsRef = useRef<DOMElement>(null);
+  const modelRowsRef = useRef<DOMElement>(null);
   // Growing the accounts window estimates the NEXT (hidden, unmeasurable)
   // row's height from the average of the visible ones. When that account is
   // much taller than average, the growth overflows and is removed again —
@@ -607,27 +702,16 @@ function LiveDashboard({
   // the slack it would actually need (the slack it had plus the overflow it
   // caused) and not retried below that; the memory resets when the
   // viewport or the fleet changes, since either can change row heights.
-  const growAttemptRef = useRef<{ to: number; slack: number } | null>(null);
-  const growDeniedRef = useRef<{ to: number; slack: number } | null>(null);
-  // The same denial memory for the activity list: log rows are usually one
-  // line, but a long details value wraps in a narrow pane, and growth that
-  // assumed one line per row cycled with the shrink just like tall accounts
-  // did. The refinement rule (retry with a smaller target, never the denied
-  // one) converges because the denied target only ever decreases.
-  const logGrowAttemptRef = useRef<{ to: number; slack: number } | null>(null);
-  const logGrowDeniedRef = useRef<{ to: number; slack: number } | null>(null);
+  const fitMemoryRef = useRef<FitMemory>({ attempts: {}, denials: {} });
   const fitKeyRef = useRef("");
   useEffect(() => {
-    // The newest entry's timestamp is part of the key: new activity replaces
-    // rows with differently-wrapped ones, so a denial measured against the
-    // old rows must not outlive them.
-    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}:${logs[0]?.ts ?? 0}`;
+    // Denials are measured against concrete row heights, so the memory
+    // resets whenever those can change: viewport size, fleet size, model
+    // count, or the newest activity entry (new rows wrap differently).
+    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}`;
     if (fitKeyRef.current !== fitKey) {
       fitKeyRef.current = fitKey;
-      growAttemptRef.current = null;
-      growDeniedRef.current = null;
-      logGrowAttemptRef.current = null;
-      logGrowDeniedRef.current = null;
+      fitMemoryRef.current = { attempts: {}, denials: {} };
     }
     if (frameBound === undefined) {
       if (logVisible !== LOG_VISIBLE) setLogVisible(LOG_VISIBLE);
@@ -638,75 +722,34 @@ function LiveDashboard({
     const modelsPanelOpen = focus === "models" || modelsStatus !== null;
     const contentH = contentRef.current ? measureElement(contentRef.current).height : 0;
     const accountsH = accountRowsRef.current ? measureElement(accountRowsRef.current).height : 0;
-    const avgAccountRow = shownAccounts > 0 ? Math.max(1, accountsH / shownAccounts) : 2;
     const logsH = logRowsRef.current ? measureElement(logRowsRef.current).height : 0;
+    const modelsH = modelRowsRef.current ? measureElement(modelRowsRef.current).height : 0;
     const shownLogs = Math.min(logVisible, logs.length);
-    const avgLogRow = shownLogs > 0 ? Math.max(1, logsH / shownLogs) : 1;
-    const excess = contentH - frameBound;
-    if (excess > 0) {
-      const attempt = growAttemptRef.current;
-      if (attempt && attempt.to === shownAccounts) {
-        growDeniedRef.current = { to: attempt.to, slack: attempt.slack + excess };
-      }
-      growAttemptRef.current = null;
-      const logAttempt = logGrowAttemptRef.current;
-      if (logAttempt && logAttempt.to === logVisible) {
-        logGrowDeniedRef.current = { to: logAttempt.to, slack: logAttempt.slack + excess };
-      }
-      logGrowAttemptRef.current = null;
-      // All amounts in LINES, converted through the measured average row
-      // height — wrapped rows must not be treated as one line each.
-      const logDrop = Math.min(logVisible - MIN_LOG_VISIBLE, Math.ceil(excess / avgLogRow));
-      if (logDrop > 0) setLogVisible(logVisible - logDrop);
-      let remaining = Math.max(0, excess - Math.max(0, logDrop) * avgLogRow);
-      if (remaining > 0 && shownAccounts > 1) {
-        const accountDrop = Math.min(shownAccounts - 1, Math.ceil(remaining / avgAccountRow));
-        if (accountDrop > 0) {
-          setAccountsVisible(shownAccounts - accountDrop);
-          remaining = Math.max(0, remaining - accountDrop * avgAccountRow);
-        }
-      }
-      if (remaining > 0 && modelsPanelOpen && modelsVisible > MIN_MODELS_VISIBLE) {
-        setModelsVisible(Math.max(MIN_MODELS_VISIBLE, modelsVisible - Math.ceil(remaining)));
-      }
-      return;
-    }
-    const slack = -excess;
-    growAttemptRef.current = null; // whatever grew last commit fits
-    logGrowAttemptRef.current = null;
-    // Grow the models window first when the panel is open — it is the active
-    // surface and its rows are one line each, so the math is exact.
-    if (modelsPanelOpen && modelsVisible < MODEL_VISIBLE_ROWS && slack >= 2) {
-      setModelsVisible(Math.min(MODEL_VISIBLE_ROWS, modelsVisible + Math.max(1, slack - 1)));
-      return;
-    }
-    // Then accounts, one per commit (they carry routing state the operator
-    // acts on), unless this exact growth was recently denied at this slack.
-    const denied = growDeniedRef.current;
-    const wouldGrowTo = shownAccounts + 1;
-    const growthDenied = denied !== null && denied.to === wouldGrowTo && slack < denied.slack;
-    if (!growthDenied && shownAccounts < data.accounts.length && slack >= Math.ceil(avgAccountRow) + 1) {
-      growAttemptRef.current = { to: wouldGrowTo, slack };
-      setAccountsVisible(wouldGrowTo);
-      return;
-    }
-    // Activity rows last, sized by the measured average height. A denied
-    // target is retried one row smaller rather than repeated, stepping down
-    // until growth fits or stops.
-    if (logVisible < LOG_VISIBLE && slack >= 2) {
-      let logTarget = Math.min(
-        LOG_VISIBLE,
-        logVisible + Math.max(1, Math.floor((slack - 1) / avgLogRow)),
-      );
-      const logDenied = logGrowDeniedRef.current;
-      if (logDenied && slack < logDenied.slack) {
-        logTarget = Math.min(logTarget, logDenied.to - 1);
-      }
-      if (logTarget > logVisible) {
-        logGrowAttemptRef.current = { to: logTarget, slack };
-        setLogVisible(logTarget);
-      }
-    }
+    const shownModels = Math.min(modelsVisible, modelsStatus?.models.length ?? 0);
+
+    // Shrink priority order; growth walks it in reverse, so the models panel
+    // (the active surface while open) regrows first and the activity list
+    // last. Every list goes through the same measured-average + denial
+    // mechanics — each list got its own oscillation bug while the paths were
+    // separate (tall accounts, wrapped activity details, wrapped model ids).
+    const lists: FitList[] = [
+      {
+        key: "logs", current: logVisible, min: MIN_LOG_VISIBLE, max: LOG_VISIBLE,
+        avgRow: shownLogs > 0 ? Math.max(1, logsH / shownLogs) : 1,
+      },
+      {
+        key: "accounts", current: shownAccounts, min: 1, max: data.accounts.length, growOne: true,
+        avgRow: shownAccounts > 0 ? Math.max(1, accountsH / shownAccounts) : 2,
+      },
+      ...(modelsPanelOpen ? [{
+        key: "models", current: modelsVisible, min: MIN_MODELS_VISIBLE, max: MODEL_VISIBLE_ROWS,
+        avgRow: shownModels > 0 ? Math.max(1, modelsH / shownModels) : 1,
+      }] : []),
+    ];
+    const targets = planViewportFit(contentH - frameBound, lists, fitMemoryRef.current);
+    if (targets["logs"] !== undefined) setLogVisible(targets["logs"]);
+    if (targets["accounts"] !== undefined) setAccountsVisible(targets["accounts"]);
+    if (targets["models"] !== undefined) setModelsVisible(targets["models"]);
   });
 
   // First visible activity row. The stored position only moves on navigation;
@@ -1092,6 +1135,7 @@ function LiveDashboard({
             selectedIndex={selectedModelIndex}
             focused={focus === "models"}
             visibleRows={modelsVisible}
+            rowsRef={modelRowsRef}
           />
           <Box marginTop={1} />
         </>
@@ -1251,6 +1295,7 @@ function ModelsPanel({
   selectedIndex,
   focused,
   visibleRows = MODEL_VISIBLE_ROWS,
+  rowsRef,
 }: {
   status: ModelsStatus | null;
   selectedIndex: number;
@@ -1259,6 +1304,9 @@ function ModelsPanel({
    *  MODEL_VISIBLE_ROWS window could extend below the viewport clip while
    *  [c]/[o] still applied the invisible selection. */
   visibleRows?: number;
+  /** Measured by the fitting controller: wrapped model ids make a row taller
+   *  than one line, and unmeasured growth is how lists oscillate. */
+  rowsRef?: React.Ref<DOMElement>;
 }) {
   const models = status?.models ?? [];
   const visible = getVisibleModelWindow(models, selectedIndex, Math.max(1, visibleRows));
@@ -1283,15 +1331,17 @@ function ModelsPanel({
             : (
                 <>
                   <Text color="gray">  showing {visible.start + 1}-{visible.end} of {models.length}</Text>
-                  {visible.rows.map((model, i) => (
-                    <ModelRow
-                      key={model.id}
-                      model={model}
-                      selected={focused && visible.start + i === selectedIndex}
-                      currentClaude={status.routing.anthropicDefaultModel}
-                      currentOpenAI={status.routing.openAIDefaultModel}
-                    />
-                  ))}
+                  <Box flexDirection="column" ref={rowsRef}>
+                    {visible.rows.map((model, i) => (
+                      <ModelRow
+                        key={model.id}
+                        model={model}
+                        selected={focused && visible.start + i === selectedIndex}
+                        currentClaude={status.routing.anthropicDefaultModel}
+                        currentOpenAI={status.routing.openAIDefaultModel}
+                      />
+                    ))}
+                  </Box>
                 </>
               )}
       </Box>
