@@ -8,7 +8,7 @@ import type { Request } from "express";
 import { TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
-import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner } from "../utils/self-update.js";
+import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
 import { logRoute, logError, logStartup } from "./logger.js";
@@ -748,6 +748,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     res.json({
       status,
+      // The version of the code this daemon actually runs — not what is
+      // installed on disk. A service manager can keep an old build alive
+      // long after an upgrade (launchd pins the versioned pnpm store path
+      // in its plist), and without this field no client can tell.
+      version: getCurrentVersion(),
       mode,
       target,
       operational: createOperationalStatus({
