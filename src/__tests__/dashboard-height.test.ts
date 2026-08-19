@@ -141,6 +141,43 @@ describe("dashboard viewport fitting", () => {
     }
   });
 
+  it("re-fits immediately on a width-only resize that wraps lines taller", async () => {
+    // Ink lays out at the new width on its own, but without a rows change the
+    // old hook bailed out of the React commit — so the fitting effect never
+    // remeasured the wrapped (taller) content and the overflow jump returned
+    // until the next poll. Any resize must trigger a re-fit.
+    const health = tallHealth();
+    health.recentLogs = health.recentLogs.map(log => ({
+      ...log,
+      details: `sticky routed with a rather long explanation ${"x".repeat(110)}`,
+    }));
+    const dash = renderDashboard(health, {}, { rows: 60, columns: 220 });
+    const ansi = new RegExp(String.fromCharCode(27) + "\\[[0-9;]*m", "g");
+    const maxLineWidth = (frame: string): number =>
+      Math.max(...frame.split("\n").map(l => l.replace(ansi, "").length));
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("RECENT ACTIVITY");
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(60);
+      });
+
+      // Freeze polling so only the resize path can trigger the re-fit.
+      vi.stubGlobal("fetch", vi.fn(() => new Promise(() => { /* hang */ })));
+      dash.resize({ columns: 90 });
+
+      await dash.waitUntil(() => {
+        const frame = dash.lastFrame();
+        // Laid out at the new width...
+        expect(maxLineWidth(frame)).toBeLessThanOrEqual(90);
+        // ...and still fitting the viewport, header intact.
+        expect(frameHeight(frame)).toBeLessThanOrEqual(60);
+        expect(frame).toContain("CC-Router");
+      });
+    } finally {
+      await dash.cleanup();
+    }
+  });
+
   it("still shows the full 20 activity rows when the terminal is tall enough", async () => {
     const dash = renderDashboard(tallHealth(), {}, { rows: 120, columns: 220 });
     try {

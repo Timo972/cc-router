@@ -349,18 +349,34 @@ export function followScrollWindow(
   return Math.min(Math.max(0, top), maxTop);
 }
 
-/** Current terminal height in rows, tracking resizes. 0 when unknown. */
+/**
+ * Current terminal height in rows, tracking resizes. 0 when unknown.
+ *
+ * Columns are tracked alongside rows even though only rows is returned: a
+ * width-only resize re-wraps text and changes the RENDERED height without
+ * changing the row count, and the fitting effect only runs on a React
+ * commit. Bailing out when rows is unchanged would leave the freshly
+ * wrapped, taller frame unmeasured until the next poll — reintroducing the
+ * scroll jump this hook exists to prevent.
+ */
 function useTerminalRows(): number {
   const { stdout } = useStdout();
-  const [rows, setRows] = useState(stdout?.rows ?? 0);
+  const [viewport, setViewport] = useState({
+    rows: stdout?.rows ?? 0,
+    columns: stdout?.columns ?? 0,
+  });
   useEffect(() => {
     if (!stdout) return;
-    const onResize = () => setRows(stdout.rows ?? 0);
+    const onResize = () => setViewport(prev => {
+      const rows = stdout.rows ?? 0;
+      const columns = stdout.columns ?? 0;
+      return prev.rows === rows && prev.columns === columns ? prev : { rows, columns };
+    });
     stdout.on("resize", onResize);
     onResize();
     return () => { stdout.off("resize", onResize); };
   }, [stdout]);
-  return rows;
+  return viewport.rows;
 }
 
 interface HealthData {

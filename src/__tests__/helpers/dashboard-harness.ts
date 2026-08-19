@@ -12,6 +12,9 @@ export interface DashboardHarness {
   stdin: NodeJS.ReadStream;
   /** The most recent full frame Ink wrote (debug mode re-renders whole frames). */
   lastFrame(): string;
+  /** Change the fake terminal's dimensions and emit a `resize` event, exactly
+   *  as a real TTY would on a pane resize. */
+  resize(viewport: { columns?: number; rows?: number }): void;
   /** Push a key `times` times, waiting for a render commit between presses —
    *  `useInput` captures state per render, so two keys in one tick would both
    *  run against the same closure. */
@@ -68,6 +71,12 @@ export function renderDashboard(
   return {
     stdin,
     lastFrame: () => frames[frames.length - 1] ?? "",
+    resize: (viewport) => {
+      const mutable = stdout as unknown as { columns: number; rows: number; emit(event: string): void };
+      if (viewport.columns !== undefined) mutable.columns = viewport.columns;
+      if (viewport.rows !== undefined) mutable.rows = viewport.rows;
+      mutable.emit("resize");
+    },
     press: async (sequence, times = 1) => {
       for (let i = 0; i < times; i++) {
         (stdin as unknown as PassThrough).push(sequence);
