@@ -105,6 +105,21 @@ function frameHeight(frame: string): number {
   return frame.split("\n").length;
 }
 
+/** An account whose usage carries many model-limit rows — renders much
+ *  taller than the fleet's average row. */
+function tallAccount(id: string) {
+  const account = makeAccount(id);
+  account.rateLimits.usage.modelLimits = Array.from({ length: 8 }, (_, i) => ({
+    modelFamily: `family-${i}`,
+    displayName: `Model Family ${i}`,
+    utilization: 0.1 * i,
+    resetAt: 0,
+    active: true,
+    severity: "",
+  }));
+  return account;
+}
+
 describe("dashboard viewport fitting", () => {
   it("fits the frame into a short terminal and keeps the header visible", async () => {
     // Ink can only erase as many lines as the viewport holds. A frame taller
@@ -237,6 +252,97 @@ describe("dashboard viewport fitting", () => {
       await dash.press("d");
       await dash.waitUntil(() => {
         expect(dash.lastFrame()).toContain('Delete "account-09"');
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(25);
+      });
+    } finally {
+      await dash.cleanup();
+    }
+  }, 20_000);
+
+  it("does not oscillate when the next hidden account is much taller than average", async () => {
+    // The grow step estimated the next account's height from the AVERAGE of
+    // the visible rows. Two short accounts followed by one tall account made
+    // grow-add and overflow-remove alternate forever — hundreds of repaints
+    // per second and React's maximum-update-depth warning.
+    const health = tallHealth();
+    health.accounts = [makeAccount("short-01"), makeAccount("short-02"), tallAccount("tall-03")];
+    // 36 rows is the reproducing band: two short accounts fit with enough
+    // slack that the average-based estimate keeps re-admitting the tall one.
+    const dash = renderDashboard(health, {}, { rows: 36, columns: 220 });
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("ACCOUNTS");
+      });
+      // Freeze polling so any further repaints can only come from the
+      // fitting controller itself.
+      vi.stubGlobal("fetch", vi.fn(() => new Promise(() => { /* hang */ })));
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const settled = dash.frames().length;
+      await new Promise(resolve => setTimeout(resolve, 400));
+      const later = dash.frames().length;
+      expect(later - settled).toBeLessThanOrEqual(2);
+      expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(36);
+    } finally {
+      await dash.cleanup();
+    }
+  });
+
+  it("keeps the delete confirmation visible when the selected account fills the pane", async () => {
+    // A single account with many capacity rows can occupy the whole short
+    // pane; the prompt used to render BELOW the account rows, where the clip
+    // swallowed it — while confirmDelete input stayed armed, so an unseen
+    // `y` deleted the account.
+    const health = tallHealth();
+    health.accounts = [tallAccount("tall-only")];
+    const dash = renderDashboard(health, {}, { rows: 20, columns: 220 });
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("ACCOUNTS");
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(20);
+      });
+      await dash.press("\t"); // focus accounts
+      await dash.press("d");
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain('Delete "tall-only"');
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(20);
+      });
+    } finally {
+      await dash.cleanup();
+    }
+  }, 15_000);
+
+  it("keeps the selected model above the clip in a short pane", async () => {
+    // The models window followed its selection but at a fixed 16 rows; in a
+    // short pane the outer clip hid its bottom rows while [c]/[o] still
+    // applied the invisible selection.
+    const health = tallHealth();
+    health.accounts = [makeAccount("only-account")];
+    const modelsPayload = {
+      routing: {},
+      models: Array.from({ length: 16 }, (_, i) => ({
+        id: `anthropic/model-${String(i + 1).padStart(2, "0")}`,
+      })),
+    };
+    const dash = renderDashboard(health, {}, { rows: 25, columns: 220 });
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("ACCOUNTS");
+      });
+      // Route model-list calls to the models payload; keep health for the poll.
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(async (url: unknown) =>
+        String(url).includes("/cc-router/models")
+          ? Response.json(modelsPayload)
+          : Response.json(health),
+      ));
+
+      await dash.press("m"); // loads models and focuses the panel
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("MODELS");
+      });
+      await dash.press(KEY_DOWN, 15);
+
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("model-16");
         expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(25);
       });
     } finally {

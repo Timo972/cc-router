@@ -16,6 +16,7 @@ const POLL_INTERVAL_MS = 2_000;
  *  header and OPERATIONS panel permanently out of view. */
 const LOG_VISIBLE = 20;
 const MIN_LOG_VISIBLE = 3;
+const MIN_MODELS_VISIBLE = 3;
 const MODEL_VISIBLE_ROWS = 16;
 const DASHBOARD_VERSION = getCurrentVersion();
 // Distinguishes "this machine's daemon" (restartable from this shell) from a
@@ -350,16 +351,16 @@ export function followScrollWindow(
 }
 
 /**
- * Current terminal height in rows, tracking resizes. 0 when unknown.
+ * Current terminal size, tracking resizes. rows/columns are 0 when unknown.
  *
- * Columns are tracked alongside rows even though only rows is returned: a
- * width-only resize re-wraps text and changes the RENDERED height without
- * changing the row count, and the fitting effect only runs on a React
- * commit. Bailing out when rows is unchanged would leave the freshly
- * wrapped, taller frame unmeasured until the next poll — reintroducing the
- * scroll jump this hook exists to prevent.
+ * Columns matter even where only rows is consumed: a width-only resize
+ * re-wraps text and changes the RENDERED height without changing the row
+ * count, and the fitting effect only runs on a React commit. Bailing out
+ * when rows is unchanged would leave the freshly wrapped, taller frame
+ * unmeasured until the next poll — reintroducing the scroll jump this hook
+ * exists to prevent.
  */
-function useTerminalRows(): number {
+function useTerminalViewport(): { rows: number; columns: number } {
   const { stdout } = useStdout();
   const [viewport, setViewport] = useState({
     rows: stdout?.rows ?? 0,
@@ -376,7 +377,7 @@ function useTerminalRows(): number {
     onResize();
     return () => { stdout.off("resize", onResize); };
   }, [stdout]);
-  return viewport.rows;
+  return viewport;
 }
 
 interface HealthData {
@@ -589,39 +590,80 @@ function LiveDashboard({
   //    cut: the activity list shrinks first (to MIN_LOG_VISIBLE), then the
   //    accounts window (to one account). Growth is stepped and hysteretic so
   //    variable-height rows cannot oscillate the layout.
-  const terminalRows = useTerminalRows();
+  const { rows: terminalRows, columns: terminalColumns } = useTerminalViewport();
   const frameBound = terminalRows > 0 ? terminalRows - 1 : undefined;
   const [logVisible, setLogVisible] = useState(MIN_LOG_VISIBLE);
   const [accountsVisible, setAccountsVisible] = useState(Number.MAX_SAFE_INTEGER);
+  const [modelsVisible, setModelsVisible] = useState(MODEL_VISIBLE_ROWS);
   const shownAccounts = Math.max(1, Math.min(accountsVisible, data.accounts.length));
   const contentRef = useRef<DOMElement>(null);
   const accountRowsRef = useRef<DOMElement>(null);
+  // Growing the accounts window estimates the NEXT (hidden, unmeasurable)
+  // row's height from the average of the visible ones. When that account is
+  // much taller than average, the growth overflows and is removed again —
+  // and without memory the same growth is retried every commit, forever
+  // (hundreds of repaints per second). A denied growth is remembered with
+  // the slack it would actually need (the slack it had plus the overflow it
+  // caused) and not retried below that; the memory resets when the
+  // viewport or the fleet changes, since either can change row heights.
+  const growAttemptRef = useRef<{ to: number; slack: number } | null>(null);
+  const growDeniedRef = useRef<{ to: number; slack: number } | null>(null);
+  const fitKeyRef = useRef("");
   useEffect(() => {
+    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}`;
+    if (fitKeyRef.current !== fitKey) {
+      fitKeyRef.current = fitKey;
+      growAttemptRef.current = null;
+      growDeniedRef.current = null;
+    }
     if (frameBound === undefined) {
       if (logVisible !== LOG_VISIBLE) setLogVisible(LOG_VISIBLE);
       if (accountsVisible !== Number.MAX_SAFE_INTEGER) setAccountsVisible(Number.MAX_SAFE_INTEGER);
+      if (modelsVisible !== MODEL_VISIBLE_ROWS) setModelsVisible(MODEL_VISIBLE_ROWS);
       return;
     }
+    const modelsPanelOpen = focus === "models" || modelsStatus !== null;
     const contentH = contentRef.current ? measureElement(contentRef.current).height : 0;
     const accountsH = accountRowsRef.current ? measureElement(accountRowsRef.current).height : 0;
     const avgAccountRow = shownAccounts > 0 ? Math.max(1, accountsH / shownAccounts) : 2;
     const excess = contentH - frameBound;
     if (excess > 0) {
+      const attempt = growAttemptRef.current;
+      if (attempt && attempt.to === shownAccounts) {
+        growDeniedRef.current = { to: attempt.to, slack: attempt.slack + excess };
+      }
+      growAttemptRef.current = null;
       const logDrop = Math.min(logVisible - MIN_LOG_VISIBLE, excess);
       if (logDrop > 0) setLogVisible(logVisible - logDrop);
-      const remaining = excess - Math.max(0, logDrop);
+      let remaining = excess - Math.max(0, logDrop);
       if (remaining > 0 && shownAccounts > 1) {
         const accountDrop = Math.min(shownAccounts - 1, Math.ceil(remaining / avgAccountRow));
-        if (accountDrop > 0) setAccountsVisible(shownAccounts - accountDrop);
+        if (accountDrop > 0) {
+          setAccountsVisible(shownAccounts - accountDrop);
+          remaining = Math.max(0, remaining - accountDrop * avgAccountRow);
+        }
+      }
+      if (remaining > 0 && modelsPanelOpen && modelsVisible > MIN_MODELS_VISIBLE) {
+        setModelsVisible(Math.max(MIN_MODELS_VISIBLE, modelsVisible - Math.ceil(remaining)));
       }
       return;
     }
     const slack = -excess;
-    // Grow accounts before activity rows (they carry routing state the
-    // operator acts on), one account per commit so a taller-than-average
-    // row cannot overshoot into another shrink.
-    if (shownAccounts < data.accounts.length && slack >= Math.ceil(avgAccountRow) + 1) {
-      setAccountsVisible(shownAccounts + 1);
+    growAttemptRef.current = null; // whatever grew last commit fits
+    // Grow the models window first when the panel is open — it is the active
+    // surface and its rows are one line each, so the math is exact.
+    if (modelsPanelOpen && modelsVisible < MODEL_VISIBLE_ROWS && slack >= 2) {
+      setModelsVisible(Math.min(MODEL_VISIBLE_ROWS, modelsVisible + Math.max(1, slack - 1)));
+      return;
+    }
+    // Then accounts, one per commit (they carry routing state the operator
+    // acts on), unless this exact growth was recently denied at this slack.
+    const denied = growDeniedRef.current;
+    const wouldGrowTo = shownAccounts + 1;
+    const growthDenied = denied !== null && denied.to === wouldGrowTo && slack < denied.slack;
+    if (!growthDenied && shownAccounts < data.accounts.length && slack >= Math.ceil(avgAccountRow) + 1) {
+      growAttemptRef.current = { to: wouldGrowTo, slack };
+      setAccountsVisible(wouldGrowTo);
       return;
     }
     if (logVisible < LOG_VISIBLE && slack >= 2) {
@@ -981,6 +1023,7 @@ function LiveDashboard({
             status={modelsStatus}
             selectedIndex={selectedModelIndex}
             focused={focus === "models"}
+            visibleRows={modelsVisible}
           />
           <Box marginTop={1} />
         </>
@@ -1006,6 +1049,36 @@ function LiveDashboard({
           </Text>
         </Box>
 
+        {/* ── Inline prompt (edit / confirm) ──
+            Above the account rows, not below: a selected account with many
+            capacity rows can fill a short pane entirely, and a prompt
+            rendered after it fell below the clip while its input stayed
+            armed — an unseen `y` deleted the account. Directly under the
+            ACCOUNTS header, the prompt is visible whenever the header is. */}
+        {mode === "editWeekly" && selectedAccount && (
+          <Box marginTop={1} paddingLeft={2}>
+            <Text color="cyan">Set 7d cap for </Text>
+            <Text color="white" bold>{selectedAccount.id}</Text>
+            <Text color="cyan"> (0–100%): </Text>
+            <Text color="white" bold>{editBuffer}</Text>
+            <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
+          </Box>
+        )}
+        {mode === "editSession" && selectedAccount && (
+          <Box marginTop={1} paddingLeft={2}>
+            <Text color="cyan">Set 5h cap for </Text>
+            <Text color="white" bold>{selectedAccount.id}</Text>
+            <Text color="cyan"> (0–100%): </Text>
+            <Text color="white" bold>{editBuffer}</Text>
+            <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
+          </Box>
+        )}
+        {mode === "confirmDelete" && selectedAccount && (
+          <Box marginTop={1} paddingLeft={2}>
+            <Text color="red" bold>Delete "{selectedAccount.id}"?  [y] yes  [n/Esc] cancel</Text>
+          </Box>
+        )}
+
         <Box marginTop={1} flexDirection="column" ref={accountRowsRef}>
           {data.accounts.slice(accountWindowTop, accountWindowTop + shownAccounts).map((a, i) => (
             <AccountRow
@@ -1016,31 +1089,6 @@ function LiveDashboard({
           ))}
         </Box>
       </Box>
-
-      {/* ── Inline prompt (edit / confirm) ── */}
-      {mode === "editWeekly" && selectedAccount && (
-        <Box marginTop={1} paddingLeft={2}>
-          <Text color="cyan">Set 7d cap for </Text>
-          <Text color="white" bold>{selectedAccount.id}</Text>
-          <Text color="cyan"> (0–100%): </Text>
-          <Text color="white" bold>{editBuffer}</Text>
-          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
-        </Box>
-      )}
-      {mode === "editSession" && selectedAccount && (
-        <Box marginTop={1} paddingLeft={2}>
-          <Text color="cyan">Set 5h cap for </Text>
-          <Text color="white" bold>{selectedAccount.id}</Text>
-          <Text color="cyan"> (0–100%): </Text>
-          <Text color="white" bold>{editBuffer}</Text>
-          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
-        </Box>
-      )}
-      {mode === "confirmDelete" && selectedAccount && (
-        <Box marginTop={1} paddingLeft={2}>
-          <Text color="red" bold>Delete "{selectedAccount.id}"?  [y] yes  [n/Esc] cancel</Text>
-        </Box>
-      )}
 
       {/* ── Banner (transient action feedback) ── */}
       {banner && (
@@ -1164,13 +1212,18 @@ function ModelsPanel({
   status,
   selectedIndex,
   focused,
+  visibleRows = MODEL_VISIBLE_ROWS,
 }: {
   status: ModelsStatus | null;
   selectedIndex: number;
   focused: boolean;
+  /** Height-aware row budget from the fitting controller — the fixed
+   *  MODEL_VISIBLE_ROWS window could extend below the viewport clip while
+   *  [c]/[o] still applied the invisible selection. */
+  visibleRows?: number;
 }) {
   const models = status?.models ?? [];
-  const visible = getVisibleModelWindow(models, selectedIndex, MODEL_VISIBLE_ROWS);
+  const visible = getVisibleModelWindow(models, selectedIndex, Math.max(1, visibleRows));
 
   return (
     <Box flexDirection="column">
