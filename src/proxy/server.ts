@@ -43,6 +43,7 @@ import type { RoutedAccountLease } from "./session-router.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
 import { OpenAIUsageRefresher } from "../providers/openai/usage-fetch.js";
+import { createAnthropicUsageCapture } from "./usage-capture.js";
 import { canUseExtraUsage } from "../providers/anthropic/usage.js";
 import {
   applyUpstreamFailureRoutingDetailed,
@@ -1346,8 +1347,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         //   message_start  → input_tokens, cache_read/creation_input_tokens
         //   message_delta   → output_tokens
         // Non-streaming JSON carries all fields in a single usage object.
-        // We use incremental line parsing (not buffering) so we can capture
-        // both events without holding the full stream in memory.
+        // The proxy is byte-transparent and the client's accept-encoding makes
+        // upstream compress, so the capture decompresses its own copy of the
+        // stream (see usage-capture.ts) — previously compressed responses were
+        // skipped, which in practice was EVERY response: no cache rate or
+        // token counts ever appeared on Anthropic activity rows.
         const contentType = String(proxyRes.headers["content-type"] ?? "");
         const encoding = String(proxyRes.headers["content-encoding"] ?? "");
         const isCompressed = /gzip|br|deflate/.test(encoding);
@@ -1359,53 +1363,17 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         streamTracker.attach(proxyRes, response);
         proxyRes.on("data", (chunk: Buffer) => streamTracker.observeChunk(chunk));
 
-        if (!isCompressed && (contentType.includes("text/event-stream") || contentType.includes("application/json"))) {
-          const isSSE = contentType.includes("text/event-stream");
-
-          if (isSSE) {
-            let lineBuf = "";
-            let gotInput = false;
-            let gotOutput = false;
-
-            proxyRes.on("data", (chunk: Buffer) => {
-              if (gotInput && gotOutput) return;
-              lineBuf += chunk.toString("utf8");
-              const lines = lineBuf.split("\n");
-              lineBuf = lines.pop() ?? ""; // keep incomplete last line
-
-              for (const line of lines) {
-                if (!line.startsWith("data: ")) continue;
-                try {
-                  const evt = JSON.parse(line.slice(6)) as {
-                    type?: string;
-                    message?: { usage?: Record<string, number> };
-                    usage?: Record<string, number>;
-                  };
-                  if (!gotInput && evt.type === "message_start" && evt.message?.usage) {
-                    applyInputUsage(entry, evt.message.usage);
-                    gotInput = true;
-                  }
-                  if (!gotOutput && evt.type === "message_delta" && evt.usage) {
-                    applyOutputUsage(entry, evt.usage);
-                    gotOutput = true;
-                  }
-                } catch { /* partial JSON across chunk boundary — next chunk will complete it */ }
-              }
-            });
-          } else {
-            // Non-streaming JSON: buffer full body then parse once
-            let buf = "";
-            proxyRes.on("data", (chunk: Buffer) => { buf += chunk.toString("utf8"); });
-            proxyRes.on("end", () => {
-              try {
-                const body = JSON.parse(buf) as { usage?: Record<string, number> };
-                if (body.usage) {
-                  applyInputUsage(entry, body.usage);
-                  applyOutputUsage(entry, body.usage);
-                }
-              } catch { /* ignore */ }
-            });
-          }
+        const usageCapture = createAnthropicUsageCapture({
+          contentType,
+          contentEncoding: encoding,
+          // Mutates the already-logged entry in place; the dashboard picks the
+          // values up on its next poll.
+          onInputUsage: (usage) => applyInputUsage(entry, usage),
+          onOutputUsage: (usage) => applyOutputUsage(entry, usage),
+        });
+        if (usageCapture) {
+          proxyRes.on("data", (chunk: Buffer) => usageCapture.write(chunk));
+          proxyRes.on("end", () => usageCapture.end());
         }
       },
 

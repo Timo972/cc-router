@@ -55,6 +55,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Anthropic activity rows show their cache rate and token counts. The proxy
+  captures usage by passively parsing the response body, but skipped any
+  compressed response — and since the proxy is byte-transparent, the client's
+  own `accept-encoding` makes upstream compress essentially every response, so
+  no `/messages` row ever carried token fields while Codex rows (whose relay
+  decompresses anyway) did. The capture now decompresses its own copy of the
+  stream (gzip/brotli/deflate) purely for parsing, stops paying for the
+  stream once both usage events have been seen, and remains strictly
+  best-effort: a corrupt or unsupported coding ends the capture, never the
+  response.
 - `cc-router stop` no longer terminates itself — or your editor sessions —
   when it falls back to killing by port. The fallback listed every process
   with a socket on the proxy port (`lsof -ti :port` reports both ends of
