@@ -467,6 +467,35 @@ describe("dashboard viewport fitting", () => {
     }
   }, 20_000);
 
+  it("does not oscillate when the selection at the end of the list shifts the window on resize", async () => {
+    // followScrollWindow derives the window offset from the visible count,
+    // so with the LAST account selected, a controller-driven grow/shrink
+    // also shifts the offset. When the offsets were part of the memory
+    // reset key, that reset wiped the pending attempt before the overflow
+    // could be denied — grow and shrink alternated forever (200+ repaints
+    // per 400ms across rows 26-32).
+    const health = tallHealth();
+    health.accounts = [tallAccount("tall-01"), makeAccount("short-02")];
+    const dash = renderDashboard(health, {}, { rows: 30, columns: 220 });
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("ACCOUNTS");
+      });
+      await dash.press("\t");
+      await dash.press(KEY_DOWN); // select the last account
+      vi.stubGlobal("fetch", vi.fn(() => new Promise(() => { /* hang */ })));
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const settled = dash.frames().length;
+      await new Promise(resolve => setTimeout(resolve, 400));
+      const later = dash.frames().length;
+      expect(later - settled).toBeLessThanOrEqual(2);
+      expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(30);
+      expect(dash.lastFrame()).toContain("short-02"); // selection stays visible
+    } finally {
+      await dash.cleanup();
+    }
+  }, 15_000);
+
   it("still shows the full 20 activity rows when the terminal is tall enough", async () => {
     const dash = renderDashboard(tallHealth(), {}, { rows: 120, columns: 220 });
     try {

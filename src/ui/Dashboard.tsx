@@ -776,11 +776,15 @@ function LiveDashboard({
   useEffect(() => {
     // Denials are measured against concrete row heights, so the memory
     // resets whenever those visibly change: viewport size, fleet size, model
-    // count, the newest activity entry (new rows wrap differently), or a
-    // scrolled window showing different rows. Content mutations the key
-    // cannot see (an account's capacity rows changing on a poll) are covered
-    // by the denial TTL instead.
-    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}:${accountWindowTop}:${logWindowTop}`;
+    // count, or the newest activity entry (new rows wrap differently).
+    // Deliberately NOT part of the key: the window offsets. They derive from
+    // the visible counts, so with a selection at the end of a list a
+    // controller-driven grow/shrink shifts them — keying on them wiped the
+    // pending attempt on the very commit that should have recorded the
+    // denial, re-enabling the grow/shrink oscillation. Geometry drift from
+    // scrolling (like every other content mutation the key cannot see) is
+    // covered by the denial TTL instead.
+    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}`;
     if (fitKeyRef.current !== fitKey) {
       fitKeyRef.current = fitKey;
       fitMemoryRef.current = { attempts: {}, denials: {} };
