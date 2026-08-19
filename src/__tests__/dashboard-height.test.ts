@@ -399,6 +399,74 @@ describe("dashboard viewport fitting", () => {
     }
   }, 15_000);
 
+  it("shrinks the model window below three rows so the selection stays visible", async () => {
+    // In a 14-16 row pane the chrome leaves room for only one or two model
+    // rows; a hard minimum of three rendered a third row below the clip that
+    // the selection could land on while [c]/[o] stayed armed.
+    const health = tallHealth();
+    health.accounts = [makeAccount("only-account")];
+    const modelsPayload = {
+      routing: {},
+      models: Array.from({ length: 16 }, (_, i) => ({
+        id: `anthropic/model-${String(i + 1).padStart(2, "0")}`,
+      })),
+    };
+    const dash = renderDashboard(health, {}, { rows: 15, columns: 220 });
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("CC-Router");
+      });
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(async (url: unknown) =>
+        String(url).includes("/cc-router/models")
+          ? Response.json(modelsPayload)
+          : Response.json(health),
+      ));
+      await dash.press("m");
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("MODELS");
+      });
+      await dash.press(KEY_DOWN, 2);
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("model-03");
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(15);
+      });
+    } finally {
+      await dash.cleanup();
+    }
+  }, 15_000);
+
+  it("re-expands a denied list once the rows it was denied against change shape", async () => {
+    // A denial is measured against concrete row heights. When a health poll
+    // later shrinks the tall hidden account — same fleet size, same newest
+    // log entry — the stale denial must not keep the list collapsed forever.
+    const grown = tallHealth();
+    grown.accounts = [makeAccount("short-01"), makeAccount("short-02"), tallAccount("tall-03")];
+    const shrunk = tallHealth();
+    shrunk.accounts = [makeAccount("short-01"), makeAccount("short-02"), makeAccount("tall-03")];
+    let payload: unknown = grown;
+    // 38 rows is the discriminating viewport: the tall fleet collapses to
+    // two visible accounts while three short accounts fit entirely.
+    const dash = renderDashboard(grown, {}, { rows: 38, columns: 220 });
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => Response.json(payload)));
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("ACCOUNTS");
+      });
+      // Let the controller settle (the tall account's growth gets denied).
+      await new Promise(resolve => setTimeout(resolve, 400));
+      expect(dash.lastFrame()).not.toContain("tall-03");
+
+      // The tall account becomes short via an ordinary poll.
+      payload = shrunk;
+      await vi.waitFor(() => {
+        expect(dash.lastFrame()).toContain("tall-03");
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(38);
+      }, { timeout: 12_000, interval: 100 });
+    } finally {
+      await dash.cleanup();
+    }
+  }, 20_000);
+
   it("still shows the full 20 activity rows when the terminal is tall enough", async () => {
     const dash = renderDashboard(tallHealth(), {}, { rows: 120, columns: 220 });
     try {

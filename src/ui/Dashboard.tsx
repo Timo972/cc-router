@@ -16,7 +16,10 @@ const POLL_INTERVAL_MS = 2_000;
  *  header and OPERATIONS panel permanently out of view. */
 const LOG_VISIBLE = 20;
 const MIN_LOG_VISIBLE = 3;
-const MIN_MODELS_VISIBLE = 3;
+/** The model window may shrink to a single row: it follows its selection, so
+ *  one visible row IS the selected row — while a larger minimum rendered
+ *  rows below the clip that the selection could land on invisibly. */
+const MIN_MODELS_VISIBLE = 1;
 const MODEL_VISIBLE_ROWS = 16;
 const DASHBOARD_VERSION = getCurrentVersion();
 // Distinguishes "this machine's daemon" (restartable from this shell) from a
@@ -371,7 +374,7 @@ export interface FitList {
   growOne?: boolean;
 }
 
-export interface FitAttempt { to: number; slack: number }
+export interface FitAttempt { to: number; slack: number; expiresAt?: number; count?: number }
 
 /** Cross-commit memory: the growth attempted last step, and growths that
  *  overflowed (denied) together with the slack they would actually need. */
@@ -379,6 +382,17 @@ export interface FitMemory {
   attempts: Record<string, FitAttempt | undefined>;
   denials: Record<string, FitAttempt | undefined>;
 }
+
+/**
+ * How long a denied growth stays denied. A denial is measured against
+ * concrete rendered row heights, and those can change through ordinary data
+ * updates the reset key cannot enumerate (an account gaining or losing
+ * capacity rows, a scrolled window showing different entries). Expiry is the
+ * general cure: a stale denial costs at most one clipped grow/shrink pair
+ * per TTL — invisible under the frame bound — instead of a list that stays
+ * collapsed until an unrelated resize.
+ */
+export const FIT_DENIAL_TTL_MS = 2_500;
 
 /**
  * One reallocation step for the height-fitting controller. `excess` is the
@@ -398,14 +412,31 @@ export function planViewportFit(
   excess: number,
   lists: FitList[],
   memory: FitMemory,
+  now = 0,
 ): Record<string, number> {
   const targets: Record<string, number> = {};
+
+  for (const [key, denied] of Object.entries(memory.denials)) {
+    if (denied?.expiresAt !== undefined && denied.expiresAt <= now) {
+      delete memory.denials[key];
+    }
+  }
 
   if (excess > 0) {
     for (const list of lists) {
       const attempt = memory.attempts[list.key];
       if (attempt && attempt.to === list.current) {
-        memory.denials[list.key] = { to: attempt.to, slack: attempt.slack + excess };
+        // Re-denials escalate the TTL (capped at a minute): a hidden row that
+        // stays tall would otherwise be probed every TTL forever, while one
+        // that changed shape is picked up on the next expiry.
+        const prior = memory.denials[list.key];
+        const count = (prior?.to === attempt.to ? (prior.count ?? 1) : 0) + 1;
+        memory.denials[list.key] = {
+          to: attempt.to,
+          slack: attempt.slack + excess,
+          count,
+          expiresAt: now + Math.min(60_000, FIT_DENIAL_TTL_MS * 2 ** (count - 1)),
+        };
       }
       delete memory.attempts[list.key];
     }
@@ -426,18 +457,42 @@ export function planViewportFit(
   for (let i = lists.length - 1; i >= 0; i--) {
     const list = lists[i];
     if (list.current >= list.max) continue;
-    let target: number;
-    if (list.growOne) {
-      if (slack < Math.ceil(list.avgRow) + 1) continue;
-      target = list.current + 1;
-    } else {
-      if (slack < 2) continue;
-      target = Math.min(list.max, list.current + Math.max(1, Math.floor((slack - 1) / list.avgRow)));
+    // The slack alone may not cover this list's growth gate after a
+    // lower-priority list absorbed it (e.g. logs grew while an account
+    // growth was denied). A higher-priority growth may RECLAIM budget by
+    // shrinking lower-priority lists in the same step — without this, an
+    // expired denial finds no slack left and the list stays collapsed.
+    const unitCost = Math.max(1, Math.ceil(list.avgRow));
+    const gate = list.growOne ? unitCost + 1 : 2;
+    let usable = slack;
+    const funding: Array<{ key: string; to: number }> = [];
+    if (usable < gate) {
+      if (i === 0) continue; // no lower-priority lists to fund from — the gate stands
+      // Fund one row's ACTUAL cost, not the gate: the +1 hysteresis margin
+      // applies only to free-slack growth — a funded growth is protected
+      // from flapping by the denial memory, and demanding the margin here
+      // made a growth permanently unfundable when lower-priority lists
+      // could yield exactly the row's height and nothing more.
+      let deficit = unitCost - usable;
+      for (let j = 0; j < i && deficit > 0; j++) {
+        const funder = lists[j];
+        const dropMax = funder.current - funder.min;
+        if (dropMax <= 0) continue;
+        const drop = Math.min(dropMax, Math.ceil(deficit / funder.avgRow));
+        funding.push({ key: funder.key, to: funder.current - drop });
+        deficit -= drop * funder.avgRow;
+      }
+      if (deficit > 0) continue; // cannot fund this growth — try lower priority
+      usable = Math.max(usable, unitCost);
     }
+    let target = list.growOne
+      ? list.current + 1
+      : Math.min(list.max, list.current + Math.max(1, Math.floor((usable - 1) / list.avgRow)));
     const denied = memory.denials[list.key];
-    if (denied && slack < denied.slack) target = Math.min(target, denied.to - 1);
-    if (target <= list.current) continue;
-    memory.attempts[list.key] = { to: target, slack };
+    if (denied && usable < denied.slack) target = Math.min(target, denied.to - 1);
+    if (target <= list.current) continue; // denied or no room — funding is discarded
+    for (const fund of funding) targets[fund.key] = fund.to;
+    memory.attempts[list.key] = { to: target, slack: usable };
     targets[list.key] = target;
     break;
   }
@@ -706,9 +761,12 @@ function LiveDashboard({
   const fitKeyRef = useRef("");
   useEffect(() => {
     // Denials are measured against concrete row heights, so the memory
-    // resets whenever those can change: viewport size, fleet size, model
-    // count, or the newest activity entry (new rows wrap differently).
-    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}`;
+    // resets whenever those visibly change: viewport size, fleet size, model
+    // count, the newest activity entry (new rows wrap differently), or a
+    // scrolled window showing different rows. Content mutations the key
+    // cannot see (an account's capacity rows changing on a poll) are covered
+    // by the denial TTL instead.
+    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}:${accountWindowTop}:${logWindowTop}`;
     if (fitKeyRef.current !== fitKey) {
       fitKeyRef.current = fitKey;
       fitMemoryRef.current = { attempts: {}, denials: {} };
@@ -746,7 +804,7 @@ function LiveDashboard({
         avgRow: shownModels > 0 ? Math.max(1, modelsH / shownModels) : 1,
       }] : []),
     ];
-    const targets = planViewportFit(contentH - frameBound, lists, fitMemoryRef.current);
+    const targets = planViewportFit(contentH - frameBound, lists, fitMemoryRef.current, Date.now());
     if (targets["logs"] !== undefined) setLogVisible(targets["logs"]);
     if (targets["accounts"] !== undefined) setAccountsVisible(targets["accounts"]);
     if (targets["models"] !== undefined) setModelsVisible(targets["models"]);

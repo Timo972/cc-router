@@ -39,7 +39,7 @@ describe("planViewportFit", () => {
     lists[0].current = 8;
     const shrink = planViewportFit(2, lists, mem);
     expect(shrink.logs).toBeLessThan(8);
-    expect(mem.denials["logs"]).toEqual({ to: 8, slack: 6 });
+    expect(mem.denials["logs"]).toMatchObject({ to: 8, slack: 6 });
     // Same slack again: the denied target must not be retried — the next
     // attempt steps DOWN from the denied target instead.
     lists[0].current = shrink.logs!;
@@ -101,5 +101,52 @@ describe("planViewportFit", () => {
       }
       expect(steps, `budget ${budget} did not converge`).toBeLessThan(60);
     }
+  });
+});
+
+describe("planViewportFit priority rebalancing", () => {
+  it("reclaims budget from lower-priority lists when slack alone cannot fund a growth", () => {
+    // Accounts (higher grow priority) sit below max while logs have absorbed
+    // all the slack. Waiting for slack to reappear on its own would leave
+    // the account list collapsed forever — the planner funds the growth by
+    // shrinking logs in the same step.
+    const lists: FitList[] = [
+      { key: "logs", current: 12, min: 3, max: 20, avgRow: 1 },
+      { key: "accounts", current: 1, min: 1, max: 3, avgRow: 3, growOne: true },
+    ];
+    const targets = planViewportFit(-1, lists, memory());
+    expect(targets["accounts"]).toBe(2);
+    expect(targets["logs"]).toBeLessThan(12);
+  });
+
+  it("does not fund a growth that is still denied", () => {
+    const lists: FitList[] = [
+      { key: "logs", current: 12, min: 3, max: 20, avgRow: 1 },
+      { key: "accounts", current: 1, min: 1, max: 3, avgRow: 3, growOne: true },
+    ];
+    const mem = memory();
+    mem.denials["accounts"] = { to: 2, slack: 50, expiresAt: 10_000 };
+    const targets = planViewportFit(-1, lists, mem, 1_000);
+    // The denial blocks the reclaim; the slack falls through to logs.
+    expect(targets["accounts"]).toBeUndefined();
+  });
+});
+
+describe("planViewportFit denial expiry", () => {
+  it("retries a denied growth after the denial's TTL — row geometry may have changed", () => {
+    const lists: FitList[] = [{ key: "logs", current: 5, min: 3, max: 20, avgRow: 1 }];
+    const mem = memory();
+    expect(planViewportFit(-4, lists, mem, 1_000)).toEqual({ logs: 8 });
+    lists[0].current = 8;
+    planViewportFit(2, lists, mem, 1_100); // denied
+    lists[0].current = 6;
+    // Within the TTL the denial clamps the target below the denied one...
+    const early = planViewportFit(-4, lists, mem, 2_000);
+    expect(early.logs ?? 6).toBeLessThan(8);
+    // ...but once it expires, the full growth is retried: the rows the
+    // denial was measured against may no longer exist.
+    lists[0].current = 6;
+    const late = planViewportFit(-4, lists, mem, 60_000);
+    expect(late).toEqual({ logs: 9 });
   });
 });
