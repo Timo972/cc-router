@@ -350,6 +350,55 @@ describe("dashboard viewport fitting", () => {
     }
   }, 20_000);
 
+  it("does not oscillate when hidden activity rows wrap to several lines", async () => {
+    // The log growth step assumed one line per row. A long details value in
+    // a narrow pane wraps to 3-4 lines, so grow-add and overflow-remove
+    // alternated forever — 300+ repaints per 400ms at 56 rows x 80 columns.
+    const health = tallHealth();
+    health.accounts = [makeAccount("only-account")];
+    health.recentLogs = health.recentLogs.map(log => ({ ...log, details: "x".repeat(200) }));
+    // Mid-band of the reproduction: 200-char details oscillate at rows 54-70.
+    const dash = renderDashboard(health, {}, { rows: 60, columns: 80 });
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("RECENT ACTIVITY");
+      });
+      vi.stubGlobal("fetch", vi.fn(() => new Promise(() => { /* hang */ })));
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const settled = dash.frames().length;
+      await new Promise(resolve => setTimeout(resolve, 400));
+      const later = dash.frames().length;
+      expect(later - settled).toBeLessThanOrEqual(2);
+      expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(60);
+    } finally {
+      await dash.cleanup();
+    }
+  });
+
+  it("keeps the delete confirmation visible even when only the header fits", async () => {
+    // With the operations panel present, an 11-12 row pane clipped the
+    // prompt that sat under the ACCOUNTS header — while confirmDelete input
+    // stayed armed. An active prompt must outrank everything except the
+    // header bar itself.
+    const health = tallHealth();
+    health.accounts = [makeAccount("only-account")];
+    const dash = renderDashboard(health, {}, { rows: 12, columns: 220 });
+    try {
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("CC-Router");
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(12);
+      });
+      await dash.press("\t");
+      await dash.press("d");
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain('Delete "only-account"');
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(12);
+      });
+    } finally {
+      await dash.cleanup();
+    }
+  }, 15_000);
+
   it("still shows the full 20 activity rows when the terminal is tall enough", async () => {
     const dash = renderDashboard(tallHealth(), {}, { rows: 120, columns: 220 });
     try {

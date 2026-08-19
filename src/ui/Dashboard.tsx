@@ -598,6 +598,7 @@ function LiveDashboard({
   const shownAccounts = Math.max(1, Math.min(accountsVisible, data.accounts.length));
   const contentRef = useRef<DOMElement>(null);
   const accountRowsRef = useRef<DOMElement>(null);
+  const logRowsRef = useRef<DOMElement>(null);
   // Growing the accounts window estimates the NEXT (hidden, unmeasurable)
   // row's height from the average of the visible ones. When that account is
   // much taller than average, the growth overflows and is removed again —
@@ -608,13 +609,25 @@ function LiveDashboard({
   // viewport or the fleet changes, since either can change row heights.
   const growAttemptRef = useRef<{ to: number; slack: number } | null>(null);
   const growDeniedRef = useRef<{ to: number; slack: number } | null>(null);
+  // The same denial memory for the activity list: log rows are usually one
+  // line, but a long details value wraps in a narrow pane, and growth that
+  // assumed one line per row cycled with the shrink just like tall accounts
+  // did. The refinement rule (retry with a smaller target, never the denied
+  // one) converges because the denied target only ever decreases.
+  const logGrowAttemptRef = useRef<{ to: number; slack: number } | null>(null);
+  const logGrowDeniedRef = useRef<{ to: number; slack: number } | null>(null);
   const fitKeyRef = useRef("");
   useEffect(() => {
-    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}`;
+    // The newest entry's timestamp is part of the key: new activity replaces
+    // rows with differently-wrapped ones, so a denial measured against the
+    // old rows must not outlive them.
+    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}:${logs[0]?.ts ?? 0}`;
     if (fitKeyRef.current !== fitKey) {
       fitKeyRef.current = fitKey;
       growAttemptRef.current = null;
       growDeniedRef.current = null;
+      logGrowAttemptRef.current = null;
+      logGrowDeniedRef.current = null;
     }
     if (frameBound === undefined) {
       if (logVisible !== LOG_VISIBLE) setLogVisible(LOG_VISIBLE);
@@ -626,6 +639,9 @@ function LiveDashboard({
     const contentH = contentRef.current ? measureElement(contentRef.current).height : 0;
     const accountsH = accountRowsRef.current ? measureElement(accountRowsRef.current).height : 0;
     const avgAccountRow = shownAccounts > 0 ? Math.max(1, accountsH / shownAccounts) : 2;
+    const logsH = logRowsRef.current ? measureElement(logRowsRef.current).height : 0;
+    const shownLogs = Math.min(logVisible, logs.length);
+    const avgLogRow = shownLogs > 0 ? Math.max(1, logsH / shownLogs) : 1;
     const excess = contentH - frameBound;
     if (excess > 0) {
       const attempt = growAttemptRef.current;
@@ -633,9 +649,16 @@ function LiveDashboard({
         growDeniedRef.current = { to: attempt.to, slack: attempt.slack + excess };
       }
       growAttemptRef.current = null;
-      const logDrop = Math.min(logVisible - MIN_LOG_VISIBLE, excess);
+      const logAttempt = logGrowAttemptRef.current;
+      if (logAttempt && logAttempt.to === logVisible) {
+        logGrowDeniedRef.current = { to: logAttempt.to, slack: logAttempt.slack + excess };
+      }
+      logGrowAttemptRef.current = null;
+      // All amounts in LINES, converted through the measured average row
+      // height — wrapped rows must not be treated as one line each.
+      const logDrop = Math.min(logVisible - MIN_LOG_VISIBLE, Math.ceil(excess / avgLogRow));
       if (logDrop > 0) setLogVisible(logVisible - logDrop);
-      let remaining = excess - Math.max(0, logDrop);
+      let remaining = Math.max(0, excess - Math.max(0, logDrop) * avgLogRow);
       if (remaining > 0 && shownAccounts > 1) {
         const accountDrop = Math.min(shownAccounts - 1, Math.ceil(remaining / avgAccountRow));
         if (accountDrop > 0) {
@@ -650,6 +673,7 @@ function LiveDashboard({
     }
     const slack = -excess;
     growAttemptRef.current = null; // whatever grew last commit fits
+    logGrowAttemptRef.current = null;
     // Grow the models window first when the panel is open — it is the active
     // surface and its rows are one line each, so the math is exact.
     if (modelsPanelOpen && modelsVisible < MODEL_VISIBLE_ROWS && slack >= 2) {
@@ -666,8 +690,22 @@ function LiveDashboard({
       setAccountsVisible(wouldGrowTo);
       return;
     }
+    // Activity rows last, sized by the measured average height. A denied
+    // target is retried one row smaller rather than repeated, stepping down
+    // until growth fits or stops.
     if (logVisible < LOG_VISIBLE && slack >= 2) {
-      setLogVisible(Math.min(LOG_VISIBLE, logVisible + Math.max(1, slack - 1)));
+      let logTarget = Math.min(
+        LOG_VISIBLE,
+        logVisible + Math.max(1, Math.floor((slack - 1) / avgLogRow)),
+      );
+      const logDenied = logGrowDeniedRef.current;
+      if (logDenied && slack < logDenied.slack) {
+        logTarget = Math.min(logTarget, logDenied.to - 1);
+      }
+      if (logTarget > logVisible) {
+        logGrowAttemptRef.current = { to: logTarget, slack };
+        setLogVisible(logTarget);
+      }
     }
   });
 
@@ -978,6 +1016,36 @@ function LiveDashboard({
         <Text color="gray">  ·  updated {updatedAgo}s ago  ·  [q] quit</Text>
       </Box>
 
+      {/* ── Inline prompt (edit / confirm) ──
+          Directly under the header bar, above EVERYTHING else: these prompts
+          arm keyboard input (`y` deletes), and any placement further down
+          can end up below the viewport clip in a short pane — an armed,
+          invisible destructive confirmation. Here they are visible in any
+          pane of three rows or more. */}
+      {mode === "editWeekly" && selectedAccount && (
+        <Box paddingLeft={2}>
+          <Text color="cyan">Set 7d cap for </Text>
+          <Text color="white" bold>{selectedAccount.id}</Text>
+          <Text color="cyan"> (0–100%): </Text>
+          <Text color="white" bold>{editBuffer}</Text>
+          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
+        </Box>
+      )}
+      {mode === "editSession" && selectedAccount && (
+        <Box paddingLeft={2}>
+          <Text color="cyan">Set 5h cap for </Text>
+          <Text color="white" bold>{selectedAccount.id}</Text>
+          <Text color="cyan"> (0–100%): </Text>
+          <Text color="white" bold>{editBuffer}</Text>
+          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
+        </Box>
+      )}
+      {mode === "confirmDelete" && selectedAccount && (
+        <Box paddingLeft={2}>
+          <Text color="red" bold>Delete "{selectedAccount.id}"?  [y] yes  [n/Esc] cancel</Text>
+        </Box>
+      )}
+
       {/* A daemon left running by a service manager can be a different build
           than the CLI rendering this dashboard — launchd keeps the old
           versioned install path alive across package upgrades. Every log row
@@ -1049,36 +1117,6 @@ function LiveDashboard({
           </Text>
         </Box>
 
-        {/* ── Inline prompt (edit / confirm) ──
-            Above the account rows, not below: a selected account with many
-            capacity rows can fill a short pane entirely, and a prompt
-            rendered after it fell below the clip while its input stayed
-            armed — an unseen `y` deleted the account. Directly under the
-            ACCOUNTS header, the prompt is visible whenever the header is. */}
-        {mode === "editWeekly" && selectedAccount && (
-          <Box marginTop={1} paddingLeft={2}>
-            <Text color="cyan">Set 7d cap for </Text>
-            <Text color="white" bold>{selectedAccount.id}</Text>
-            <Text color="cyan"> (0–100%): </Text>
-            <Text color="white" bold>{editBuffer}</Text>
-            <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
-          </Box>
-        )}
-        {mode === "editSession" && selectedAccount && (
-          <Box marginTop={1} paddingLeft={2}>
-            <Text color="cyan">Set 5h cap for </Text>
-            <Text color="white" bold>{selectedAccount.id}</Text>
-            <Text color="cyan"> (0–100%): </Text>
-            <Text color="white" bold>{editBuffer}</Text>
-            <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
-          </Box>
-        )}
-        {mode === "confirmDelete" && selectedAccount && (
-          <Box marginTop={1} paddingLeft={2}>
-            <Text color="red" bold>Delete "{selectedAccount.id}"?  [y] yes  [n/Esc] cancel</Text>
-          </Box>
-        )}
-
         <Box marginTop={1} flexDirection="column" ref={accountRowsRef}>
           {data.accounts.slice(accountWindowTop, accountWindowTop + shownAccounts).map((a, i) => (
             <AccountRow
@@ -1132,7 +1170,7 @@ function LiveDashboard({
       <Box marginTop={1} />
     </Box>
 
-      <Box flexDirection="column">
+      <Box flexDirection="column" ref={logRowsRef}>
         {visibleLogs.length === 0
           ? <Text color="gray">  No activity yet</Text>
           : visibleLogs.map((log, i) => (
