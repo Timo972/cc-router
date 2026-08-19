@@ -415,12 +415,15 @@ export function planViewportFit(
   now = 0,
 ): Record<string, number> {
   const targets: Record<string, number> = {};
-
-  for (const [key, denied] of Object.entries(memory.denials)) {
-    if (denied?.expiresAt !== undefined && denied.expiresAt <= now) {
-      delete memory.denials[key];
-    }
-  }
+  // An expired denial stops CLAMPING but is not forgotten: its retry count
+  // must survive the lapse, or the escalating backoff restarts at the base
+  // TTL on every re-denial and a permanently tall hidden row gets probed
+  // every few seconds forever. The record is deleted only when a retried
+  // growth finally fits (geometry improved) or the caller resets the memory.
+  const activeDenial = (key: string): FitAttempt | undefined => {
+    const denied = memory.denials[key];
+    return denied && (denied.expiresAt === undefined || denied.expiresAt > now) ? denied : undefined;
+  };
 
   if (excess > 0) {
     for (const list of lists) {
@@ -428,9 +431,11 @@ export function planViewportFit(
       if (attempt && attempt.to === list.current) {
         // Re-denials escalate the TTL (capped at a minute): a hidden row that
         // stays tall would otherwise be probed every TTL forever, while one
-        // that changed shape is picked up on the next expiry.
-        const prior = memory.denials[list.key];
-        const count = (prior?.to === attempt.to ? (prior.count ?? 1) : 0) + 1;
+        // that changed shape is picked up on the next expiry. The count
+        // continues from ANY prior denial of this list — including a lapsed
+        // one, and regardless of the target (the frontier is monotone while
+        // active, so a different target means a lapse happened in between).
+        const count = (memory.denials[list.key]?.count ?? 0) + 1;
         memory.denials[list.key] = {
           to: attempt.to,
           slack: attempt.slack + excess,
@@ -452,7 +457,16 @@ export function planViewportFit(
     return targets;
   }
 
-  for (const list of lists) delete memory.attempts[list.key];
+  for (const list of lists) {
+    // A standing attempt in the fitting branch means last commit's growth
+    // fit. That disproves a denial only when the growth reached the denied
+    // target — a smaller growth fitting says nothing about the larger one,
+    // and resetting on it would let the denied target be retried in a loop.
+    const attempt = memory.attempts[list.key];
+    const denied = memory.denials[list.key];
+    if (attempt && denied && attempt.to >= denied.to) delete memory.denials[list.key];
+    delete memory.attempts[list.key];
+  }
   const slack = -excess;
   for (let i = lists.length - 1; i >= 0; i--) {
     const list = lists[i];
@@ -488,7 +502,7 @@ export function planViewportFit(
     let target = list.growOne
       ? list.current + 1
       : Math.min(list.max, list.current + Math.max(1, Math.floor((usable - 1) / list.avgRow)));
-    const denied = memory.denials[list.key];
+    const denied = activeDenial(list.key);
     if (denied && usable < denied.slack) target = Math.min(target, denied.to - 1);
     if (target <= list.current) continue; // denied or no room — funding is discarded
     for (const fund of funding) targets[fund.key] = fund.to;

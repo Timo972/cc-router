@@ -150,3 +150,62 @@ describe("planViewportFit denial expiry", () => {
     expect(late).toEqual({ logs: 9 });
   });
 });
+
+describe("planViewportFit backoff persistence", () => {
+  it("escalates the TTL across expiries — the count must survive the geometry constraint lapsing", () => {
+    const lists: FitList[] = [{ key: "logs", current: 5, min: 3, max: 20, avgRow: 1 }];
+    const mem = memory();
+    // Grow, overflow, deny: count 1, base TTL.
+    planViewportFit(-4, lists, mem, 0);
+    lists[0].current = 8;
+    planViewportFit(3, lists, mem, 100);
+    expect(mem.denials["logs"]).toMatchObject({ count: 1 });
+    lists[0].current = 5;
+    // Past expiry the full growth is retried; when it overflows AGAIN the
+    // re-denial must continue the backoff, not restart it — otherwise a
+    // permanently tall hidden row is probed at the base TTL forever.
+    planViewportFit(-4, lists, mem, 3_000);
+    lists[0].current = 8;
+    planViewportFit(3, lists, mem, 3_100);
+    expect(mem.denials["logs"]).toMatchObject({ count: 2 });
+    expect(mem.denials["logs"]!.expiresAt).toBe(3_100 + 5_000);
+  });
+
+  it("clears the denial record entirely when a retried growth finally fits", () => {
+    const lists: FitList[] = [{ key: "logs", current: 5, min: 3, max: 20, avgRow: 1 }];
+    const mem = memory();
+    planViewportFit(-4, lists, mem, 0);
+    lists[0].current = 8;
+    planViewportFit(3, lists, mem, 100); // denied
+    lists[0].current = 5;
+    planViewportFit(-4, lists, mem, 3_000); // retried after expiry...
+    lists[0].current = 8;
+    planViewportFit(-1, lists, mem, 3_100); // ...and it fits: geometry improved
+    expect(mem.denials["logs"]).toBeUndefined();
+  });
+
+  it("keeps the denial frontier monotonically decreasing while active", () => {
+    // The P1 concern from review round seven: alternating rejected targets
+    // ping-ponging the frontier. Within an active window this cannot happen —
+    // every attempt is clamped below the standing denial, so each re-denial
+    // carries a strictly lower target.
+    const lists: FitList[] = [{ key: "logs", current: 3, min: 3, max: 20, avgRow: 1 }];
+    const mem = memory();
+    const deniedTargets: number[] = [];
+    let now = 0;
+    for (let i = 0; i < 6; i++) {
+      now += 10;
+      const grown = planViewportFit(-8, lists, mem, now);
+      if (grown.logs === undefined) break;
+      lists[0].current = grown.logs;
+      now += 10;
+      planViewportFit(5, lists, mem, now); // every growth overflows
+      lists[0].current = 3;
+      if (mem.denials["logs"]) deniedTargets.push(mem.denials["logs"]!.to);
+    }
+    for (let i = 1; i < deniedTargets.length; i++) {
+      expect(deniedTargets[i]).toBeLessThan(deniedTargets[i - 1]);
+    }
+    expect(deniedTargets.length).toBeGreaterThan(1);
+  });
+});
