@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Box, Text, useInput, useApp } from "ink";
+import { Box, Text, useInput, useApp, useStdout, measureElement } from "ink";
+import type { DOMElement } from "ink";
 import type { LogEntry } from "../proxy/stats.js";
 import { createAccountsApi } from "./accountsApi.js";
 import type { AccountsApi } from "./accountsApi.js";
@@ -8,7 +9,13 @@ import type { ModelEntry, ModelsApi, ModelsStatus } from "./modelsApi.js";
 import { getCurrentVersion } from "../utils/self-update.js";
 
 const POLL_INTERVAL_MS = 2_000;
+/** Most activity rows the dashboard will show — the list shrinks below this
+ *  (down to MIN_LOG_VISIBLE) when the terminal is too short for the full
+ *  frame. Ink can only erase as many lines as the viewport holds, so a frame
+ *  taller than the terminal makes every poll re-append it — scrolling the
+ *  header and OPERATIONS panel permanently out of view. */
 const LOG_VISIBLE = 20;
+const MIN_LOG_VISIBLE = 3;
 const MODEL_VISIBLE_ROWS = 16;
 const DASHBOARD_VERSION = getCurrentVersion();
 // Distinguishes "this machine's daemon" (restartable from this shell) from a
@@ -342,6 +349,20 @@ export function followScrollWindow(
   return Math.min(Math.max(0, top), maxTop);
 }
 
+/** Current terminal height in rows, tracking resizes. 0 when unknown. */
+function useTerminalRows(): number {
+  const { stdout } = useStdout();
+  const [rows, setRows] = useState(stdout?.rows ?? 0);
+  useEffect(() => {
+    if (!stdout) return;
+    const onResize = () => setRows(stdout.rows ?? 0);
+    stdout.on("resize", onResize);
+    onResize();
+    return () => { stdout.off("resize", onResize); };
+  }, [stdout]);
+  return rows;
+}
+
 interface HealthData {
   status: "ok" | "degraded";
   /** Version of the code the daemon is running. Absent on daemons built
@@ -538,12 +559,40 @@ function LiveDashboard({
     ? Math.max(0, logs.findIndex(l => l.ts === selectedTs))
     : 0;
 
+  // ── Viewport fitting ──────────────────────────────────────────────────────
+  // The frame must fit the terminal or Ink cannot erase it between polls (see
+  // LOG_VISIBLE above). After each commit the chrome above and below the
+  // activity list is measured and the list absorbs the deficit; if even the
+  // chrome alone exceeds the viewport, the frame is clipped at the BOTTOM —
+  // the header and operations panel always win over the detail panel.
+  const terminalRows = useTerminalRows();
+  const [logVisible, setLogVisible] = useState(MIN_LOG_VISIBLE);
+  const [clipHeight, setClipHeight] = useState<number | undefined>(undefined);
+  const aboveLogsRef = useRef<DOMElement>(null);
+  const belowLogsRef = useRef<DOMElement>(null);
+  const contentRef = useRef<DOMElement>(null);
+  useEffect(() => {
+    // One row of slack: a frame of exactly `rows` lines still scrolls by one
+    // when the cursor advances past the last line.
+    const budget = terminalRows > 0 ? terminalRows - 1 : Number.POSITIVE_INFINITY;
+    const aboveH = aboveLogsRef.current ? measureElement(aboveLogsRef.current).height : 0;
+    const belowH = belowLogsRef.current ? measureElement(belowLogsRef.current).height : 0;
+    const idealRaw = Number.isFinite(budget) ? budget - aboveH - belowH : LOG_VISIBLE;
+    const ideal = Math.max(MIN_LOG_VISIBLE, Math.min(LOG_VISIBLE, idealRaw));
+    if (ideal !== logVisible) setLogVisible(ideal);
+    // `contentRef` measures the NATURAL height (flexShrink 0 inside the
+    // clipped box), so this also detects when clipping can be lifted again.
+    const contentH = contentRef.current ? measureElement(contentRef.current).height : 0;
+    const clip = Number.isFinite(budget) && contentH > budget ? budget : undefined;
+    if (clip !== clipHeight) setClipHeight(clip);
+  });
+
   // First visible activity row. The stored position only moves on navigation;
   // the derived value re-clamps every render because the selection is
   // timestamp-anchored — new entries arriving between keypresses can push the
   // selected row out of the stored window, and it must stay visible anyway.
   const [logScrollTop, setLogScrollTop] = useState(0);
-  const logWindowTop = followScrollWindow(logScrollTop, selectedLogIndex, logs.length, LOG_VISIBLE);
+  const logWindowTop = followScrollWindow(logScrollTop, selectedLogIndex, logs.length, logVisible);
 
   // Selected account by id
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
@@ -750,12 +799,12 @@ function LiveDashboard({
       if (key.upArrow) {
         const next = Math.max(0, selectedLogIndex - 1);
         setSelectedTs(logs[next]?.ts ?? null);
-        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, LOG_VISIBLE));
+        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, logVisible));
       }
       if (key.downArrow) {
         const next = Math.min(logs.length - 1, selectedLogIndex + 1);
         setSelectedTs(logs[next]?.ts ?? null);
-        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, LOG_VISIBLE));
+        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, logVisible));
       }
     }
 
@@ -818,10 +867,12 @@ function LiveDashboard({
   });
 
   const selectedLog = logs[selectedLogIndex] ?? null;
-  const visibleLogs = logs.slice(logWindowTop, logWindowTop + LOG_VISIBLE);
+  const visibleLogs = logs.slice(logWindowTop, logWindowTop + logVisible);
 
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" height={clipHeight} overflowY="hidden">
+    <Box flexDirection="column" flexShrink={0} ref={contentRef}>
+    <Box flexDirection="column" ref={aboveLogsRef}>
 
       {/* ── Header bar ── */}
       <Box>
@@ -971,27 +1022,29 @@ function LiveDashboard({
 
       <Box marginTop={1} />
 
-      {/* ── Recent activity ── */}
+      {/* ── Recent activity (title measures as "above", rows flex) ── */}
+      <Text bold> RECENT ACTIVITY</Text>
+      <Box marginTop={1} />
+    </Box>
+
       <Box flexDirection="column">
-        <Text bold> RECENT ACTIVITY</Text>
-        <Box marginTop={1} flexDirection="column">
-          {visibleLogs.length === 0
-            ? <Text color="gray">  No activity yet</Text>
-            : visibleLogs.map((log, i) => (
-                <LogRow key={`${log.ts}-${i}`} log={log} selected={focus === "logs" && logWindowTop + i === selectedLogIndex} />
-              ))
-          }
-        </Box>
+        {visibleLogs.length === 0
+          ? <Text color="gray">  No activity yet</Text>
+          : visibleLogs.map((log, i) => (
+              <LogRow key={`${log.ts}-${i}`} log={log} selected={focus === "logs" && logWindowTop + i === selectedLogIndex} />
+            ))
+        }
       </Box>
 
       {/* ── Detail panel ── */}
       {focus === "logs" && selectedLog && (
-        <>
+        <Box flexDirection="column" ref={belowLogsRef}>
           <Box marginTop={1} />
           <DetailPanel log={selectedLog} />
-        </>
+        </Box>
       )}
 
+    </Box>
     </Box>
   );
 }

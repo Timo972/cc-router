@@ -29,9 +29,15 @@ export interface DashboardHarness {
  * the dashboard polls — a shared Response would flip the second poll into the
  * error screen.
  */
-export function renderDashboard(health: unknown, props: Partial<DashboardProps> = {}): DashboardHarness {
+export function renderDashboard(
+  health: unknown,
+  props: Partial<DashboardProps> = {},
+  viewport: { columns?: number; rows?: number } = {},
+): DashboardHarness {
   vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(Response.json(health))));
 
+  const columns = viewport.columns ?? 240;
+  const rows = viewport.rows ?? 100;
   const stdin = Object.assign(new PassThrough(), {
     isTTY: true,
     setRawMode: vi.fn(),
@@ -39,12 +45,12 @@ export function renderDashboard(health: unknown, props: Partial<DashboardProps> 
     unref: vi.fn(),
   }) as unknown as NodeJS.ReadStream;
   const stdout = Object.assign(new PassThrough(), {
-    columns: 240,
-    rows: 100,
+    columns,
+    rows,
   }) as unknown as NodeJS.WriteStream;
   const stderr = Object.assign(new PassThrough(), {
-    columns: 240,
-    rows: 100,
+    columns,
+    rows,
   }) as unknown as NodeJS.WriteStream;
 
   const frames: string[] = [];
