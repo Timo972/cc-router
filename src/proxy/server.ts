@@ -4,17 +4,23 @@ import { ServerResponse } from "http";
 import { timingSafeEqual } from "crypto";
 import type { IncomingMessage } from "http";
 import type { Socket } from "net";
-import type { Request } from "express";
-import { TokenPool } from "./token-pool.js";
-import { nextEventSequence } from "./event-sequence.js";
+import type { Request, Response } from "express";
+import { EmptyPoolError, NoEligibleAccountError, TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
 import { logRoute, logError, logStartup } from "./logger.js";
-import { createLocalRoutingErrorLog, stats } from "./stats.js";
+import {
+  applyAnthropicInputUsage,
+  applyAnthropicOutputUsage,
+  createLocalRoutingErrorLog,
+  stats,
+} from "./stats.js";
 import type { LogEntry } from "./stats.js";
+import { applyRateLimitHeaders } from "../providers/anthropic/rate-limit-headers.js";
+import { mountAnthropicMessagesRoute, withOAuthBeta } from "./anthropic-messages-route.js";
 import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
@@ -512,66 +518,9 @@ function providerStatus(accounts: HealthAccountView[]): ProviderOperationalStatu
   };
 }
 
-// Mutates entry and updates aggregate counters with token usage from Anthropic's
-// response. Called asynchronously after the log entry is already stored,
-// so the dashboard picks up the values on the next poll.
-function applyInputUsage(entry: LogEntry, usage: Record<string, number>): void {
-  entry.cacheReadTokens = usage["cache_read_input_tokens"] ?? 0;
-  entry.cacheCreationTokens = usage["cache_creation_input_tokens"] ?? 0;
-  entry.inputTokens = usage["input_tokens"] ?? 0;
-
-  stats.totalCacheReadTokens += entry.cacheReadTokens;
-  stats.totalCacheCreationTokens += entry.cacheCreationTokens;
-  stats.totalInputTokens += entry.inputTokens;
-}
-
-function applyOutputUsage(entry: LogEntry, usage: Record<string, number>): void {
-  entry.outputTokens = usage["output_tokens"] ?? 0;
-  stats.totalOutputTokens += entry.outputTokens;
-}
-
-// ─── Rate limit header extraction ──────────────────────────────────────────
-
-function inferPlan(requestsLimit: number): string {
-  if (requestsLimit <= 0) return "";
-  if (requestsLimit <= 100) return "Pro";
-  if (requestsLimit <= 500) return "Max 5x";
-  return "Max 20x";
-}
-
-function extractRateLimits(headers: Record<string, string | string[] | undefined>): AccountRateLimits | null {
-  const h = (name: string) => String(headers[name] ?? "");
-  const status = h("anthropic-ratelimit-unified-status");
-  if (!status) return null; // No unified headers in this response
-
-  const requestsLimit = parseInt(h("anthropic-ratelimit-requests-limit"), 10) || 0;
-
-  return {
-    status: status === "rate_limited" ? "rate_limited" : "allowed",
-    fiveHourUtil: parseFloat(h("anthropic-ratelimit-unified-5h-utilization")) || 0,
-    fiveHourReset: parseInt(h("anthropic-ratelimit-unified-5h-reset"), 10) || 0,
-    sevenDayUtil: parseFloat(h("anthropic-ratelimit-unified-7d-utilization")) || 0,
-    sevenDayReset: parseInt(h("anthropic-ratelimit-unified-7d-reset"), 10) || 0,
-    claim: h("anthropic-ratelimit-unified-representative-claim"),
-    plan: inferPlan(requestsLimit),
-    requestsLimit,
-    lastUpdated: Date.now(),
-    // Wall-clock ms ties with the usage refresh the router starts from this
-    // same response, so the ordering token is what makes them comparable.
-    lastUpdatedSeq: nextEventSequence(),
-  };
-}
-
-/** Apply upstream rate-limit headers without discarding the usage snapshot. */
-export function applyRateLimitHeaders(
-  account: Account,
-  headers: Record<string, string | string[] | undefined>,
-): boolean {
-  const rateLimits = extractRateLimits(headers);
-  if (!rateLimits) return false;
-  account.rateLimits = { ...account.rateLimits, ...rateLimits };
-  return true;
-}
+// Re-exported so existing importers keep working; the implementation moved to
+// providers/anthropic so both Anthropic transports share it.
+export { applyRateLimitHeaders } from "../providers/anthropic/rate-limit-headers.js";
 
 /**
  * Build the single function through which this server writes OpenAI accounts.
@@ -1220,6 +1169,58 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
   });
 
+  // Shared between the retrying /v1/messages route and the generic /v1 chain
+  // so a locally rejected request is reported identically on both.
+  const onAnthropicEmptyPool = (err: EmptyPoolError, _req: Request, res: Response) => {
+    stats.totalErrors++;
+    logError("proxy", 503, err.message);
+    res.status(503).json({
+      type: "error",
+      error: { type: "no_accounts", message: err.message },
+    });
+  };
+  const onAnthropicNoEligibleAccount = (err: NoEligibleAccountError, req: Request) => {
+    stats.totalErrors++;
+    const entry = createLocalRoutingErrorLog(err.reason, req._ccRouteContext?.modelFamily);
+    stats.addLog(entry);
+    logError(entry.accountId, entry.statusCode ?? 0, entry.details ?? "no-eligible");
+  };
+  const onAnthropicRefreshFailure = (account: Account) => {
+    stats.totalErrors++;
+    logError(account.id, 401, "Token refresh failed");
+  };
+
+  // Claude-bound POST /v1/messages goes through its own transport with
+  // router-side 429 failover and 5xx retry; every other /v1 endpoint stays on
+  // the generic byte-transparent proxy below.
+  mountAnthropicMessagesRoute(app, {
+    target,
+    timeoutMs: proxyRequestTimeoutMs,
+    pool,
+    sessionRouter,
+    needsRefresh,
+    refresh: account => refreshAccountIfCurrent(account, pool),
+    onRefreshFailure: onAnthropicRefreshFailure,
+    onEmptyPool: onAnthropicEmptyPool,
+    onNoEligibleAccount: onAnthropicNoEligibleAccount,
+    // A relayed 401 means the token is stale — refresh in the background so
+    // the next request succeeds without making this client wait on it.
+    onUpstream401: account => {
+      void refreshAccountIfCurrent(account, pool).catch(console.error);
+    },
+    // Refresh in the background to narrow only ambiguity-owned global state
+    // when fresh usage proves a requested-model exhaustion.
+    onRateLimited: (route, ambiguousCooldownToken) => {
+      queueMicrotask(() => {
+        void usageRefresher.refreshAfterCurrent(route.account).then(result => {
+          if (result.ok) {
+            reconcileAmbiguousRateLimitCooldown(route, pool, ambiguousCooldownToken);
+          }
+        });
+      });
+    },
+  });
+
   // ─── Proxy middleware ──────────────────────────────────────────────────────
   // IMPORTANT: selfHandleResponse must be false (default) for SSE streaming to
   // work transparently. Setting it to true breaks streaming.
@@ -1243,15 +1244,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // CRITICAL: api.anthropic.com requires the "oauth-2025-04-20" beta flag to
         // accept OAuth tokens (sk-ant-oat01-*). Without it the request is rejected
         // with "OAuth authentication is currently not supported."
-        // APPEND — do NOT replace — so existing betas (tools, computer-use, etc.) are preserved.
-        const existingBeta = proxyReq.getHeader("anthropic-beta");
-        const betas = existingBeta
-          ? String(existingBeta).split(",").map(b => b.trim()).filter(Boolean)
-          : [];
-        if (!betas.includes("oauth-2025-04-20")) {
-          betas.push("oauth-2025-04-20");
-          proxyReq.setHeader("anthropic-beta", betas.join(","));
-        }
+        // APPEND — do NOT replace — so existing betas (tools, computer-use, etc.)
+        // are preserved. Shared with the retrying /v1/messages transport.
+        proxyReq.setHeader("anthropic-beta", withOAuthBeta(proxyReq.getHeader("anthropic-beta")));
 
         // All other headers are forwarded automatically by http-proxy-middleware:
         //   anthropic-version         — required by Anthropic API
@@ -1392,8 +1387,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           contentEncoding: encoding,
           // Mutates the already-logged entry in place; the dashboard picks the
           // values up on its next poll.
-          onInputUsage: (usage) => applyInputUsage(entry, usage),
-          onOutputUsage: (usage) => applyOutputUsage(entry, usage),
+          onInputUsage: (usage) => applyAnthropicInputUsage(entry, usage),
+          onOutputUsage: (usage) => applyAnthropicOutputUsage(entry, usage),
         });
         if (usageCapture) {
           proxyRes.on("data", (chunk: Buffer) => usageCapture.write(chunk));
@@ -1439,27 +1434,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // and breaks SSE streaming passthrough.
   app.use("/v1", createAnthropicRoutingMiddleware({
     sessionRouter,
-    onEmptyPool: (err, _req, res) => {
-      stats.totalErrors++;
-      logError("proxy", 503, err.message);
-      res.status(503).json({
-        type: "error",
-        error: { type: "no_accounts", message: err.message },
-      });
-    },
-    onNoEligibleAccount: (err, req) => {
-      stats.totalErrors++;
-      const entry = createLocalRoutingErrorLog(err.reason, req._ccRouteContext?.modelFamily);
-      stats.addLog(entry);
-      logError(entry.accountId, entry.statusCode ?? 0, entry.details ?? "no-eligible");
-    },
+    onEmptyPool: onAnthropicEmptyPool,
+    onNoEligibleAccount: onAnthropicNoEligibleAccount,
   }), createAnthropicRefreshMiddleware({
     needsRefresh,
     refresh: account => refreshAccountIfCurrent(account, pool),
-    onRefreshFailure: (account) => {
-      stats.totalErrors++;
-      logError(account.id, 401, "Token refresh failed");
-    },
+    onRefreshFailure: onAnthropicRefreshFailure,
   }), (req, _res, next) => {
     const route = req._ccRoute!;
     const account = route.account;

@@ -32,6 +32,10 @@ export interface ResponsesRoutesOptions {
   recordActivity?: (entry: LogEntry) => void;
   now?: () => number;
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
+  /** Upstream attempts per client request (test override; default 3). */
+  maxAttempts?: number;
+  /** Delay before re-sending to the SAME account (test override). */
+  sameAccountRetryDelayMs?: number;
 }
 
 const RESPONSES_ENVELOPE: OpenAIIngressEnvelope = {
@@ -178,6 +182,10 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       now,
       envelope: RESPONSES_ENVELOPE,
       onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
+      ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
+      ...(opts.sameAccountRetryDelayMs !== undefined
+        ? { sameAccountRetryDelayMs: opts.sameAccountRetryDelayMs }
+        : {}),
       relay: async (upstream, res, entry, report) => {
         if (body.stream === true) {
           const observer = createCodexUsageObserver();

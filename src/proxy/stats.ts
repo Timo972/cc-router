@@ -90,6 +90,28 @@ class ProxyStats {
 // Singleton — shared across server and health endpoint
 export const stats = new ProxyStats();
 
+/**
+ * Record Anthropic input-side usage (message_start, or a non-streaming JSON
+ * body) on both the request's log entry and the running totals. Mutates an
+ * entry that is typically already stored — the dashboard picks the values up
+ * on its next poll.
+ */
+export function applyAnthropicInputUsage(entry: LogEntry, usage: Record<string, number>): void {
+  entry.cacheReadTokens = usage["cache_read_input_tokens"] ?? 0;
+  entry.cacheCreationTokens = usage["cache_creation_input_tokens"] ?? 0;
+  entry.inputTokens = usage["input_tokens"] ?? 0;
+
+  stats.totalCacheReadTokens += entry.cacheReadTokens;
+  stats.totalCacheCreationTokens += entry.cacheCreationTokens;
+  stats.totalInputTokens += entry.inputTokens;
+}
+
+/** Record Anthropic output-side usage (message_delta) — see input counterpart. */
+export function applyAnthropicOutputUsage(entry: LogEntry, usage: Record<string, number>): void {
+  entry.outputTokens = usage["output_tokens"] ?? 0;
+  stats.totalOutputTokens += entry.outputTokens;
+}
+
 /** Record Codex token usage on both the request's log entry and the running totals. */
 export function applyCodexUsage(entry: LogEntry, usage: CodexUsageTotals | undefined): void {
   if (!usage) return;

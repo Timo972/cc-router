@@ -8,6 +8,30 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Automatic upstream failover and retry on both providers. A 429 or 5xx
+  received before any response byte is relayed no longer passes straight
+  through to the client: the router applies the existing cooldown/affinity
+  bookkeeping and retries the request itself — on a *different* account
+  after a 429 (or a 503/529 overload), on the same account after a short
+  pause for a plain 500/502/504 — up to 3 upstream attempts per request.
+  Covers Claude `/v1/messages`, Codex `/v1/responses`, and cross-routed
+  `/v1/messages`. When nothing is eligible or the budget is exhausted, the
+  last failed upstream response is relayed unchanged, exactly as before;
+  401s still pass through with a background token refresh, and the router
+  still never retries after response bytes have started. Failed attempts
+  show up in the activity log with a `:will-retry` suffix.
+
+### Changed
+
+- Claude-bound POST `/v1/messages` moved from the generic proxy middleware
+  to a dedicated transport (same byte-transparent relay contract: verbatim
+  status/headers, raw body bytes, no synthesized events) so the router can
+  decide to retry at upstream response headers. Every other `/v1` endpoint
+  stays on the generic proxy. Claude activity rows now record the requested
+  model and the full `/v1/messages` path.
+
 ### Fixed
 
 - An account whose quota refills early — upgrading a Claude plan being the

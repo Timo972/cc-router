@@ -1488,7 +1488,7 @@ describe("mountResponsesRoutes sticky routing", () => {
     expect(bucket?.secondary?.utilization).toBeCloseTo(0.05);
   });
 
-  it("relays a 429 byte-for-byte with its headers, sets a global cooldown, and rebinds the retry", async () => {
+  it("absorbs a 429 by failing over within the request, cools the account, and keeps the rebind", async () => {
     const accounts = [makeRuntimeAccount("openai-a"), makeRuntimeAccount("openai-b")];
     const seen: string[] = [];
     const forwardOpenAI = vi.fn(async (opts: { account: OpenAIAccount }) => {
@@ -1504,19 +1504,23 @@ describe("mountResponsesRoutes sticky routing", () => {
     const { app, openAIPool } = mountWithPool(accounts, forwardOpenAI);
 
     await withServer(app, async baseUrl => {
+      // The router itself retries the 429 on the idle account, so the client
+      // sees only the successful response — no round-trip of its own.
       const first = await post(baseUrl, {}, { "session_id": "s1" });
-      expect(first.status).toBe(429);
-      expect(first.headers.get("retry-after")).toBe("120");
-      expect(await first.text()).toBe("upstream-429");
+      expect(first.status).toBe(200);
+      await first.text();
+      expect(seen).toHaveLength(2);
+      expect(seen[1]).not.toBe(seen[0]);
       expect(openAIPool.isCoolingDown(seen[0]!)).toBe(true);
 
+      // The session's next request sticks to the account that served it.
       const second = await post(baseUrl, {}, { "session_id": "s1" });
       expect(second.status).toBe(200);
       await second.text();
     });
 
-    expect(seen).toHaveLength(2);
-    expect(seen[1]).not.toBe(seen[0]);
+    expect(seen).toHaveLength(3);
+    expect(seen[2]).toBe(seen[1]);
   });
 
   it("records the real upstream status for a streamed non-SSE error, not a synthesized 502", async () => {

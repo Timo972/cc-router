@@ -49,6 +49,10 @@ export interface MessagesCrossProviderRouteOptions {
   recordActivity?: (entry: LogEntry) => void;
   now?: () => number;
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
+  /** Upstream attempts per client request (test override; default 3). */
+  maxAttempts?: number;
+  /** Delay before re-sending to the SAME account (test override). */
+  sameAccountRetryDelayMs?: number;
 }
 
 const MESSAGES_ENVELOPE: OpenAIIngressEnvelope = {
@@ -460,6 +464,10 @@ export function mountMessagesCrossProviderRoute(
         now,
         envelope: MESSAGES_ENVELOPE,
         onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
+        ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
+        ...(opts.sameAccountRetryDelayMs !== undefined
+          ? { sameAccountRetryDelayMs: opts.sameAccountRetryDelayMs }
+          : {}),
         relay: (upstream, res, entry, report) =>
           sendOpenAIAsAnthropic(upstream, res, requestedStream, entry, report),
       });
