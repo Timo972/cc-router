@@ -51,12 +51,16 @@ describe("fetchAnthropicUsage", () => {
       json: async () => ({ five_hour: { utilization: 25 } }),
     }) as Response);
 
-    await expect(fetchAnthropicUsage(a, { fetch, now: () => 123 })).resolves.toEqual({
+    await expect(fetchAnthropicUsage(a, {
+      fetch,
+      now: () => 123,
+      nextSequence: () => 7,
+    })).resolves.toEqual({
       ok: true,
       snapshot: {
         fiveHour: { utilization: 0.25, resetAt: 0 },
         modelLimits: [],
-        requestedAt: 123,
+        requestedSeq: 7,
         fetchedAt: 123,
         fetchStatus: "fresh",
       },
@@ -71,12 +75,17 @@ describe("fetchAnthropicUsage", () => {
     }));
   });
 
-  it("stamps requestedAt before the request and fetchedAt after the body", async () => {
-    // Callers order a snapshot's data by requestedAt, so it must predate the
-    // response: a refresh in flight while a limit is hit completes afterwards
-    // but describes the account as it was before.
+  it("claims its ordering token before the request goes out", async () => {
+    // Callers order a snapshot's data by requestedSeq, so it must be claimed
+    // before the request: a refresh in flight while a limit is hit completes
+    // afterwards but describes the account as it was before. A token claimed
+    // after the response would order it after that limit and licence a
+    // wrongful release.
+    let seq = 0;
     let clock = 100;
+    const seenDuringRequest: number[] = [];
     const fetch = vi.fn(async () => {
+      seenDuringRequest.push(seq);
       clock = 500;
       return {
         ok: true,
@@ -88,11 +97,18 @@ describe("fetchAnthropicUsage", () => {
       } as Response;
     });
 
-    const result = await fetchAnthropicUsage(account("a"), { fetch, now: () => clock });
+    const result = await fetchAnthropicUsage(account("a"), {
+      fetch,
+      now: () => clock,
+      nextSequence: () => ++seq,
+    });
 
+    // The token existed by the time the request was issued...
+    expect(seenDuringRequest).toEqual([1]);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.snapshot.requestedAt).toBe(100);
+    // ...and it is the one the snapshot carries, not a later one.
+    expect(result.snapshot.requestedSeq).toBe(1);
     expect(result.snapshot.fetchedAt).toBe(900);
   });
 

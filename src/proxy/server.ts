@@ -6,6 +6,7 @@ import type { IncomingMessage } from "http";
 import type { Socket } from "net";
 import type { Request } from "express";
 import { TokenPool } from "./token-pool.js";
+import { nextEventSequence } from "./event-sequence.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
@@ -553,6 +554,9 @@ function extractRateLimits(headers: Record<string, string | string[] | undefined
     plan: inferPlan(requestsLimit),
     requestsLimit,
     lastUpdated: Date.now(),
+    // Wall-clock ms ties with the usage refresh the router starts from this
+    // same response, so the ordering token is what makes them comparable.
+    lastUpdatedSeq: nextEventSequence(),
   };
 }
 

@@ -5,6 +5,7 @@ import type {
   ModelRateLimit,
   RateLimitWindow,
 } from "../../proxy/types.js";
+import { nextEventSequence } from "../../proxy/event-sequence.js";
 
 const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA_HEADER = "oauth-2025-04-20";
@@ -162,7 +163,7 @@ function legacyModelLimit(family: string, value: unknown): ModelRateLimit | unde
 export function parseAnthropicUsage(
   value: unknown,
   fetchedAt: number,
-  requestedAt?: number,
+  requestedSeq?: number,
 ): AccountUsageSnapshot | null {
   if (!isRecord(value) || !Object.keys(value).some((key) => USAGE_FIELDS.has(key))) return null;
 
@@ -179,7 +180,7 @@ export function parseAnthropicUsage(
     fetchedAt,
     fetchStatus: "fresh",
   };
-  if (requestedAt !== undefined) snapshot.requestedAt = requestedAt;
+  if (requestedSeq !== undefined) snapshot.requestedSeq = requestedSeq;
   const fiveHour = parseWindow(value.five_hour);
   const sevenDay = parseWindow(value.seven_day);
   const extraUsage = parseExtraUsage(value.extra_usage);
@@ -208,6 +209,7 @@ export async function fetchAnthropicUsage(
   options: {
     fetch?: typeof globalThis.fetch;
     now?: () => number;
+    nextSequence?: () => number;
     timeoutMs?: number;
   } = {},
 ): Promise<UsageFetchResult> {
@@ -216,10 +218,10 @@ export async function fetchAnthropicUsage(
   const timeoutMs = Math.max(0, options.timeoutMs ?? DEFAULT_USAGE_TIMEOUT_MS);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  // Stamped before the request goes out: the response describes the account no
-  // earlier than this, which is what lets a caller order the snapshot against
-  // events that happened while it was in flight.
-  const requestedAt = now();
+  // Claimed before the request goes out: the response describes the account no
+  // earlier than this point in the event order, which is what lets a caller
+  // order the snapshot against events that happened while it was in flight.
+  const requestedSeq = options.nextSequence?.() ?? nextEventSequence();
 
   try {
     const response = await request(ANTHROPIC_USAGE_ENDPOINT, {
@@ -239,7 +241,7 @@ export async function fetchAnthropicUsage(
       return { ok: false, reason: "invalid_json" };
     }
 
-    const snapshot = parseAnthropicUsage(body, now(), requestedAt);
+    const snapshot = parseAnthropicUsage(body, now(), requestedSeq);
     return snapshot
       ? { ok: true, snapshot }
       : { ok: false, reason: "invalid_schema" };

@@ -24,17 +24,32 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `429 no-eligible`.
 
   A usage snapshot now supersedes both blockers, under two conditions that
-  keep it from unbenching an account that is still limited. The refresh must
-  have been *initiated* after the block was recorded — snapshots carry a new
-  `requestedAt` for this, because `fetchedAt` is stamped after the response
-  body is parsed and so can post-date a limit the request never saw. And the
-  snapshot must report on the scope that caused the block: only the claimed
-  window releases a global cooldown, and only the matching family releases a
-  model cooldown. Blocks for limits no snapshot describes — an upstream 529
-  overload, the `seven_day_oauth_apps` quota, an unattributed claim — stay
-  purely time-based. Within scope, releasing opens no hole: the same
-  snapshot feeds the exhausted-window check, so an account with no real
-  capacity stays blocked on its own merits.
+  keep it from unbenching an account that is still limited.
+
+  The refresh must have been *initiated* after the block was recorded.
+  `fetchedAt` cannot answer that — it is stamped after the response body is
+  parsed, so a refresh already on the wire when a 429 lands completes
+  afterwards while describing the account as it was before. Neither can
+  wall-clock milliseconds: the 429, the headers taken from it, and the
+  refresh the router starts in response all happen in one event-loop turn
+  and read the same millisecond (measured at 199 ties in 200 runs), which
+  would have made that immediate refresh useless. Ordering now runs on a
+  process-wide monotonic sequence, with tokens on the usage snapshot, the
+  header snapshot, and each cooldown entry.
+
+  And the snapshot must report on the scope that caused the block: only the
+  claimed window releases a global cooldown, and only the matching family
+  releases a model cooldown. Blocks for limits no snapshot describes — an
+  upstream 529 overload, the `seven_day_oauth_apps` quota, an unattributed
+  claim — stay purely time-based. Overlapping global cooldowns are tracked
+  per scope rather than as a single longest expiry, so a 529 and a five-hour
+  429 arriving together neither merge nor cancel each other: releasing the
+  quota cooldown leaves the overload running, and the brief overload does not
+  make the multi-hour cooldown permanent.
+
+  Within scope, releasing opens no hole: the same snapshot feeds the
+  exhausted-window check, so an account with no real capacity stays blocked
+  on its own merits.
 
 ---
 

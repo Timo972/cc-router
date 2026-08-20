@@ -15,6 +15,10 @@ export interface AccountRateLimits {
   plan: string;              // "Pro" | "Max 5x" | "Max 20x" | ""
   requestsLimit: number;     // per-minute RPM from anthropic-ratelimit-requests-limit
   lastUpdated: number;       // Unix timestamp in ms
+  /** Event-sequence token for the response these headers came from (see
+   *  event-sequence.ts). Orders them against a usage refresh that may have
+   *  been initiated in the same millisecond. Absent means unorderable. */
+  lastUpdatedSeq?: number;
   /** Detailed usage from the OAuth usage endpoint, when available. */
   usage?: AccountUsageSnapshot;
 }
@@ -68,11 +72,12 @@ export interface AccountUsageSnapshot {
   sevenDay?: RateLimitWindow;
   modelLimits: ModelRateLimit[];
   extraUsage?: ExtraUsageState;
-  /** When the refresh was *initiated*, in ms. `fetchedAt` is stamped after the
-   *  response body is parsed, so it can post-date a limit the request never
-   *  saw; only this timestamp orders the snapshot's data against later events.
-   *  Absent on snapshots from before this was recorded. */
-  requestedAt?: number;
+  /** Event-sequence token claimed when the refresh was *initiated* (see
+   *  event-sequence.ts). `fetchedAt` is stamped after the response body is
+   *  parsed, so it can post-date a limit the request never saw; and wall-clock
+   *  ms ties for events in one event-loop turn. Only this token orders the
+   *  snapshot's data against other events. Absent means unorderable. */
+  requestedSeq?: number;
   fetchedAt: number;
   fetchStatus: "fresh" | "stale" | "unavailable";
 }

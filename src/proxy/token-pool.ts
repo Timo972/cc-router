@@ -8,6 +8,7 @@ import type {
 } from "./types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "./types.js";
 import { canUseExtraUsage, normalizeModelFamily } from "../providers/anthropic/usage.js";
+import { nextEventSequence } from "./event-sequence.js";
 import {
   EmptyPoolError,
   NoEligibleAccountError,
@@ -30,25 +31,36 @@ interface HardBlock {
 }
 
 /**
- * A cooldown expiry plus the moment it was recorded. `recordedAt` is what
+ * A cooldown expiry plus its place in the event order. `recordedSeq` is what
  * lets a later usage snapshot supersede the expiry without an earlier,
  * in-flight snapshot cancelling a cooldown it predates.
  */
 interface CooldownEntry {
   until: number;
-  recordedAt: number;
+  recordedSeq: number;
 }
+
+/**
+ * Which limit a whole-account cooldown came from. The two usage windows can be
+ * superseded by a snapshot reporting on them; `unscoped` covers every limit no
+ * snapshot describes — an upstream overload, the OAuth-apps quota, a claim we
+ * could not attribute — and is released only by the clock.
+ */
+type GlobalCooldownScope = UsageWindowScope | "unscoped";
 
 interface AccountCooldowns {
   globalUntil: number;
   modelUntil: Map<string, CooldownEntry>;
-  definiteGlobalUntil: number;
-  definiteGlobalRecordedAt: number;
-  /** The usage window whose limit produced the definite global cooldown, when
-   *  the usage endpoint reports one for it. Undefined means no snapshot can
-   *  speak for this cooldown, so only the clock releases it. */
-  definiteGlobalWindow?: UsageWindowScope;
-  pendingAmbiguous: Map<number, { until: number; recordedAt: number; modelFamily?: string }>;
+  /**
+   * One entry per scope, deliberately not collapsed into a single expiry.
+   * Concurrent requests routinely produce overlapping cooldowns from different
+   * scopes — a 529 overload alongside a five-hour 429 — and keeping only the
+   * longest would either let a usage snapshot clear the overload it cannot
+   * speak for, or let the brief overload make the multi-hour quota cooldown
+   * permanently unsupersedable, depending on arrival order.
+   */
+  definiteGlobal: Map<GlobalCooldownScope, CooldownEntry>;
+  pendingAmbiguous: Map<number, { until: number; modelFamily?: string }>;
 }
 
 const MAX_TRUSTED_RATE_LIMIT_RESET_MS = 8 * 24 * 60 * 60 * 1_000;
@@ -89,20 +101,22 @@ function reportsHeadroom(value: unknown): boolean {
 }
 
 /**
- * The moment a snapshot's data can be ordered against, or undefined when it
- * cannot be ordered at all.
+ * The snapshot's place in the event order, or undefined when it has none.
  *
- * This is deliberately the *initiation* time, not `fetchedAt`: the latter is
+ * This is deliberately the *initiation* token, not `fetchedAt`: the latter is
  * stamped after the response body is parsed, so a refresh already on the wire
  * when a limit is hit completes afterwards while describing the account as it
  * was before. Comparing that would treat pre-limit data as post-limit
- * evidence. A snapshot recorded before this field existed returns undefined
- * and never supersedes anything.
+ * evidence. Wall-clock ms cannot substitute either — the 429, its headers, and
+ * the refresh the router starts from it all land in one event-loop turn and
+ * read the same millisecond. A snapshot with no token never supersedes.
  */
-function supersedingTimestamp(usage: AccountUsageSnapshot | undefined): number | undefined {
+function supersedingSequence(usage: AccountUsageSnapshot | undefined): number | undefined {
   if (!usage || usage.fetchStatus !== "fresh") return undefined;
-  const requestedAt = usage.requestedAt;
-  return typeof requestedAt === "number" && Number.isFinite(requestedAt) ? requestedAt : undefined;
+  const requestedSeq = usage.requestedSeq;
+  return typeof requestedSeq === "number" && Number.isFinite(requestedSeq)
+    ? requestedSeq
+    : undefined;
 }
 
 /**
@@ -126,8 +140,10 @@ function supersedingTimestamp(usage: AccountUsageSnapshot | undefined): number |
  */
 function usageSupersedesRateLimitedStatus(r: AccountRateLimits): boolean {
   const usage = r.usage;
-  const supersedingAt = supersedingTimestamp(usage);
-  if (supersedingAt === undefined || supersedingAt <= r.lastUpdated) return false;
+  const supersedingSeq = supersedingSequence(usage);
+  if (supersedingSeq === undefined) return false;
+  // Headers with no ordering token cannot be compared, so they stand.
+  if (r.lastUpdatedSeq === undefined || supersedingSeq <= r.lastUpdatedSeq) return false;
   if (r.claim === "five_hour") return reportsHeadroom(usage?.fiveHour?.utilization);
   if (r.claim === "seven_day") return reportsHeadroom(usage?.sevenDay?.utilization);
   if (r.claim === "") {
@@ -224,17 +240,22 @@ export interface AccountPatch {
 
 export interface TokenPoolOptions {
   now?: () => number;
+  /** Ordering-token source, injectable so tests can construct exact
+   *  same-millisecond races. Defaults to the process-wide sequence. */
+  nextSequence?: () => number;
 }
 
 export class TokenPool implements AccountPool<Account> {
   private readonly inFlight = new Map<string, number>();
   private readonly cooldowns = new Map<Account, AccountCooldowns>();
   private readonly now: () => number;
+  private readonly nextSequence: () => number;
   private currentIndex = 0;
   private nextAmbiguousCooldownToken = 1;
 
   constructor(private readonly accounts: Account[], options: TokenPoolOptions = {}) {
     this.now = options.now ?? Date.now;
+    this.nextSequence = options.nextSequence ?? nextEventSequence;
   }
 
   /**
@@ -339,12 +360,11 @@ export class TokenPool implements AccountPool<Account> {
     const expiry = this.proposedExpiry(account, durationMs);
     if (expiry === undefined) return;
     const state = this.cooldownsFor(account);
-    const extending = expiry > state.definiteGlobalUntil;
-    state.definiteGlobalUntil = Math.max(state.definiteGlobalUntil, expiry);
-    state.definiteGlobalRecordedAt = this.now();
-    // A cooldown is only supersedable while every contribution to its expiry
-    // is: an unscoped one arriving later must not inherit an earlier scope.
-    if (extending || usageWindow === undefined) state.definiteGlobalWindow = usageWindow;
+    const scope: GlobalCooldownScope = usageWindow ?? "unscoped";
+    state.definiteGlobal.set(scope, {
+      until: Math.max(state.definiteGlobal.get(scope)?.until ?? 0, expiry),
+      recordedSeq: this.nextSequence(),
+    });
     this.recomputeGlobalUntil(state);
   }
 
@@ -360,7 +380,7 @@ export class TokenPool implements AccountPool<Account> {
     const state = this.cooldownsFor(account);
     state.modelUntil.set(family, {
       until: Math.max(state.modelUntil.get(family)?.until ?? 0, expiry),
-      recordedAt: this.now(),
+      recordedSeq: this.nextSequence(),
     });
   }
 
@@ -377,7 +397,6 @@ export class TokenPool implements AccountPool<Account> {
     const family = normalizeModelFamily(modelFamily);
     state.pendingAmbiguous.set(token, {
       until: expiry,
-      recordedAt: this.now(),
       ...(family ? { modelFamily: family } : {}),
     });
     this.recomputeGlobalUntil(state);
@@ -402,7 +421,7 @@ export class TokenPool implements AccountPool<Account> {
     const expiry = Math.max(pending.until, proposed);
     state.modelUntil.set(family, {
       until: Math.max(state.modelUntil.get(family)?.until ?? 0, expiry),
-      recordedAt: this.now(),
+      recordedSeq: this.nextSequence(),
     });
     state.pendingAmbiguous.delete(token);
     this.recomputeGlobalUntil(state);
@@ -597,8 +616,7 @@ export class TokenPool implements AccountPool<Account> {
       state = {
         globalUntil: 0,
         modelUntil: new Map(),
-        definiteGlobalUntil: 0,
-        definiteGlobalRecordedAt: 0,
+        definiteGlobal: new Map(),
         pendingAmbiguous: new Map(),
       };
       this.cooldowns.set(account, state);
@@ -608,10 +626,8 @@ export class TokenPool implements AccountPool<Account> {
 
   private clearExpiredCooldownState(account: Account, state: AccountCooldowns): void {
     const now = this.now();
-    if (state.definiteGlobalUntil <= now) {
-      state.definiteGlobalUntil = 0;
-      state.definiteGlobalRecordedAt = 0;
-      state.definiteGlobalWindow = undefined;
+    for (const [scope, entry] of state.definiteGlobal) {
+      if (entry.until <= now) state.definiteGlobal.delete(scope);
     }
     for (const [token, pending] of state.pendingAmbiguous) {
       if (pending.until <= now) state.pendingAmbiguous.delete(token);
@@ -641,8 +657,10 @@ export class TokenPool implements AccountPool<Account> {
    * it. And the snapshot must report on the scope that produced the cooldown:
    * only the claimed window releases a global cooldown, and only the matching
    * family releases a model cooldown. Cooldowns for limits no snapshot
-   * describes — upstream overload, the OAuth-apps quota, an unattributed claim
-   * — carry no scope and stay purely time-based.
+   * describes are `unscoped` and stay purely time-based, as do ambiguous ones.
+   *
+   * Each scope is judged on its own, so releasing one leaves any other still
+   * running — an overload cooldown outlives the quota cooldown beside it.
    *
    * Within scope, releasing opens no hole: `hardBlock` reads the same snapshot
    * for its exhausted-window check, so an account whose capacity is genuinely
@@ -650,25 +668,20 @@ export class TokenPool implements AccountPool<Account> {
    */
   private releaseCooldownsSupersededByUsage(account: Account, state: AccountCooldowns): void {
     const usage = account.rateLimits.usage;
-    const supersedingAt = supersedingTimestamp(usage);
-    if (usage === undefined || supersedingAt === undefined) return;
+    const supersedingSeq = supersedingSequence(usage);
+    if (usage === undefined || supersedingSeq === undefined) return;
 
-    if (state.definiteGlobalUntil > 0 &&
-      state.definiteGlobalWindow !== undefined &&
-      supersedingAt > state.definiteGlobalRecordedAt) {
-      const window = state.definiteGlobalWindow === "five_hour" ? usage.fiveHour : usage.sevenDay;
-      if (reportsHeadroom(window?.utilization)) {
-        state.definiteGlobalUntil = 0;
-        state.definiteGlobalRecordedAt = 0;
-        state.definiteGlobalWindow = undefined;
-      }
+    for (const [scope, entry] of state.definiteGlobal) {
+      if (scope === "unscoped" || supersedingSeq <= entry.recordedSeq) continue;
+      const window = scope === "five_hour" ? usage.fiveHour : usage.sevenDay;
+      if (reportsHeadroom(window?.utilization)) state.definiteGlobal.delete(scope);
     }
 
     // A family the snapshot does not mention is left alone: silence is not
     // evidence of headroom. `active` is deliberately not consulted, matching
     // matchingModelWindows() — utilization is what gates routing.
     for (const [family, entry] of state.modelUntil) {
-      if (supersedingAt <= entry.recordedAt) continue;
+      if (supersedingSeq <= entry.recordedSeq) continue;
       const limit = usage.modelLimits.find(
         candidate => normalizeModelFamily(candidate.modelFamily) === family,
       );
@@ -683,7 +696,10 @@ export class TokenPool implements AccountPool<Account> {
   }
 
   private recomputeGlobalUntil(state: AccountCooldowns): void {
-    let globalUntil = state.definiteGlobalUntil;
+    let globalUntil = 0;
+    for (const entry of state.definiteGlobal.values()) {
+      globalUntil = Math.max(globalUntil, entry.until);
+    }
     for (const pending of state.pendingAmbiguous.values()) {
       globalUntil = Math.max(globalUntil, pending.until);
     }
