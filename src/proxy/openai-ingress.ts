@@ -170,7 +170,9 @@ export interface OpenAIIngressOptions {
    * when a relayed upstream response carries a 401 — lets the caller kick
    * off a background subscription-token refresh outside the request path. */
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
-  /** Upstream attempts per client request (test override; default 3). */
+  /** Upstream attempts per client request (default 3). `1` disables
+   *  router-side failover/retry entirely — the `autoFailover: false`
+   *  config opt-out is wired through here. */
   maxAttempts?: number;
   /** Delay before re-sending to the SAME account (test override). */
   sameAccountRetryDelayMs?: number;

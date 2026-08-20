@@ -24,7 +24,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   last failed upstream response is relayed unchanged, exactly as before;
   401s still pass through with a background token refresh, and the router
   still never retries after response bytes have started. Failed attempts
-  show up in the activity log with a `:will-retry` suffix.
+  show up in the activity log with a `:will-retry` suffix. On by
+  default — set `"autoFailover": false` in `~/.cc-router/config.json`
+  (restart required) to opt out and restore pure pass-through behavior.
 
 ### Changed
 

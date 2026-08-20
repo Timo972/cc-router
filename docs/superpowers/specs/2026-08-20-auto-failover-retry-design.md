@@ -116,9 +116,16 @@ requests) and the generic `/v1` proxy chain:
 
 `mountAnthropicMessagesRoute(app, …)` is mounted directly after
 `mountMessagesCrossProviderRoute`. The no-eligible/empty-pool callbacks are
-shared with the `/v1` chain. No config flag: the retry only ever uses accounts
-the router already considers usable, is bounded, and preserves pass-through
-as the terminal fallback.
+shared with the `/v1` chain.
+
+The feature is on by default and toggleable: `"autoFailover": false` in
+`~/.cc-router/config.json` (read at startup via `getAutoFailoverEnabled()`;
+anything but an explicit `false` keeps the default on) opts out for anyone
+who cannot work with the commit trade-off above. The off switch is wired as
+a single-attempt budget (`maxAttempts: 1`) into all three mounts — both
+transports then relay every upstream failure unchanged, byte-for-byte, which
+is exactly the pre-feature contract. The startup banner prints the active
+state next to the auto-update line.
 
 ## Diagnostics
 

@@ -34,6 +34,7 @@ import {
   loadOpenAIAccounts,
   readAccountsFromPath,
   writeConfig,
+  getAutoFailoverEnabled,
   getProxyRequestTimeoutMs,
 } from "../config/manager.js";
 
@@ -598,6 +599,39 @@ describe("readAccountsFromPath", () => {
   it("returns empty array for a non-existent path", () => {
     const missing = `${MOCK_DIR}/does-not-exist.json`;
     expect(readAccountsFromPath(missing)).toEqual([]);
+  });
+});
+
+describe("getAutoFailoverEnabled", () => {
+  it("defaults to enabled when config.json does not exist", () => {
+    expect(getAutoFailoverEnabled()).toBe(true);
+  });
+
+  it("defaults to enabled when config.json does not mention autoFailover", () => {
+    writeConfig({ proxySecret: "secret" });
+
+    expect(getAutoFailoverEnabled()).toBe(true);
+  });
+
+  it("stays enabled on an explicit true", () => {
+    writeConfig({ autoFailover: true });
+
+    expect(getAutoFailoverEnabled()).toBe(true);
+  });
+
+  it("disables only on an explicit false", () => {
+    writeConfig({ autoFailover: false });
+
+    expect(getAutoFailoverEnabled()).toBe(false);
+  });
+
+  it("treats a malformed value as the enabled default", () => {
+    fs.writeFileSync(
+      `${MOCK_DIR}/config.json`,
+      JSON.stringify({ autoFailover: "no" }),
+    );
+
+    expect(getAutoFailoverEnabled()).toBe(true);
   });
 });
 

@@ -521,6 +521,35 @@ describe("mountAnthropicMessagesRoute", () => {
     expect(final.details).toContain("held-response-lost");
   }, 10_000);
 
+  it("relays every failure unchanged when maxAttempts is 1 (autoFailover: false)", async () => {
+    // The config opt-out is wired through as a single-attempt budget: an idle
+    // second account exists, but the 429 must pass through untouched with no
+    // second upstream request — the pre-failover contract.
+    const { server, calls } = scriptedUpstream((_call, _req, res) => {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": "60" });
+      res.end("{\"type\":\"error\"}");
+    });
+    const upstreamPort = await listen(server);
+    const { app, activity } = mountRoute([makeAccount("a"), makeAccount("b")], upstreamPort, {
+      maxAttempts: 1,
+    });
+
+    try {
+      await withApp(app, async baseUrl => {
+        const response = await postMessages(baseUrl, { "x-claude-code-session-id": "session-1" });
+        expect(response.status).toBe(429);
+        expect(response.headers.get("retry-after")).toBe("60");
+        expect(await response.text()).toBe("{\"type\":\"error\"}");
+      });
+    } finally {
+      await close(server);
+    }
+
+    expect(calls).toHaveLength(1);
+    expect(activity).toHaveLength(1);
+    expect(activity[0]!.details).not.toContain(":will-retry");
+  });
+
   it("retries an unscoped plain 5xx wherever a fresh request would route", async () => {
     // A session-less request has no affinity to preserve, and the failed
     // attempt's still-held lease counts as load — so the retry lands on the

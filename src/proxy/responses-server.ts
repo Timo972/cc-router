@@ -32,7 +32,9 @@ export interface ResponsesRoutesOptions {
   recordActivity?: (entry: LogEntry) => void;
   now?: () => number;
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
-  /** Upstream attempts per client request (test override; default 3). */
+  /** Upstream attempts per client request (default 3). `1` disables
+   *  router-side failover/retry entirely — the `autoFailover: false`
+   *  config opt-out is wired through here. */
   maxAttempts?: number;
   /** Delay before re-sending to the SAME account (test override). */
   sameAccountRetryDelayMs?: number;

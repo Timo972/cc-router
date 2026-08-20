@@ -7,7 +7,7 @@ import type { Socket } from "net";
 import type { Request, Response } from "express";
 import { EmptyPoolError, NoEligibleAccountError, TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
-import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
@@ -643,6 +643,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   const app = express();
   const proxyRequestTimeoutMs = getProxyRequestTimeoutMs();
+  // Router-side 429 failover / 5xx retry is on by default; `"autoFailover":
+  // false` in config.json opts out for anyone who cannot work with the
+  // trade-off (a committed retry abandons the original failure response).
+  // A single-attempt budget IS the off switch: both transports then relay
+  // every upstream failure unchanged, exactly as before the feature existed.
+  const autoFailover = getAutoFailoverEnabled();
+  const upstreamAttempts = autoFailover ? {} : { maxAttempts: 1 };
 
   // ─── Proxy auth middleware ─────────────────────────────────────────────────
   // If a proxySecret is configured, all requests must present it as EITHER
@@ -1153,6 +1160,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
+    ...upstreamAttempts,
   });
 
   mountMessagesCrossProviderRoute(app, {
@@ -1161,6 +1169,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
+    ...upstreamAttempts,
   });
 
   // Shared between the retrying /v1/messages route and the generic /v1 chain
@@ -1192,6 +1201,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     timeoutMs: proxyRequestTimeoutMs,
     pool,
     sessionRouter,
+    ...upstreamAttempts,
     needsRefresh,
     refresh: account => refreshAccountIfCurrent(account, pool),
     onRefreshFailure: onAnthropicRefreshFailure,
@@ -1537,6 +1547,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     console.log(autoUpdate
       ? chalk.gray("  Auto-update: enabled (patch/minor)")
       : chalk.gray("  Auto-update: off (notify-only) — run 'cc-router update' to install"));
+    console.log(autoFailover
+      ? chalk.gray("  Auto-failover: on — 429/5xx retried across accounts before the first relayed byte")
+      : chalk.gray("  Auto-failover: off — upstream failures pass through; clients own retries"));
 
     // Anonymous telemetry — fire-and-forget, never blocks proxy startup.
     try {

@@ -184,6 +184,31 @@ describe("runOpenAIIngress upstream retry", () => {
     expect(activity[2]!.details).not.toContain(":will-retry");
   });
 
+  it("relays every failure unchanged when maxAttempts is 1 (autoFailover: false)", async () => {
+    const attempts: string[] = [];
+    const forward: ForwardOpenAI = async ({ account }) => {
+      attempts.push(account.id);
+      return jsonResponse(429, { error: { message: "rate limited" } }, { "retry-after": "60" });
+    };
+    const { app, activity } = mountWithPool(
+      [makeRuntimeAccount("openai-a"), makeRuntimeAccount("openai-b")],
+      forward,
+      { maxAttempts: 1 },
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postResponses(baseUrl, {});
+      expect(res.status).toBe(429);
+      expect(res.headers.get("retry-after")).toBe("60");
+    });
+
+    // An idle second account exists, but the single-attempt budget (the
+    // autoFailover: false wiring) relays the 429 straight through.
+    expect(attempts).toHaveLength(1);
+    expect(activity).toHaveLength(1);
+    expect(activity[0]!.details).not.toContain(":will-retry");
+  });
+
   it("never retries a non-retryable failure", async () => {
     const attempts: string[] = [];
     const forward: ForwardOpenAI = async ({ account }) => {
