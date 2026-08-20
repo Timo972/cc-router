@@ -479,6 +479,48 @@ describe("mountAnthropicMessagesRoute", () => {
     expect(calls[1]!.authorization).not.toBe(calls[0]!.authorization);
   });
 
+  it("answers 502 instead of hanging when the held failure body dies during a failed failover refresh", async () => {
+    // The 429 arrives with headers but its body never completes; while the
+    // failover account's token refresh is pending, the upstream socket dies.
+    // The refresh then fails, so the route falls back to the held response —
+    // which is now a destroyed stream that can never be piped. The client
+    // must get a terminal 502, not an open response that never ends.
+    const upstreamSockets: import("node:http").ServerResponse[] = [];
+    const { server, calls } = scriptedUpstream((_call, _req, res) => {
+      res.writeHead(429, { "content-type": "application/json", "content-length": "64" });
+      res.write("{\"type\":\"error\"");
+      upstreamSockets.push(res); // held open — destroyed by the refresh mock below
+    });
+    const upstreamPort = await listen(server);
+    const refresh = vi.fn(async () => {
+      if (refresh.mock.calls.length === 1) return true; // initial account
+      upstreamSockets[0]!.destroy();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      return false; // failover account's refresh fails → fall back to held 429
+    });
+    const { app, activity } = mountRoute([makeAccount("a"), makeAccount("b")], upstreamPort, {
+      needsRefresh: () => true,
+      refresh,
+    });
+
+    try {
+      await withApp(app, async baseUrl => {
+        const response = await postMessages(baseUrl, { "x-claude-code-session-id": "session-1" });
+        expect(response.status).toBe(502);
+        const body = await response.json() as { type: string; error: { type: string } };
+        expect(body.error.type).toBe("proxy_error");
+      });
+    } finally {
+      await close(server);
+    }
+
+    expect(calls).toHaveLength(1);
+    expect(refresh).toHaveBeenCalledTimes(2);
+    const final = activity.at(-1)!;
+    expect(final.statusCode).toBe(502);
+    expect(final.details).toContain("held-response-lost");
+  }, 10_000);
+
   it("retries an unscoped plain 5xx wherever a fresh request would route", async () => {
     // A session-less request has no affinity to preserve, and the failed
     // attempt's still-held lease counts as load — so the retry lands on the

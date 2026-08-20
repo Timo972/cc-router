@@ -479,6 +479,31 @@ export function mountAnthropicMessagesRoute(
         return;
       }
 
+      // The held response can die while a retry decision is pending — its
+      // socket erroring during the failover account's token refresh is the
+      // concrete case. The forward-time error guard keeps that from crashing
+      // the daemon, but a destroyed body can no longer be relayed: piping it
+      // emits neither data nor end and would leave the client waiting
+      // forever. Nothing has been written yet, so answer with the same local
+      // 502 any other transport failure produces.
+      if (upstream.destroyed) {
+        if (entry.type === "route") stats.totalErrors++;
+        entry.type = "error";
+        entry.statusCode = 502;
+        entry.details = `${entry.details}:held-response-lost`;
+        recordActivity(entry);
+        release();
+        logError(account.id, 502, `upstream ${status} response was lost before it could be relayed`);
+        res.status(502).json({
+          type: "error",
+          error: {
+            type: "proxy_error",
+            message: `Upstream ${status} response was lost before it could be relayed`,
+          },
+        });
+        return;
+      }
+
       // ── Final: relay this response byte-transparently ─────────────────────
       // The entry is recorded now (headers time) and mutated in place by the
       // usage capture; the dashboard picks the values up on its next poll —
