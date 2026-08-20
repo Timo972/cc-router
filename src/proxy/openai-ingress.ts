@@ -398,6 +398,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
 
   let finalStatus = upstream.status;
   let relayFailed = false;
+  let relayFailureMessage = "";
   const relayReport: OpenAIRelayReport = { upstreamReportedFailure: false };
   try {
     const result = await relay(upstream, res, entry, relayReport);
@@ -409,7 +410,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     // can do is tear the connection down.
     relayFailed = true;
     const message = error instanceof Error ? error.message : String(error);
-    logError(account.id, 502, `openai response relay failed: ${message}`);
+    relayFailureMessage = message;
     // The recorded status is what this request *became*, which is a failure
     // whether or not another HTTP response can still be sent. Leaving it at
     // the upstream's 200 in the headers-already-sent case produced an
@@ -438,6 +439,16 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   // upstream announce a failure. Only the truncation is the disconnect's to
   // explain away.
   const clientCancelled = clientGone.signal.aborted && !relayReport.upstreamReportedFailure;
+
+  // Logged only now, after the cancellation classification: the Codex CLI
+  // aborts streams routinely (a superseded turn, Ctrl-C, a pane closing),
+  // and each abort rejects the relay's body read with "This operation was
+  // aborted". Logging that from the catch block printed an [ERROR] line for
+  // every one — eight hours of them in one unattended overnight session —
+  // while the stats correctly ignored them. The log now matches the stats.
+  if (relayFailed && !clientCancelled) {
+    logError(account.id, 502, `openai response relay failed: ${relayFailureMessage}`);
+  }
 
   // Activity/stats must reflect what the client actually received, not just
   // the raw upstream signal: the non-streaming collector can synthesize a

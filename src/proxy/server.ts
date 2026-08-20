@@ -1334,6 +1334,24 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             ? routeFailureDetails(route, "service-overloaded")
             : "service-overloaded";
           logError(account.id, 529, "Service overloaded — cooldown 30s");
+        } else if (status >= 500) {
+          // Any other upstream 5xx passes through byte-transparent — but it
+          // must not pass through the DIAGNOSTICS silently: an overnight
+          // Anthropic 500 stopped an unattended Claude session while this
+          // log showed nothing and the stats reported a clean night. The
+          // question "did the proxy or the upstream fail?" was only
+          // answerable by cross-referencing the client's own transcript.
+          // Unlike 429/529 this takes no cooldown: a plain 5xx says nothing
+          // about the account's capacity and can even be request-specific,
+          // so cooling the account down would punish it for upstream's (or
+          // the request's) problem.
+          stats.totalErrors++;
+          account.errorCount++;
+          pendingLog.type = "error";
+          pendingLog.details = route
+            ? routeFailureDetails(route, "upstream-error")
+            : "upstream-error";
+          logError(account.id, status, "Upstream server error (passed through)");
         }
 
         // ── Capture rate limit utilization from response headers ────────────
