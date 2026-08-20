@@ -1,4 +1,4 @@
-import type { Account, AccountRecord, RouteContext } from "./types.js";
+import type { Account, AccountRateLimits, AccountRecord, RouteContext } from "./types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "./types.js";
 import { canUseExtraUsage, normalizeModelFamily } from "../providers/anthropic/usage.js";
 import {
@@ -22,11 +22,22 @@ interface HardBlock {
   retryAtMs?: number;
 }
 
+/**
+ * A cooldown expiry plus the moment it was recorded. `recordedAt` is what
+ * lets a later usage snapshot supersede the expiry without an earlier,
+ * in-flight snapshot cancelling a cooldown it predates.
+ */
+interface CooldownEntry {
+  until: number;
+  recordedAt: number;
+}
+
 interface AccountCooldowns {
   globalUntil: number;
-  modelUntil: Map<string, number>;
+  modelUntil: Map<string, CooldownEntry>;
   definiteGlobalUntil: number;
-  pendingAmbiguous: Map<number, { until: number; modelFamily?: string }>;
+  definiteGlobalRecordedAt: number;
+  pendingAmbiguous: Map<number, { until: number; recordedAt: number; modelFamily?: string }>;
 }
 
 const MAX_TRUSTED_RATE_LIMIT_RESET_MS = 8 * 24 * 60 * 60 * 1_000;
@@ -55,6 +66,37 @@ function modelScopedClaim(claim: string): boolean {
   return claim.startsWith("seven_day_") &&
     claim !== "seven_day_oauth_apps" &&
     claim !== "seven_day_overage_included";
+}
+
+/**
+ * True only for a utilization the provider actually reported as below its
+ * limit. An absent or non-finite value is "unknown", never headroom: these
+ * checks decide whether to *release* a block, so unknown must not unbench.
+ */
+function reportsHeadroom(value: unknown): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value < 1;
+}
+
+/**
+ * True when a usage snapshot newer than the limiting headers reports both
+ * account-wide windows below their limit.
+ *
+ * `status` is a snapshot of the last response's headers, and the reset
+ * timestamps it is cleared against belong to the window that was limiting
+ * *then*. Anything that refills that window early — a plan upgrade being the
+ * common case — leaves the flag describing a limit that no longer exists,
+ * and a benched account never receives the response that would correct it.
+ * The usage endpoint is the provider's own account of the same windows, so a
+ * newer fresh snapshot showing headroom supersedes the flag. This is the same
+ * supersession rule `TokenPool.releaseCooldownsSupersededByUsage` applies to
+ * the pool's cooldown map.
+ */
+function usageSupersedesRateLimitedStatus(r: AccountRateLimits): boolean {
+  const usage = r.usage;
+  if (!usage || usage.fetchStatus !== "fresh") return false;
+  if (!Number.isFinite(usage.fetchedAt) || usage.fetchedAt <= r.lastUpdated) return false;
+  return reportsHeadroom(usage.fiveHour?.utilization) &&
+    reportsHeadroom(usage.sevenDay?.utilization);
 }
 
 /** Accept only reset timestamps within the same bounded horizon as cooldown evidence. */
@@ -127,7 +169,7 @@ function clearExpiredRateLimitWindows(
       (r.claim === "five_hour" && r.fiveHourReset > 0) ||
       (r.claim === "seven_day" && r.sevenDayReset > 0) ||
       (r.claim === "" && (r.fiveHourReset > 0 || r.sevenDayReset > 0));
-    if (!stillBlocked) {
+    if (!stillBlocked || usageSupersedesRateLimitedStatus(r)) {
       r.status = "allowed";
       recovered = true;
     }
@@ -249,6 +291,7 @@ export class TokenPool implements AccountPool<Account> {
     if (expiry === undefined) return;
     const state = this.cooldownsFor(account);
     state.definiteGlobalUntil = Math.max(state.definiteGlobalUntil, expiry);
+    state.definiteGlobalRecordedAt = this.now();
     this.recomputeGlobalUntil(state);
   }
 
@@ -262,7 +305,10 @@ export class TokenPool implements AccountPool<Account> {
     const family = normalizeModelFamily(modelFamily);
     if (expiry === undefined || family === undefined) return;
     const state = this.cooldownsFor(account);
-    state.modelUntil.set(family, Math.max(state.modelUntil.get(family) ?? 0, expiry));
+    state.modelUntil.set(family, {
+      until: Math.max(state.modelUntil.get(family)?.until ?? 0, expiry),
+      recordedAt: this.now(),
+    });
   }
 
   /** Mark a conservative global cooldown as eligible for later narrowing. */
@@ -278,6 +324,7 @@ export class TokenPool implements AccountPool<Account> {
     const family = normalizeModelFamily(modelFamily);
     state.pendingAmbiguous.set(token, {
       until: expiry,
+      recordedAt: this.now(),
       ...(family ? { modelFamily: family } : {}),
     });
     this.recomputeGlobalUntil(state);
@@ -300,7 +347,10 @@ export class TokenPool implements AccountPool<Account> {
     if (!family || pending.modelFamily !== family) return false;
     const proposed = this.proposedExpiry(account, durationMs) ?? 0;
     const expiry = Math.max(pending.until, proposed);
-    state.modelUntil.set(family, Math.max(state.modelUntil.get(family) ?? 0, expiry));
+    state.modelUntil.set(family, {
+      until: Math.max(state.modelUntil.get(family)?.until ?? 0, expiry),
+      recordedAt: this.now(),
+    });
     state.pendingAmbiguous.delete(token);
     this.recomputeGlobalUntil(state);
     if (state.globalUntil <= this.now()) {
@@ -321,7 +371,7 @@ export class TokenPool implements AccountPool<Account> {
     const family = normalizeModelFamily(context?.modelFamily ?? context?.requestedModel);
     return Math.max(
       current.globalUntil,
-      family ? current.modelUntil.get(family) ?? 0 : 0,
+      family ? current.modelUntil.get(family)?.until ?? 0 : 0,
     );
   }
 
@@ -353,10 +403,10 @@ export class TokenPool implements AccountPool<Account> {
     return {
       globalUntilMs: current.globalUntil,
       modelCooldowns: [...current.modelUntil]
-        .filter(([, untilMs]) => untilMs > 0)
+        .filter(([, entry]) => entry.until > 0)
         .sort(([left], [right]) => left.localeCompare(right))
         .slice(0, 12)
-        .map(([modelFamily, untilMs]) => ({ modelFamily, untilMs })),
+        .map(([modelFamily, entry]) => ({ modelFamily, untilMs: entry.until })),
     };
   }
 
@@ -495,6 +545,7 @@ export class TokenPool implements AccountPool<Account> {
         globalUntil: 0,
         modelUntil: new Map(),
         definiteGlobalUntil: 0,
+        definiteGlobalRecordedAt: 0,
         pendingAmbiguous: new Map(),
       };
       this.cooldowns.set(account, state);
@@ -504,15 +555,68 @@ export class TokenPool implements AccountPool<Account> {
 
   private clearExpiredCooldownState(account: Account, state: AccountCooldowns): void {
     const now = this.now();
-    if (state.definiteGlobalUntil <= now) state.definiteGlobalUntil = 0;
+    if (state.definiteGlobalUntil <= now) {
+      state.definiteGlobalUntil = 0;
+      state.definiteGlobalRecordedAt = 0;
+    }
     for (const [token, pending] of state.pendingAmbiguous) {
       if (pending.until <= now) state.pendingAmbiguous.delete(token);
     }
-    this.recomputeGlobalUntil(state);
-    for (const [family, expiry] of state.modelUntil) {
-      if (expiry <= now) state.modelUntil.delete(family);
+    for (const [family, entry] of state.modelUntil) {
+      if (entry.until <= now) state.modelUntil.delete(family);
     }
+    this.releaseCooldownsSupersededByUsage(account, state);
+    this.recomputeGlobalUntil(state);
     this.deleteEmptyCooldowns(account, state);
+  }
+
+  /**
+   * Drop cooldowns whose evidence a newer usage snapshot has superseded.
+   *
+   * A cooldown expiry is only a cache of "no capacity until T", derived from
+   * the reset timestamps attached to a 429. Anything that refills the window
+   * ahead of that timestamp — a plan upgrade being the common case — leaves
+   * the cached expiry describing a limit that no longer exists, and because
+   * the account is benched no new response ever arrives to correct it. That
+   * is the same deadlock `clearExpiredRateLimitWindows` resolves for the
+   * header snapshot, which cannot see cooldowns held here.
+   *
+   * A usage snapshot fetched after the cooldown was recorded is the provider's
+   * own account of the same windows, so where it reports headroom the stored
+   * expiry is discarded. Releasing here opens no hole: `hardBlock` reads that
+   * same snapshot for its exhausted-window check, so an account whose capacity
+   * is genuinely gone stays blocked on that check instead.
+   */
+  private releaseCooldownsSupersededByUsage(account: Account, state: AccountCooldowns): void {
+    const usage = account.rateLimits.usage;
+    if (!usage || usage.fetchStatus !== "fresh") return;
+    const fetchedAt = usage.fetchedAt;
+    if (!Number.isFinite(fetchedAt)) return;
+
+    // Both account-wide windows must be reported below their limit before a
+    // whole-account cooldown can be called obsolete.
+    const globalHeadroom = reportsHeadroom(usage.fiveHour?.utilization) &&
+      reportsHeadroom(usage.sevenDay?.utilization);
+    if (globalHeadroom) {
+      if (state.definiteGlobalUntil > 0 && fetchedAt > state.definiteGlobalRecordedAt) {
+        state.definiteGlobalUntil = 0;
+        state.definiteGlobalRecordedAt = 0;
+      }
+      for (const [token, pending] of state.pendingAmbiguous) {
+        if (fetchedAt > pending.recordedAt) state.pendingAmbiguous.delete(token);
+      }
+    }
+
+    // A family the snapshot does not mention is left alone: silence is not
+    // evidence of headroom. `active` is deliberately not consulted, matching
+    // matchingModelWindows() — utilization is what gates routing.
+    for (const [family, entry] of state.modelUntil) {
+      if (fetchedAt <= entry.recordedAt) continue;
+      const limit = usage.modelLimits.find(
+        candidate => normalizeModelFamily(candidate.modelFamily) === family,
+      );
+      if (limit && reportsHeadroom(limit.utilization)) state.modelUntil.delete(family);
+    }
   }
 
   private deleteEmptyCooldowns(account: Account, state: AccountCooldowns): void {
@@ -535,7 +639,10 @@ export class TokenPool implements AccountPool<Account> {
     this.clearExpiredCooldownState(account, state);
     const current = this.cooldowns.get(account);
     if (!current) return 0;
-    const expiries = [current.globalUntil, ...current.modelUntil.values()].filter(value => value > 0);
+    const expiries = [
+      current.globalUntil,
+      ...[...current.modelUntil.values()].map(entry => entry.until),
+    ].filter(value => value > 0);
     return expiries.length > 0 ? Math.min(...expiries) : 0;
   }
 

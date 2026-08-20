@@ -8,6 +8,25 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- An account whose quota refills early — upgrading a Claude plan being the
+  common case — is returned to rotation as soon as the usage endpoint says
+  so, instead of staying benched for the rest of the pre-upgrade window. A
+  429 records a cooldown whose expiry comes from the reset timestamps on
+  that response, and both that cooldown and the header-derived
+  `rate_limited` flag were released only by the wall clock. Nothing
+  reconnected them to the usage refresher, so a plan upgrade produced an
+  account reporting `0%` on every window, `usage fresh`, and `busy` with a
+  multi-hour cooldown — and because it was benched, no new response could
+  ever arrive to correct it. A usage snapshot that is fresh, newer than the
+  evidence that created the block, and reports the relevant windows below
+  their limit now supersedes both. Releasing opens no hole: the same
+  snapshot feeds the exhausted-window check, so an account with no real
+  capacity stays blocked on its own merits. In the reported case one stale
+  cooldown on the only account with capacity left the whole pool answering
+  `429 no-eligible`.
+
 ---
 
 ## [0.10.1] — 2026-08-20
