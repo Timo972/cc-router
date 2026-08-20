@@ -55,6 +55,22 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A passed-through upstream 5xx on the Anthropic path is logged and counted.
+  The proxy is byte-transparent and only special-cased 401/429/529, so a
+  plain upstream 500 left no trace: an overnight Anthropic 500 stopped an
+  unattended Claude session while the daemon log showed nothing and the
+  stats reported a clean night. It now produces an `[ERROR]` line, an
+  activity entry (`upstream-error`), and error counts — with no cooldown,
+  since a plain 5xx says nothing about the account's capacity and can even
+  be request-specific.
+- A client-cancelled stream abort is no longer logged as an error on the
+  OpenAI path. The Codex CLI aborts streams routinely, and each abort
+  rejects the relay's body read — the log printed an `[ERROR] ... relay
+  failed` line for every one (eight hours of them in one overnight
+  session) while the stats correctly classified them as cancellations. The
+  log line now waits for the cancellation check, so it fires only for real
+  relay failures.
+
 - The dashboard fits the terminal. The frame had a fixed shape — 20 activity
   rows, a detail panel, and every account expanded — which with a real fleet
   of accounts rendered ~70 lines. Ink can only erase as many lines as the

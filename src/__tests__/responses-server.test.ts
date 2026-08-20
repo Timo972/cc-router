@@ -13,7 +13,7 @@ import { applyCodexRateLimits, createOpenAIAccount, type OpenAIAccount } from ".
 import { parseCodexRateLimits } from "../providers/openai/usage.js";
 import { stats, type LogEntry } from "../proxy/stats.js";
 
-type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean }) => Promise<Response>;
+type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean; signal?: AbortSignal }) => Promise<Response>;
 
 async function withServer(
   app: ReturnType<typeof express>,
@@ -707,6 +707,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     );
     const { app, activity, openAIPool } = mountWithPool([account], forward);
 
+    const logSpy = vi.spyOn(console, "log");
     const server = createServer(app);
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     let client: ClientRequest | undefined;
@@ -740,6 +741,70 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
       expect(account.consecutiveErrors).toBe(0);
       expect(activity[0]).toEqual(expect.objectContaining({ type: "route", statusCode: 200 }));
       expect(activity[0]?.details).toContain("client-cancelled");
+      // ...and it must not be LOGGED as an error either: codex clients abort
+      // streams routinely, and one unattended session printed eight hours of
+      // "[ERROR] ... relay failed" for what the stats correctly ignored.
+      const errorLines = logSpy.mock.calls.map(call => String(call[0])).filter(line => line.includes("relay failed"));
+      expect(errorLines).toEqual([]);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  it("does not log a client-cancelled relay abort as an error", async () => {
+    // Production shape of the abort: the client disconnect aborts the
+    // forward's signal, which rejects the in-flight body read — the relay
+    // throws "This operation was aborted". The stats already classify this
+    // as a cancellation; the log printed "[ERROR] ... relay failed" anyway,
+    // eight hours of it in one unattended overnight session.
+    const account = makeRuntimeAccount("openai-victor");
+    const firstChunk = deferred<void>();
+    const forward: ForwardOpenAI = async ({ signal }) => new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'));
+          firstChunk.resolve();
+          signal?.addEventListener("abort", () => {
+            controller.error(new DOMException("This operation was aborted", "AbortError"));
+          });
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity, openAIPool } = mountWithPool([account], forward);
+
+    const logSpy = vi.spyOn(console, "log");
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/responses",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await firstChunk.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(openAIPool.getInFlight(account.id)).toBe(0));
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      expect(activity[0]?.details).toContain("client-cancelled");
+      expect(account.errorCount).toBe(0);
+      const errorLines = logSpy.mock.calls.map(call => String(call[0])).filter(line => line.includes("relay failed"));
+      expect(errorLines).toEqual([]);
     } finally {
       client?.destroy();
       await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
@@ -1084,6 +1149,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     };
     const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
+    const logSpy = vi.spyOn(console, "log");
     await withServer(app, async baseUrl => {
       const res = await fetch(`${baseUrl}/v1/responses`, {
         method: "POST",
@@ -1098,6 +1164,11 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     });
 
     expect(activity.some(entry => entry.type === "error")).toBe(true);
+    // A REAL relay failure (no client disconnect) must still reach the log —
+    // deferring the log line for the cancellation check must not swallow it.
+    expect(
+      logSpy.mock.calls.map(call => String(call[0])).filter(line => line.includes("relay failed")),
+    ).toHaveLength(1);
   });
 
   it("does not crash when upstream response classification (header/rate-limit parsing) throws", async () => {
