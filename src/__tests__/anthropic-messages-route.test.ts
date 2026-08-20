@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import type { Request } from "express";
 import { describe, expect, it, vi } from "vitest";
-import { mountAnthropicMessagesRoute, withOAuthBeta } from "../proxy/anthropic-messages-route.js";
+import { mountAnthropicMessagesRoute, unbracketedHostname, withOAuthBeta } from "../proxy/anthropic-messages-route.js";
 import type { AnthropicMessagesRouteOptions } from "../proxy/anthropic-messages-route.js";
 import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.js";
 import { OpenAITokenPool } from "../providers/openai/token-pool.js";
@@ -477,6 +477,83 @@ describe("mountAnthropicMessagesRoute", () => {
     expect(fellThrough).toBe(false);
     expect(calls).toHaveLength(2);
     expect(calls[1]!.authorization).not.toBe(calls[0]!.authorization);
+  });
+
+  it("retries an unscoped plain 5xx wherever a fresh request would route", async () => {
+    // A session-less request has no affinity to preserve, and the failed
+    // attempt's still-held lease counts as load — so the retry lands on the
+    // idle account, exactly where the client's own retry would have gone
+    // before the router absorbed it. (Same-account-after-pause is the
+    // sticky/single-account behavior, covered above.)
+    const { server, calls } = scriptedUpstream((call, _req, res) => {
+      if (call === 1) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end("{\"type\":\"error\"}");
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{\"id\":\"msg_1\"}");
+    });
+    const upstreamPort = await listen(server);
+    const { app, activity } = mountRoute([makeAccount("a"), makeAccount("b")], upstreamPort);
+
+    try {
+      await withApp(app, async baseUrl => {
+        const response = await postMessages(baseUrl);
+        expect(response.status).toBe(200);
+        await response.text();
+      });
+    } finally {
+      await close(server);
+    }
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.authorization).not.toBe(calls[0]!.authorization);
+    expect(activity[0]!.details).toContain(":will-retry");
+  });
+
+  it("reaches an IPv6 literal target (URL.hostname keeps brackets node:http rejects)", async ctx => {
+    const sseBody = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const { server, calls } = scriptedUpstream((_call, _req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(sseBody);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "::1", () => {
+          server.off("error", reject);
+          resolve();
+        });
+      });
+    } catch {
+      ctx.skip(); // environment without an IPv6 loopback
+      return;
+    }
+    const upstreamPort = (server.address() as AddressInfo).port;
+    const { app } = mountRoute([makeAccount("solo")], upstreamPort, {
+      target: `http://[::1]:${upstreamPort}`,
+    });
+
+    try {
+      await withApp(app, async baseUrl => {
+        const response = await postMessages(baseUrl);
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe(sseBody);
+      });
+    } finally {
+      await close(server);
+    }
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.host).toBe(`[::1]:${upstreamPort}`);
+  });
+
+  it("strips brackets only from IPv6 literal hostnames", () => {
+    expect(unbracketedHostname(new URL("http://[::1]:4000"))).toBe("::1");
+    expect(unbracketedHostname(new URL("https://[2001:db8::1]/base"))).toBe("2001:db8::1");
+    expect(unbracketedHostname(new URL("https://api.anthropic.com"))).toBe("api.anthropic.com");
+    expect(unbracketedHostname(new URL("http://127.0.0.1:4000"))).toBe("127.0.0.1");
   });
 
   it("appends the oauth beta without disturbing existing betas", () => {

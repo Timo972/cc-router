@@ -112,6 +112,19 @@ interface ForwardedAttempt {
   response: Promise<IncomingMessage>;
 }
 
+/**
+ * URL.hostname keeps the brackets on an IPv6 literal ("[::1]"), but
+ * node:http's host option expects them stripped — a bracketed value is
+ * treated as a DNS name and fails with ENOTFOUND. The Host *header* is
+ * unaffected: it is built from URL.host, where the brackets belong.
+ */
+export function unbracketedHostname(target: URL): string {
+  const { hostname } = target;
+  return hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1)
+    : hostname;
+}
+
 function forwardAttempt(opts: {
   target: URL;
   path: string;
@@ -123,7 +136,7 @@ function forwardAttempt(opts: {
   const secure = opts.target.protocol === "https:";
   const requestFn = secure ? httpsRequest : httpRequest;
   const upstreamRequest = requestFn({
-    host: opts.target.hostname,
+    host: unbracketedHostname(opts.target),
     port: opts.target.port !== "" ? Number(opts.target.port) : secure ? 443 : 80,
     method: opts.method,
     path: opts.path,

@@ -33,10 +33,16 @@ router retries the request itself instead of passing the failure through:
   rules. A 5xx the provider's failure routing treats as an overload (Anthropic
   529; Codex 503 and 529) takes the overload cooldown and invalidates the
   binding, so the retry fails over to a different account with no delay. Any
-  other 5xx takes no cooldown and keeps the sticky binding, so the retry lands
-  on the *same* account after a 500 ms abort-aware delay — on the Anthropic
-  path that includes 503, which Anthropic does not use as its overload signal
-  (529 is).
+  other 5xx takes no cooldown and keeps the sticky binding, so a
+  session-bound retry lands on the *same* account after a 500 ms abort-aware
+  delay — on the Anthropic path that includes 503, which Anthropic does not
+  use as its overload signal (529 is). A session-less request has no binding
+  to preserve: its retry re-routes the way a fresh request would, and because
+  the failed attempt's lease still counts as in-flight load, that typically
+  selects an idle different account with no delay — the same account the
+  client's own retry would have reached back when the failure was passed
+  through. The pause applies exactly when the pool hands the same account
+  back (single account, or everything else busier or blocked).
 - **Pass-through remains the fallback:** if re-acquisition throws
   `NoEligibleAccountError`/`EmptyPoolError`, the new account's token refresh
   fails, the same account comes back for a 429, or the attempt budget is
