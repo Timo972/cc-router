@@ -45,9 +45,19 @@ function numberValue(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function utilization(value: unknown): number {
+/**
+ * Normalize a reported percentage into a 0–1 fraction, or undefined when the
+ * provider reported nothing usable.
+ *
+ * The distinction matters downstream: a *reported* 0 is proof of capacity and
+ * can retire a cooldown, while a missing or non-numeric figure is only absence
+ * of information. Collapsing the two to 0 would let a malformed payload —
+ * `five_hour: {}`, `utilization: null` — unbench an account that is still
+ * being rate limited.
+ */
+function utilization(value: unknown): number | undefined {
   const number = numberValue(value);
-  if (number === undefined) return 0;
+  if (number === undefined) return undefined;
   return Math.max(0, Math.min(1, number / 100));
 }
 
@@ -69,8 +79,9 @@ function getFirst(record: UnknownRecord, keys: string[]): unknown {
 
 function parseWindow(value: unknown): RateLimitWindow | undefined {
   if (!isRecord(value)) return undefined;
+  const reported = utilization(getFirst(value, ["utilization", "percentage", "percent"]));
   return {
-    utilization: utilization(getFirst(value, ["utilization", "percentage", "percent"])),
+    ...(reported === undefined ? {} : { utilization: reported }),
     resetAt: resetAt(getFirst(value, ["resets_at", "reset_at", "resetAt"])),
   };
 }
@@ -114,11 +125,12 @@ function parseModelLimit(value: unknown): ModelRateLimit | undefined {
   const model = modelDetails(value);
   if (!model) return undefined;
   const active = getFirst(value, ["active", "is_active"]);
+  const reported = utilization(getFirst(value, ["utilization", "percentage", "percent"]));
   return {
     kind: "weekly_scoped",
     group: stringValue(value.group) ?? "weekly",
     ...model,
-    utilization: utilization(getFirst(value, ["utilization", "percentage", "percent"])),
+    ...(reported === undefined ? {} : { utilization: reported }),
     resetAt: resetAt(getFirst(value, ["resets_at", "reset_at", "resetAt"])),
     active: typeof active === "boolean" ? active : true,
     severity: stringValue(value.severity) ?? "",

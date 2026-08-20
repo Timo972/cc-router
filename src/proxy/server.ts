@@ -353,7 +353,9 @@ function publicUsageSnapshot(usage: NonNullable<AccountRateLimits["usage"]>): Pu
   };
 }
 
-function publicWindow(window: { utilization: number; resetAt: number }): PublicRateLimitWindow {
+// An unreported utilization surfaces as 0 here, which is what the dashboard
+// has always shown for it; only release decisions need the distinction.
+function publicWindow(window: { utilization?: number; resetAt: number }): PublicRateLimitWindow {
   return { utilization: publicUtilization(window.utilization), resetAt: publicTimestamp(window.resetAt) };
 }
 

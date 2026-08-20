@@ -195,6 +195,16 @@ function matchingModelLimit(
   );
 }
 
+/** A reported figure strictly inside the normalized headroom range. */
+function withinHeadroomRange(value: number | undefined): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value < 1;
+}
+
+/** A reported figure at or above its limit. Unreported is never "at limit". */
+function atReportedLimit(value: number | undefined): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value >= 1;
+}
+
 function classifyCooldown(
   claimValue: unknown,
   route: FailureRoute<FailureAccount>,
@@ -219,7 +229,7 @@ function classifyCooldown(
 
   if (claim === "seven_day_overage_included") {
     const matching = matchingModelLimit(route.account, requestedFamily);
-    if (requestedFamily && matching?.active === true && matching.utilization >= 1) {
+    if (requestedFamily && matching?.active === true && atReportedLimit(matching.utilization)) {
       return {
         kind: "model",
         ambiguous: false,
@@ -292,17 +302,11 @@ export function reconcileAmbiguousRateLimitCooldown<TAccount extends FailureAcco
   const usage = route.account.rateLimits?.usage;
   if (token === undefined || !family || !usage || usage.fetchStatus !== "fresh") return false;
   if (!usage.fiveHour || !usage.sevenDay) return false;
-  if (!Number.isFinite(usage.fiveHour.utilization) ||
-    !Number.isFinite(usage.sevenDay.utilization) ||
-    usage.fiveHour.utilization < 0 ||
-    usage.sevenDay.utilization < 0 ||
-    usage.fiveHour.utilization >= 1 ||
-    usage.sevenDay.utilization >= 1) return false;
+  if (!withinHeadroomRange(usage.fiveHour.utilization) ||
+    !withinHeadroomRange(usage.sevenDay.utilization)) return false;
   if (canUseExtraUsage(usage.extraUsage)) return false;
   const matching = matchingModelLimit(route.account, family);
-  if (!matching || !matching.active || !Number.isFinite(matching.utilization) || matching.utilization < 1) {
-    return false;
-  }
+  if (!matching || !matching.active || !atReportedLimit(matching.utilization)) return false;
   if (!pool.reconcileAmbiguousGlobalCooldownForAccount) return false;
 
   const nowMs = now();

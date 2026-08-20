@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { TokenPool } from "../proxy/token-pool.js";
+import { parseAnthropicUsage } from "../providers/anthropic/usage.js";
 import type { Account, AccountUsageSnapshot, ModelRateLimit } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
 
@@ -83,6 +84,9 @@ interface SnapshotOptions {
   models?: ModelRateLimit[];
   fetchStatus?: AccountUsageSnapshot["fetchStatus"];
   omitWindows?: boolean;
+  /** Present the windows the way the parser renders a malformed payload:
+   *  the window exists, but carries no utilization figure. */
+  unreportedWindows?: boolean;
 }
 
 function snapshot(options: SnapshotOptions): AccountUsageSnapshot {
@@ -94,8 +98,12 @@ function snapshot(options: SnapshotOptions): AccountUsageSnapshot {
   };
   if (options.requestedSeq !== undefined) snap.requestedSeq = options.requestedSeq;
   if (!options.omitWindows) {
-    snap.fiveHour = { utilization: options.fiveHour ?? 0, resetAt: 2_000_000_000 };
-    snap.sevenDay = { utilization: options.sevenDay ?? 0, resetAt: 2_000_000_000 };
+    snap.fiveHour = options.unreportedWindows
+      ? { resetAt: 0 }
+      : { utilization: options.fiveHour ?? 0, resetAt: 2_000_000_000 };
+    snap.sevenDay = options.unreportedWindows
+      ? { resetAt: 0 }
+      : { utilization: options.sevenDay ?? 0, resetAt: 2_000_000_000 };
   }
   return snap;
 }
@@ -211,6 +219,98 @@ describe("global cooldowns superseded only within the scope that created them", 
     expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
   });
 
+  it("keeps a cooldown when the window carries no utilization figure", () => {
+    // A recognized but malformed payload — `five_hour: {}`, or a non-numeric
+    // utilization — leaves a window present with nothing reported in it. That
+    // is missing data, not proof of capacity, and must not unbench an account
+    // that may still be answering 429s.
+    const h = harness("unreported-utilization");
+    h.pool.setGlobalCooldownForAccount(h.account, TWO_HOURS, "five_hour");
+    const cooldownUntil = h.now() + TWO_HOURS;
+
+    h.advance(3 * 60_000);
+    setUsage(h.account, snapshot({ requestedSeq: h.nextSeq(), unreportedWindows: true }));
+
+    expect(h.pool.getCooldownSummary(h.account.id).globalUntilMs).toBe(cooldownUntil);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+  });
+
+  it("keeps a model cooldown when that family reports no utilization figure", () => {
+    const h = harness("unreported-model-utilization");
+    h.pool.setModelCooldownForAccount(h.account, "fable", FIVE_DAYS);
+    const cooldownUntil = h.now() + FIVE_DAYS;
+
+    h.advance(3 * 60_000);
+    setUsage(h.account, snapshot({
+      requestedSeq: h.nextSeq(),
+      models: [{
+        kind: "weekly_scoped",
+        group: "weekly",
+        modelFamily: "fable",
+        displayName: "Fable",
+        resetAt: 0,
+        active: true,
+        severity: "unknown",
+      }],
+    }));
+
+    expect(h.pool.getCooldownSummary(h.account.id).modelCooldowns).toEqual([
+      { modelFamily: "fable", untilMs: cooldownUntil },
+    ]);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+  });
+
+  it("keeps a cooldown against a real malformed payload end to end", () => {
+    // The layers have to agree: the parser must not manufacture a zero, and
+    // the pool must not read one as capacity. Driving the real parser proves
+    // the pair, rather than a hand-built snapshot shape.
+    const h = harness("malformed-payload");
+    h.pool.setGlobalCooldownForAccount(h.account, TWO_HOURS, "five_hour");
+    const cooldownUntil = h.now() + TWO_HOURS;
+
+    h.advance(3 * 60_000);
+    const parsed = parseAnthropicUsage(
+      { five_hour: {}, seven_day: { utilization: null } },
+      h.now(),
+      h.nextSeq(),
+    );
+    expect(parsed).not.toBeNull();
+    setUsage(h.account, parsed!);
+
+    expect(h.pool.getCooldownSummary(h.account.id).globalUntilMs).toBe(cooldownUntil);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+
+    // The same payload carrying a genuine zero does retire it.
+    const reported = parseAnthropicUsage(
+      { five_hour: { utilization: 0 }, seven_day: { utilization: 0 } },
+      h.now(),
+      h.nextSeq(),
+    );
+    setUsage(h.account, reported!);
+
+    expect(h.pool.getCooldownSummary(h.account.id).globalUntilMs).toBe(0);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+  });
+
+  it("keeps a rate_limited status when the claimed window reports nothing", () => {
+    const h = harness("unreported-status");
+    h.account.rateLimits = {
+      ...h.account.rateLimits,
+      status: "rate_limited",
+      claim: "five_hour",
+      fiveHourUtil: 1,
+      fiveHourReset: Math.floor(h.now() / 1000) + 2 * 60 * 60,
+      lastUpdated: h.now(),
+      lastUpdatedSeq: h.nextSeq(),
+    };
+
+    h.advance(3 * 60_000);
+    setUsage(h.account, snapshot({ requestedSeq: h.nextSeq(), unreportedWindows: true }));
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+    expect(h.account.rateLimits.status).toBe("rate_limited");
+  });
+
   it("ignores a snapshot that is not fresh", () => {
     const h = harness("stale-snapshot");
     h.pool.setGlobalCooldownForAccount(h.account, TWO_HOURS, "five_hour");
@@ -302,6 +402,37 @@ describe("overlapping global cooldowns from different scopes", () => {
     h.jumpTo(fiveHourUntil + 1);
     expect(h.pool.getCooldownSummary(h.account.id).globalUntilMs).toBe(sevenDayUntil);
     expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+  });
+
+  it("does not let a later shorter 429 revive an already-superseded expiry", () => {
+    // Two requests are in flight. The first 429s with a long reset, the
+    // refresh it triggers comes back with headroom, and only then does the
+    // second — already on the wire — 429 with a short reset. Nothing swept
+    // in between, so the release had no chance to run.
+    const h = harness("shorter-429-after-refresh");
+
+    h.pool.setGlobalCooldownForAccount(h.account, TWO_HOURS, "five_hour");
+
+    // The refresh proving headroom was initiated after that first 429.
+    const refreshSeq = h.nextSeq();
+
+    // The second 429 lands before any sweep, and asks for far less time.
+    h.advance(1_000);
+    h.pool.setGlobalCooldownForAccount(h.account, 60_000, "five_hour");
+    const shortUntil = h.now() + 60_000;
+
+    // The refresh retires the long expiry it was newer than; the short one
+    // it predates survives on its own terms.
+    setUsage(h.account, snapshot({ requestedSeq: refreshSeq, fiveHour: 0, sevenDay: 0 }));
+
+    expect(h.pool.getCooldownSummary(h.account.id).globalUntilMs).toBe(shortUntil);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+
+    // Once the short cooldown is out, nothing holds the account back — the
+    // long expiry must not outlive the snapshot that superseded it.
+    h.jumpTo(shortUntil + 1);
+    expect(h.pool.getCooldownSummary(h.account.id).globalUntilMs).toBe(0);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
   });
 
   it("keeps each scope on its own window", () => {

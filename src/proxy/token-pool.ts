@@ -52,14 +52,19 @@ interface AccountCooldowns {
   globalUntil: number;
   modelUntil: Map<string, CooldownEntry>;
   /**
-   * One entry per scope, deliberately not collapsed into a single expiry.
-   * Concurrent requests routinely produce overlapping cooldowns from different
-   * scopes — a 529 overload alongside a five-hour 429 — and keeping only the
-   * longest would either let a usage snapshot clear the overload it cannot
-   * speak for, or let the brief overload make the multi-hour quota cooldown
-   * permanently unsupersedable, depending on arrival order.
+   * Global cooldowns grouped by scope, and within a scope kept as separate
+   * expiries rather than one maximum.
+   *
+   * Both dimensions carry information that merging destroys. Across scopes: a
+   * 529 overload alongside a five-hour 429 must not merge, or a usage snapshot
+   * would clear the overload it cannot speak for — or the brief overload would
+   * make the multi-hour cooldown permanently unsupersedable, depending on
+   * arrival order. Within a scope: keeping only the longest expiry but
+   * stamping it with the newest event's sequence would let a later, shorter
+   * 429 revive an expiry a refresh had already retired. Each expiry therefore
+   * stays paired with the sequence of the event that produced it.
    */
-  definiteGlobal: Map<GlobalCooldownScope, CooldownEntry>;
+  definiteGlobal: Map<GlobalCooldownScope, CooldownEntry[]>;
   pendingAmbiguous: Map<number, { until: number; modelFamily?: string }>;
 }
 
@@ -361,10 +366,15 @@ export class TokenPool implements AccountPool<Account> {
     if (expiry === undefined) return;
     const state = this.cooldownsFor(account);
     const scope: GlobalCooldownScope = usageWindow ?? "unscoped";
-    state.definiteGlobal.set(scope, {
-      until: Math.max(state.definiteGlobal.get(scope)?.until ?? 0, expiry),
-      recordedSeq: this.nextSequence(),
-    });
+    // This event has the newest sequence, so it dominates every existing entry
+    // it also outlasts: those can never outlive it nor be released before it.
+    // Dropping them keeps the list to expiries that still say something new,
+    // which in practice is one or two.
+    const surviving = (state.definiteGlobal.get(scope) ?? []).filter(
+      entry => entry.until > expiry,
+    );
+    surviving.push({ until: expiry, recordedSeq: this.nextSequence() });
+    state.definiteGlobal.set(scope, surviving);
     this.recomputeGlobalUntil(state);
   }
 
@@ -626,8 +636,10 @@ export class TokenPool implements AccountPool<Account> {
 
   private clearExpiredCooldownState(account: Account, state: AccountCooldowns): void {
     const now = this.now();
-    for (const [scope, entry] of state.definiteGlobal) {
-      if (entry.until <= now) state.definiteGlobal.delete(scope);
+    for (const [scope, entries] of state.definiteGlobal) {
+      const live = entries.filter(entry => entry.until > now);
+      if (live.length === 0) state.definiteGlobal.delete(scope);
+      else if (live.length !== entries.length) state.definiteGlobal.set(scope, live);
     }
     for (const [token, pending] of state.pendingAmbiguous) {
       if (pending.until <= now) state.pendingAmbiguous.delete(token);
@@ -671,10 +683,15 @@ export class TokenPool implements AccountPool<Account> {
     const supersedingSeq = supersedingSequence(usage);
     if (usage === undefined || supersedingSeq === undefined) return;
 
-    for (const [scope, entry] of state.definiteGlobal) {
-      if (scope === "unscoped" || supersedingSeq <= entry.recordedSeq) continue;
+    for (const [scope, entries] of state.definiteGlobal) {
+      if (scope === "unscoped") continue;
       const window = scope === "five_hour" ? usage.fiveHour : usage.sevenDay;
-      if (reportsHeadroom(window?.utilization)) state.definiteGlobal.delete(scope);
+      if (!reportsHeadroom(window?.utilization)) continue;
+      // Retire only the expiries this refresh is newer than. A 429 that landed
+      // after it started still stands on its own evidence.
+      const surviving = entries.filter(entry => supersedingSeq <= entry.recordedSeq);
+      if (surviving.length === 0) state.definiteGlobal.delete(scope);
+      else if (surviving.length !== entries.length) state.definiteGlobal.set(scope, surviving);
     }
 
     // A family the snapshot does not mention is left alone: silence is not
@@ -697,8 +714,8 @@ export class TokenPool implements AccountPool<Account> {
 
   private recomputeGlobalUntil(state: AccountCooldowns): void {
     let globalUntil = 0;
-    for (const entry of state.definiteGlobal.values()) {
-      globalUntil = Math.max(globalUntil, entry.until);
+    for (const entries of state.definiteGlobal.values()) {
+      for (const entry of entries) globalUntil = Math.max(globalUntil, entry.until);
     }
     for (const pending of state.pendingAmbiguous.values()) {
       globalUntil = Math.max(globalUntil, pending.until);

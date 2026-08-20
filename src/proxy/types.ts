@@ -36,7 +36,11 @@ export const DEFAULT_RATE_LIMITS: AccountRateLimits = {
 };
 
 export interface RateLimitWindow {
-  utilization: number;
+  /** Absent when the provider reported no usable figure. Consumers deciding
+   *  whether to *block* treat that as 0 (see TokenPool.safeUtilization);
+   *  consumers deciding whether to *release* a block must not — missing data
+   *  is not evidence of capacity. */
+  utilization?: number;
   resetAt: number;
 }
 
@@ -46,7 +50,9 @@ export interface ModelRateLimit {
   modelId?: string;
   modelFamily: string;
   displayName: string;
-  utilization: number;
+  /** Absent when the provider reported no usable figure — see
+   *  RateLimitWindow.utilization. */
+  utilization?: number;
   resetAt: number;
   active: boolean;
   severity: string;
