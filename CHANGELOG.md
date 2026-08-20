@@ -8,6 +8,32 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.10.1] — 2026-08-20
+
+### Fixed
+
+- A passed-through upstream 5xx on the Anthropic path is logged and counted.
+  The proxy is byte-transparent and only special-cased 401/429/529, so a
+  plain upstream 500 left no trace: an overnight Anthropic 500 stopped an
+  unattended Claude session while the daemon log showed nothing and the
+  stats reported a clean night. It now produces an `[ERROR]` line, an
+  activity entry (`upstream-error`), and error counts — with no cooldown,
+  since a plain 5xx says nothing about the account's capacity and can even
+  be request-specific.
+- A client-cancelled stream abort is no longer logged as an error on the
+  OpenAI path. The Codex CLI aborts streams routinely, and each abort
+  rejects the relay's body read — the log printed an `[ERROR] ... relay
+  failed` line for every one (eight hours of them in one overnight
+  session) while the stats correctly classified them as cancellations. The
+  log line now waits for the cancellation check, so it fires only for real
+  relay failures.
+
+---
+
+## [0.10.0] — 2026-08-19
+
 ### Added
 
 - OpenAI/Codex account usage is fetched proactively, so `cc-router status`
@@ -52,24 +78,31 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one row when the selection steps past its bottom or top edge, stays put while
   the selection moves inside it, and re-clamps when new entries push the
   selected row (which is timestamp-anchored) out of the stored window.
+- OpenAI/Codex sticky session routing: sessions pin to one account for prompt-cache
+  locality (`session_id` → `x-claude-code-session-id` → `prompt_cache_key`), with
+  load- and headroom-aware selection for new sessions.
+- Codex usage tracking from `x-codex-*` response headers: default 5h/weekly windows
+  plus dynamically discovered model-scoped metered buckets, credits, and plan.
+- Scoped cooldowns on upstream failures: bucket-scoped via `x-codex-active-limit`,
+  account-global otherwise; local 429/503 responses when no account is eligible.
+- Dashboard: OpenAI accounts now show 5h/weekly bars, per-bucket rows, credits,
+  plan, request/error/in-flight/session counts, and cooldown state.
+- Unprefixed `gpt-*` models route to OpenAI. The Codex CLI writes the bare slug
+  from its own registry — `model = "gpt-5.6-sol"` in `config.toml`, or whatever
+  its `/model` picker selects — and an unprefixed name went to the Claude path,
+  where `/v1/responses` answers `501 Not Implemented`. No configuration could
+  redirect it, because `openAIAliases` is only consulted for names that are
+  already prefixed; those aliases now apply to the bare form as well. Every
+  other unprefixed model still routes to Claude.
+
+### Changed
+
+- OpenAI account records persist `scopes`, `sessionLimitPercent`, and
+  `weeklyLimitPercent`.
+- The stateless OpenAI round-robin picker was removed in favor of
+  `OpenAITokenPool`.
 
 ### Fixed
-
-- A passed-through upstream 5xx on the Anthropic path is logged and counted.
-  The proxy is byte-transparent and only special-cased 401/429/529, so a
-  plain upstream 500 left no trace: an overnight Anthropic 500 stopped an
-  unattended Claude session while the daemon log showed nothing and the
-  stats reported a clean night. It now produces an `[ERROR]` line, an
-  activity entry (`upstream-error`), and error counts — with no cooldown,
-  since a plain 5xx says nothing about the account's capacity and can even
-  be request-specific.
-- A client-cancelled stream abort is no longer logged as an error on the
-  OpenAI path. The Codex CLI aborts streams routinely, and each abort
-  rejects the relay's body read — the log printed an `[ERROR] ... relay
-  failed` line for every one (eight hours of them in one overnight
-  session) while the stats correctly classified them as cancellations. The
-  log line now waits for the cancellation check, so it fires only for real
-  relay failures.
 
 - The dashboard fits the terminal. The frame had a fixed shape — 20 activity
   rows, a detail panel, and every account expanded — which with a real fleet
@@ -159,39 +192,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on `CC_ROUTER_DAEMON`, which the LaunchAgent and systemd unit never set —
   they set `CC_ROUTER_SERVICE` — so every service-managed instance left no PID
   behind and took the weaker port-based stop path.
-
----
-
-## [0.10.0] — 2026-08-18
-
-### Added
-
-- OpenAI/Codex sticky session routing: sessions pin to one account for prompt-cache
-  locality (`session_id` → `x-claude-code-session-id` → `prompt_cache_key`), with
-  load- and headroom-aware selection for new sessions.
-- Codex usage tracking from `x-codex-*` response headers: default 5h/weekly windows
-  plus dynamically discovered model-scoped metered buckets, credits, and plan.
-- Scoped cooldowns on upstream failures: bucket-scoped via `x-codex-active-limit`,
-  account-global otherwise; local 429/503 responses when no account is eligible.
-- Dashboard: OpenAI accounts now show 5h/weekly bars, per-bucket rows, credits,
-  plan, request/error/in-flight/session counts, and cooldown state.
-- Unprefixed `gpt-*` models route to OpenAI. The Codex CLI writes the bare slug
-  from its own registry — `model = "gpt-5.6-sol"` in `config.toml`, or whatever
-  its `/model` picker selects — and an unprefixed name went to the Claude path,
-  where `/v1/responses` answers `501 Not Implemented`. No configuration could
-  redirect it, because `openAIAliases` is only consulted for names that are
-  already prefixed; those aliases now apply to the bare form as well. Every
-  other unprefixed model still routes to Claude.
-
-### Changed
-
-- OpenAI account records persist `scopes`, `sessionLimitPercent`, and
-  `weeklyLimitPercent`.
-- The stateless OpenAI round-robin picker was removed in favor of
-  `OpenAITokenPool`.
-
-### Fixed
-
 - A refresh token the OAuth server rejects as terminally expired
   (`400 invalid_grant`) is no longer retried forever. Every rejection was
   treated as transient, so the five-minute refresh loop kept re-POSTing a token
