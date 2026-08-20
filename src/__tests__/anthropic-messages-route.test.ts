@@ -3,8 +3,11 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import type { Request } from "express";
 import { describe, expect, it, vi } from "vitest";
-import { mountAnthropicMessagesRoute } from "../proxy/anthropic-messages-route.js";
+import { mountAnthropicMessagesRoute, withOAuthBeta } from "../proxy/anthropic-messages-route.js";
 import type { AnthropicMessagesRouteOptions } from "../proxy/anthropic-messages-route.js";
+import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.js";
+import { OpenAITokenPool } from "../providers/openai/token-pool.js";
+import { createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
 import { SessionRouter } from "../proxy/session-router.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import type { Account } from "../proxy/types.js";
@@ -408,6 +411,80 @@ describe("mountAnthropicMessagesRoute", () => {
     } finally {
       await close(server);
     }
+  });
+
+  it("handles Anthropic-bound requests handed on by the production cross-provider dispatch", async () => {
+    // Mirrors server.ts's mount order: cross-provider dispatch (owns body
+    // parsing) → retrying Anthropic route → generic /v1 fallthrough. An
+    // Anthropic-bound 429 must be absorbed by the retry route, never reach
+    // the generic proxy, and still fail over.
+    const sseBody = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const { server, calls } = scriptedUpstream((call, _req, res) => {
+      if (call === 1) {
+        res.writeHead(429, { "content-type": "application/json", "retry-after": "60" });
+        res.end("{\"type\":\"error\"}");
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(sseBody);
+    });
+    const upstreamPort = await listen(server);
+
+    const accounts = [makeAccount("a"), makeAccount("b")];
+    const pool = new TokenPool(accounts);
+    const sessionRouter = new SessionRouter(pool);
+    const openAIAccount: OpenAIAccount = createOpenAIAccount({
+      id: "openai-a",
+      provider: "openai_subscription",
+      accessToken: "header.e30.sig",
+      refreshToken: "rt",
+      expiresAt: Date.now() + 3_600_000,
+      enabled: true,
+    });
+    const openAIPool = new OpenAITokenPool([openAIAccount]);
+    const app = express();
+    mountMessagesCrossProviderRoute(app, {
+      openAIRouter: new SessionRouter<OpenAIAccount>(openAIPool),
+      openAIPool,
+    });
+    mountAnthropicMessagesRoute(app, {
+      target: `http://127.0.0.1:${upstreamPort}`,
+      timeoutMs: 2_000,
+      pool,
+      sessionRouter,
+      needsRefresh: () => false,
+      refresh: async () => true,
+      onRefreshFailure: vi.fn(),
+      recordActivity: () => {},
+      sameAccountRetryDelayMs: 5,
+    });
+    let fellThrough = false;
+    app.use("/v1", (_req, res) => {
+      fellThrough = true;
+      res.status(599).end();
+    });
+
+    try {
+      await withApp(app, async baseUrl => {
+        const response = await postMessages(baseUrl, { "x-claude-code-session-id": "session-1" });
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe(sseBody);
+      });
+    } finally {
+      await close(server);
+    }
+
+    expect(fellThrough).toBe(false);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.authorization).not.toBe(calls[0]!.authorization);
+  });
+
+  it("appends the oauth beta without disturbing existing betas", () => {
+    expect(withOAuthBeta(undefined)).toBe("oauth-2025-04-20");
+    expect(withOAuthBeta("")).toBe("oauth-2025-04-20");
+    expect(withOAuthBeta("context-1m-2025-08-07, computer-use-2025-01-24"))
+      .toBe("context-1m-2025-08-07,computer-use-2025-01-24,oauth-2025-04-20");
+    expect(withOAuthBeta("oauth-2025-04-20")).toBe("oauth-2025-04-20");
   });
 
   it("falls through to the next route when no raw body was buffered", async () => {
