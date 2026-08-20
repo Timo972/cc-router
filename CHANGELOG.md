@@ -27,6 +27,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   show up in the activity log with a `:will-retry` suffix. On by
   default — set `"autoFailover": false` in `~/.cc-router/config.json`
   (restart required) to opt out and restore pure pass-through behavior.
+  Note that current Claude Code builds no longer retry 429s themselves,
+  so with failover off a rate limit surfaces directly in the session.
 
 ### Changed
 

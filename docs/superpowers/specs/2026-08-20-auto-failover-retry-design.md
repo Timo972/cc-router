@@ -6,10 +6,12 @@
 ## Problem
 
 Today CC-Router passes upstream 429/5xx responses through unchanged and relies
-on the client to retry. That works, but wastes a full client round-trip per
-failure, and some clients give up: an unattended overnight Claude session has
-been stopped by a single Anthropic 500 that a router-side retry would have
-absorbed. With multiple accounts configured, a 429 on account A is not a
+on the client to retry. That no longer works: current Claude Code builds do
+not retry 429s at all, so a passed-through rate limit surfaces in the session
+as an error and ends the turn — the old recovery path where the client's
+retry landed on another usable account is gone. Clients also give up on 5xx:
+an unattended overnight Claude session has been stopped by a single Anthropic
+500 that a router-side retry would have absorbed. With multiple accounts configured, a 429 on account A is not a
 reason to fail the request at all — account B is sitting idle.
 
 ## Behavior
