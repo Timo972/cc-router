@@ -12,12 +12,7 @@ import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurre
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
 import { logRoute, logError, logStartup } from "./logger.js";
-import {
-  applyAnthropicInputUsage,
-  applyAnthropicOutputUsage,
-  createLocalRoutingErrorLog,
-  stats,
-} from "./stats.js";
+import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { applyRateLimitHeaders } from "../providers/anthropic/rate-limit-headers.js";
 import { mountAnthropicMessagesRoute, withOAuthBeta } from "./anthropic-messages-route.js";
@@ -50,7 +45,7 @@ import type { RoutedAccountLease } from "./session-router.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
 import { OpenAIUsageRefresher } from "../providers/openai/usage-fetch.js";
-import { createAnthropicUsageCapture } from "./usage-capture.js";
+import { attachAnthropicResponseCapture } from "./anthropic-response-capture.js";
 import { canUseExtraUsage } from "../providers/anthropic/usage.js";
 import {
   applyUpstreamFailureRoutingDetailed,
@@ -69,7 +64,6 @@ import {
   createAnthropicRefreshMiddleware,
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
-import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
@@ -1362,38 +1356,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         stats.addLog(entry);
 
         // ── Capture token usage from Anthropic response body ─────────────────
-        // SSE streams carry usage across two events:
-        //   message_start  → input_tokens, cache_read/creation_input_tokens
-        //   message_delta   → output_tokens
-        // Non-streaming JSON carries all fields in a single usage object.
-        // The proxy is byte-transparent and the client's accept-encoding makes
-        // upstream compress, so the capture decompresses its own copy of the
-        // stream (see usage-capture.ts) — previously compressed responses were
-        // skipped, which in practice was EVERY response: no cache rate or
-        // token counts ever appeared on Anthropic activity rows.
-        const contentType = String(proxyRes.headers["content-type"] ?? "");
-        const encoding = String(proxyRes.headers["content-encoding"] ?? "");
-        const isCompressed = /gzip|br|deflate/.test(encoding);
-        const streamTracker = createStreamLifecycleTracker(
+        // Passive stream-lifecycle + token-usage taps, shared with the
+        // retrying /v1/messages transport (see anthropic-response-capture.ts).
+        attachAnthropicResponseCapture(
+          proxyRes,
+          response,
+          entry,
           (req as Request)._startTime ?? Date.now(),
-          !isCompressed && contentType.includes("text/event-stream"),
         );
-        entry.streamLifecycle = streamTracker.state;
-        streamTracker.attach(proxyRes, response);
-        proxyRes.on("data", (chunk: Buffer) => streamTracker.observeChunk(chunk));
-
-        const usageCapture = createAnthropicUsageCapture({
-          contentType,
-          contentEncoding: encoding,
-          // Mutates the already-logged entry in place; the dashboard picks the
-          // values up on its next poll.
-          onInputUsage: (usage) => applyAnthropicInputUsage(entry, usage),
-          onOutputUsage: (usage) => applyAnthropicOutputUsage(entry, usage),
-        });
-        if (usageCapture) {
-          proxyRes.on("data", (chunk: Buffer) => usageCapture.write(chunk));
-          proxyRes.on("end", () => usageCapture.end());
-        }
       },
 
       error: (err: Error, _req: IncomingMessage, res: ServerResponse | Socket) => {

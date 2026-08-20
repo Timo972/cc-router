@@ -14,8 +14,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   received before any response byte is relayed no longer passes straight
   through to the client: the router applies the existing cooldown/affinity
   bookkeeping and retries the request itself — on a *different* account
-  after a 429 (or a 503/529 overload), on the same account after a short
-  pause for a plain 500/502/504 — up to 3 upstream attempts per request.
+  after a 429 or an overload the provider cools down (Anthropic 529;
+  Codex 503/529), on the same account after a short pause for any other
+  5xx — up to 3 upstream attempts per request.
   Covers Claude `/v1/messages`, Codex `/v1/responses`, and cross-routed
   `/v1/messages`. When nothing is eligible or the budget is exhausted, the
   last failed upstream response is relayed unchanged, exactly as before;

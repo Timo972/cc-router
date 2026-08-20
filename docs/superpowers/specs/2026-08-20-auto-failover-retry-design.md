@@ -29,11 +29,14 @@ router retries the request itself instead of passing the failure through:
   cooldown set by the failure bookkeeping already excludes the failed account
   from re-acquisition; an explicit same-account guard relays the original
   response if that invariant is ever violated. No delay between attempts.
-- **5xx → retry:** re-acquisition follows the existing routing rules. Plain
-  500/502/504 take no cooldown and keep the sticky binding, so the retry lands
-  on the *same* account (with a 500 ms abort-aware delay). 503/529 take the
-  overload cooldown and invalidate the binding, so the retry fails over to a
-  different account (no delay).
+- **5xx → retry:** re-acquisition follows each provider's existing routing
+  rules. A 5xx the provider's failure routing treats as an overload (Anthropic
+  529; Codex 503 and 529) takes the overload cooldown and invalidates the
+  binding, so the retry fails over to a different account with no delay. Any
+  other 5xx takes no cooldown and keeps the sticky binding, so the retry lands
+  on the *same* account after a 500 ms abort-aware delay — on the Anthropic
+  path that includes 503, which Anthropic does not use as its overload signal
+  (529 is).
 - **Pass-through remains the fallback:** if re-acquisition throws
   `NoEligibleAccountError`/`EmptyPoolError`, the new account's token refresh
   fails, the same account comes back for a 429, or the attempt budget is
@@ -41,6 +44,11 @@ router retries the request itself instead of passing the failure through:
   byte-for-byte, headers included — exactly as today.
 - **401 is never retried** (unchanged: pass through, background token
   refresh, client retries).
+- **Committing to a retry abandons the held failure response.** A
+  network-level failure on the retry attempt therefore follows the existing
+  network-failure path — a local 502 — rather than resurrecting the abandoned
+  upstream response. Holding failed response bodies (and their sockets) open
+  across a whole further attempt is deliberately not done.
 - **Never after first byte:** the retry decision happens at upstream response
   headers. Mid-stream failures on an already-relaying response are untouched;
   the router still never synthesizes response bytes.

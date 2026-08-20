@@ -420,7 +420,9 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       logError(account.id, upstream.status, `openai response classification failed: ${message}`);
     }
 
-    if (!upstreamFailed || !isRetryableUpstreamStatus(upstream.status)
+    // Retryable statuses (429 || >= 500) are a strict subset of
+    // `upstreamFailed`, so this predicate alone decides the loop.
+    if (!isRetryableUpstreamStatus(upstream.status)
       || attempt >= maxAttempts || clientGone.signal.aborted) {
       break;
     }
@@ -435,8 +437,14 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     let next: typeof selected;
     try {
       next = acquireRequestRoute(sessionKey, res, openAIRouter, { requestedModel });
-    } catch {
-      // Nothing eligible to fail over to — pass the failure through.
+    } catch (error) {
+      // Nothing eligible to fail over to — pass the failure through. Only
+      // routing-level rejections are expected here; anything else is a bug
+      // worth a log line, though pass-through stays the safe outcome.
+      if (!(error instanceof NoEligibleAccountError) && !(error instanceof EmptyPoolError)) {
+        const message = error instanceof Error ? error.message : String(error);
+        logError("proxy", 500, `unexpected routing failure during retry: ${message}`);
+      }
       break;
     }
     if (upstream.status === 429 && next.route.account.id === account.id) {

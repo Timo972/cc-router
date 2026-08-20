@@ -14,12 +14,11 @@ import {
   routeReasonDetails,
 } from "./lease-lifecycle.js";
 import type { RoutedAccountLease, SessionRouter } from "./session-router.js";
-import type { TokenPool } from "./token-pool.js";
+import { EmptyPoolError, NoEligibleAccountError, type TokenPool } from "./token-pool.js";
 import type { Account } from "./types.js";
 import { applyRateLimitHeaders } from "../providers/anthropic/rate-limit-headers.js";
-import { createAnthropicUsageCapture } from "./usage-capture.js";
-import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
-import { applyAnthropicInputUsage, applyAnthropicOutputUsage, boundModelId, stats } from "./stats.js";
+import { attachAnthropicResponseCapture } from "./anthropic-response-capture.js";
+import { boundModelId, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { logError, logRoute } from "./logger.js";
 import {
@@ -380,8 +379,14 @@ export function mountAnthropicMessagesRoute(
         let next: { route: RoutedAccountLease; release: () => void } | undefined;
         try {
           next = acquireRequestRoute(sessionHeader, res, opts.sessionRouter, context);
-        } catch {
+        } catch (error) {
           // Nothing eligible to fail over to — pass the failure through.
+          // Only routing-level rejections are expected here; anything else is
+          // a bug worth a log line, though pass-through stays the safe outcome.
+          if (!(error instanceof NoEligibleAccountError) && !(error instanceof EmptyPoolError)) {
+            const message = error instanceof Error ? error.message : String(error);
+            logError("proxy", 0, `unexpected routing failure during retry: ${message}`);
+          }
           next = undefined;
         }
         if (next && status === 429 && next.route.account.id === account.id) {
@@ -437,35 +442,36 @@ export function mountAnthropicMessagesRoute(
         }
       }
 
-      // ── Final: relay this response byte-transparently ─────────────────────
-      // The entry is recorded now (headers time) and mutated in place by the
-      // usage capture below; the dashboard picks the values up on its next
-      // poll — same contract as the generic proxy path.
+      // The client may have left while the response headers (or the retry
+      // decision) were in flight — the abort listener has already torn the
+      // upstream request down, so there is nothing to relay and no reader to
+      // relay it to. The attempt's bookkeeping above still stands; only a
+      // response that upstream itself answered cleanly gets the cancellation
+      // marker, mirroring the OpenAI ingress.
+      // The final attempt's entry describes the whole client request: it
+      // starts at the request and spans every attempt (and retry delay),
+      // exactly like the OpenAI ingress — so ts + durationMs always equals
+      // the moment the entry was finalized. Failed :will-retry entries keep
+      // their own per-attempt window.
+      entry.ts = startedAt;
       entry.durationMs = now() - startedAt;
-      recordActivity(entry);
 
-      const contentType = String(upstream.headers["content-type"] ?? "");
-      const encoding = String(upstream.headers["content-encoding"] ?? "");
-      const isCompressed = /gzip|br|deflate/.test(encoding);
-      const streamTracker = createStreamLifecycleTracker(
-        startedAt,
-        !isCompressed && contentType.includes("text/event-stream"),
-      );
-      entry.streamLifecycle = streamTracker.state;
-      streamTracker.attach(upstream, res);
-      upstream.on("data", (chunk: Buffer) => streamTracker.observeChunk(chunk));
-
-      const usageCapture = createAnthropicUsageCapture({
-        contentType,
-        contentEncoding: encoding,
-        onInputUsage: usage => applyAnthropicInputUsage(entry, usage),
-        onOutputUsage: usage => applyAnthropicOutputUsage(entry, usage),
-      });
-      if (usageCapture) {
-        upstream.on("data", (chunk: Buffer) => usageCapture.write(chunk));
-        upstream.on("end", () => usageCapture.end());
+      if (clientGone.signal.aborted || res.writableEnded) {
+        if (entry.type === "route") {
+          entry.details = entry.details ? `${entry.details} client-cancelled` : "client-cancelled";
+        }
+        recordActivity(entry);
+        upstream.destroy();
+        release();
+        return;
       }
 
+      // ── Final: relay this response byte-transparently ─────────────────────
+      // The entry is recorded now (headers time) and mutated in place by the
+      // usage capture; the dashboard picks the values up on its next poll —
+      // same contract as the generic proxy path.
+      recordActivity(entry);
+      attachAnthropicResponseCapture(upstream, res, entry, startedAt);
       relayUpstreamResponse(upstream, req, res);
       return;
     }
