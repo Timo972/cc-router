@@ -56,6 +56,7 @@ describe("fetchAnthropicUsage", () => {
       snapshot: {
         fiveHour: { utilization: 0.25, resetAt: 0 },
         modelLimits: [],
+        requestedAt: 123,
         fetchedAt: 123,
         fetchStatus: "fresh",
       },
@@ -68,6 +69,31 @@ describe("fetchAnthropicUsage", () => {
       },
       signal: expect.any(AbortSignal),
     }));
+  });
+
+  it("stamps requestedAt before the request and fetchedAt after the body", async () => {
+    // Callers order a snapshot's data by requestedAt, so it must predate the
+    // response: a refresh in flight while a limit is hit completes afterwards
+    // but describes the account as it was before.
+    let clock = 100;
+    const fetch = vi.fn(async () => {
+      clock = 500;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => {
+          clock = 900;
+          return { five_hour: { utilization: 25 } };
+        },
+      } as Response;
+    });
+
+    const result = await fetchAnthropicUsage(account("a"), { fetch, now: () => clock });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.snapshot.requestedAt).toBe(100);
+    expect(result.snapshot.fetchedAt).toBe(900);
   });
 
   it.each([401, 429, 500])("returns a sanitized HTTP failure for %i", async status => {

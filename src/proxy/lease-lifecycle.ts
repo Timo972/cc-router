@@ -1,4 +1,4 @@
-import type { AccountUsageSnapshot, RouteContext } from "./types.js";
+import type { AccountUsageSnapshot, RouteContext, UsageWindowScope } from "./types.js";
 import { canUseExtraUsage, normalizeModelFamily } from "../providers/anthropic/usage.js";
 
 export interface ResponseLifecycle {
@@ -33,7 +33,11 @@ export interface BindingInvalidator {
 
 export interface CooldownSetter<TAccount extends { readonly id: string }> {
   setCooldownForAccount(account: TAccount, durationMs: number): void;
-  setGlobalCooldownForAccount?(account: TAccount, durationMs: number): void;
+  setGlobalCooldownForAccount?(
+    account: TAccount,
+    durationMs: number,
+    usageWindow?: UsageWindowScope,
+  ): void;
   setModelCooldownForAccount?(account: TAccount, modelFamily: string, durationMs: number): void;
   setAmbiguousGlobalCooldownForAccount?(
     account: TAccount,
@@ -126,6 +130,11 @@ interface CooldownClassification {
   readonly ambiguous: boolean;
   readonly modelFamily?: string;
   readonly usageResetAtMs?: number;
+  /** The usage window this cooldown's limit belongs to, when the usage endpoint
+   *  reports one for it. Absent for limits no snapshot describes — the
+   *  OAuth-apps quota, and any claim we could not attribute — so those stay
+   *  purely time-based. */
+  readonly usageWindow?: UsageWindowScope;
 }
 
 function asHeaders(value: unknown): FailureHeaders {
@@ -195,10 +204,15 @@ function classifyCooldown(
   const usage = route.account.rateLimits?.usage;
 
   if (claim === "five_hour" || claim === "seven_day" || claim === "seven_day_oauth_apps") {
-    const usageWindow = claim === "five_hour" ? usage?.fiveHour : claim === "seven_day" ? usage?.sevenDay : undefined;
+    // seven_day_oauth_apps is a distinct quota the usage endpoint does not
+    // report, so it gets no window and can never be superseded by one.
+    const scope: UsageWindowScope | undefined =
+      claim === "five_hour" ? "five_hour" : claim === "seven_day" ? "seven_day" : undefined;
+    const usageWindow = scope === "five_hour" ? usage?.fiveHour : scope === "seven_day" ? usage?.sevenDay : undefined;
     return {
       kind: "global",
       ambiguous: false,
+      ...(scope ? { usageWindow: scope } : {}),
       ...(usageWindow ? { usageResetAtMs: usageWindow.resetAt * 1_000 } : {}),
     };
   }
@@ -255,11 +269,12 @@ function setGlobalCooldown<TAccount extends { readonly id: string }>(
   durationMs: number,
   ambiguous: boolean,
   modelFamily?: string,
+  usageWindow?: UsageWindowScope,
 ): number | undefined {
   if (ambiguous && pool.setAmbiguousGlobalCooldownForAccount) {
     return pool.setAmbiguousGlobalCooldownForAccount(account, durationMs, modelFamily);
   } else if (pool.setGlobalCooldownForAccount) {
-    pool.setGlobalCooldownForAccount(account, durationMs);
+    pool.setGlobalCooldownForAccount(account, durationMs, usageWindow);
   } else {
     pool.setCooldownForAccount(account, durationMs);
   }
@@ -346,6 +361,7 @@ export function applyUpstreamFailureRoutingDetailed<TAccount extends FailureAcco
         durationMs,
         classification.ambiguous,
         route.modelFamily,
+        classification.usageWindow,
       );
     }
     return {

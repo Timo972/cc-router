@@ -5,6 +5,8 @@ import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
 
 const FABLE = { requestedModel: "claude-fable-5", modelFamily: "fable" } as const;
 const SONNET = { requestedModel: "claude-sonnet-4-20250514", modelFamily: "sonnet" } as const;
+const TWO_HOURS = 2 * 60 * 60_000;
+const FIVE_DAYS = 5 * 24 * 60 * 60_000;
 
 function makeAccount(id: string): Account {
   return {
@@ -29,7 +31,7 @@ function makeAccount(id: string): Account {
   };
 }
 
-function modelLimit(modelFamily: string, utilization: number, active = true): ModelRateLimit {
+function modelLimit(modelFamily: string, utilization: number): ModelRateLimit {
   return {
     kind: "weekly_scoped",
     group: "weekly",
@@ -37,82 +39,171 @@ function modelLimit(modelFamily: string, utilization: number, active = true): Mo
     displayName: modelFamily,
     utilization,
     resetAt: utilization >= 1 ? 2_000_000_000 : 0,
-    active,
+    active: true,
     severity: utilization >= 1 ? "critical" : "unknown",
   };
 }
 
 interface SnapshotOptions {
-  fetchedAt: number;
+  /** When the refresh completed. Defaults to `requestedAt`. */
+  fetchedAt?: number;
+  /** When the refresh was initiated — the timestamp supersession trusts. */
+  requestedAt?: number;
   fiveHour?: number;
   sevenDay?: number;
   models?: ModelRateLimit[];
   fetchStatus?: AccountUsageSnapshot["fetchStatus"];
+  omitRequestedAt?: boolean;
+  omitWindows?: boolean;
 }
 
 function snapshot(options: SnapshotOptions): AccountUsageSnapshot {
-  return {
-    fiveHour: { utilization: options.fiveHour ?? 0, resetAt: 2_000_000_000 },
-    sevenDay: { utilization: options.sevenDay ?? 0, resetAt: 2_000_000_000 },
+  const requestedAt = options.requestedAt ?? options.fetchedAt ?? 0;
+  const snap: AccountUsageSnapshot = {
     modelLimits: options.models ?? [],
     extraUsage: { enabled: false, spendLimitReached: false },
-    fetchedAt: options.fetchedAt,
+    fetchedAt: options.fetchedAt ?? requestedAt,
     fetchStatus: options.fetchStatus ?? "fresh",
   };
+  if (!options.omitRequestedAt) snap.requestedAt = requestedAt;
+  if (!options.omitWindows) {
+    snap.fiveHour = { utilization: options.fiveHour ?? 0, resetAt: 2_000_000_000 };
+    snap.sevenDay = { utilization: options.sevenDay ?? 0, resetAt: 2_000_000_000 };
+  }
+  return snap;
 }
 
 function setUsage(account: Account, usage: AccountUsageSnapshot): void {
   account.rateLimits = { ...account.rateLimits, usage };
 }
 
-describe("cooldowns superseded by a newer usage snapshot", () => {
-  it("releases a global cooldown once a newer snapshot reports headroom", () => {
+describe("global cooldowns superseded only within the scope that created them", () => {
+  it("releases a five_hour cooldown once a newer snapshot reports five-hour headroom", () => {
     let now = 1_000_000_000_000;
-    const account = makeAccount("upgraded");
+    const account = makeAccount("five-hour-limited");
     const pool = new TokenPool([account], { now: () => now });
 
-    // A five_hour 429 benches the account until its 5h window resets in 2h.
-    pool.setGlobalCooldownForAccount(account, 2 * 60 * 60_000);
+    pool.setGlobalCooldownForAccount(account, TWO_HOURS, "five_hour");
     expect(pool.isEligible(account.id, FABLE)).toBe(false);
 
-    // The plan is upgraded; three minutes later the usage endpoint reports
-    // every window back to zero.
     now += 3 * 60_000;
-    setUsage(account, snapshot({ fetchedAt: now, fiveHour: 0, sevenDay: 0 }));
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 0 }));
 
     expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(0);
     expect(pool.isCoolingDown(account.id)).toBe(false);
     expect(pool.isEligible(account.id, FABLE)).toBe(true);
   });
 
-  it("keeps a global cooldown when the newer snapshot still reports no headroom", () => {
+  it("releases a seven_day cooldown once a newer snapshot reports seven-day headroom", () => {
     let now = 1_000_000_000_000;
-    const account = makeAccount("still-limited");
+    const account = makeAccount("seven-day-limited");
     const pool = new TokenPool([account], { now: () => now });
 
-    pool.setGlobalCooldownForAccount(account, 2 * 60 * 60_000);
-    const cooldownUntil = now + 2 * 60 * 60_000;
+    pool.setGlobalCooldownForAccount(account, TWO_HOURS, "seven_day");
 
     now += 3 * 60_000;
-    setUsage(account, snapshot({ fetchedAt: now, fiveHour: 1, sevenDay: 0.4 }));
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0.2, sevenDay: 0 }));
+
+    expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(0);
+    expect(pool.isEligible(account.id, FABLE)).toBe(true);
+  });
+
+  it("keeps a five_hour cooldown while the five-hour window is still spent", () => {
+    let now = 1_000_000_000_000;
+    const account = makeAccount("five-hour-still-spent");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setGlobalCooldownForAccount(account, TWO_HOURS, "five_hour");
+    const cooldownUntil = now + TWO_HOURS;
+
+    // The seven-day window has headroom; the limiting window does not.
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 1, sevenDay: 0 }));
 
     expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(cooldownUntil);
     expect(pool.isEligible(account.id, FABLE)).toBe(false);
   });
 
-  it("ignores a snapshot fetched before the cooldown was recorded", () => {
+  it("keeps a seven_day cooldown when only the unrelated five-hour window recovered", () => {
     let now = 1_000_000_000_000;
-    const account = makeAccount("racing-snapshot");
+    const account = makeAccount("seven-day-still-spent");
     const pool = new TokenPool([account], { now: () => now });
 
-    // A refresh lands first, reporting headroom...
-    setUsage(account, snapshot({ fetchedAt: now, fiveHour: 0, sevenDay: 0 }));
+    pool.setGlobalCooldownForAccount(account, TWO_HOURS, "seven_day");
+    const cooldownUntil = now + TWO_HOURS;
 
-    // ...and only then does the 429 arrive. The older snapshot knows nothing
-    // about the limit that produced it and must not cancel it.
-    now += 30_000;
-    pool.setGlobalCooldownForAccount(account, 2 * 60 * 60_000);
-    const cooldownUntil = now + 2 * 60 * 60_000;
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 1 }));
+
+    expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(cooldownUntil);
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+  });
+
+  it("releases a five_hour cooldown from its own window while the seven-day window is spent", () => {
+    // Only the claimed window's recovery is in question here. The exhausted
+    // seven-day window is hardBlock's business, not the cooldown's, so the
+    // cooldown goes while the account stays blocked.
+    let now = 1_000_000_000_000;
+    const account = makeAccount("five-hour-recovered-seven-day-spent");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setGlobalCooldownForAccount(account, TWO_HOURS, "five_hour");
+
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 1 }));
+
+    expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(0);
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+  });
+
+  it("keeps an unscoped cooldown, which no usage window speaks for", () => {
+    // A 529 overload cooldown and the seven_day_oauth_apps claim both land
+    // here: the snapshot carries no window describing either limit, so
+    // ordinary five-hour/seven-day headroom is not evidence about them.
+    let now = 1_000_000_000_000;
+    const account = makeAccount("unscoped");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setGlobalCooldownForAccount(account, 30_000);
+    const cooldownUntil = now + 30_000;
+
+    now += 3_000;
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 0 }));
+
+    expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(cooldownUntil);
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+  });
+
+  it("keeps an ambiguous cooldown, whose limiting scope is unknown", () => {
+    let now = 1_000_000_000_000;
+    const account = makeAccount("ambiguous");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setAmbiguousGlobalCooldownForAccount(account, TWO_HOURS, "fable");
+    const cooldownUntil = now + TWO_HOURS;
+
+    now += 3 * 60_000;
+    setUsage(account, snapshot({
+      requestedAt: now,
+      fiveHour: 0,
+      sevenDay: 0,
+      models: [modelLimit("fable", 0)],
+    }));
+
+    expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(cooldownUntil);
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+  });
+
+  it("keeps a scoped cooldown when the snapshot omits that window", () => {
+    let now = 1_000_000_000_000;
+    const account = makeAccount("windowless-snapshot");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setGlobalCooldownForAccount(account, TWO_HOURS, "five_hour");
+    const cooldownUntil = now + TWO_HOURS;
+
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ requestedAt: now, omitWindows: true }));
 
     expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(cooldownUntil);
     expect(pool.isEligible(account.id, FABLE)).toBe(false);
@@ -123,102 +214,11 @@ describe("cooldowns superseded by a newer usage snapshot", () => {
     const account = makeAccount("stale-snapshot");
     const pool = new TokenPool([account], { now: () => now });
 
-    pool.setGlobalCooldownForAccount(account, 2 * 60 * 60_000);
-    const cooldownUntil = now + 2 * 60 * 60_000;
+    pool.setGlobalCooldownForAccount(account, TWO_HOURS, "five_hour");
+    const cooldownUntil = now + TWO_HOURS;
 
     now += 3 * 60_000;
-    setUsage(account, snapshot({ fetchedAt: now, fiveHour: 0, sevenDay: 0, fetchStatus: "stale" }));
-
-    expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(cooldownUntil);
-    expect(pool.isEligible(account.id, FABLE)).toBe(false);
-  });
-
-  it("releases an ambiguous global cooldown once a newer snapshot reports headroom", () => {
-    let now = 1_000_000_000_000;
-    const account = makeAccount("ambiguous");
-    const pool = new TokenPool([account], { now: () => now });
-
-    pool.setAmbiguousGlobalCooldownForAccount(account, 2 * 60 * 60_000, "fable");
-    expect(pool.isEligible(account.id, FABLE)).toBe(false);
-
-    now += 3 * 60_000;
-    setUsage(account, snapshot({
-      fetchedAt: now,
-      models: [modelLimit("fable", 0, false)],
-    }));
-
-    expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(0);
-    expect(pool.isEligible(account.id, FABLE)).toBe(true);
-  });
-
-  it("releases a model cooldown once a newer snapshot reports that family has headroom", () => {
-    let now = 1_000_000_000_000;
-    const account = makeAccount("model-scoped");
-    const pool = new TokenPool([account], { now: () => now });
-
-    pool.setModelCooldownForAccount(account, "fable", 5 * 24 * 60 * 60_000);
-    expect(pool.isEligible(account.id, FABLE)).toBe(false);
-
-    now += 3 * 60_000;
-    setUsage(account, snapshot({
-      fetchedAt: now,
-      models: [modelLimit("fable", 0, false)],
-    }));
-
-    expect(pool.getCooldownSummary(account.id).modelCooldowns).toEqual([]);
-    expect(pool.isEligible(account.id, FABLE)).toBe(true);
-  });
-
-  it("keeps a model cooldown while that family is still exhausted", () => {
-    let now = 1_000_000_000_000;
-    const account = makeAccount("model-still-exhausted");
-    const pool = new TokenPool([account], { now: () => now });
-
-    pool.setModelCooldownForAccount(account, "fable", 5 * 24 * 60 * 60_000);
-    const cooldownUntil = now + 5 * 24 * 60 * 60_000;
-
-    now += 3 * 60_000;
-    setUsage(account, snapshot({
-      fetchedAt: now,
-      models: [modelLimit("fable", 1)],
-    }));
-
-    expect(pool.getCooldownSummary(account.id).modelCooldowns).toEqual([
-      { modelFamily: "fable", untilMs: cooldownUntil },
-    ]);
-    expect(pool.isEligible(account.id, FABLE)).toBe(false);
-  });
-
-  it("keeps a model cooldown the snapshot does not mention", () => {
-    let now = 1_000_000_000_000;
-    const account = makeAccount("model-unreported");
-    const pool = new TokenPool([account], { now: () => now });
-
-    pool.setModelCooldownForAccount(account, "fable", 5 * 24 * 60 * 60_000);
-    const cooldownUntil = now + 5 * 24 * 60 * 60_000;
-
-    now += 3 * 60_000;
-    setUsage(account, snapshot({ fetchedAt: now, models: [modelLimit("opus", 0, false)] }));
-
-    expect(pool.getCooldownSummary(account.id).modelCooldowns).toEqual([
-      { modelFamily: "fable", untilMs: cooldownUntil },
-    ]);
-    expect(pool.isEligible(account.id, FABLE)).toBe(false);
-  });
-
-  it("keeps the global cooldown of an account the snapshot has no windows for", () => {
-    let now = 1_000_000_000_000;
-    const account = makeAccount("windowless-snapshot");
-    const pool = new TokenPool([account], { now: () => now });
-
-    pool.setGlobalCooldownForAccount(account, 2 * 60 * 60_000);
-    const cooldownUntil = now + 2 * 60 * 60_000;
-
-    now += 3 * 60_000;
-    account.rateLimits = {
-      ...account.rateLimits,
-      usage: { modelLimits: [], fetchedAt: now, fetchStatus: "fresh" },
-    };
+    setUsage(account, snapshot({ requestedAt: now, fetchStatus: "stale" }));
 
     expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(cooldownUntil);
     expect(pool.isEligible(account.id, FABLE)).toBe(false);
@@ -229,12 +229,12 @@ describe("cooldowns superseded by a newer usage snapshot", () => {
     const account = makeAccount("global-clear-model-exhausted");
     const pool = new TokenPool([account], { now: () => now });
 
-    pool.setGlobalCooldownForAccount(account, 2 * 60 * 60_000);
+    pool.setGlobalCooldownForAccount(account, TWO_HOURS, "five_hour");
 
     // The account-wide windows recovered, but Fable specifically is spent.
     now += 3 * 60_000;
     setUsage(account, snapshot({
-      fetchedAt: now,
+      requestedAt: now,
       fiveHour: 0,
       sevenDay: 0,
       models: [modelLimit("fable", 1)],
@@ -248,12 +248,131 @@ describe("cooldowns superseded by a newer usage snapshot", () => {
   });
 });
 
+describe("supersession requires a refresh initiated after the block", () => {
+  it("ignores a refresh that started before the cooldown was recorded", () => {
+    let now = 1_000_000_000_000;
+    const account = makeAccount("in-flight-refresh");
+    const pool = new TokenPool([account], { now: () => now });
+
+    // A scheduled refresh is already on the wire...
+    const refreshStartedAt = now;
+
+    // ...the request 429s while it is in flight...
+    now += 400;
+    pool.setGlobalCooldownForAccount(account, TWO_HOURS, "five_hour");
+    const cooldownUntil = now + TWO_HOURS;
+
+    // ...and only then does the response body finish parsing. It completed
+    // after the 429 but describes the account as it was before it.
+    now += 600;
+    setUsage(account, snapshot({
+      requestedAt: refreshStartedAt,
+      fetchedAt: now,
+      fiveHour: 0,
+      sevenDay: 0,
+    }));
+
+    expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(cooldownUntil);
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+  });
+
+  it("ignores a snapshot with no initiation timestamp at all", () => {
+    let now = 1_000_000_000_000;
+    const account = makeAccount("no-requested-at");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setGlobalCooldownForAccount(account, TWO_HOURS, "five_hour");
+    const cooldownUntil = now + TWO_HOURS;
+
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ fetchedAt: now, omitRequestedAt: true }));
+
+    expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(cooldownUntil);
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+  });
+
+  it("ignores a refresh that started before a model cooldown was recorded", () => {
+    let now = 1_000_000_000_000;
+    const account = makeAccount("in-flight-refresh-model");
+    const pool = new TokenPool([account], { now: () => now });
+
+    const refreshStartedAt = now;
+    now += 400;
+    pool.setModelCooldownForAccount(account, "fable", FIVE_DAYS);
+    const cooldownUntil = now + FIVE_DAYS;
+
+    now += 600;
+    setUsage(account, snapshot({
+      requestedAt: refreshStartedAt,
+      fetchedAt: now,
+      models: [modelLimit("fable", 0)],
+    }));
+
+    expect(pool.getCooldownSummary(account.id).modelCooldowns).toEqual([
+      { modelFamily: "fable", untilMs: cooldownUntil },
+    ]);
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+  });
+});
+
+describe("model cooldowns superseded by a newer usage snapshot", () => {
+  it("releases a model cooldown once a newer snapshot reports that family has headroom", () => {
+    let now = 1_000_000_000_000;
+    const account = makeAccount("model-scoped");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setModelCooldownForAccount(account, "fable", FIVE_DAYS);
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ requestedAt: now, models: [modelLimit("fable", 0)] }));
+
+    expect(pool.getCooldownSummary(account.id).modelCooldowns).toEqual([]);
+    expect(pool.isEligible(account.id, FABLE)).toBe(true);
+  });
+
+  it("keeps a model cooldown while that family is still exhausted", () => {
+    let now = 1_000_000_000_000;
+    const account = makeAccount("model-still-exhausted");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setModelCooldownForAccount(account, "fable", FIVE_DAYS);
+    const cooldownUntil = now + FIVE_DAYS;
+
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ requestedAt: now, models: [modelLimit("fable", 1)] }));
+
+    expect(pool.getCooldownSummary(account.id).modelCooldowns).toEqual([
+      { modelFamily: "fable", untilMs: cooldownUntil },
+    ]);
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+  });
+
+  it("keeps a model cooldown the snapshot does not mention", () => {
+    let now = 1_000_000_000_000;
+    const account = makeAccount("model-unreported");
+    const pool = new TokenPool([account], { now: () => now });
+
+    pool.setModelCooldownForAccount(account, "fable", FIVE_DAYS);
+    const cooldownUntil = now + FIVE_DAYS;
+
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ requestedAt: now, models: [modelLimit("opus", 0)] }));
+
+    expect(pool.getCooldownSummary(account.id).modelCooldowns).toEqual([
+      { modelFamily: "fable", untilMs: cooldownUntil },
+    ]);
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+  });
+});
+
 // Values captured from a live account that had just been moved to a 20x plan:
 // the usage endpoint reported every window empty, while the pool still held the
 // cooldown minted from the pre-upgrade 429 and 429'd every request for the rest
 // of the old five-hour window.
 describe("regression: account benched by a pre-upgrade cooldown", () => {
   const HEADERS_AT_MS = 1_787_238_524_415;
+  const USAGE_REQUESTED_AT_MS = 1_787_239_726_000;
   const USAGE_FETCHED_AT_MS = 1_787_239_726_282;
   const FIVE_HOUR_RESET_SEC = 1_787_248_800;
 
@@ -272,7 +391,7 @@ describe("regression: account benched by a pre-upgrade cooldown", () => {
       sevenDayReset: 1_787_353_200,
       lastUpdated: HEADERS_AT_MS,
     };
-    pool.setGlobalCooldownForAccount(account, FIVE_HOUR_RESET_SEC * 1_000 - now);
+    pool.setGlobalCooldownForAccount(account, FIVE_HOUR_RESET_SEC * 1_000 - now, "five_hour");
     expect(pool.getCooldownSummary(account.id).globalUntilMs).toBe(FIVE_HOUR_RESET_SEC * 1_000);
     expect(pool.isEligible(account.id, FABLE)).toBe(false);
 
@@ -291,6 +410,7 @@ describe("regression: account benched by a pre-upgrade cooldown", () => {
         severity: "unknown",
       }],
       extraUsage: { enabled: false, spendLimitReached: false },
+      requestedAt: USAGE_REQUESTED_AT_MS,
       fetchedAt: USAGE_FETCHED_AT_MS,
       fetchStatus: "fresh",
     });
@@ -302,12 +422,12 @@ describe("regression: account benched by a pre-upgrade cooldown", () => {
 });
 
 describe("header rate_limited status superseded by a newer usage snapshot", () => {
-  function rateLimitedAccount(id: string, headerTimeMs: number): Account {
+  function rateLimitedAccount(id: string, headerTimeMs: number, claim = "five_hour"): Account {
     const account = makeAccount(id);
     account.rateLimits = {
       ...account.rateLimits,
       status: "rate_limited",
-      claim: "five_hour",
+      claim,
       fiveHourUtil: 1,
       fiveHourReset: Math.floor(headerTimeMs / 1000) + 2 * 60 * 60,
       lastUpdated: headerTimeMs,
@@ -322,7 +442,7 @@ describe("header rate_limited status superseded by a newer usage snapshot", () =
     expect(pool.isEligible(account.id, FABLE)).toBe(false);
 
     now += 3 * 60_000;
-    setUsage(account, snapshot({ fetchedAt: now, fiveHour: 0, sevenDay: 0 }));
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 0 }));
 
     expect(pool.isEligible(account.id, FABLE)).toBe(true);
     expect(account.rateLimits.status).toBe("allowed");
@@ -336,30 +456,90 @@ describe("header rate_limited status superseded by a newer usage snapshot", () =
     pool.onCooldownExpired = a => recovered.push(a.id);
 
     now += 3 * 60_000;
-    setUsage(account, snapshot({ fetchedAt: now, fiveHour: 0, sevenDay: 0 }));
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 0 }));
     pool.sweepExpiredCooldowns();
 
     expect(recovered).toEqual(["header-limited-callback"]);
   });
 
-  it("stays blocked when the newer snapshot still reports no headroom", () => {
+  it("stays blocked when the limiting window still reports no headroom", () => {
     let now = 1_000_000_000_000;
     const account = rateLimitedAccount("header-still-limited", now);
     const pool = new TokenPool([account], { now: () => now });
 
     now += 3 * 60_000;
-    setUsage(account, snapshot({ fetchedAt: now, fiveHour: 1, sevenDay: 0.4 }));
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 1, sevenDay: 0 }));
 
     expect(pool.isEligible(account.id, FABLE)).toBe(false);
     expect(account.rateLimits.status).toBe("rate_limited");
   });
 
-  it("stays blocked when the snapshot predates the limiting headers", () => {
+  it("supersedes a five_hour claim from its own window alone", () => {
     let now = 1_000_000_000_000;
-    const account = rateLimitedAccount("header-newer-than-snapshot", now);
+    const account = rateLimitedAccount("header-five-hour-scoped", now);
     const pool = new TokenPool([account], { now: () => now });
-    // Snapshot fetched a minute before the 429 headers landed.
-    setUsage(account, snapshot({ fetchedAt: now - 60_000, fiveHour: 0, sevenDay: 0 }));
+
+    // The seven-day window being spent is irrelevant to a five_hour claim.
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 1 }));
+    pool.sweepExpiredCooldowns();
+
+    expect(account.rateLimits.status).toBe("allowed");
+  });
+
+  it("supersedes a seven_day claim only from the seven-day window", () => {
+    let now = 1_000_000_000_000;
+    const account = rateLimitedAccount("header-seven-day", now, "seven_day");
+    account.rateLimits = {
+      ...account.rateLimits,
+      sevenDayReset: Math.floor(now / 1000) + 7 * 24 * 60 * 60,
+    };
+    const pool = new TokenPool([account], { now: () => now });
+
+    // Five-hour headroom says nothing about the seven-day claim.
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 1 }));
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+    expect(account.rateLimits.status).toBe("rate_limited");
+
+    // The claimed window recovering does supersede it.
+    now += 60_000;
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 0 }));
+    expect(pool.isEligible(account.id, FABLE)).toBe(true);
+    expect(account.rateLimits.status).toBe("allowed");
+  });
+
+  it("requires both windows for an unattributed claim", () => {
+    let now = 1_000_000_000_000;
+    const account = rateLimitedAccount("header-unknown-claim", now, "");
+    account.rateLimits = {
+      ...account.rateLimits,
+      sevenDayReset: Math.floor(now / 1000) + 7 * 24 * 60 * 60,
+    };
+    const pool = new TokenPool([account], { now: () => now });
+
+    now += 3 * 60_000;
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 1 }));
+    expect(pool.isEligible(account.id, FABLE)).toBe(false);
+    expect(account.rateLimits.status).toBe("rate_limited");
+
+    now += 60_000;
+    setUsage(account, snapshot({ requestedAt: now, fiveHour: 0, sevenDay: 0 }));
+    expect(pool.isEligible(account.id, FABLE)).toBe(true);
+    expect(account.rateLimits.status).toBe("allowed");
+  });
+
+  it("stays blocked when the refresh started before the limiting headers", () => {
+    let now = 1_000_000_000_000;
+    const account = rateLimitedAccount("header-newer-than-refresh", now);
+    const pool = new TokenPool([account], { now: () => now });
+
+    setUsage(account, snapshot({
+      requestedAt: now - 60_000,
+      fetchedAt: now + 500,
+      fiveHour: 0,
+      sevenDay: 0,
+    }));
 
     expect(pool.isEligible(account.id, FABLE)).toBe(false);
     expect(account.rateLimits.status).toBe("rate_limited");
@@ -371,7 +551,7 @@ describe("header rate_limited status superseded by a newer usage snapshot", () =
     const pool = new TokenPool([account], { now: () => now });
 
     now += 3 * 60_000;
-    setUsage(account, snapshot({ fetchedAt: now, fiveHour: 0, sevenDay: 0, fetchStatus: "stale" }));
+    setUsage(account, snapshot({ requestedAt: now, fetchStatus: "stale" }));
 
     expect(pool.isEligible(account.id, FABLE)).toBe(false);
     expect(account.rateLimits.status).toBe("rate_limited");

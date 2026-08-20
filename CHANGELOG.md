@@ -19,13 +19,22 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reconnected them to the usage refresher, so a plan upgrade produced an
   account reporting `0%` on every window, `usage fresh`, and `busy` with a
   multi-hour cooldown — and because it was benched, no new response could
-  ever arrive to correct it. A usage snapshot that is fresh, newer than the
-  evidence that created the block, and reports the relevant windows below
-  their limit now supersedes both. Releasing opens no hole: the same
-  snapshot feeds the exhausted-window check, so an account with no real
-  capacity stays blocked on its own merits. In the reported case one stale
-  cooldown on the only account with capacity left the whole pool answering
+  ever arrive to correct it. In the reported case one stale cooldown on the
+  only account with capacity left the whole pool answering
   `429 no-eligible`.
+
+  A usage snapshot now supersedes both blockers, under two conditions that
+  keep it from unbenching an account that is still limited. The refresh must
+  have been *initiated* after the block was recorded — snapshots carry a new
+  `requestedAt` for this, because `fetchedAt` is stamped after the response
+  body is parsed and so can post-date a limit the request never saw. And the
+  snapshot must report on the scope that caused the block: only the claimed
+  window releases a global cooldown, and only the matching family releases a
+  model cooldown. Blocks for limits no snapshot describes — an upstream 529
+  overload, the `seven_day_oauth_apps` quota, an unattributed claim — stay
+  purely time-based. Within scope, releasing opens no hole: the same
+  snapshot feeds the exhausted-window check, so an account with no real
+  capacity stays blocked on its own merits.
 
 ---
 

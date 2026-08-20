@@ -184,7 +184,8 @@ describe("applyUpstreamFailureRouting", () => {
     expect(applyUpstreamFailureRouting(429, { "retry-after": "12.5", "anthropic-ratelimit-unified-representative-claim": "five_hour" }, route, { invalidate }, pool, () => 1_000))
       .toBe(12.5);
     expect(invalidate).toHaveBeenCalledWith("session-a", "account-a", 7);
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 12_500);
+    expect(pool.setGlobalCooldownForAccount)
+      .toHaveBeenCalledWith(route.account, 12_500, "five_hour");
   });
 
   it("returns a normalized model limiting scope for safe 429 activity logs", () => {
@@ -236,9 +237,16 @@ describe("applyUpstreamFailureRouting", () => {
       .toHaveBeenCalledWith(route.account, 60_000, "sonnet");
   });
 
-  it.each(["five_hour", "seven_day", "seven_day_oauth_apps"])(
-    "classifies the representative claim %s as account-global",
-    (claim) => {
+  // The third argument is the usage window a later snapshot may supersede the
+  // cooldown from. seven_day_oauth_apps is a quota the usage endpoint does not
+  // report, so it gets none and stays purely time-based.
+  it.each<[string, string | undefined]>([
+    ["five_hour", "five_hour"],
+    ["seven_day", "seven_day"],
+    ["seven_day_oauth_apps", undefined],
+  ])(
+    "classifies the representative claim %s as account-global scoped to %s",
+    (claim, usageWindow) => {
       const pool = cooldowns();
       applyUpstreamFailureRouting(
         429,
@@ -252,7 +260,8 @@ describe("applyUpstreamFailureRouting", () => {
         () => 1_000,
       );
 
-      expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 10_000);
+      expect(pool.setGlobalCooldownForAccount)
+        .toHaveBeenCalledWith(route.account, 10_000, usageWindow);
       expect(pool.setModelCooldownForAccount).not.toHaveBeenCalled();
     },
   );
@@ -637,7 +646,9 @@ describe("applyUpstreamFailureRouting", () => {
     expect(applyUpstreamFailureRouting(529, { "retry-after": "900" }, route, { invalidate }, pool))
       .toBe(30);
     expect(invalidate).toHaveBeenCalledWith("session-a", "account-a", 7);
-    expect(pool.setGlobalCooldownForAccount).toHaveBeenCalledWith(route.account, 30_000);
+    // An overload is not a quota limit, so no usage window can release it.
+    expect(pool.setGlobalCooldownForAccount)
+      .toHaveBeenCalledWith(route.account, 30_000, undefined);
   });
 
   it("does not mutate routing for successful responses", () => {

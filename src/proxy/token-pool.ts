@@ -1,4 +1,11 @@
-import type { Account, AccountRateLimits, AccountRecord, RouteContext } from "./types.js";
+import type {
+  Account,
+  AccountRateLimits,
+  AccountRecord,
+  AccountUsageSnapshot,
+  RouteContext,
+  UsageWindowScope,
+} from "./types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "./types.js";
 import { canUseExtraUsage, normalizeModelFamily } from "../providers/anthropic/usage.js";
 import {
@@ -37,6 +44,10 @@ interface AccountCooldowns {
   modelUntil: Map<string, CooldownEntry>;
   definiteGlobalUntil: number;
   definiteGlobalRecordedAt: number;
+  /** The usage window whose limit produced the definite global cooldown, when
+   *  the usage endpoint reports one for it. Undefined means no snapshot can
+   *  speak for this cooldown, so only the clock releases it. */
+  definiteGlobalWindow?: UsageWindowScope;
   pendingAmbiguous: Map<number, { until: number; recordedAt: number; modelFamily?: string }>;
 }
 
@@ -78,8 +89,25 @@ function reportsHeadroom(value: unknown): boolean {
 }
 
 /**
- * True when a usage snapshot newer than the limiting headers reports both
- * account-wide windows below their limit.
+ * The moment a snapshot's data can be ordered against, or undefined when it
+ * cannot be ordered at all.
+ *
+ * This is deliberately the *initiation* time, not `fetchedAt`: the latter is
+ * stamped after the response body is parsed, so a refresh already on the wire
+ * when a limit is hit completes afterwards while describing the account as it
+ * was before. Comparing that would treat pre-limit data as post-limit
+ * evidence. A snapshot recorded before this field existed returns undefined
+ * and never supersedes anything.
+ */
+function supersedingTimestamp(usage: AccountUsageSnapshot | undefined): number | undefined {
+  if (!usage || usage.fetchStatus !== "fresh") return undefined;
+  const requestedAt = usage.requestedAt;
+  return typeof requestedAt === "number" && Number.isFinite(requestedAt) ? requestedAt : undefined;
+}
+
+/**
+ * True when a usage refresh started after the limiting headers landed and
+ * reports the claimed window below its limit.
  *
  * `status` is a snapshot of the last response's headers, and the reset
  * timestamps it is cleared against belong to the window that was limiting
@@ -87,16 +115,26 @@ function reportsHeadroom(value: unknown): boolean {
  * common case — leaves the flag describing a limit that no longer exists,
  * and a benched account never receives the response that would correct it.
  * The usage endpoint is the provider's own account of the same windows, so a
- * newer fresh snapshot showing headroom supersedes the flag. This is the same
+ * later snapshot showing headroom supersedes the flag. This is the same
  * supersession rule `TokenPool.releaseCooldownsSupersededByUsage` applies to
  * the pool's cooldown map.
+ *
+ * Only the claimed window counts. An unattributed claim requires both windows,
+ * mirroring the reset-based rule above it; a claim naming a quota the snapshot
+ * does not report cannot reach here at all, since `stillBlocked` is already
+ * false for it.
  */
 function usageSupersedesRateLimitedStatus(r: AccountRateLimits): boolean {
   const usage = r.usage;
-  if (!usage || usage.fetchStatus !== "fresh") return false;
-  if (!Number.isFinite(usage.fetchedAt) || usage.fetchedAt <= r.lastUpdated) return false;
-  return reportsHeadroom(usage.fiveHour?.utilization) &&
-    reportsHeadroom(usage.sevenDay?.utilization);
+  const supersedingAt = supersedingTimestamp(usage);
+  if (supersedingAt === undefined || supersedingAt <= r.lastUpdated) return false;
+  if (r.claim === "five_hour") return reportsHeadroom(usage?.fiveHour?.utilization);
+  if (r.claim === "seven_day") return reportsHeadroom(usage?.sevenDay?.utilization);
+  if (r.claim === "") {
+    return reportsHeadroom(usage?.fiveHour?.utilization) &&
+      reportsHeadroom(usage?.sevenDay?.utilization);
+  }
+  return false;
 }
 
 /** Accept only reset timestamps within the same bounded horizon as cooldown evidence. */
@@ -285,13 +323,28 @@ export class TokenPool implements AccountPool<Account> {
     this.setGlobalCooldownForAccount(account, durationMs);
   }
 
-  /** Apply an account-global cooldown to the exact account incarnation routed. */
-  setGlobalCooldownForAccount(account: Account, durationMs: number): void {
+  /**
+   * Apply an account-global cooldown to the exact account incarnation routed.
+   *
+   * `usageWindow` names the window whose limit caused this, when the usage
+   * endpoint reports one for it. Omitting it — an upstream overload, an
+   * OAuth-apps quota, any caller that cannot attribute the limit — makes the
+   * cooldown purely time-based, since no snapshot describes that limit.
+   */
+  setGlobalCooldownForAccount(
+    account: Account,
+    durationMs: number,
+    usageWindow?: UsageWindowScope,
+  ): void {
     const expiry = this.proposedExpiry(account, durationMs);
     if (expiry === undefined) return;
     const state = this.cooldownsFor(account);
+    const extending = expiry > state.definiteGlobalUntil;
     state.definiteGlobalUntil = Math.max(state.definiteGlobalUntil, expiry);
     state.definiteGlobalRecordedAt = this.now();
+    // A cooldown is only supersedable while every contribution to its expiry
+    // is: an unscoped one arriving later must not inherit an earlier scope.
+    if (extending || usageWindow === undefined) state.definiteGlobalWindow = usageWindow;
     this.recomputeGlobalUntil(state);
   }
 
@@ -558,6 +611,7 @@ export class TokenPool implements AccountPool<Account> {
     if (state.definiteGlobalUntil <= now) {
       state.definiteGlobalUntil = 0;
       state.definiteGlobalRecordedAt = 0;
+      state.definiteGlobalWindow = undefined;
     }
     for (const [token, pending] of state.pendingAmbiguous) {
       if (pending.until <= now) state.pendingAmbiguous.delete(token);
@@ -581,29 +635,32 @@ export class TokenPool implements AccountPool<Account> {
    * is the same deadlock `clearExpiredRateLimitWindows` resolves for the
    * header snapshot, which cannot see cooldowns held here.
    *
-   * A usage snapshot fetched after the cooldown was recorded is the provider's
-   * own account of the same windows, so where it reports headroom the stored
-   * expiry is discarded. Releasing here opens no hole: `hardBlock` reads that
-   * same snapshot for its exhausted-window check, so an account whose capacity
-   * is genuinely gone stays blocked on that check instead.
+   * Two conditions keep this from unbenching an account that is still limited.
+   * The refresh must have *started* after the cooldown was recorded, so data
+   * gathered before the limiting response is never mistaken for evidence about
+   * it. And the snapshot must report on the scope that produced the cooldown:
+   * only the claimed window releases a global cooldown, and only the matching
+   * family releases a model cooldown. Cooldowns for limits no snapshot
+   * describes — upstream overload, the OAuth-apps quota, an unattributed claim
+   * — carry no scope and stay purely time-based.
+   *
+   * Within scope, releasing opens no hole: `hardBlock` reads the same snapshot
+   * for its exhausted-window check, so an account whose capacity is genuinely
+   * gone stays blocked on that check instead.
    */
   private releaseCooldownsSupersededByUsage(account: Account, state: AccountCooldowns): void {
     const usage = account.rateLimits.usage;
-    if (!usage || usage.fetchStatus !== "fresh") return;
-    const fetchedAt = usage.fetchedAt;
-    if (!Number.isFinite(fetchedAt)) return;
+    const supersedingAt = supersedingTimestamp(usage);
+    if (usage === undefined || supersedingAt === undefined) return;
 
-    // Both account-wide windows must be reported below their limit before a
-    // whole-account cooldown can be called obsolete.
-    const globalHeadroom = reportsHeadroom(usage.fiveHour?.utilization) &&
-      reportsHeadroom(usage.sevenDay?.utilization);
-    if (globalHeadroom) {
-      if (state.definiteGlobalUntil > 0 && fetchedAt > state.definiteGlobalRecordedAt) {
+    if (state.definiteGlobalUntil > 0 &&
+      state.definiteGlobalWindow !== undefined &&
+      supersedingAt > state.definiteGlobalRecordedAt) {
+      const window = state.definiteGlobalWindow === "five_hour" ? usage.fiveHour : usage.sevenDay;
+      if (reportsHeadroom(window?.utilization)) {
         state.definiteGlobalUntil = 0;
         state.definiteGlobalRecordedAt = 0;
-      }
-      for (const [token, pending] of state.pendingAmbiguous) {
-        if (fetchedAt > pending.recordedAt) state.pendingAmbiguous.delete(token);
+        state.definiteGlobalWindow = undefined;
       }
     }
 
@@ -611,7 +668,7 @@ export class TokenPool implements AccountPool<Account> {
     // evidence of headroom. `active` is deliberately not consulted, matching
     // matchingModelWindows() — utilization is what gates routing.
     for (const [family, entry] of state.modelUntil) {
-      if (fetchedAt <= entry.recordedAt) continue;
+      if (supersedingAt <= entry.recordedAt) continue;
       const limit = usage.modelLimits.find(
         candidate => normalizeModelFamily(candidate.modelFamily) === family,
       );

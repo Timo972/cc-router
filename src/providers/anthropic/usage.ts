@@ -159,7 +159,11 @@ function legacyModelLimit(family: string, value: unknown): ModelRateLimit | unde
 }
 
 /** Parse the OAuth usage endpoint without retaining its provider-specific payload. */
-export function parseAnthropicUsage(value: unknown, fetchedAt: number): AccountUsageSnapshot | null {
+export function parseAnthropicUsage(
+  value: unknown,
+  fetchedAt: number,
+  requestedAt?: number,
+): AccountUsageSnapshot | null {
   if (!isRecord(value) || !Object.keys(value).some((key) => USAGE_FIELDS.has(key))) return null;
 
   const limits = Array.isArray(value.limits) ? value.limits : undefined;
@@ -175,6 +179,7 @@ export function parseAnthropicUsage(value: unknown, fetchedAt: number): AccountU
     fetchedAt,
     fetchStatus: "fresh",
   };
+  if (requestedAt !== undefined) snapshot.requestedAt = requestedAt;
   const fiveHour = parseWindow(value.five_hour);
   const sevenDay = parseWindow(value.seven_day);
   const extraUsage = parseExtraUsage(value.extra_usage);
@@ -211,6 +216,10 @@ export async function fetchAnthropicUsage(
   const timeoutMs = Math.max(0, options.timeoutMs ?? DEFAULT_USAGE_TIMEOUT_MS);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  // Stamped before the request goes out: the response describes the account no
+  // earlier than this, which is what lets a caller order the snapshot against
+  // events that happened while it was in flight.
+  const requestedAt = now();
 
   try {
     const response = await request(ANTHROPIC_USAGE_ENDPOINT, {
@@ -230,7 +239,7 @@ export async function fetchAnthropicUsage(
       return { ok: false, reason: "invalid_json" };
     }
 
-    const snapshot = parseAnthropicUsage(body, now());
+    const snapshot = parseAnthropicUsage(body, now(), requestedAt);
     return snapshot
       ? { ok: true, snapshot }
       : { ok: false, reason: "invalid_schema" };

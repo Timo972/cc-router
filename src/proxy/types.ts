@@ -58,11 +58,21 @@ export interface ExtraUsageState {
   limitMinor?: number;
 }
 
+/** The account-wide usage windows the OAuth usage endpoint reports. Quotas it
+ *  does not report (OAuth-apps limits, upstream overload) deliberately have no
+ *  member here: nothing in a snapshot can speak for them. */
+export type UsageWindowScope = "five_hour" | "seven_day";
+
 export interface AccountUsageSnapshot {
   fiveHour?: RateLimitWindow;
   sevenDay?: RateLimitWindow;
   modelLimits: ModelRateLimit[];
   extraUsage?: ExtraUsageState;
+  /** When the refresh was *initiated*, in ms. `fetchedAt` is stamped after the
+   *  response body is parsed, so it can post-date a limit the request never
+   *  saw; only this timestamp orders the snapshot's data against later events.
+   *  Absent on snapshots from before this was recorded. */
+  requestedAt?: number;
   fetchedAt: number;
   fetchStatus: "fresh" | "stale" | "unavailable";
 }
