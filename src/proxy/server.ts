@@ -64,6 +64,7 @@ import {
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
 import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
+import { createAllowanceView } from "./allowance.js";
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
@@ -207,6 +208,7 @@ export interface OperationalStatus {
   endpoints: {
     health: string;
     accounts: string;
+    allowance: string;
     messages: string;
     responses: string;
     models: string;
@@ -257,6 +259,7 @@ export function createOperationalStatus(opts: {
     endpoints: {
       health: "/cc-router/health",
       accounts: "/cc-router/accounts",
+      allowance: "/cc-router/allowance",
       messages: "/v1/messages",
       responses: "/v1/responses",
       models: "/v1/models",
@@ -817,6 +820,31 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       accounts: accountViews,
       recentLogs: stats.getRecentLogs(50),
     });
+  });
+
+  // ─── Allowance endpoint (cc-router internal, NOT proxied) ─────────────────
+  // Operational-status sibling of /cc-router/health, not an account
+  // operation — hence a top-level route rather than living under
+  // accountsRouter. Read-only allowance signal (anthropic + openai only) —
+  // createAllowanceView is a PURE function over the already-in-memory account
+  // views, so polling it can never itself rate-limit an account. See
+  // ./allowance.ts for the 7d-primary logic. Behind the same secret gate as
+  // every other path except /cc-router/health (see ~line 757).
+  app.get("/cc-router/allowance", (_req, res) => {
+    // Sweep expired cooldowns on each poll, mirroring the health route, so an
+    // account that cooled down during idle time reads as available rather
+    // than stale.
+    pool.sweepExpiredCooldowns();
+    openAIPool.sweepExpiredCooldowns();
+    const resolveRoutingMetrics = createRoutingMetricsResolver();
+    const views = createHealthAccountViews(
+      pool.getAll(),
+      openAIAccounts,
+      resolveRoutingMetrics,
+      createOpenAIRoutingResolver(),
+      loadGrokHealthSnapshots(),
+    );
+    res.json(createAllowanceView(views, Date.now()));
   });
 
   // ─── Account management endpoints (authenticated) ─────────────────────────
