@@ -15,7 +15,7 @@ import { logRoute, logError, logStartup } from "./logger.js";
 import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
-import { loadGrokAccountSnapshots, type GrokAccountSnapshot } from "../providers/xai/overview.js";
+import { grokTierFromAccessToken, loadGrokAccountSnapshots, type GrokAccountSnapshot } from "../providers/xai/overview.js";
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
@@ -132,6 +132,7 @@ export interface PublicCodexRateLimits {
   plan: string; // sanitized, "" when unknown
   buckets: PublicCodexBucket[]; // default bucket first, max 8
   credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  resetCredits?: { available: number };
   lastUpdated: number;
 }
 
@@ -319,20 +320,24 @@ function loadGrokHealthSnapshots(): GrokAccountSnapshot[] {
   const stored = loadXaiAccounts();
   if (stored.length === 0) return overlay;
   const now = Date.now();
-  return stored.map(account => ({
-    id: account.id,
-    provider: "xai_subscription" as const,
-    enabled: true as const,
-    healthy: account.enabled !== false && account.expiresAt > now,
-    busy: liveSessions > 0,
-    inFlightRequests: 0 as const,
-    activeSessions: liveSessions,
-    requestCount: 0,
-    errorCount: 0,
-    expiresInMs: account.expiresAt - now,
-    lastUsedMs: 0,
-    lastRefreshMs: 0,
-  }));
+  return stored.map(account => {
+    const tier = grokTierFromAccessToken(account.accessToken);
+    return {
+      id: account.id,
+      provider: "xai_subscription" as const,
+      enabled: true as const,
+      healthy: account.enabled !== false && account.expiresAt > now,
+      busy: liveSessions > 0,
+      inFlightRequests: 0 as const,
+      activeSessions: liveSessions,
+      requestCount: 0,
+      errorCount: 0,
+      expiresInMs: account.expiresAt - now,
+      lastUsedMs: 0,
+      lastRefreshMs: 0,
+      ...(tier !== undefined ? { tier } : {}),
+    };
+  });
 }
 
 function publicAnthropicAccountView(
@@ -512,6 +517,7 @@ function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView):
   const balance = typeof credits?.balance === "string"
     ? credits.balance.replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 32)
     : "";
+  const resetAvailable = rl.resetCredits?.available;
   return {
     status: rl.status === "rate_limited" ? "rate_limited" : "ok",
     plan: publicCodexPlan(rl.plan),
@@ -522,6 +528,9 @@ function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView):
         unlimited: credits.unlimited === true,
         ...(balance ? { balance } : {}),
       },
+    } : {}),
+    ...(typeof resetAvailable === "number" && Number.isFinite(resetAvailable) ? {
+      resetCredits: { available: Math.max(0, Math.min(99, Math.floor(resetAvailable))) },
     } : {}),
     lastUpdated: publicTimestamp(rl.lastUpdated),
   };

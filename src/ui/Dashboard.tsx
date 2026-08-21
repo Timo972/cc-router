@@ -1472,6 +1472,12 @@ function OperationsPanel({ operational, baseUrl, focus }: { operational: Operati
       <ProviderBadge label="Claude" status={operational.providers.anthropic} ready={claudeReady} />
       <Text color="gray">  </Text>
       <ProviderBadge label="ChatGPT" status={operational.providers.openai} ready={openAIReady} />
+      <Text color="gray">  </Text>
+      <ProviderBadge
+        label="Grok"
+        status={operational.providers.xai ?? { configured: false, accounts: 0, healthy: 0, enabled: 0 }}
+        ready={(operational.providers.xai?.healthy ?? 0) > 0}
+      />
       {crossReady && <Text color="gray">  ·  cross-route</Text>}
       <Text color="gray">  ·  </Text>
       <Text color={focus === "models" ? "white" : "cyan"}>[m]</Text>
@@ -1712,9 +1718,10 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
   const usage = rl.usage;
   const globalCapacity = getGlobalCapacityView(rl);
   const isOpenAI = isOpenAIAccount(a);
-  const isLimited = isOpenAI ? isCodexLimited(a.codexRateLimits) : rl.status === "rate_limited";
+  const isXai = isXaiAccount(a);
+  const isLimited = isLimitedAccount(a);
   const isDisabled = a.enabled === false;
-  const modelNote = isOpenAI ? undefined : noteModelLimit(a);
+  const modelNote = isOpenAI || isXai ? undefined : noteModelLimit(a);
   const extraCap = usage?.extraUsage;
   const extraOff = extraCap !== undefined && extraCap.usable !== true
     && (extraCap.spendLimitReached
@@ -1732,7 +1739,7 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
   const codexWindows = getCodexDefaultWindows(a.codexRateLimits);
   const sessionWindow = codexWindows.find(window => window.kind === "session");
   const weeklyWindow = codexWindows.find(window => window.kind === "weekly");
-  const hasClaudeQuota = !isOpenAI && (rl.lastUpdated > 0 || usage);
+  const hasClaudeQuota = !isOpenAI && !isXai && (rl.lastUpdated > 0 || usage);
   const fiveHour = isOpenAI
     ? sessionWindow
     : hasClaudeQuota ? globalCapacity.fiveHour : undefined;

@@ -168,6 +168,10 @@ function parseExpiresAt(value: unknown, claims: Record<string, unknown> | null):
   return exp !== undefined && exp > 0 ? exp * 1000 : 0;
 }
 
+export function grokTierFromAccessToken(accessToken: string): number | undefined {
+  return numberClaim(decodeJwtPayload(accessToken), "tier");
+}
+
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
   const parts = token.split(".");
   if (parts.length < 2 || !parts[1]) return null;

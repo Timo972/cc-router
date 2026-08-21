@@ -73,6 +73,7 @@ function tallHealth() {
       providers: {
         anthropic: { configured: true, accounts: 9, healthy: 9, enabled: 9 },
         openai: { configured: false, accounts: 0, healthy: 0, enabled: 0 },
+        xai: { configured: false, accounts: 0, healthy: 0, enabled: 0 },
       },
       endpoints: {
         health: "/cc-router/health",
@@ -508,6 +509,8 @@ describe("dashboard viewport fitting", () => {
 
   it("shows the DETAILS box for the selected activity row", async () => {
     const health = tallHealth();
+    health.operational.providers.openai = { configured: true, accounts: 1, healthy: 1, enabled: 1 };
+    health.operational.providers.xai = { configured: true, accounts: 1, healthy: 1, enabled: 1 };
     health.accounts = [
       ...health.accounts.slice(0, 2),
       {
@@ -539,6 +542,7 @@ describe("dashboard viewport fitting", () => {
         expect(frame).toContain("chatgpt-ok");
         expect(frame).toContain("grok");
         expect(frame).toContain("tier 1");
+        expect(frame).toContain("Grok 1/1");
       });
     } finally {
       await dash.cleanup();
