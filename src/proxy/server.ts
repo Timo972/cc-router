@@ -129,6 +129,7 @@ export interface PublicCodexRateLimits {
   plan: string; // sanitized, "" when unknown
   buckets: PublicCodexBucket[]; // default bucket first, max 8
   credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  resetCredits?: { available: number };
   lastUpdated: number;
 }
 
@@ -464,6 +465,7 @@ function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView):
   const balance = typeof credits?.balance === "string"
     ? credits.balance.replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 32)
     : "";
+  const resetAvailable = rl.resetCredits?.available;
   return {
     status: rl.status === "rate_limited" ? "rate_limited" : "ok",
     plan: publicCodexPlan(rl.plan),
@@ -474,6 +476,9 @@ function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView):
         unlimited: credits.unlimited === true,
         ...(balance ? { balance } : {}),
       },
+    } : {}),
+    ...(typeof resetAvailable === "number" && Number.isFinite(resetAvailable) ? {
+      resetCredits: { available: Math.max(0, Math.min(99, Math.floor(resetAvailable))) },
     } : {}),
     lastUpdated: publicTimestamp(rl.lastUpdated),
   };

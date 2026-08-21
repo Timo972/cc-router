@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  creditsColumnLabel,
+  resetCreditsColumnLabel,
   earliestWeeklyReset,
   isLimitedAccount,
   isOpenAIAccount,
@@ -142,29 +142,36 @@ describe("openaiQuotaGapNote", () => {
   });
 });
 
-describe("creditsColumnLabel", () => {
-  it("is an em dash for Claude and for ChatGPT without a credits object", () => {
-    expect(creditsColumnLabel(claude("max-account-1"))).toBe("—");
-    expect(creditsColumnLabel(chatgpt("no-credits-field"))).toBe("—");
+describe("resetCreditsColumnLabel", () => {
+  it("is an em dash for Claude and for ChatGPT without resetCredits", () => {
+    expect(resetCreditsColumnLabel(claude("max-account-1"))).toBe("—");
+    expect(resetCreditsColumnLabel(chatgpt("no-reset-credits-field"))).toBe("—");
   });
 
-  it("prints Codex credits when present", () => {
-    const withCredits = {
+  it("prints the banked usage-limit reset count when present", () => {
+    const withZero = {
       ...chatgpt("plus"),
       codexRateLimits: {
         ...chatgpt("plus").codexRateLimits,
-        credits: { hasCredits: false, unlimited: false },
+        resetCredits: { available: 0 },
       },
     };
-    expect(creditsColumnLabel(withCredits)).toBe("no");
-    expect(creditsColumnLabel({
-      ...withCredits,
-      codexRateLimits: { ...withCredits.codexRateLimits, credits: { hasCredits: true, unlimited: false } },
-    })).toBe("yes");
-    expect(creditsColumnLabel({
-      ...withCredits,
-      codexRateLimits: { ...withCredits.codexRateLimits, credits: { hasCredits: false, unlimited: true } },
-    })).toBe("∞");
+    expect(resetCreditsColumnLabel(withZero)).toBe("0");
+    expect(resetCreditsColumnLabel({
+      ...withZero,
+      codexRateLimits: { ...withZero.codexRateLimits, resetCredits: { available: 2 } },
+    })).toBe("2");
+  });
+
+  it("ignores billing credits and still shows an em dash without resetCredits", () => {
+    const billingOnly = {
+      ...chatgpt("plus"),
+      codexRateLimits: {
+        ...chatgpt("plus").codexRateLimits,
+        credits: { hasCredits: true, unlimited: false },
+      },
+    };
+    expect(resetCreditsColumnLabel(billingOnly)).toBe("—");
   });
 });
 
