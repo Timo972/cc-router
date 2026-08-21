@@ -336,14 +336,12 @@ export function isOpenAIAccount(account: Pick<AccountStat, "provider">): boolean
   return account.provider === "openai_subscription";
 }
 
-/** Compact `cr` column: banked Codex usage-limit resets, or an em dash when unknown. */
+/** Compact `rst` column: banked Codex usage-limit resets. Claude is an em dash. */
 export function resetCreditsColumnLabel(
   account: Pick<AccountStat, "provider" | "codexRateLimits">,
 ): string {
   if (!isOpenAIAccount(account)) return "—";
-  const resetCredits = account.codexRateLimits?.resetCredits;
-  if (!resetCredits) return "—";
-  return String(resetCredits.available);
+  return String(account.codexRateLimits?.resetCredits?.available ?? 0);
 }
 
 export function isLimitedAccount(
@@ -1652,13 +1650,13 @@ const COL = {
   pct: 4,
   note: 22,
   reset: 8,
-  cr: 6,
+  rst: 5,
 } as const;
 
 function ColumnLegend() {
   return (
     <Text color="gray">
-      {`  ${"".padEnd(COL.name)} ${"req".padStart(COL.req)}${"s·n".padStart(COL.sess)}  ${"5h".padStart(COL.pct)} ${"7d".padStart(COL.pct)}  ${"note".padEnd(COL.note)} ${"↻5h".padEnd(COL.reset)} ${"↻7d".padEnd(COL.reset)} ${"cr".padStart(COL.cr)}`}
+      {`  ${"".padEnd(COL.name)} ${"req".padStart(COL.req)}${"s·n".padStart(COL.sess)}  ${"5h".padStart(COL.pct)} ${"7d".padStart(COL.pct)}  ${"note".padEnd(COL.note)} ${"↻5h".padEnd(COL.reset)} ${"↻7d".padEnd(COL.reset)} ${"rst".padStart(COL.rst)}`}
     </Text>
   );
 }
@@ -1739,7 +1737,7 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
       <Text> </Text>
       <ResetCell resetTs={sevenDay?.resetAt} />
       <Text> </Text>
-      <Text color="gray">{creditsLabel.padStart(COL.cr)}</Text>
+      <Text color="gray">{creditsLabel.padStart(COL.rst)}</Text>
       {a.credentialsPendingWrite && <Text color="yellow">  unsaved</Text>}
     </Box>
   );

@@ -10,7 +10,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Status dashboard `cr` column shows Codex banked usage-limit reset count
+- Status dashboard `rst` column shows Codex banked usage-limit reset count
   (`0` = none available); Claude cells are `—`.
 
 ---

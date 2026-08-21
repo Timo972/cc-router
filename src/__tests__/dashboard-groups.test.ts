@@ -143,9 +143,9 @@ describe("openaiQuotaGapNote", () => {
 });
 
 describe("resetCreditsColumnLabel", () => {
-  it("is an em dash for Claude and for ChatGPT without resetCredits", () => {
+  it("is an em dash for Claude and 0 for ChatGPT without resetCredits", () => {
     expect(resetCreditsColumnLabel(claude("max-account-1"))).toBe("—");
-    expect(resetCreditsColumnLabel(chatgpt("no-reset-credits-field"))).toBe("—");
+    expect(resetCreditsColumnLabel(chatgpt("no-reset-credits-field"))).toBe("0");
   });
 
   it("prints the banked usage-limit reset count when present", () => {
@@ -163,7 +163,7 @@ describe("resetCreditsColumnLabel", () => {
     })).toBe("2");
   });
 
-  it("ignores billing credits and still shows an em dash without resetCredits", () => {
+  it("ignores billing credits and still shows 0 without resetCredits", () => {
     const billingOnly = {
       ...chatgpt("plus"),
       codexRateLimits: {
@@ -171,7 +171,7 @@ describe("resetCreditsColumnLabel", () => {
         credits: { hasCredits: true, unlimited: false },
       },
     };
-    expect(resetCreditsColumnLabel(billingOnly)).toBe("—");
+    expect(resetCreditsColumnLabel(billingOnly)).toBe("0");
   });
 });
 
