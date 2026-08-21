@@ -41,12 +41,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claimed window releases a global cooldown, and only the matching family
   releases a model cooldown. Blocks for limits no snapshot describes — an
   upstream 529 overload, the `seven_day_oauth_apps` quota, an unattributed
-  claim — stay purely time-based. Global cooldowns are grouped by scope, and
-  within a scope each expiry keeps the sequence of the event that produced it,
-  so overlapping blocks neither merge nor cancel each other: releasing a quota
-  cooldown leaves a concurrent overload running, a brief overload does not make
-  a multi-hour cooldown permanent, and a later shorter 429 cannot revive an
-  expiry a refresh had already retired.
+  claim — stay purely time-based. Cooldowns are grouped by scope — global by
+  limiting window, model by family — and within each scope every expiry keeps
+  the sequence of the event that produced it, so overlapping blocks neither
+  merge nor cancel each other: releasing a quota cooldown leaves a concurrent
+  overload running, a brief overload does not make a multi-hour cooldown
+  permanent, and a later shorter 429 cannot revive an expiry a refresh had
+  already retired.
 
   Relatedly, a usage window with no usable figure — `five_hour: {}`, a
   non-numeric utilization — no longer parses as `0`. It now arrives with the

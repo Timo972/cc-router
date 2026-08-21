@@ -48,9 +48,59 @@ interface CooldownEntry {
  */
 type GlobalCooldownScope = UsageWindowScope | "unscoped";
 
+/**
+ * Operations on one scope's cooldown entries.
+ *
+ * Both cooldown maps — global scopes and model families — need identical
+ * handling, and keeping two copies of it is what let the same merge bug live
+ * on in the model path after the global path was fixed. Every mutation goes
+ * through these four functions so the invariant has one home.
+ */
+const cooldownEntries = {
+  /**
+   * Add a new expiry, dropping entries the new event makes redundant.
+   *
+   * The new event carries the highest sequence, so any entry it also outlasts
+   * can neither outlive it nor be released before it. Entries that expire
+   * later still say something this one does not, and are kept with their own
+   * sequences — collapsing them onto the newest sequence would let a later,
+   * shorter cooldown revive an expiry a refresh had already retired.
+   */
+  merge(entries: CooldownEntry[] | undefined, until: number, recordedSeq: number): CooldownEntry[] {
+    const surviving = (entries ?? []).filter(entry => entry.until > until);
+    surviving.push({ until, recordedSeq });
+    return surviving;
+  },
+
+  /** Drop entries a refresh at `supersedingSeq` was initiated after. */
+  retireBefore(entries: CooldownEntry[], supersedingSeq: number): CooldownEntry[] {
+    return entries.filter(entry => supersedingSeq <= entry.recordedSeq);
+  },
+
+  /** Drop entries whose expiry has passed. */
+  live(entries: CooldownEntry[], nowMs: number): CooldownEntry[] {
+    return entries.filter(entry => entry.until > nowMs);
+  },
+
+  /** The scope's effective expiry: the furthest-out entry still standing. */
+  latestUntil(entries: CooldownEntry[] | undefined): number {
+    let latest = 0;
+    for (const entry of entries ?? []) latest = Math.max(latest, entry.until);
+    return latest;
+  },
+};
+
+/** Store `entries` under `key`, removing the key entirely when nothing is left. */
+function putEntries<K>(map: Map<K, CooldownEntry[]>, key: K, entries: CooldownEntry[]): void {
+  if (entries.length === 0) map.delete(key);
+  else map.set(key, entries);
+}
+
 interface AccountCooldowns {
   globalUntil: number;
-  modelUntil: Map<string, CooldownEntry>;
+  /** Per model family, held as entry lists for the same reason as
+   *  `definiteGlobal`: a merged expiry loses the sequence that justified it. */
+  modelUntil: Map<string, CooldownEntry[]>;
   /**
    * Global cooldowns grouped by scope, and within a scope kept as separate
    * expiries rather than one maximum.
@@ -366,15 +416,11 @@ export class TokenPool implements AccountPool<Account> {
     if (expiry === undefined) return;
     const state = this.cooldownsFor(account);
     const scope: GlobalCooldownScope = usageWindow ?? "unscoped";
-    // This event has the newest sequence, so it dominates every existing entry
-    // it also outlasts: those can never outlive it nor be released before it.
-    // Dropping them keeps the list to expiries that still say something new,
-    // which in practice is one or two.
-    const surviving = (state.definiteGlobal.get(scope) ?? []).filter(
-      entry => entry.until > expiry,
-    );
-    surviving.push({ until: expiry, recordedSeq: this.nextSequence() });
-    state.definiteGlobal.set(scope, surviving);
+    putEntries(state.definiteGlobal, scope, cooldownEntries.merge(
+      state.definiteGlobal.get(scope),
+      expiry,
+      this.nextSequence(),
+    ));
     this.recomputeGlobalUntil(state);
   }
 
@@ -388,10 +434,11 @@ export class TokenPool implements AccountPool<Account> {
     const family = normalizeModelFamily(modelFamily);
     if (expiry === undefined || family === undefined) return;
     const state = this.cooldownsFor(account);
-    state.modelUntil.set(family, {
-      until: Math.max(state.modelUntil.get(family)?.until ?? 0, expiry),
-      recordedSeq: this.nextSequence(),
-    });
+    putEntries(state.modelUntil, family, cooldownEntries.merge(
+      state.modelUntil.get(family),
+      expiry,
+      this.nextSequence(),
+    ));
   }
 
   /** Mark a conservative global cooldown as eligible for later narrowing. */
@@ -429,10 +476,11 @@ export class TokenPool implements AccountPool<Account> {
     if (!family || pending.modelFamily !== family) return false;
     const proposed = this.proposedExpiry(account, durationMs) ?? 0;
     const expiry = Math.max(pending.until, proposed);
-    state.modelUntil.set(family, {
-      until: Math.max(state.modelUntil.get(family)?.until ?? 0, expiry),
-      recordedSeq: this.nextSequence(),
-    });
+    putEntries(state.modelUntil, family, cooldownEntries.merge(
+      state.modelUntil.get(family),
+      expiry,
+      this.nextSequence(),
+    ));
     state.pendingAmbiguous.delete(token);
     this.recomputeGlobalUntil(state);
     if (state.globalUntil <= this.now()) {
@@ -453,7 +501,7 @@ export class TokenPool implements AccountPool<Account> {
     const family = normalizeModelFamily(context?.modelFamily ?? context?.requestedModel);
     return Math.max(
       current.globalUntil,
-      family ? current.modelUntil.get(family)?.until ?? 0 : 0,
+      family ? cooldownEntries.latestUntil(current.modelUntil.get(family)) : 0,
     );
   }
 
@@ -485,10 +533,13 @@ export class TokenPool implements AccountPool<Account> {
     return {
       globalUntilMs: current.globalUntil,
       modelCooldowns: [...current.modelUntil]
-        .filter(([, entry]) => entry.until > 0)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .slice(0, 12)
-        .map(([modelFamily, entry]) => ({ modelFamily, untilMs: entry.until })),
+        .map(([modelFamily, entries]) => ({
+          modelFamily,
+          untilMs: cooldownEntries.latestUntil(entries),
+        }))
+        .filter(cooldown => cooldown.untilMs > 0)
+        .sort((left, right) => left.modelFamily.localeCompare(right.modelFamily))
+        .slice(0, 12),
     };
   }
 
@@ -637,15 +688,13 @@ export class TokenPool implements AccountPool<Account> {
   private clearExpiredCooldownState(account: Account, state: AccountCooldowns): void {
     const now = this.now();
     for (const [scope, entries] of state.definiteGlobal) {
-      const live = entries.filter(entry => entry.until > now);
-      if (live.length === 0) state.definiteGlobal.delete(scope);
-      else if (live.length !== entries.length) state.definiteGlobal.set(scope, live);
+      putEntries(state.definiteGlobal, scope, cooldownEntries.live(entries, now));
     }
     for (const [token, pending] of state.pendingAmbiguous) {
       if (pending.until <= now) state.pendingAmbiguous.delete(token);
     }
-    for (const [family, entry] of state.modelUntil) {
-      if (entry.until <= now) state.modelUntil.delete(family);
+    for (const [family, entries] of state.modelUntil) {
+      putEntries(state.modelUntil, family, cooldownEntries.live(entries, now));
     }
     this.releaseCooldownsSupersededByUsage(account, state);
     this.recomputeGlobalUntil(state);
@@ -683,26 +732,26 @@ export class TokenPool implements AccountPool<Account> {
     const supersedingSeq = supersedingSequence(usage);
     if (usage === undefined || supersedingSeq === undefined) return;
 
+    // Retire only the expiries this refresh was initiated after. A 429 that
+    // landed while it was in flight still stands on its own evidence.
     for (const [scope, entries] of state.definiteGlobal) {
       if (scope === "unscoped") continue;
       const window = scope === "five_hour" ? usage.fiveHour : usage.sevenDay;
       if (!reportsHeadroom(window?.utilization)) continue;
-      // Retire only the expiries this refresh is newer than. A 429 that landed
-      // after it started still stands on its own evidence.
-      const surviving = entries.filter(entry => supersedingSeq <= entry.recordedSeq);
-      if (surviving.length === 0) state.definiteGlobal.delete(scope);
-      else if (surviving.length !== entries.length) state.definiteGlobal.set(scope, surviving);
+      putEntries(state.definiteGlobal, scope,
+        cooldownEntries.retireBefore(entries, supersedingSeq));
     }
 
     // A family the snapshot does not mention is left alone: silence is not
     // evidence of headroom. `active` is deliberately not consulted, matching
     // matchingModelWindows() — utilization is what gates routing.
-    for (const [family, entry] of state.modelUntil) {
-      if (supersedingSeq <= entry.recordedSeq) continue;
+    for (const [family, entries] of state.modelUntil) {
       const limit = usage.modelLimits.find(
         candidate => normalizeModelFamily(candidate.modelFamily) === family,
       );
-      if (limit && reportsHeadroom(limit.utilization)) state.modelUntil.delete(family);
+      if (!limit || !reportsHeadroom(limit.utilization)) continue;
+      putEntries(state.modelUntil, family,
+        cooldownEntries.retireBefore(entries, supersedingSeq));
     }
   }
 
@@ -715,7 +764,7 @@ export class TokenPool implements AccountPool<Account> {
   private recomputeGlobalUntil(state: AccountCooldowns): void {
     let globalUntil = 0;
     for (const entries of state.definiteGlobal.values()) {
-      for (const entry of entries) globalUntil = Math.max(globalUntil, entry.until);
+      globalUntil = Math.max(globalUntil, cooldownEntries.latestUntil(entries));
     }
     for (const pending of state.pendingAmbiguous.values()) {
       globalUntil = Math.max(globalUntil, pending.until);
@@ -731,7 +780,7 @@ export class TokenPool implements AccountPool<Account> {
     if (!current) return 0;
     const expiries = [
       current.globalUntil,
-      ...[...current.modelUntil.values()].map(entry => entry.until),
+      ...[...current.modelUntil.values()].map(entries => cooldownEntries.latestUntil(entries)),
     ].filter(value => value > 0);
     return expiries.length > 0 ? Math.min(...expiries) : 0;
   }

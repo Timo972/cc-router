@@ -600,6 +600,68 @@ describe("model cooldowns superseded by a later usage snapshot", () => {
     expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
   });
 
+  it("does not let a later shorter 429 revive a superseded model expiry", () => {
+    // Same shape as the global case: two requests in flight against one
+    // family, the refresh triggered by the first returning headroom, and the
+    // second 429 landing with a shorter reset before anything swept.
+    const h = harness("shorter-model-429-after-refresh");
+    h.pool.setModelCooldownForAccount(h.account, "fable", FIVE_DAYS);
+
+    const refreshSeq = h.nextSeq();
+
+    h.advance(1_000);
+    h.pool.setModelCooldownForAccount(h.account, "fable", 60_000);
+    const shortUntil = h.now() + 60_000;
+
+    setUsage(h.account, snapshot({
+      requestedSeq: refreshSeq,
+      models: [modelLimit("fable", 0)],
+    }));
+
+    expect(h.pool.getCooldownSummary(h.account.id).modelCooldowns).toEqual([
+      { modelFamily: "fable", untilMs: shortUntil },
+    ]);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+
+    // The five-day expiry must not outlive the refresh that superseded it.
+    h.jumpTo(shortUntil + 1);
+    expect(h.pool.getCooldownSummary(h.account.id).modelCooldowns).toEqual([]);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+  });
+
+  it("does not let ambiguity reconciliation revive a superseded model expiry", () => {
+    // The reconciliation setter merges into the same per-family state, so it
+    // must preserve provenance the same way.
+    const h = harness("reconcile-model-merge");
+    h.pool.setModelCooldownForAccount(h.account, "fable", FIVE_DAYS);
+
+    const refreshSeq = h.nextSeq();
+
+    h.advance(1_000);
+    const token = h.pool.setAmbiguousGlobalCooldownForAccount(h.account, 60_000, "fable");
+    expect(token).toBeDefined();
+    expect(h.pool.reconcileAmbiguousGlobalCooldownForAccount(
+      h.account,
+      token!,
+      "fable",
+      60_000,
+    )).toBe(true);
+    const reconciledUntil = h.now() + 60_000;
+
+    setUsage(h.account, snapshot({
+      requestedSeq: refreshSeq,
+      models: [modelLimit("fable", 0)],
+    }));
+
+    expect(h.pool.getCooldownSummary(h.account.id).modelCooldowns).toEqual([
+      { modelFamily: "fable", untilMs: reconciledUntil },
+    ]);
+
+    h.jumpTo(reconciledUntil + 1);
+    expect(h.pool.getCooldownSummary(h.account.id).modelCooldowns).toEqual([]);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+  });
+
   it("keeps a model cooldown while that family is still exhausted", () => {
     const h = harness("model-still-exhausted");
     h.pool.setModelCooldownForAccount(h.account, "fable", FIVE_DAYS);
