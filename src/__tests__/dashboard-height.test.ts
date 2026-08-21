@@ -504,4 +504,19 @@ describe("dashboard viewport fitting", () => {
       await dash.cleanup();
     }
   });
+
+  it("shows the DETAILS box for the selected activity row", async () => {
+    const dash = renderDashboard(tallHealth(), {}, { rows: 120, columns: 220 });
+    try {
+      await dash.waitUntil(() => {
+        const frame = dash.lastFrame();
+        expect(frame).toContain("DETAILS");
+        expect(frame).toContain("Account:");
+        expect(frame).toContain("Status:");
+        expect(frame).toContain("200 OK");
+      });
+    } finally {
+      await dash.cleanup();
+    }
+  });
 });
