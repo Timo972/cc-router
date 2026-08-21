@@ -335,6 +335,18 @@ export function isOpenAIAccount(account: Pick<AccountStat, "provider">): boolean
   return account.provider === "openai_subscription";
 }
 
+/** Compact `cr` column: Codex credits, or an em dash when the account has none. */
+export function creditsColumnLabel(
+  account: Pick<AccountStat, "provider" | "codexRateLimits">,
+): string {
+  if (!isOpenAIAccount(account)) return "—";
+  const credits = account.codexRateLimits?.credits;
+  if (!credits) return "—";
+  if (credits.unlimited) return "∞";
+  if (credits.balance) return credits.balance.slice(0, 6);
+  return credits.hasCredits ? "yes" : "no";
+}
+
 export function isLimitedAccount(
   account: Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">,
 ): boolean {
@@ -1641,12 +1653,13 @@ const COL = {
   pct: 4,
   note: 22,
   reset: 8,
+  cr: 6,
 } as const;
 
 function ColumnLegend() {
   return (
     <Text color="gray">
-      {`  ${"".padEnd(COL.name)} ${"req".padStart(COL.req)}${"s·n".padStart(COL.sess)}  ${"5h".padStart(COL.pct)} ${"7d".padStart(COL.pct)}  ${"note".padEnd(COL.note)} ${"↻5h".padEnd(COL.reset)} ${"↻7d".padEnd(COL.reset)}`}
+      {`  ${"".padEnd(COL.name)} ${"req".padStart(COL.req)}${"s·n".padStart(COL.sess)}  ${"5h".padStart(COL.pct)} ${"7d".padStart(COL.pct)}  ${"note".padEnd(COL.note)} ${"↻5h".padEnd(COL.reset)} ${"↻7d".padEnd(COL.reset)} ${"cr".padStart(COL.cr)}`}
     </Text>
   );
 }
@@ -1694,6 +1707,7 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
   const sevenDay = isOpenAI
     ? weeklyWindow
     : hasClaudeQuota ? globalCapacity.sevenDay : undefined;
+  const creditsLabel = creditsColumnLabel(a);
 
   const dot = isDisabled ? "⊘" : isLimited ? "⊘" : a.busy ? "◌" : a.healthy ? "●" : "●";
   const dotColor = isDisabled ? "gray" : isLimited ? "red" : a.busy ? "yellow" : a.healthy ? "green" : "red";
@@ -1725,6 +1739,8 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
       <ResetCell resetTs={fiveHour?.resetAt} />
       <Text> </Text>
       <ResetCell resetTs={sevenDay?.resetAt} />
+      <Text> </Text>
+      <Text color="gray">{creditsLabel.padStart(COL.cr)}</Text>
       {a.credentialsPendingWrite && <Text color="yellow">  unsaved</Text>}
     </Box>
   );

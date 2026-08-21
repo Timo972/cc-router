@@ -8,6 +8,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Status dashboard has a `cr` column for ChatGPT credits. Claude rows show `—`.
+
 ---
 
 ## [0.10.1] — 2026-08-20

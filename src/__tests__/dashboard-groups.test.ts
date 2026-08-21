@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  creditsColumnLabel,
   earliestWeeklyReset,
   isLimitedAccount,
   isOpenAIAccount,
@@ -138,6 +139,32 @@ describe("openaiQuotaGapNote", () => {
 
   it("stays quiet when a weekly window exists", () => {
     expect(openaiQuotaGapNote(chatgpt("info-droidrun", 0.96))).toBeUndefined();
+  });
+});
+
+describe("creditsColumnLabel", () => {
+  it("is an em dash for Claude and for ChatGPT without a credits object", () => {
+    expect(creditsColumnLabel(claude("max-account-1"))).toBe("—");
+    expect(creditsColumnLabel(chatgpt("no-credits-field"))).toBe("—");
+  });
+
+  it("prints Codex credits when present", () => {
+    const withCredits = {
+      ...chatgpt("plus"),
+      codexRateLimits: {
+        ...chatgpt("plus").codexRateLimits,
+        credits: { hasCredits: false, unlimited: false },
+      },
+    };
+    expect(creditsColumnLabel(withCredits)).toBe("no");
+    expect(creditsColumnLabel({
+      ...withCredits,
+      codexRateLimits: { ...withCredits.codexRateLimits, credits: { hasCredits: true, unlimited: false } },
+    })).toBe("yes");
+    expect(creditsColumnLabel({
+      ...withCredits,
+      codexRateLimits: { ...withCredits.codexRateLimits, credits: { hasCredits: false, unlimited: true } },
+    })).toBe("∞");
   });
 });
 
