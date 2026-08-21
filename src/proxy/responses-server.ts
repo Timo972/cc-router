@@ -32,6 +32,15 @@ export interface ResponsesRoutesOptions {
   recordActivity?: (entry: LogEntry) => void;
   now?: () => number;
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
+  /** Upstream attempts per client request (default 3). `1` disables
+   *  router-side failover/retry entirely — the `autoFailover: false`
+   *  config opt-out is wired through here. */
+  maxAttempts?: number;
+  /** Delay before re-sending to the SAME account (test override). */
+  sameAccountRetryDelayMs?: number;
+  /** Longest a failover account's token refresh may hold the ready-to-relay
+   *  upstream failure (test override; default 15s). */
+  retryRefreshTimeoutMs?: number;
 }
 
 const RESPONSES_ENVELOPE: OpenAIIngressEnvelope = {
@@ -178,6 +187,13 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       now,
       envelope: RESPONSES_ENVELOPE,
       onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
+      ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
+      ...(opts.sameAccountRetryDelayMs !== undefined
+        ? { sameAccountRetryDelayMs: opts.sameAccountRetryDelayMs }
+        : {}),
+      ...(opts.retryRefreshTimeoutMs !== undefined
+        ? { retryRefreshTimeoutMs: opts.retryRefreshTimeoutMs }
+        : {}),
       relay: async (upstream, res, entry, report) => {
         if (body.stream === true) {
           const observer = createCodexUsageObserver();

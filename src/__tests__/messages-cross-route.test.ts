@@ -1063,7 +1063,7 @@ describe("messages cross-route sticky routing", () => {
     expect(account.rateLimits.buckets.get("codex")?.primary?.utilization).toBeCloseTo(0.33);
   });
 
-  it("relays an upstream 429, cools the account, and rebinds the session's next request", async () => {
+  it("absorbs an upstream 429 by failing over within the request and cools the account", async () => {
     const accounts = [makeRuntimeAccount("openai-a"), makeRuntimeAccount("openai-b")];
     const seen: string[] = [];
     const forwardOpenAI = vi.fn(async (opts: { account: OpenAIAccount }) => {
@@ -1079,17 +1079,23 @@ describe("messages cross-route sticky routing", () => {
     const { app, openAIPool } = mountWithPool(accounts, forwardOpenAI);
 
     await withServer(app, async baseUrl => {
+      // The router retries the 429 on the idle account itself; the client only
+      // ever sees the successful response.
       const first = await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s1" });
-      expect(first.status).toBe(429);
+      expect(first.status).toBe(200);
       await first.text();
+      expect(seen).toHaveLength(2);
+      expect(seen[1]).not.toBe(seen[0]);
       expect(openAIPool.isCoolingDown(seen[0]!)).toBe(true);
 
+      // The session's next request sticks to the account that served it.
       const second = await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s1" });
       expect(second.status).toBe(200);
       await second.text();
     });
 
-    expect(seen[1]).not.toBe(seen[0]);
+    expect(seen).toHaveLength(3);
+    expect(seen[2]).toBe(seen[1]);
   });
 
   it("returns a local Anthropic-envelope 429 with Retry-After when everything is blocked", async () => {
