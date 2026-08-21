@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   earliestWeeklyReset,
+  grokQuotaNote,
+  isClaudeAccount,
   isLimitedAccount,
   isOpenAIAccount,
   isWeeklyLimited,
+  isXaiAccount,
   noteModelLimit,
   openaiQuotaGapNote,
   orderAccountsForDashboard,
@@ -62,14 +65,15 @@ function claude(id: string, fiveHour = 0, sevenDay = 0) {
 }
 
 describe("orderAccountsForDashboard", () => {
-  it("puts Claude accounts before ChatGPT and keeps relative order", () => {
+  it("puts Claude accounts before ChatGPT and Grok, and keeps relative order", () => {
     const ordered = orderAccountsForDashboard([
       { provider: "openai_subscription", id: "gpt-b" },
+      { provider: "xai_subscription", id: "grok-alex" },
       { provider: "anthropic_subscription", id: "claude-a" },
       { provider: "openai_subscription", id: "gpt-c" },
       { id: "claude-d" },
     ]);
-    expect(ordered.map(a => a.id)).toEqual(["claude-a", "claude-d", "gpt-b", "gpt-c"]);
+    expect(ordered.map(a => a.id)).toEqual(["claude-a", "claude-d", "gpt-b", "gpt-c", "grok-alex"]);
   });
 });
 
@@ -78,6 +82,9 @@ describe("isOpenAIAccount", () => {
     expect(isOpenAIAccount({})).toBe(false);
     expect(isOpenAIAccount({ provider: "anthropic_subscription" })).toBe(false);
     expect(isOpenAIAccount({ provider: "openai_subscription" })).toBe(true);
+    expect(isXaiAccount({ provider: "xai_subscription" })).toBe(true);
+    expect(isClaudeAccount({ provider: "xai_subscription" })).toBe(false);
+    expect(isClaudeAccount({})).toBe(true);
   });
 });
 
@@ -137,16 +144,33 @@ describe("openaiQuotaGapNote", () => {
   });
 
   it("stays quiet when a weekly window exists", () => {
-    expect(openaiQuotaGapNote(chatgpt("info-droidrun", 0.96))).toBeUndefined();
+    expect(openaiQuotaGapNote(chatgpt("chatgpt-ok", 0.96))).toBeUndefined();
+  });
+});
+
+describe("grokQuotaNote", () => {
+  it("shows the spend tier for a healthy Grok CLI login", () => {
+    expect(grokQuotaNote({
+      provider: "xai_subscription",
+      healthy: true,
+      xai: { tier: 1 },
+    })).toBe("tier 1");
+  });
+
+  it("marks an expired Grok login", () => {
+    expect(grokQuotaNote({
+      provider: "xai_subscription",
+      healthy: false,
+    })).toBe("expired");
   });
 });
 
 describe("limit sorting", () => {
   const idleClaude = claude("max-account-1", 0.4, 0.2);
-  const usable = chatgpt("info-droidrun", 0.96, 300);
-  const fullA = chatgpt("dev-droidrun", 1, 100);
-  const fullB = chatgpt("eren-droidrun", 1, 80);
-  const fullC = chatgpt("lucius-max", 1, 200);
+  const usable = chatgpt("chatgpt-ok", 0.96, 300);
+  const fullA = chatgpt("chatgpt-full-a", 1, 100);
+  const fullB = chatgpt("chatgpt-full-b", 1, 80);
+  const fullC = chatgpt("chatgpt-full-c", 1, 200);
 
   it("treats a 100% weekly Codex window as limited", () => {
     expect(isWeeklyLimited(usable)).toBe(false);
@@ -169,14 +193,14 @@ describe("limit sorting", () => {
 
   it("keeps each limited ChatGPT account visible, sorted below usable ones", () => {
     const ordered = orderAccountsForDashboard(
-      [fullA, idleClaude, usable, fullB, fullC] as never,
+      [fullA, idleClaude, usable, fullB, fullC],
     );
     expect(ordered.map(a => a.id)).toEqual([
       "max-account-1",
-      "info-droidrun",
-      "dev-droidrun",
-      "eren-droidrun",
-      "lucius-max",
+      "chatgpt-ok",
+      "chatgpt-full-a",
+      "chatgpt-full-b",
+      "chatgpt-full-c",
     ]);
   });
 

@@ -411,6 +411,7 @@ describe("createOperationalStatus", () => {
       providers: {
         anthropic: { configured: true, accounts: 1, healthy: 1, enabled: 1 },
         openai: { configured: true, accounts: 1, healthy: 1, enabled: 1 },
+        xai: { configured: false, accounts: 0, healthy: 0, enabled: 0 },
       },
       endpoints: {
         health: "/cc-router/health",
@@ -436,5 +437,39 @@ describe("createOperationalStatus", () => {
 
     expect(JSON.stringify(status)).not.toContain("openai-access");
     expect(JSON.stringify(status)).not.toContain("ant-access");
+  });
+
+  it("surfaces a Grok CLI overview account without copying tokens", () => {
+    const views = createHealthAccountViews([], [], undefined, undefined, [{
+      id: "grok-alex",
+      provider: "xai_subscription",
+      enabled: true,
+      healthy: true,
+      busy: true,
+      inFlightRequests: 0,
+      activeSessions: 2,
+      requestCount: 0,
+      errorCount: 0,
+      expiresInMs: 60_000,
+      lastUsedMs: 0,
+      lastRefreshMs: 0,
+      tier: 1,
+    }]);
+    expect(views).toEqual([{
+      id: "grok-alex",
+      provider: "xai_subscription",
+      enabled: true,
+      healthy: true,
+      busy: true,
+      inFlightRequests: 0,
+      activeSessions: 2,
+      requestCount: 0,
+      errorCount: 0,
+      expiresInMs: 60_000,
+      lastUsedMs: 0,
+      lastRefreshMs: 0,
+      xai: { tier: 1 },
+    }]);
+    expect(JSON.stringify(views)).not.toContain("eyJ");
   });
 });

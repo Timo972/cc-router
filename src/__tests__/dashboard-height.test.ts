@@ -8,7 +8,8 @@ afterEach(() => {
 function makeAccount(id: string) {
   return {
     id,
-    provider: "anthropic_subscription",
+    provider: "anthropic_subscription" as string,
+    xai: undefined as { tier: number } | undefined,
     healthy: true,
     busy: false,
     inFlightRequests: 0,
@@ -510,9 +511,16 @@ describe("dashboard viewport fitting", () => {
     health.accounts = [
       ...health.accounts.slice(0, 2),
       {
-        ...makeAccount("info-droidrun"),
-        id: "info-droidrun",
+        ...makeAccount("chatgpt-ok"),
+        id: "chatgpt-ok",
         provider: "openai_subscription",
+      },
+      {
+        ...makeAccount("grok-alex"),
+        id: "grok-alex",
+        provider: "xai_subscription",
+        xai: { tier: 1 },
+        activeSessions: 2,
       },
     ];
     const dash = renderDashboard(health, {}, { rows: 120, columns: 220 });
@@ -523,10 +531,14 @@ describe("dashboard viewport fitting", () => {
         expect(frame).toContain("row01");
         const claudeAt = frame.indexOf("CLAUDE");
         const chatgptAt = frame.indexOf("CHATGPT");
+        const grokAt = frame.indexOf("GROK");
         expect(claudeAt).toBeGreaterThan(-1);
         expect(chatgptAt).toBeGreaterThan(claudeAt);
+        expect(grokAt).toBeGreaterThan(chatgptAt);
         expect(frame).toContain("account-01");
-        expect(frame).toContain("info-droidrun");
+        expect(frame).toContain("chatgpt-ok");
+        expect(frame).toContain("grok-alex");
+        expect(frame).toContain("tier 1");
       });
     } finally {
       await dash.cleanup();

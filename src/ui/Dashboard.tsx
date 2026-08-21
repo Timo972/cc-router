@@ -75,7 +75,7 @@ export interface CodexRateLimitsView {
 
 interface AccountStat {
   id: string;
-  provider?: "anthropic_subscription" | "openai_subscription";
+  provider?: "anthropic_subscription" | "openai_subscription" | "xai_subscription";
   healthy: boolean;
   busy: boolean;
   inFlightRequests?: number;
@@ -93,6 +93,7 @@ interface AccountStat {
   modelCooldowns?: Array<{ modelFamily: string; untilMs: number }>;
   codexRateLimits?: CodexRateLimitsView;
   credentialsPendingWrite?: boolean;
+  xai?: { tier?: number };
 }
 
 const EMPTY_RL: AccountRateLimitsView = {
@@ -335,9 +336,18 @@ export function isOpenAIAccount(account: Pick<AccountStat, "provider">): boolean
   return account.provider === "openai_subscription";
 }
 
+export function isXaiAccount(account: Pick<AccountStat, "provider">): boolean {
+  return account.provider === "xai_subscription";
+}
+
+export function isClaudeAccount(account: Pick<AccountStat, "provider">): boolean {
+  return !isOpenAIAccount(account) && !isXaiAccount(account);
+}
+
 export function isLimitedAccount(
   account: Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">,
 ): boolean {
+  if (isXaiAccount(account)) return false;
   if (isOpenAIAccount(account)) return isCodexLimited(account.codexRateLimits);
   if (account.rateLimits?.status === "rate_limited") return true;
   if (!account.rateLimits) return false;
@@ -345,8 +355,8 @@ export function isLimitedAccount(
   return view.fiveHour.utilization >= 1 || view.sevenDay.utilization >= 1;
 }
 
-/** Claude first, ChatGPT second; within each group, accounts at limit last. */
-export function orderAccountsForDashboard<T extends Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">>(
+/** Claude, then ChatGPT, then Grok; within each group, accounts at limit last. */
+export function orderAccountsForDashboard<T extends Pick<AccountStat, "id" | "provider" | "codexRateLimits" | "rateLimits">>(
   accounts: T[],
 ): T[] {
   const usableThenLimited = (list: T[]) => [
@@ -354,8 +364,9 @@ export function orderAccountsForDashboard<T extends Pick<AccountStat, "provider"
     ...list.filter(account => isLimitedAccount(account)),
   ];
   return [
-    ...usableThenLimited(accounts.filter(account => !isOpenAIAccount(account))),
+    ...usableThenLimited(accounts.filter(isClaudeAccount)),
     ...usableThenLimited(accounts.filter(isOpenAIAccount)),
+    ...usableThenLimited(accounts.filter(isXaiAccount)),
   ];
 }
 
@@ -389,6 +400,13 @@ export function noteModelLimit(
 }
 
 /** ChatGPT accounts with a known plan but no usage windows (e.g. Pro). */
+export function grokQuotaNote(account: Pick<AccountStat, "provider" | "xai" | "healthy">): string | undefined {
+  if (!isXaiAccount(account)) return undefined;
+  if (account.healthy === false) return "expired";
+  const tier = account.xai?.tier;
+  return typeof tier === "number" && Number.isFinite(tier) ? `tier ${tier}` : "cli";
+}
+
 export function openaiQuotaGapNote(
   account: Pick<AccountStat, "provider" | "codexRateLimits">,
 ): string | undefined {
@@ -661,6 +679,7 @@ interface OperationalStatus {
   providers: {
     anthropic: ProviderOperationalStatus;
     openai: ProviderOperationalStatus;
+    xai?: ProviderOperationalStatus;
   };
   endpoints: {
     health: string;
@@ -988,6 +1007,10 @@ function LiveDashboard({
   // support, so the dashboard was refusing an operation the server had.
   const doToggleEnabled = useCallback(async () => {
     if (!selectedAccount) return;
+    if (isXaiAccount(selectedAccount)) {
+      showBanner("Grok is read-only here — use grok login / grok logout", "yellow");
+      return;
+    }
     const newValue = !(selectedAccount.enabled !== false);
     try {
       await api.patch(selectedAccount.id, { enabled: newValue });
@@ -1166,9 +1189,17 @@ function LiveDashboard({
       if (input === "a") { void doToggleProvider("anthropic_subscription"); return; }
       if (input === "o") { void doToggleProvider("openai_subscription"); return; }
       if (input === "w") {
+        if (selectedAccount && isXaiAccount(selectedAccount)) {
+          showBanner("Grok has no 7d cap in cc-router", "yellow");
+          return;
+        }
         setMode("editWeekly"); setEditBuffer(""); return;
       }
       if (input === "s") {
+        if (selectedAccount && isXaiAccount(selectedAccount)) {
+          showBanner("Grok has no 5h cap in cc-router", "yellow");
+          return;
+        }
         setMode("editSession"); setEditBuffer(""); return;
       }
       // Also provider-agnostic: `DELETE /cc-router/accounts/:id` removes an
@@ -1177,6 +1208,10 @@ function LiveDashboard({
       // the CLI for something the dashboard can do was left over from before
       // that existed.
       if (input === "d") {
+        if (selectedAccount && isXaiAccount(selectedAccount)) {
+          showBanner("Grok accounts live in ~/.grok — run grok logout", "yellow");
+          return;
+        }
         setMode("confirmDelete"); return;
       }
     }
@@ -1579,10 +1614,12 @@ function AccountGroups({
   selectedIndex: number;
   focused: boolean;
 }) {
-  const claudeVisible = visible.filter(account => !isOpenAIAccount(account));
+  const claudeVisible = visible.filter(isClaudeAccount);
   const chatgptVisible = visible.filter(isOpenAIAccount);
-  const claudeFleet = fleet.filter(account => !isOpenAIAccount(account));
+  const grokVisible = visible.filter(isXaiAccount);
+  const claudeFleet = fleet.filter(isClaudeAccount);
   const chatgptFleet = fleet.filter(isOpenAIAccount);
+  const grokFleet = fleet.filter(isXaiAccount);
 
   if (visible.length === 0) {
     return <Text color="gray">  No accounts</Text>;
@@ -1597,23 +1634,29 @@ function AccountGroups({
       />
     ));
 
+  const groups: Array<{ key: string; visible: AccountStat[]; fleet: AccountStat[]; offset: number }> = [];
+  let offset = 0;
+  if (claudeVisible.length > 0) {
+    groups.push({ key: "CLAUDE", visible: claudeVisible, fleet: claudeFleet, offset });
+    offset += claudeVisible.length;
+  }
+  if (chatgptVisible.length > 0) {
+    groups.push({ key: "CHATGPT", visible: chatgptVisible, fleet: chatgptFleet, offset });
+    offset += chatgptVisible.length;
+  }
+  if (grokVisible.length > 0) {
+    groups.push({ key: "GROK", visible: grokVisible, fleet: grokFleet, offset });
+  }
+
   return (
     <Box flexDirection="column">
-      {claudeVisible.length > 0 && (
-        <Box flexDirection="column">
-          <GroupHeader label="CLAUDE" accounts={claudeFleet} />
+      {groups.map((group, index) => (
+        <Box key={group.key} flexDirection="column" marginTop={index === 0 ? 0 : 1}>
+          <GroupHeader label={group.key} accounts={group.fleet} />
           <ColumnLegend />
-          {renderRows(claudeVisible, 0)}
+          {renderRows(group.visible, group.offset)}
         </Box>
-      )}
-      {chatgptVisible.length > 0 && (
-        <Box flexDirection="column">
-          {claudeVisible.length > 0 && <Box marginTop={1} />}
-          <GroupHeader label="CHATGPT" accounts={chatgptFleet} />
-          <ColumnLegend />
-          {renderRows(chatgptVisible, claudeVisible.length)}
-        </Box>
-      )}
+      ))}
     </Box>
   );
 }
@@ -1677,12 +1720,14 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
     && (extraCap.spendLimitReached
       || (modelNote !== undefined && modelNote.utilization >= 1 && extraCap.enabled === false));
   const gapNote = openaiQuotaGapNote(a);
+  const grokNote = grokQuotaNote(a);
   const note = [
     modelNote
       ? `${modelNote.label} ${Math.round(modelNote.utilization * 100)}%`
       : "",
     extraOff ? "extra off" : "",
     gapNote ?? "",
+    grokNote ?? "",
   ].filter(Boolean).join(" · ");
   const codexWindows = getCodexDefaultWindows(a.codexRateLimits);
   const sessionWindow = codexWindows.find(window => window.kind === "session");

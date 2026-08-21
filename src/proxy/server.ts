@@ -15,6 +15,7 @@ import { logRoute, logError, logStartup } from "./logger.js";
 import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
+import { loadGrokAccountSnapshots, type GrokAccountSnapshot } from "../providers/xai/overview.js";
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
@@ -84,7 +85,7 @@ export interface ServerOptions {
 
 export interface HealthAccountView {
   id: string;
-  provider: "anthropic_subscription" | "openai_subscription";
+  provider: "anthropic_subscription" | "openai_subscription" | "xai_subscription";
   enabled: boolean;
   healthy: boolean;
   busy: boolean;
@@ -108,6 +109,8 @@ export interface HealthAccountView {
    *  the write lands would fall back to the old refresh token, which the
    *  provider already invalidated, and require re-authentication. */
   credentialsPendingWrite?: boolean;
+  /** Spend-tier from the Grok CLI access-token claims. Dashboard-only. */
+  xai?: { tier: number };
 }
 
 export interface PublicCodexWindow {
@@ -198,6 +201,7 @@ export interface OperationalStatus {
   providers: {
     anthropic: ProviderOperationalStatus;
     openai: ProviderOperationalStatus;
+    xai: ProviderOperationalStatus;
   };
   endpoints: {
     health: string;
@@ -237,6 +241,7 @@ export function createOperationalStatus(opts: {
 }): OperationalStatus {
   const anthropicAccounts = opts.accounts.filter(a => a.provider === "anthropic_subscription");
   const openAIAccounts = opts.accounts.filter(a => a.provider === "openai_subscription");
+  const xaiAccounts = opts.accounts.filter(a => a.provider === "xai_subscription");
   const modelRouting = opts.modelRouting ?? {};
 
   return {
@@ -246,6 +251,7 @@ export function createOperationalStatus(opts: {
     providers: {
       anthropic: providerStatus(anthropicAccounts),
       openai: providerStatus(openAIAccounts),
+      xai: providerStatus(xaiAccounts),
     },
     endpoints: {
       health: "/cc-router/health",
@@ -275,6 +281,7 @@ export function createHealthAccountViews(
   openAIAccounts: OpenAIAccount[],
   resolveRoutingMetrics: RoutingMetricsResolver = zeroRoutingMetrics,
   resolveOpenAIRouting?: (accountId: string) => { metrics: AccountRoutingMetrics; cooldowns: OpenAICooldownView },
+  xaiAccounts: GrokAccountSnapshot[] = [],
 ): HealthAccountView[] {
   return [
     ...anthropicAccounts.map(account => (
@@ -284,7 +291,26 @@ export function createHealthAccountViews(
       account,
       resolveOpenAIRouting?.(account.id) ?? { metrics: zeroRoutingMetrics(account.id), cooldowns: { globalUntilMs: 0, bucketCooldowns: [] } },
     )),
+    ...xaiAccounts.map(publicXaiAccountView),
   ];
+}
+
+function publicXaiAccountView(account: GrokAccountSnapshot): HealthAccountView {
+  return {
+    id: account.id,
+    provider: "xai_subscription",
+    enabled: true,
+    healthy: account.healthy,
+    busy: account.busy,
+    inFlightRequests: 0,
+    activeSessions: account.activeSessions,
+    requestCount: account.requestCount,
+    errorCount: 0,
+    expiresInMs: account.expiresInMs,
+    lastUsedMs: 0,
+    lastRefreshMs: 0,
+    ...(account.tier !== undefined ? { xai: { tier: account.tier } } : {}),
+  };
 }
 
 function publicAnthropicAccountView(
@@ -750,6 +776,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       openAIAccounts,
       resolveRoutingMetrics,
       createOpenAIRoutingResolver(),
+      loadGrokAccountSnapshots(),
     );
     const status = accountViews.some(a => a.healthy) ? "ok" : "degraded";
 
@@ -803,6 +830,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         openAIAccounts,
         resolveRoutingMetrics,
         createOpenAIRoutingResolver(),
+        loadGrokAccountSnapshots(),
       ),
     });
   });
