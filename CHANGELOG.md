@@ -8,6 +8,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `cc-router cli claude` and `cc-router cli codex` toggle Claude Code / Codex
+  CLI routing without stopping the proxy: `start`, `stop`, `resume` (same as
+  start), and `status`. `cc-router cli` shows both. Short aliases
+  `cc-router claude` / `cc-router codex` still work. `configure --remove` now
+  also works with `configure codex --remove`. `stop --full` / `revert` and
+  `client disconnect` strip the Codex managed block as well as Claude Code
+  settings.
+- Dashboard `[c]` / `[x]` toggle Claude Code / Codex CLI routing without
+  stopping the proxy (`[c]` still sets the Claude model default while MODELS
+  is focused).
+
 ---
 
 ## [0.10.1] — 2026-08-20

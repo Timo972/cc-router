@@ -4,6 +4,8 @@ import {
   codexBaseUrlFromRouterUrl,
   writeCodexRouterConfig,
   writeCodexRouterConfigFromClient,
+  removeCodexRouterConfig,
+  readCodexRouterConfig,
 } from "../utils/codex-config.js";
 
 describe("writeCodexRouterConfig", () => {
@@ -85,6 +87,138 @@ describe("writeCodexRouterConfig", () => {
     });
 
     expect(writeFileSync.mock.calls[0][1]).toContain("model = \"openai/gpt-5-codex\"");
+  });
+});
+
+describe("removeCodexRouterConfig", () => {
+  it("strips the managed block and leaves unrelated Codex config intact", () => {
+    const writeFileSync = vi.fn();
+    const existing = [
+      "model = \"gpt-5.6-sol\"",
+      "",
+      "# cc-router:start",
+      "model_provider = \"cc-router\"",
+      "",
+      "[model_providers.cc-router]",
+      "base_url = \"http://localhost:3456/v1\"",
+      "# cc-router:end",
+      "",
+      "[profiles.work]",
+      "model = \"gpt-5-codex\"",
+      "",
+    ].join("\n");
+
+    const result = removeCodexRouterConfig({
+      homeDir: "/tmp/home",
+      fs: {
+        existsSync: () => true,
+        readFileSync: () => existing,
+        writeFileSync,
+        mkdirSync: vi.fn(),
+      },
+    });
+
+    expect(result.removed).toBe(true);
+    const written = String(writeFileSync.mock.calls[0][1]);
+    expect(written).toContain("model = \"gpt-5.6-sol\"");
+    expect(written).toContain("[profiles.work]");
+    expect(written).not.toContain("# cc-router:start");
+    expect(written).not.toContain("model_provider = \"cc-router\"");
+    expect(written).not.toContain("[model_providers.cc-router]");
+  });
+
+  it("is a no-op when Codex is not configured for the router", () => {
+    const writeFileSync = vi.fn();
+    const result = removeCodexRouterConfig({
+      homeDir: "/tmp/home",
+      fs: {
+        existsSync: () => true,
+        readFileSync: () => "model = \"gpt-5.6-sol\"\n",
+        writeFileSync,
+        mkdirSync: vi.fn(),
+      },
+    });
+
+    expect(result.removed).toBe(false);
+    expect(writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("round-trips start then stop then start without duplicating the block", () => {
+    let stored = "model = \"gpt-5.6-sol\"\n";
+    const fs = {
+      existsSync: () => true,
+      readFileSync: () => stored,
+      writeFileSync: (_path: string, data: string) => {
+        stored = data;
+      },
+      mkdirSync: vi.fn(),
+    };
+
+    writeCodexRouterConfig({
+      homeDir: "/tmp/home",
+      baseUrl: "http://localhost:3456/v1",
+      fs,
+    });
+    expect(readCodexRouterConfig({ homeDir: "/tmp/home", fs }).configured).toBe(true);
+    expect(stored.match(/# cc-router:start/g)).toHaveLength(1);
+
+    removeCodexRouterConfig({ homeDir: "/tmp/home", fs });
+    expect(readCodexRouterConfig({ homeDir: "/tmp/home", fs }).configured).toBe(false);
+    expect(stored).toContain("model = \"gpt-5.6-sol\"");
+    expect(stored).not.toContain("# cc-router:start");
+
+    writeCodexRouterConfig({
+      homeDir: "/tmp/home",
+      baseUrl: "http://localhost:3456/v1",
+      defaultModel: "openai/gpt-5-codex",
+      fs,
+    });
+    expect(stored.match(/# cc-router:start/g)).toHaveLength(1);
+    expect(stored).toContain("model = \"gpt-5.6-sol\"");
+    expect(stored).toContain("model = \"openai/gpt-5-codex\"");
+  });
+
+  it("refuses to touch a malformed managed block", () => {
+    expect(() => removeCodexRouterConfig({
+      homeDir: "/tmp/home",
+      fs: {
+        existsSync: () => true,
+        readFileSync: () => "# cc-router:start\nmodel_provider = \"cc-router\"\n",
+        writeFileSync: vi.fn(),
+        mkdirSync: vi.fn(),
+      },
+    })).toThrow("Malformed cc-router managed block");
+  });
+});
+
+describe("readCodexRouterConfig", () => {
+  it("reports the managed provider URL and model when configured", () => {
+    const existing = [
+      "# cc-router:start",
+      "model = \"openai/gpt-5-codex\"",
+      "model_provider = \"cc-router\"",
+      "",
+      "[model_providers.cc-router]",
+      "base_url = \"http://localhost:3456/v1\"",
+      "# cc-router:end",
+      "",
+    ].join("\n");
+
+    expect(readCodexRouterConfig({
+      homeDir: "/tmp/home",
+      fs: {
+        existsSync: () => true,
+        readFileSync: () => existing,
+        writeFileSync: vi.fn(),
+        mkdirSync: vi.fn(),
+      },
+    })).toEqual({
+      path: join("/tmp/home", ".codex", "config.toml"),
+      configured: true,
+      baseUrl: "http://localhost:3456/v1",
+      model: "openai/gpt-5-codex",
+      modelProvider: "cc-router",
+    });
   });
 });
 

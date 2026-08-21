@@ -7,6 +7,14 @@ import type { AccountsApi } from "./accountsApi.js";
 import { createModelsApi } from "./modelsApi.js";
 import type { ModelEntry, ModelsApi, ModelsStatus } from "./modelsApi.js";
 import { getCurrentVersion } from "../utils/self-update.js";
+import {
+  readClaudeRouting,
+  readCodexRouting,
+  setClaudeRouting,
+  setCodexRouting,
+  type ClaudeRoutingStatus,
+  type CodexRoutingStatus,
+} from "../utils/cli-routing.js";
 
 const POLL_INTERVAL_MS = 2_000;
 /** Most activity rows the dashboard will show — the list shrinks below this
@@ -724,6 +732,20 @@ function LiveDashboard({
   data: HealthData; port: number; baseUrl: string; lastUpdate: number;
   api: AccountsApi; modelsApi: ModelsApi; onIntent?: (intent: "quit" | "addAccount") => void;
 }) {
+  const [cliRouting, setCliRouting] = useState(() => ({
+    claude: readClaudeRouting(),
+    codex: readCodexRouting(),
+  }));
+  const refreshCliRouting = useCallback(() => {
+    setCliRouting({
+      claude: readClaudeRouting(),
+      codex: readCodexRouting(),
+    });
+  }, []);
+  useEffect(() => {
+    const timer = setInterval(refreshCliRouting, POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [refreshCliRouting]);
   const { exit } = useApp();
   const healthyCount = data.accounts.filter(a => a.healthy).length;
   const updatedAgo = Math.round((Date.now() - lastUpdate) / 1000);
@@ -958,6 +980,23 @@ function LiveDashboard({
     }
   }, [modelsApi, showBanner]);
 
+  const doToggleCli = useCallback((target: "claude" | "codex") => {
+    const current = target === "claude" ? cliRouting.claude.enabled : cliRouting.codex.enabled;
+    const result = target === "claude"
+      ? setClaudeRouting(!current)
+      : setCodexRouting(!current);
+    refreshCliRouting();
+    const label = target === "claude" ? "Claude CLI" : "Codex CLI";
+    if (!result.changed) {
+      showBanner(`${label} already ${result.enabled ? "on" : "off"}`, "gray");
+      return;
+    }
+    showBanner(
+      `${label} → ${result.enabled ? "proxy" : "native"}  (restart the CLI to pick up)`,
+      result.enabled ? "green" : "yellow",
+    );
+  }, [cliRouting, refreshCliRouting, showBanner]);
+
   const doSetSelectedModel = useCallback(async (provider: "claude" | "openai") => {
     if (!selectedModel) return;
     if (provider === "claude" && !selectedModel.id.startsWith("anthropic/")) {
@@ -1103,6 +1142,10 @@ function LiveDashboard({
       if (input === "o") { void doSetSelectedModel("openai"); return; }
     }
 
+    // CLI routing toggles — [c] is model-default only while MODELS is focused.
+    if (input === "c" && focus !== "models") { doToggleCli("claude"); return; }
+    if (input === "x") { doToggleCli("codex"); return; }
+
     if (input === "m") {
       void doLoadModels();
       return;
@@ -1199,7 +1242,7 @@ function LiveDashboard({
 
       {data.operational && (
         <>
-          <OperationsPanel operational={data.operational} baseUrl={baseUrl} focus={focus} />
+          <OperationsPanel operational={data.operational} baseUrl={baseUrl} focus={focus} cliRouting={cliRouting} />
           <Box marginTop={1} />
         </>
       )}
@@ -1312,7 +1355,12 @@ function LiveDashboard({
   );
 }
 
-function OperationsPanel({ operational, baseUrl, focus }: { operational: OperationalStatus; baseUrl: string; focus: Focus }) {
+function OperationsPanel({ operational, baseUrl, focus, cliRouting }: {
+  operational: OperationalStatus;
+  baseUrl: string;
+  focus: Focus;
+  cliRouting: { claude: ClaudeRoutingStatus; codex: CodexRoutingStatus };
+}) {
   const authLabel = operational.auth.required ? "protected" : "open";
   const authColor = operational.auth.required ? "green" : "yellow";
   const claudeReady = operational.capabilities.anthropicMessages;
@@ -1357,10 +1405,15 @@ function OperationsPanel({ operational, baseUrl, focus }: { operational: Operati
         <Text color="gray"> aliases[{operational.routing.openAIAliases.join(",") || "-"}]</Text>
       </Box>
       <Box paddingLeft={2}>
-        <Text color="gray">models </Text>
-        <Text color={focus === "models" ? "white" : "cyan"}>[m] list/select</Text>
-        <Text color="gray">  change </Text>
-        <Text color={focus === "models" ? "white" : "cyan"}>[c] Claude [o] OpenAI</Text>
+        <Text color="gray">cli </Text>
+        <Text color={cliRouting.claude.enabled ? "green" : "yellow"}>Claude {cliRouting.claude.enabled ? "on" : "off"}</Text>
+        <Text color="gray"> </Text>
+        <Text color={cliRouting.codex.enabled ? "green" : "yellow"}>Codex {cliRouting.codex.enabled ? "on" : "off"}</Text>
+        <Text color={focus === "models" ? "gray" : "cyan"}> [c]/[x]</Text>
+        <Text color="gray">  ·  models </Text>
+        <Text color={focus === "models" ? "white" : "cyan"}>[m]</Text>
+        <Text color="gray"> then </Text>
+        <Text color={focus === "models" ? "white" : "cyan"}>[c]/[o] defaults</Text>
       </Box>
     </Box>
   );

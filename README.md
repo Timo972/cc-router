@@ -219,7 +219,17 @@ cc-router configure codex    (Re)write ~/.codex/config.toml for Codex CLI
 cc-router configure codex --model openai/gpt-5-codex
 cc-router configure models --claude-model claude-sonnet-4-6 --openai-model gpt-5-codex
 cc-router configure --show   Show current Claude Code proxy settings
-cc-router configure --remove Remove cc-router settings (same as revert without stopping)
+cc-router configure --remove Remove cc-router settings from Claude Code (proxy stays up)
+cc-router configure codex --remove  Remove the Codex managed block (proxy stays up)
+
+cc-router cli                Show whether Claude Code and Codex are routing through the proxy
+cc-router cli claude start   Point Claude Code at the running proxy
+cc-router cli claude stop    Restore Claude Code to native Anthropic auth (proxy stays up)
+cc-router cli claude resume  Same as cli claude start
+cc-router cli codex start    Point Codex CLI at the running proxy
+cc-router cli codex stop     Restore Codex CLI to native OpenAI auth (proxy stays up)
+cc-router cli codex resume   Same as cli codex start
+cc-router claude … / cc-router codex …   Hidden shortcuts for the same commands
 
 cc-router client connect <url>       Connect Claude Code to a remote CC-Router
 cc-router client connect --desktop   Also configure Claude Desktop interception
@@ -501,6 +511,24 @@ mitmproxy's local mode is *process-scoped* — it only intercepts traffic from t
 
 ---
 
+## Toggle Claude Code or Codex while the proxy stays up
+
+`cc-router start` / `stop` control the proxy process. To send only one CLI back to native auth (or point it at the proxy again) without tearing the router down:
+
+```bash
+cc-router cli                 # Claude Code + Codex routing state
+cc-router cli claude stop     # Claude Code → native Anthropic auth
+cc-router cli claude resume   # Claude Code → running proxy (alias of start)
+cc-router cli codex start     # Codex CLI → running proxy
+cc-router cli codex stop      # Codex CLI → native OpenAI auth
+```
+
+`cc-router claude …` and `cc-router codex …` are shortcuts for the same commands. `cli` is the grouping — not `provider`, which already means the Anthropic/OpenAI account pool. `cc-router client` remains remote client-mode (connect this machine to another CC-Router).
+
+These rewrite `~/.claude/settings.json` or the managed block in `~/.codex/config.toml`. The proxy keeps listening. Restart any already-running Claude Code or Codex process so it picks up the new config. From `cc-router status`, `[c]` / `[x]` do the same toggles.
+
+---
+
 ## Reverting to normal Claude Code
 
 To stop using cc-router and go back to normal Claude Code authentication:
@@ -528,7 +556,7 @@ cc-router status
   Claude 2/2 healthy  OpenAI 1/1 healthy  ·  cross-route ready
   endpoints /v1/messages /v1/responses /v1/models /cc-router/accounts
   routing claude=claude-sonnet-4-6 aliases[sonnet]  openai=gpt-5-codex aliases[codex]
-  models [m] list/select  change [c] Claude [o] OpenAI
+  cli Claude on Codex off [c]/[x]  ·  models [m] then [c]/[o] defaults
 
  MODELS  [m/r] refresh  [↑/↓] select  [c] Claude default  [o] OpenAI default
   current claude=claude-sonnet-4-6  openai=gpt-5-codex
@@ -560,7 +588,8 @@ The dashboard is also a control surface. In local mode it controls the local pro
 | `w` / `s` | Change selected Claude account weekly/session cap |
 | `d` | Delete selected Claude account |
 | `m` / `r` | Load or refresh discovered provider models |
-| `c` | Set selected `anthropic/*` model as Claude default |
+| `c` | Toggle Claude Code routing (or set Claude model default when MODELS is focused) |
+| `x` | Toggle Codex CLI routing (proxy stays up) |
 | `o` | Set selected `openai/*` model as OpenAI default |
 
 List and change models without waiting for a package update:
