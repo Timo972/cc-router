@@ -68,12 +68,12 @@ describe("orderAccountsForDashboard", () => {
   it("puts Claude accounts before ChatGPT and Grok, and keeps relative order", () => {
     const ordered = orderAccountsForDashboard([
       { provider: "openai_subscription", id: "gpt-b" },
-      { provider: "xai_subscription", id: "grok-alex" },
+      { provider: "xai_subscription", id: "grok" },
       { provider: "anthropic_subscription", id: "claude-a" },
       { provider: "openai_subscription", id: "gpt-c" },
       { id: "claude-d" },
     ]);
-    expect(ordered.map(a => a.id)).toEqual(["claude-a", "claude-d", "gpt-b", "gpt-c", "grok-alex"]);
+    expect(ordered.map(a => a.id)).toEqual(["claude-a", "claude-d", "gpt-b", "gpt-c", "grok"]);
   });
 });
 

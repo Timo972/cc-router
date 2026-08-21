@@ -287,7 +287,7 @@ export function registerAccounts(program: Command): void {
       const { input } = await import("@inquirer/prompts");
       const accountId = await input({
         message: "Grok account ID:",
-        default: `grok-account-${loadXaiAccounts().length + 1}`,
+        default: loadXaiAccounts().length === 0 ? "grok" : `grok-${loadXaiAccounts().length + 1}`,
         validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
       });
 

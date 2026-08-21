@@ -8,7 +8,7 @@ function jwtWith(claims: Record<string, unknown>): string {
 
 describe("importGrokCliAuth", () => {
   it("imports the Grok CLI OIDC login into an xAI account record", () => {
-    const token = jwtWith({ email: "alex@example.com", exp: 2_000_000_000, tier: 1 });
+    const token = jwtWith({ email: "user@example.com", exp: 2_000_000_000, tier: 1 });
     const record = importGrokCliAuth({
       grokHome: "/tmp/grok-home",
       fileExists: () => true,
@@ -16,7 +16,7 @@ describe("importGrokCliAuth", () => {
         "https://auth.x.ai::client": {
           key: token,
           auth_mode: "oidc",
-          email: "alex@example.com",
+          email: "user@example.com",
           refresh_token: "refresh-token",
           expires_at: "2026-08-21T14:00:00Z",
         },
@@ -24,7 +24,7 @@ describe("importGrokCliAuth", () => {
     });
 
     expect(record).toMatchObject({
-      id: "grok-alex",
+      id: "grok",
       provider: "xai_subscription",
       refreshToken: "refresh-token",
       enabled: true,

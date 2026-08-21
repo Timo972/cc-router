@@ -516,8 +516,8 @@ describe("dashboard viewport fitting", () => {
         provider: "openai_subscription",
       },
       {
-        ...makeAccount("grok-alex"),
-        id: "grok-alex",
+        ...makeAccount("grok"),
+        id: "grok",
         provider: "xai_subscription",
         xai: { tier: 1 },
         activeSessions: 2,
@@ -537,7 +537,7 @@ describe("dashboard viewport fitting", () => {
         expect(grokAt).toBeGreaterThan(chatgptAt);
         expect(frame).toContain("account-01");
         expect(frame).toContain("chatgpt-ok");
-        expect(frame).toContain("grok-alex");
+        expect(frame).toContain("grok");
         expect(frame).toContain("tier 1");
       });
     } finally {

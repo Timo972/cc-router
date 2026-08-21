@@ -18,7 +18,7 @@ describe("loadGrokAccountSnapshots", () => {
 
   it("reads identity and live sessions without leaking tokens", () => {
     const token = jwtWith({
-      email: "alex@example.com",
+      email: "user@example.com",
       tier: 1,
       exp: Math.floor(now() / 1000) + 3600,
     });
@@ -27,7 +27,7 @@ describe("loadGrokAccountSnapshots", () => {
         "https://auth.x.ai::client": {
           key: token,
           auth_mode: "oidc",
-          email: "alex@example.com",
+          email: "user@example.com",
           expires_at: "2026-08-21T14:00:00Z",
           refresh_token: "secret-refresh",
         },
@@ -47,7 +47,7 @@ describe("loadGrokAccountSnapshots", () => {
     });
 
     expect(views).toEqual([{
-      id: "grok-alex",
+      id: "grok",
       provider: "xai_subscription",
       enabled: true,
       healthy: true,
@@ -63,7 +63,7 @@ describe("loadGrokAccountSnapshots", () => {
     }]);
     expect(JSON.stringify(views)).not.toContain("secret-refresh");
     expect(JSON.stringify(views)).not.toContain(token);
-    expect(JSON.stringify(views)).not.toContain("alex@example.com");
+    expect(JSON.stringify(views)).not.toContain("user@example.com");
   });
 
   it("marks an expired Grok login unhealthy", () => {
@@ -73,14 +73,14 @@ describe("loadGrokAccountSnapshots", () => {
       fileExists: () => true,
       readFile: () => JSON.stringify({
         a: {
-          key: jwtWith({ email: "a@x.ai", exp: Math.floor(now() / 1000) - 10 }),
+          key: jwtWith({ email: "user@example.com", exp: Math.floor(now() / 1000) - 10 }),
           auth_mode: "oidc",
-          email: "a@x.ai",
+          email: "user@example.com",
           expires_at: "2026-08-21T09:00:00Z",
         },
       }),
       isProcessAlive: () => false,
     });
-    expect(views[0]).toMatchObject({ id: "grok-a", healthy: false, busy: false, activeSessions: 0 });
+    expect(views[0]).toMatchObject({ id: "grok", healthy: false, busy: false, activeSessions: 0 });
   });
 });

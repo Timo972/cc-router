@@ -49,8 +49,7 @@ export function importGrokCliAuth(opts: ImportGrokAuthOptions = {}): XaiAccountR
   const accessToken = typeof entry.key === "string" ? entry.key.trim() : "";
   const refreshToken = typeof entry.refresh_token === "string" ? entry.refresh_token.trim() : "";
   const expiresAt = parseExpiresAt(entry.expires_at, accessToken);
-  const email = typeof entry.email === "string" ? entry.email : undefined;
-  const id = opts.accountId?.trim() || accountIdFromEmail(email);
+  const id = opts.accountId?.trim() || "grok";
 
   return createXaiAccountRecord({
     id,
@@ -88,7 +87,4 @@ function parseExpiresAt(value: unknown, accessToken: string): number {
   throw new Error("Grok login is missing a usable expiry");
 }
 
-function accountIdFromEmail(email: string | undefined): string {
-  const local = email?.split("@")[0]?.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 18);
-  return local ? `grok-${local}` : "grok";
-}
+

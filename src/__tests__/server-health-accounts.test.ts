@@ -441,7 +441,7 @@ describe("createOperationalStatus", () => {
 
   it("surfaces a Grok CLI overview account without copying tokens", () => {
     const views = createHealthAccountViews([], [], undefined, undefined, [{
-      id: "grok-alex",
+      id: "grok",
       provider: "xai_subscription",
       enabled: true,
       healthy: true,
@@ -456,7 +456,7 @@ describe("createOperationalStatus", () => {
       tier: 1,
     }]);
     expect(views).toEqual([{
-      id: "grok-alex",
+      id: "grok",
       provider: "xai_subscription",
       enabled: true,
       healthy: true,

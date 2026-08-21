@@ -51,8 +51,6 @@ interface GrokActiveSession {
   opened_at?: unknown;
 }
 
-const ID_PATTERN = /[^a-z0-9_-]+/g;
-
 export function grokHomeDir(homeDir = os.homedir()): string {
   const fromEnv = process.env["GROK_HOME"]?.trim();
   if (fromEnv) return fromEnv;
@@ -103,8 +101,7 @@ function snapshotFromAuthEntry(
   if (entry.auth_mode !== "oidc" && typeof entry.key !== "string") return undefined;
 
   const claims = typeof entry.key === "string" ? decodeJwtPayload(entry.key) : null;
-  const email = typeof entry.email === "string" ? entry.email : stringClaim(claims, "email");
-  const id = uniqueAccountId(accountIdFromEmail(email), usedIds);
+  const id = uniqueAccountId("grok", usedIds);
   const expiresAt = parseExpiresAt(entry.expires_at, claims);
   const expiresInMs = expiresAt > 0 ? expiresAt - nowMs : 0;
   const healthy = expiresInMs > 0;
@@ -150,12 +147,6 @@ function readLiveSessions(
   });
 }
 
-function accountIdFromEmail(email: string | undefined): string {
-  const local = email?.split("@")[0]?.toLowerCase() ?? "";
-  const cleaned = local.replace(ID_PATTERN, "-").replace(/^-+|-+$/g, "").slice(0, 18);
-  return cleaned ? `grok-${cleaned}` : "grok";
-}
-
 function uniqueAccountId(base: string, used: Set<string>): string {
   if (!used.has(base)) {
     used.add(base);
@@ -188,11 +179,6 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
-}
-
-function stringClaim(claims: Record<string, unknown> | null, key: string): string | undefined {
-  const value = claims?.[key];
-  return typeof value === "string" && value.trim() ? value : undefined;
 }
 
 function numberClaim(claims: Record<string, unknown> | null, key: string): number | undefined {
