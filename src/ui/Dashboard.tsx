@@ -901,6 +901,10 @@ function LiveDashboard({
   const { exit } = useApp();
   const orderedAccounts = orderAccountsForDashboard(data.accounts);
   const healthyCount = orderedAccounts.filter(a => a.healthy).length;
+  // Fleet-wide weekly-cap rollup surfaced in the always-visible ACCOUNTS title,
+  // so the "N 7d full" signal is legible at a glance even when a provider group
+  // is scrolled out of the account window (or TOTALS is hidden in compact view).
+  const weeklyFullCount = orderedAccounts.filter(isWeeklyLimited).length;
   const logs = data.recentLogs;
 
   // ── Focus / mode ──────────────────────────────────────────────────────────
@@ -1472,6 +1476,7 @@ function LiveDashboard({
             <Text color={healthyCount === orderedAccounts.length ? "green" : "yellow"}>
               {healthyCount}/{orderedAccounts.length} healthy
             </Text>
+            {weeklyFullCount > 0 && <Text color="red">{`  ·  ${weeklyFullCount} 7d full`}</Text>}
           </Text>
           {shownAccounts < orderedAccounts.length && (
             <Text color="gray">
