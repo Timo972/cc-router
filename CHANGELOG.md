@@ -20,6 +20,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Dashboard `[c]` / `[x]` toggle Claude Code / Codex CLI routing without
   stopping the proxy (`[c]` still sets the Claude model default while MODELS
   is focused).
+- Status dashboard `rst` column shows Codex banked usage-limit reset count
+  (`0` = none available); Claude cells are `—`.
 
 ---
 

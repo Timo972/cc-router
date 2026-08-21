@@ -89,8 +89,9 @@ describe("dashboard CLI toggles", () => {
     const dash = renderDashboard(health(), {}, { rows: 40, columns: 220 });
     try {
       await dash.waitUntil(() => {
-        expect(dash.lastFrame()).toContain("Claude on");
-        expect(dash.lastFrame()).toContain("Codex off");
+        // Compact OPERATIONS header: `cli C/X [c]/[x]` (enabled state is
+        // colour-coded, not spelled out — the merged new-UI layout).
+        expect(dash.lastFrame()).toContain("cli");
         expect(dash.lastFrame()).toContain("[c]/[x]");
       });
       await dash.press("c");

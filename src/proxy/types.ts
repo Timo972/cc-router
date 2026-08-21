@@ -109,7 +109,7 @@ export interface RefreshResponse {
 // Shape of each entry in accounts.json
 export interface AccountRecord {
   id: string;
-  provider?: "anthropic_subscription" | "openai_subscription" | "openai_api_key";
+  provider?: "anthropic_subscription" | "openai_subscription" | "openai_api_key" | "xai_subscription";
   accessToken: string;
   refreshToken: string;
   expiresAt: number;
