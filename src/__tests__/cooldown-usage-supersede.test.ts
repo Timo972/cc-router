@@ -792,6 +792,98 @@ describe("header rate_limited status superseded by a later usage snapshot", () =
     expect(recovered).toEqual(["header-limited-callback"]);
   });
 
+  it("waits for every account-global blocker before announcing recovery", () => {
+    // A 529 overlaps the quota 429. Superseding the header status leaves the
+    // account still blocked by the overload cooldown, so announcing recovery
+    // there would tell the user it rejoined a rotation it is absent from —
+    // and, since the status only flips once, the real recovery would pass
+    // unannounced.
+    const h = harness("recovery-gated-on-cooldown");
+    rateLimited(h, "five_hour");
+    h.pool.setGlobalCooldownForAccount(h.account, 30_000);
+    const overloadUntil = h.now() + 30_000;
+
+    const recovered: string[] = [];
+    h.pool.onCooldownExpired = a => recovered.push(a.id);
+
+    h.advance(3_000);
+    setUsage(h.account, snapshot({ requestedSeq: h.nextSeq(), fiveHour: 0, sevenDay: 0 }));
+    h.pool.sweepExpiredCooldowns();
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+    expect(recovered).toEqual([]);
+
+    // Repeated polling while still blocked must not announce anything either.
+    h.advance(1_000);
+    h.pool.sweepExpiredCooldowns();
+    expect(recovered).toEqual([]);
+
+    // Once the overload clears, the account really is back — announce it once.
+    h.jumpTo(overloadUntil + 1);
+    h.pool.sweepExpiredCooldowns();
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+    expect(recovered).toEqual(["recovery-gated-on-cooldown"]);
+
+    // And not again on subsequent polls.
+    h.pool.sweepExpiredCooldowns();
+    expect(recovered).toEqual(["recovery-gated-on-cooldown"]);
+  });
+
+  it("never announces recovery for a model-scoped limit, which is not a rotation exit", () => {
+    // A seven_day_<family> claim limits one family. The account keeps serving
+    // everything else, so it never left the rotation and there is no rejoining
+    // to report — matching hardBlock, which does not treat that claim as an
+    // account-wide blocker either.
+    const h = harness("model-scoped-claim");
+    h.account.rateLimits = {
+      ...h.account.rateLimits,
+      status: "rate_limited",
+      claim: "seven_day_fable",
+      sevenDayReset: Math.floor(h.now() / 1000) + 7 * 24 * 60 * 60,
+      lastUpdated: h.now(),
+      lastUpdatedSeq: h.nextSeq(),
+    };
+    h.pool.setModelCooldownForAccount(h.account, "fable", 60_000);
+    const fableUntil = h.now() + 60_000;
+
+    const recovered: string[] = [];
+    h.pool.onCooldownExpired = a => recovered.push(a.id);
+
+    h.pool.sweepExpiredCooldowns();
+    // Fable is spent; every other family still routes here.
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+    expect(h.pool.isEligible(h.account.id, SONNET)).toBe(true);
+    expect(recovered).toEqual([]);
+
+    h.jumpTo(fableUntil + 1);
+    h.pool.sweepExpiredCooldowns();
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+    expect(recovered).toEqual([]);
+  });
+
+  it("does not announce recovery while an account-wide window is still spent", () => {
+    const h = harness("recovery-gated-on-window");
+    rateLimited(h, "five_hour");
+    const recovered: string[] = [];
+    h.pool.onCooldownExpired = a => recovered.push(a.id);
+
+    // The claimed five-hour window recovered, but the seven-day window is
+    // exhausted, so the account is not routable for anything.
+    h.advance(3 * 60_000);
+    setUsage(h.account, snapshot({ requestedSeq: h.nextSeq(), fiveHour: 0, sevenDay: 1 }));
+    h.pool.sweepExpiredCooldowns();
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+    expect(recovered).toEqual([]);
+
+    h.advance(60_000);
+    setUsage(h.account, snapshot({ requestedSeq: h.nextSeq(), fiveHour: 0, sevenDay: 0 }));
+    h.pool.sweepExpiredCooldowns();
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+    expect(recovered).toEqual(["recovery-gated-on-window"]);
+  });
+
   it("stays blocked when the limiting window still reports no headroom", () => {
     const h = harness("header-still-limited");
     rateLimited(h, "five_hour");

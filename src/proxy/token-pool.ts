@@ -236,14 +236,9 @@ function trustworthyResetMs(resetAtSeconds: unknown, nowMs: number): number | un
  * window expires, `status` flips back to `"allowed"`. The callback fires
  * once per recovery so the dashboard can surface it.
  */
-function clearExpiredRateLimitWindows(
-  a: Account,
-  nowMs: number,
-  onExpired?: (a: Account) => void,
-): void {
+function clearExpiredRateLimitWindows(a: Account, nowMs: number): void {
   const nowSec = Math.floor(nowMs / 1000);
   const r = a.rateLimits;
-  let recovered = false;
 
   if (r.fiveHourReset > 0 && nowSec >= r.fiveHourReset) {
     r.fiveHourUtil = 0;
@@ -280,11 +275,8 @@ function clearExpiredRateLimitWindows(
       (r.claim === "" && (r.fiveHourReset > 0 || r.sevenDayReset > 0));
     if (!stillBlocked || usageSupersedesRateLimitedStatus(r)) {
       r.status = "allowed";
-      recovered = true;
     }
   }
-
-  if (recovered && onExpired) onExpired(a);
 }
 
 export interface AccountPatch {
@@ -305,6 +297,10 @@ export class TokenPool implements AccountPool<Account> {
   private readonly cooldowns = new Map<Account, AccountCooldowns>();
   private readonly now: () => number;
   private readonly nextSequence: () => number;
+  /** Accounts last seen blocked for every model, so recovery is announced once
+   *  when the final blocker clears. Weak so a removed account is not retained
+   *  merely for having been blocked when it left. */
+  private readonly globallyBlocked = new WeakSet<Account>();
   private currentIndex = 0;
   private nextAmbiguousCooldownToken = 1;
 
@@ -372,7 +368,7 @@ export class TokenPool implements AccountPool<Account> {
   tryAcquire(accountId: string, context?: RouteContext): AccountLease | null {
     const account = this.findById(accountId);
     if (!account) return null;
-    clearExpiredRateLimitWindows(account, this.now(), this.onCooldownExpired);
+    this.refreshBlockingState(account);
     if (this.hardBlock(account, context) || this.overUserCap(account)) return null;
     return this.createLease(account, false);
   }
@@ -380,7 +376,7 @@ export class TokenPool implements AccountPool<Account> {
   isEligible(accountId: string, context?: RouteContext): boolean {
     const account = this.findById(accountId);
     if (!account) return false;
-    clearExpiredRateLimitWindows(account, this.now(), this.onCooldownExpired);
+    this.refreshBlockingState(account);
     return this.hardBlock(account, context) === null && !this.overUserCap(account);
   }
 
@@ -685,6 +681,49 @@ export class TokenPool implements AccountPool<Account> {
     return state;
   }
 
+  /**
+   * Roll one account's expiry and supersession state forward, announcing
+   * recovery exactly when the last account-global blocker clears.
+   *
+   * The listener used to hang off the `rate_limited` header flag alone, which
+   * both over- and under-reports once anything else can block the account: a
+   * 429 overlapping a 529 would announce recovery while the overload cooldown
+   * still kept the account out of rotation, and because the flag only flips
+   * once, the moment it genuinely came back passed unannounced. Every blocker
+   * is settled first, then the transition is judged on all of them together.
+   */
+  private refreshBlockingState(account: Account): void {
+    // Seeded before rolling forward as well as after, because the two checks
+    // answer different questions. A blocker that expires purely by the clock
+    // already reads as clear on the way in, so the remembered flag is what
+    // detects that transition; the pre-roll check is what lets an account
+    // first observed at the very moment it recovers still count as having
+    // been blocked.
+    if (this.accountGloballyBlocked(account)) this.globallyBlocked.add(account);
+
+    clearExpiredRateLimitWindows(account, this.now());
+    const state = this.cooldowns.get(account);
+    if (state) this.clearExpiredCooldownState(account, state);
+
+    if (this.accountGloballyBlocked(account)) this.globallyBlocked.add(account);
+    else if (this.globallyBlocked.delete(account)) this.onCooldownExpired?.(account);
+  }
+
+  /**
+   * Whether anything blocks this account for *every* model, which is what the
+   * recovery listener speaks about. Deliberately excludes model-scoped state:
+   * an account spent on one family but serving another has not left rotation.
+   */
+  private accountGloballyBlocked(account: Account): boolean {
+    const r = account.rateLimits;
+    if (r.status === "rate_limited" && !modelScopedClaim(r.claim)) return true;
+    // Compared against the clock rather than swept first, so this reads
+    // correctly both before and after the state is rolled forward.
+    if ((this.cooldowns.get(account)?.globalUntil ?? 0) > this.now()) return true;
+    return this.globalWindows(account).some(window => window.utilization >= 1) &&
+      !this.canUsePaidExtra(account);
+  }
+
   private clearExpiredCooldownState(account: Account, state: AccountCooldowns): void {
     const now = this.now();
     for (const [scope, entries] of state.definiteGlobal) {
@@ -880,12 +919,7 @@ export class TokenPool implements AccountPool<Account> {
    * poll loop so the UI reflects recovery without waiting for a new request.
    */
   sweepExpiredCooldowns(): void {
-    const now = this.now();
-    for (const a of this.accounts) {
-      clearExpiredRateLimitWindows(a, now, this.onCooldownExpired);
-      const state = this.cooldowns.get(a);
-      if (state) this.clearExpiredCooldownState(a, state);
-    }
+    for (const a of this.accounts) this.refreshBlockingState(a);
   }
 
   getAll(): Account[] {

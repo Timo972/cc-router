@@ -59,6 +59,18 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exhausted-window check, so an account with no real capacity stays blocked
   on its own merits.
 
+- The activity log's "cooldown expired — rate limit cleared" entry now marks
+  the moment an account is actually routable again. It hung off the
+  header `rate_limited` flag alone, which both over- and under-reports as soon
+  as anything else can block the account: a 429 overlapping a 529 announced
+  recovery while the overload cooldown still kept the account out of rotation,
+  and because that flag only flips once, the moment it genuinely came back
+  passed unannounced. The entry is now emitted when the last account-wide
+  blocker clears — header status, global cooldown, or a spent account-wide
+  window — whichever that turns out to be. A model-scoped limit never emits
+  one, since the account kept serving every other family and so never left the
+  rotation to rejoin.
+
 ---
 
 ## [0.10.1] — 2026-08-20
