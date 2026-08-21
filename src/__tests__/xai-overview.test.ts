@@ -199,4 +199,85 @@ describe("mergeGrokIntoHealth", () => {
     };
     expect(mergeGrokIntoHealth(health, [])).toBe(health);
   });
+
+  it("enriches the daemon's tier-only Grok row with the live plan name", async () => {
+    const { mergeGrokIntoHealth } = await import("../providers/xai/overview.js");
+    const health = {
+      accounts: [
+        { provider: "anthropic_subscription" as const, id: "claude" },
+        { provider: "xai_subscription" as const, id: "grok", xai: { tier: 1 } },
+      ],
+    };
+    const merged = mergeGrokIntoHealth(health, [{
+      id: "grok",
+      provider: "xai_subscription",
+      enabled: true,
+      healthy: true,
+      busy: false,
+      inFlightRequests: 0,
+      activeSessions: 0,
+      requestCount: 0,
+      errorCount: 0,
+      expiresInMs: 60_000,
+      lastUsedMs: 0,
+      lastRefreshMs: 0,
+      tier: 1,
+      subscriptionTier: "GrokPro",
+      hasCodeAccess: true,
+    }]);
+    expect(merged.accounts).toHaveLength(2);
+    expect(merged.accounts[1]).toMatchObject({
+      provider: "xai_subscription",
+      id: "grok",
+      xai: { tier: 1, subscriptionTier: "GrokPro", hasCodeAccess: true },
+    });
+    // Non-Grok rows are untouched.
+    expect(merged.accounts[0]).toEqual({ provider: "anthropic_subscription", id: "claude" });
+  });
+
+  it("matches a single Grok snapshot even when the ids differ", async () => {
+    const { mergeGrokIntoHealth } = await import("../providers/xai/overview.js");
+    const health = { accounts: [{ provider: "xai_subscription" as const, id: "grok-1", xai: { tier: 1 } }] };
+    const merged = mergeGrokIntoHealth(health, [{
+      id: "grok",
+      provider: "xai_subscription",
+      enabled: true,
+      healthy: true,
+      busy: false,
+      inFlightRequests: 0,
+      activeSessions: 0,
+      requestCount: 0,
+      errorCount: 0,
+      expiresInMs: 60_000,
+      lastUsedMs: 0,
+      lastRefreshMs: 0,
+      subscriptionTier: "GrokPro",
+    }]);
+    expect(merged.accounts[0]).toMatchObject({ xai: { tier: 1, subscriptionTier: "GrokPro" } });
+  });
+
+  it("leaves the row untouched when snapshots carry no live signal", async () => {
+    const { mergeGrokIntoHealth } = await import("../providers/xai/overview.js");
+    const health = { accounts: [{ provider: "xai_subscription" as const, id: "grok", xai: { tier: 1 } }] };
+    expect(mergeGrokIntoHealth(health, [])).toBe(health);
+    const snapshotOnlyTier = mergeGrokIntoHealth(health, [{
+      id: "grok",
+      provider: "xai_subscription",
+      enabled: true,
+      healthy: true,
+      busy: false,
+      inFlightRequests: 0,
+      activeSessions: 0,
+      requestCount: 0,
+      errorCount: 0,
+      expiresInMs: 60_000,
+      lastUsedMs: 0,
+      lastRefreshMs: 0,
+      tier: 1,
+    }]);
+    // tier already matched, no plan → still the same shape.
+    expect(snapshotOnlyTier.accounts[0]).toMatchObject({ xai: { tier: 1 } });
+    expect((snapshotOnlyTier.accounts[0] as { xai?: { subscriptionTier?: string } }).xai?.subscriptionTier)
+      .toBeUndefined();
+  });
 });

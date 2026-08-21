@@ -202,7 +202,11 @@ export function grokSnapshotAsHealthAccount(snapshot: GrokAccountSnapshot): {
 }
 
 export function mergeGrokIntoHealth<T extends {
-  accounts: Array<{ provider?: string }>;
+  accounts: Array<{
+    provider?: string;
+    id?: string;
+    xai?: { tier?: number; subscriptionTier?: string; hasCodeAccess?: boolean };
+  }>;
   operational?: {
     providers: {
       anthropic: { configured: boolean; accounts: number; healthy: number; enabled: number };
@@ -211,7 +215,13 @@ export function mergeGrokIntoHealth<T extends {
     };
   };
 }>(health: T, snapshots: GrokAccountSnapshot[] = loadGrokHealthSnapshots()): T {
-  if (health.accounts.some(account => account.provider === "xai_subscription")) return health;
+  // The proxy daemon already emits the Grok row from the sync (network-free)
+  // path, so it carries only the coarse `tier`. Rather than skip enrichment,
+  // overlay the live plan name / code-access flag from the async snapshots the
+  // caller polled — otherwise the daemon-served row would stay stuck on "tier N".
+  if (health.accounts.some(account => account.provider === "xai_subscription")) {
+    return enrichExistingGrokAccounts(health, snapshots);
+  }
   const grokAccounts = snapshots.map(grokSnapshotAsHealthAccount);
   if (grokAccounts.length === 0) return health;
   const healthy = grokAccounts.filter(account => account.healthy).length;
@@ -228,6 +238,39 @@ export function mergeGrokIntoHealth<T extends {
       ? { operational: { ...health.operational, providers: { ...health.operational.providers, xai } } }
       : {}),
   };
+}
+
+/**
+ * Overlay the live plan name / code-access flag from freshly-polled snapshots
+ * onto the tier-only Grok rows the proxy daemon serves. Matches by account id,
+ * with a single-account fallback (the common one-Grok-login case). Returns the
+ * same object untouched when nothing changed, so the fast poll path stays cheap.
+ */
+function enrichExistingGrokAccounts<T extends {
+  accounts: Array<{
+    provider?: string;
+    id?: string;
+    xai?: { tier?: number; subscriptionTier?: string; hasCodeAccess?: boolean };
+  }>;
+}>(health: T, snapshots: GrokAccountSnapshot[]): T {
+  if (snapshots.length === 0) return health;
+  const byId = new Map(snapshots.map(snapshot => [snapshot.id, snapshot]));
+  let changed = false;
+  const accounts = health.accounts.map(account => {
+    if (account.provider !== "xai_subscription") return account;
+    const snapshot = (account.id !== undefined ? byId.get(account.id) : undefined)
+      ?? (snapshots.length === 1 ? snapshots[0] : undefined);
+    if (!snapshot) return account;
+    const enrichment = {
+      ...(snapshot.tier !== undefined ? { tier: snapshot.tier } : {}),
+      ...(snapshot.subscriptionTier !== undefined ? { subscriptionTier: snapshot.subscriptionTier } : {}),
+      ...(snapshot.hasCodeAccess !== undefined ? { hasCodeAccess: snapshot.hasCodeAccess } : {}),
+    };
+    if (Object.keys(enrichment).length === 0) return account;
+    changed = true;
+    return { ...account, xai: { ...account.xai, ...enrichment } };
+  });
+  return changed ? { ...health, accounts } : health;
 }
 
 function snapshotFromAuthEntry(
