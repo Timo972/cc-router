@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { loadGrokAccountSnapshots } from "../providers/xai/overview.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import os from "os";
+import path from "path";
+import {
+  loadGrokAccountSnapshots,
+  loadGrokHealthSnapshotsWithSubscription,
+} from "../providers/xai/overview.js";
 
 function jwtWith(claims: Record<string, unknown>): string {
   const payload = Buffer.from(JSON.stringify(claims), "utf-8").toString("base64url");
@@ -82,6 +88,62 @@ describe("loadGrokAccountSnapshots", () => {
       isProcessAlive: () => false,
     });
     expect(views[0]).toMatchObject({ id: "grok", healthy: false, busy: false, activeSessions: 0 });
+  });
+});
+
+describe("loadGrokHealthSnapshotsWithSubscription", () => {
+  const now = () => Date.parse("2026-08-21T10:00:00Z");
+  const expiresAt = Date.parse("2026-08-21T14:00:00Z");
+  let tmpDir: string;
+  let accountsPath: string;
+  const prevAccountsPath = process.env["ACCOUNTS_PATH"];
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "cc-router-xai-"));
+    accountsPath = path.join(tmpDir, "accounts.json");
+    writeFileSync(accountsPath, JSON.stringify([{
+      id: "grok",
+      provider: "xai_subscription",
+      accessToken: jwtWith({ tier: 1, exp: Math.floor(expiresAt / 1000) }),
+      refreshToken: "r",
+      expiresAt,
+      enabled: true,
+    }]));
+    process.env["ACCOUNTS_PATH"] = accountsPath;
+  });
+
+  afterEach(() => {
+    if (prevAccountsPath === undefined) delete process.env["ACCOUNTS_PATH"];
+    else process.env["ACCOUNTS_PATH"] = prevAccountsPath;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("enriches the stored account with the live plan and code-access flag", async () => {
+    const snapshots = await loadGrokHealthSnapshotsWithSubscription({
+      now,
+      grokHome: "/tmp/missing-grok-home",
+      fileExists: () => false,
+      fetchSubscription: async () => ({ ok: true, subscriptionTier: "GrokPro", hasCodeAccess: true }),
+    });
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toMatchObject({
+      id: "grok",
+      tier: 1,
+      subscriptionTier: "GrokPro",
+      hasCodeAccess: true,
+    });
+  });
+
+  it("keeps the access-token tier fallback when the live lookup fails", async () => {
+    const snapshots = await loadGrokHealthSnapshotsWithSubscription({
+      now,
+      grokHome: "/tmp/missing-grok-home",
+      fileExists: () => false,
+      fetchSubscription: async () => ({ ok: false, reason: "network" }),
+    });
+    expect(snapshots[0]).toMatchObject({ id: "grok", tier: 1 });
+    expect(snapshots[0]?.subscriptionTier).toBeUndefined();
+    expect(snapshots[0]?.hasCodeAccess).toBeUndefined();
   });
 });
 

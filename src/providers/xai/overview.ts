@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "fs";
 import os from "os";
 import path from "path";
 import { loadXaiAccounts } from "../../config/manager.js";
+import { fetchGrokSubscription, type GrokSubscriptionFetchResult } from "./subscription-fetch.js";
 
 /**
  * Read-only Grok CLI overview for the status dashboard.
@@ -10,8 +11,14 @@ import { loadXaiAccounts } from "../../config/manager.js";
  * sessions in ~/.grok/active_sessions.json. That is the source of truth —
  * cc-router does not copy those tokens into accounts.json and does not
  * intercept Grok traffic. xAI also has no Claude-style 5h/7d windows; the
- * dashboard shows live sessions plus the spend-tier from the access-token
- * claims.
+ * dashboard shows live sessions plus the subscription tier.
+ *
+ * The sync path (`loadGrokHealthSnapshots`) reports the coarse spend-tier from
+ * the access-token claims and never touches the network. The async path
+ * (`loadGrokHealthSnapshotsWithSubscription`) additionally reads the live plan
+ * name ("GrokPro", …) and code-access flag from the Grok backend — see
+ * `subscription-fetch.ts` for why that is the only quota-relevant signal xAI
+ * exposes to the CLI token.
  */
 
 export interface GrokAccountSnapshot {
@@ -28,6 +35,10 @@ export interface GrokAccountSnapshot {
   lastUsedMs: number;
   lastRefreshMs: 0;
   tier?: number;
+  /** Live plan name from the Grok backend, e.g. "GrokPro" (async path only). */
+  subscriptionTier?: string;
+  /** Live `hasGrokCodeAccess` flag from the Grok backend (async path only). */
+  hasCodeAccess?: boolean;
 }
 
 export interface GrokOverviewOptions {
@@ -118,6 +129,41 @@ export function loadGrokHealthSnapshots(opts: GrokOverviewOptions = {}): GrokAcc
   });
 }
 
+export interface GrokSubscriptionOptions extends GrokOverviewOptions {
+  /** Injectable for tests; defaults to the live Grok backend fetch. */
+  fetchSubscription?: (accessToken: string) => Promise<GrokSubscriptionFetchResult>;
+  /** Injectable for tests; defaults to the stored xAI accounts. */
+  accounts?: Array<{ id: string; accessToken: string }>;
+}
+
+/**
+ * Sync snapshots enriched with the live plan name + code-access flag. Each
+ * stored xAI account gets one `/v1/user` lookup (matched by id); a failed or
+ * missing lookup leaves the snapshot on its access-token `tier` fallback, so an
+ * offline dashboard degrades to the coarse tier instead of dropping the row.
+ */
+export async function loadGrokHealthSnapshotsWithSubscription(
+  opts: GrokSubscriptionOptions = {},
+): Promise<GrokAccountSnapshot[]> {
+  const base = loadGrokHealthSnapshots(opts);
+  if (base.length === 0) return base;
+  const accounts = opts.accounts ?? loadXaiAccounts();
+  const fetchSubscription = opts.fetchSubscription
+    ?? ((accessToken: string) => fetchGrokSubscription({ accessToken }));
+
+  return Promise.all(base.map(async snapshot => {
+    const account = accounts.find(candidate => candidate.id === snapshot.id);
+    if (!account) return snapshot;
+    const result = await fetchSubscription(account.accessToken);
+    if (!result.ok) return snapshot;
+    return {
+      ...snapshot,
+      ...(result.subscriptionTier !== undefined ? { subscriptionTier: result.subscriptionTier } : {}),
+      ...(result.hasCodeAccess !== undefined ? { hasCodeAccess: result.hasCodeAccess } : {}),
+    };
+  }));
+}
+
 export function grokSnapshotAsHealthAccount(snapshot: GrokAccountSnapshot): {
   id: string;
   provider: "xai_subscription";
@@ -131,8 +177,13 @@ export function grokSnapshotAsHealthAccount(snapshot: GrokAccountSnapshot): {
   expiresInMs: number;
   lastUsedMs: number;
   lastRefreshMs: number;
-  xai?: { tier: number };
+  xai?: { tier?: number; subscriptionTier?: string; hasCodeAccess?: boolean };
 } {
+  const xai = {
+    ...(snapshot.tier !== undefined ? { tier: snapshot.tier } : {}),
+    ...(snapshot.subscriptionTier !== undefined ? { subscriptionTier: snapshot.subscriptionTier } : {}),
+    ...(snapshot.hasCodeAccess !== undefined ? { hasCodeAccess: snapshot.hasCodeAccess } : {}),
+  };
   return {
     id: snapshot.id,
     provider: "xai_subscription",
@@ -146,7 +197,7 @@ export function grokSnapshotAsHealthAccount(snapshot: GrokAccountSnapshot): {
     expiresInMs: snapshot.expiresInMs,
     lastUsedMs: snapshot.lastUsedMs,
     lastRefreshMs: snapshot.lastRefreshMs,
-    ...(snapshot.tier !== undefined ? { xai: { tier: snapshot.tier } } : {}),
+    ...(Object.keys(xai).length > 0 ? { xai } : {}),
   };
 }
 

@@ -149,12 +149,27 @@ describe("openaiQuotaGapNote", () => {
 });
 
 describe("grokQuotaNote", () => {
-  it("shows the spend tier for a healthy Grok CLI login", () => {
+  it("prefers the live plan name over the coarse tier", () => {
+    expect(grokQuotaNote({
+      provider: "xai_subscription",
+      healthy: true,
+      xai: { tier: 1, subscriptionTier: "GrokPro" },
+    })).toBe("GrokPro");
+  });
+
+  it("falls back to the spend tier when the plan name is not known yet", () => {
     expect(grokQuotaNote({
       provider: "xai_subscription",
       healthy: true,
       xai: { tier: 1 },
     })).toBe("tier 1");
+  });
+
+  it("falls back to cli when neither plan nor tier is known", () => {
+    expect(grokQuotaNote({
+      provider: "xai_subscription",
+      healthy: true,
+    })).toBe("cli");
   });
 
   it("marks an expired Grok login", () => {

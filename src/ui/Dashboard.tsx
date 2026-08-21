@@ -7,9 +7,12 @@ import type { AccountsApi } from "./accountsApi.js";
 import { createModelsApi } from "./modelsApi.js";
 import type { ModelEntry, ModelsApi, ModelsStatus } from "./modelsApi.js";
 import { getCurrentVersion } from "../utils/self-update.js";
-import { mergeGrokIntoHealth } from "../providers/xai/overview.js";
+import { mergeGrokIntoHealth, loadGrokHealthSnapshotsWithSubscription } from "../providers/xai/overview.js";
+import type { GrokAccountSnapshot } from "../providers/xai/overview.js";
 
 const POLL_INTERVAL_MS = 2_000;
+/** Grok's plan/code-access rarely change; refresh far slower than the 2s poll. */
+const GROK_SUBSCRIPTION_INTERVAL_MS = 60_000;
 /** Most activity rows the dashboard will show — the list shrinks below this
  *  (down to MIN_LOG_VISIBLE) when the terminal is too short for the full
  *  frame. Ink can only erase as many lines as the viewport holds, so a frame
@@ -94,7 +97,7 @@ interface AccountStat {
   modelCooldowns?: Array<{ modelFamily: string; untilMs: number }>;
   codexRateLimits?: CodexRateLimitsView;
   credentialsPendingWrite?: boolean;
-  xai?: { tier?: number };
+  xai?: { tier?: number; subscriptionTier?: string; hasCodeAccess?: boolean };
 }
 
 const EMPTY_RL: AccountRateLimitsView = {
@@ -400,10 +403,17 @@ export function noteModelLimit(
   };
 }
 
-/** ChatGPT accounts with a known plan but no usage windows (e.g. Pro). */
+/**
+ * Grok has no usage windows, so the note carries the plan instead. Prefer the
+ * live plan name from `/v1/user` ("GrokPro"); fall back to the coarse
+ * access-token `tier` when the live lookup has not landed (offline / first
+ * render), and to "cli" when neither is known.
+ */
 export function grokQuotaNote(account: Pick<AccountStat, "provider" | "xai" | "healthy">): string | undefined {
   if (!isXaiAccount(account)) return undefined;
   if (account.healthy === false) return "expired";
+  const plan = account.xai?.subscriptionTier?.trim();
+  if (plan) return plan;
   const tier = account.xai?.tier;
   return typeof tier === "number" && Number.isFinite(tier) ? `tier ${tier}` : "cli";
 }
@@ -750,6 +760,26 @@ export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps
     if (!data && (input === "q" || key.escape)) exit();
   });
 
+  // Live Grok plan name / code-access, refreshed on a slow cadence and merged
+  // synchronously into each 2s health poll — so the plan shows without a
+  // /v1/user round-trip every tick. Undefined until the first fetch lands, at
+  // which point `mergeGrokIntoHealth` falls back to its access-token tier.
+  const grokSnapshotsRef = useRef<GrokAccountSnapshot[] | undefined>(undefined);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const snapshots = await loadGrokHealthSnapshotsWithSubscription();
+        if (!cancelled) grokSnapshotsRef.current = snapshots;
+      } catch {
+        // Keep the last known snapshots; the poll degrades to the tier fallback.
+      }
+    };
+    refresh();
+    const timer = setInterval(refresh, GROK_SUBSCRIPTION_INTERVAL_MS);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -766,7 +796,7 @@ export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps
         });
         if (cancelled) return;
         if (res.ok) {
-          setData(mergeGrokIntoHealth(await res.json() as HealthData));
+          setData(mergeGrokIntoHealth(await res.json() as HealthData, grokSnapshotsRef.current));
           setConnectError(null);
           setLastUpdate(Date.now());
           setRetryCount(0);
