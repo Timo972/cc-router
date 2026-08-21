@@ -83,10 +83,10 @@ describe("Dashboard rendering", () => {
             modelLimits: [{
               modelFamily: "fable",
               displayName: "Claude Fable",
-              utilization: 0,
+              utilization: 1,
               resetAt: 0,
               active: true,
-              severity: "",
+              severity: "critical",
             }],
             extraUsage: { enabled: false, spendLimitReached: false, usable: false },
             fetchedAt: 1,

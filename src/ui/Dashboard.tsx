@@ -331,6 +331,86 @@ export function isCodexLimited(codex: CodexRateLimitsView | undefined): boolean 
   return (defaultBucket.primary?.utilization ?? 0) >= 1 || (defaultBucket.secondary?.utilization ?? 0) >= 1;
 }
 
+export function isOpenAIAccount(account: Pick<AccountStat, "provider">): boolean {
+  return account.provider === "openai_subscription";
+}
+
+export function isLimitedAccount(
+  account: Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">,
+): boolean {
+  if (isOpenAIAccount(account)) return isCodexLimited(account.codexRateLimits);
+  return account.rateLimits?.status === "rate_limited" || isWeeklyLimited(account);
+}
+
+/** Claude first, ChatGPT second; within each group, accounts at limit last. */
+export function orderAccountsForDashboard<T extends Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">>(
+  accounts: T[],
+): T[] {
+  const usableThenLimited = (list: T[]) => [
+    ...list.filter(account => !isLimitedAccount(account)),
+    ...list.filter(account => isLimitedAccount(account)),
+  ];
+  return [
+    ...usableThenLimited(accounts.filter(account => !isOpenAIAccount(account))),
+    ...usableThenLimited(accounts.filter(isOpenAIAccount)),
+  ];
+}
+
+/** Compact view hides healthy/inactive model rows; selection shows the full set. */
+export function visibleCapacityRows(rows: AccountCapacityRow[], selected: boolean): AccountCapacityRow[] {
+  if (selected) return rows;
+  return rows.filter(row => row.color === "red" || row.color === "yellow");
+}
+
+export function noteModelLimit(
+  account: Pick<AccountStat, "rateLimits">,
+): { label: string; utilization: number; color: AccountCapacityRow["color"] } | undefined {
+  const limits = account.rateLimits?.usage?.modelLimits ?? [];
+  if (limits.length === 0) return undefined;
+  const fable = limits.find(limit =>
+    limit.modelFamily === "fable" || /fable/i.test(limit.displayName),
+  );
+  const limit = fable ?? limits.find(entry => entry.active) ?? limits[0];
+  if (!limit) return undefined;
+  const utilization = limit.utilization;
+  const color: AccountCapacityRow["color"] = utilization >= 1 || limit.severity === "critical"
+    ? "red"
+    : utilization >= 0.7 || limit.severity === "warning"
+      ? "yellow"
+      : "green";
+  return {
+    label: limit.displayName.replace(/^Claude\s+/i, ""),
+    utilization,
+    color,
+  };
+}
+
+export function isWeeklyLimited(account: Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">): boolean {
+  if (isOpenAIAccount(account)) {
+    return getCodexDefaultWindows(account.codexRateLimits).some(
+      window => window.kind === "weekly" && window.utilization >= 1,
+    );
+  }
+  if (!account.rateLimits) return false;
+  return getGlobalCapacityView(account.rateLimits).sevenDay.utilization >= 1;
+}
+
+export function earliestWeeklyReset(accounts: AccountStat[]): number | undefined {
+  let earliest: number | undefined;
+  for (const account of accounts) {
+    if (isOpenAIAccount(account)) {
+      for (const window of getCodexDefaultWindows(account.codexRateLimits)) {
+        if (window.kind !== "weekly" || window.resetAt <= 0) continue;
+        if (earliest === undefined || window.resetAt < earliest) earliest = window.resetAt;
+      }
+    } else if (account.rateLimits) {
+      const resetAt = getGlobalCapacityView(account.rateLimits).sevenDay.resetAt;
+      if (resetAt > 0 && (earliest === undefined || resetAt < earliest)) earliest = resetAt;
+    }
+  }
+  return earliest;
+}
+
 /**
  * First visible row of a scrolling list window that follows its selection.
  *
@@ -725,8 +805,8 @@ function LiveDashboard({
   api: AccountsApi; modelsApi: ModelsApi; onIntent?: (intent: "quit" | "addAccount") => void;
 }) {
   const { exit } = useApp();
-  const healthyCount = data.accounts.filter(a => a.healthy).length;
-  const updatedAgo = Math.round((Date.now() - lastUpdate) / 1000);
+  const orderedAccounts = orderAccountsForDashboard(data.accounts);
+  const healthyCount = orderedAccounts.filter(a => a.healthy).length;
   const logs = data.recentLogs;
 
   // ── Focus / mode ──────────────────────────────────────────────────────────
@@ -758,7 +838,8 @@ function LiveDashboard({
   const [logVisible, setLogVisible] = useState(MIN_LOG_VISIBLE);
   const [accountsVisible, setAccountsVisible] = useState(Number.MAX_SAFE_INTEGER);
   const [modelsVisible, setModelsVisible] = useState(MODEL_VISIBLE_ROWS);
-  const shownAccounts = Math.max(1, Math.min(accountsVisible, data.accounts.length));
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
+  const shownAccounts = Math.max(1, Math.min(accountsVisible, orderedAccounts.length || 1));
   const contentRef = useRef<DOMElement>(null);
   const accountRowsRef = useRef<DOMElement>(null);
   const logRowsRef = useRef<DOMElement>(null);
@@ -784,7 +865,7 @@ function LiveDashboard({
     // denial, re-enabling the grow/shrink oscillation. Geometry drift from
     // scrolling (like every other content mutation the key cannot see) is
     // covered by the denial TTL instead.
-    const fitKey = `${terminalRows}:${terminalColumns}:${data.accounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}`;
+    const fitKey = `${terminalRows}:${terminalColumns}:${orderedAccounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}`;
     if (fitKeyRef.current !== fitKey) {
       fitKeyRef.current = fitKey;
       fitMemoryRef.current = { attempts: {}, denials: {} };
@@ -814,7 +895,7 @@ function LiveDashboard({
         avgRow: shownLogs > 0 ? Math.max(1, logsH / shownLogs) : 1,
       },
       {
-        key: "accounts", current: shownAccounts, min: 1, max: data.accounts.length, growOne: true,
+        key: "accounts", current: shownAccounts, min: 1, max: Math.max(1, orderedAccounts.length), growOne: true,
         avgRow: shownAccounts > 0 ? Math.max(1, accountsH / shownAccounts) : 2,
       },
       ...(modelsPanelOpen ? [{
@@ -836,19 +917,17 @@ function LiveDashboard({
   const logWindowTop = followScrollWindow(logScrollTop, selectedLogIndex, logs.length, logVisible);
 
 
-  // Selected account by id
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const selectedAccountIndex = selectedAccountId !== null
-    ? Math.max(0, data.accounts.findIndex(a => a.id === selectedAccountId))
+    ? Math.max(0, orderedAccounts.findIndex(a => a.id === selectedAccountId))
     : 0;
-  const selectedAccount = data.accounts[selectedAccountIndex] ?? null;
+  const selectedAccount = orderedAccounts[selectedAccountIndex] ?? null;
 
   // Same follow-scroll for the accounts window: when the fitting controller
   // shrinks the list below the fleet size, the selected account must stay on
   // screen — account actions (caps, toggle, delete confirmation) target the
   // selection, and acting on an invisible account is how a wrong one dies.
   const [accountScrollTop, setAccountScrollTop] = useState(0);
-  const accountWindowTop = followScrollWindow(accountScrollTop, selectedAccountIndex, data.accounts.length, shownAccounts);
+  const accountWindowTop = followScrollWindow(accountScrollTop, selectedAccountIndex, orderedAccounts.length, shownAccounts);
 
   const [modelsStatus, setModelsStatus] = useState<ModelsStatus | null>(null);
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
@@ -1060,13 +1139,13 @@ function LiveDashboard({
     if (focus === "accounts") {
       if (key.upArrow) {
         const next = Math.max(0, selectedAccountIndex - 1);
-        setSelectedAccountId(data.accounts[next]?.id ?? null);
-        setAccountScrollTop(followScrollWindow(accountWindowTop, next, data.accounts.length, shownAccounts));
+        setSelectedAccountId(orderedAccounts[next]?.id ?? null);
+        setAccountScrollTop(followScrollWindow(accountWindowTop, next, orderedAccounts.length, shownAccounts));
       }
       if (key.downArrow) {
-        const next = Math.min(data.accounts.length - 1, selectedAccountIndex + 1);
-        setSelectedAccountId(data.accounts[next]?.id ?? null);
-        setAccountScrollTop(followScrollWindow(accountWindowTop, next, data.accounts.length, shownAccounts));
+        const next = Math.min(orderedAccounts.length - 1, selectedAccountIndex + 1);
+        setSelectedAccountId(orderedAccounts[next]?.id ?? null);
+        setAccountScrollTop(followScrollWindow(accountWindowTop, next, orderedAccounts.length, shownAccounts));
       }
 
       // Account actions (only when focus = accounts)
@@ -1130,9 +1209,19 @@ function LiveDashboard({
         <Text bold color="cyan"> CC-Router </Text>
         <Text color="gray">· </Text>
         <Text color="green">{data.mode}</Text>
-        <Text color="gray"> → {data.target}  · </Text>
+        <Text color="gray">  ·  </Text>
         <Text>up {formatUptime(data.uptime)}</Text>
-        <Text color="gray">  ·  updated {updatedAgo}s ago  ·  [q] quit</Text>
+        <Text color="gray">  ·  </Text>
+        <Text color="cyan">{data.totalRequests}</Text>
+        <Text color="gray"> req  </Text>
+        <Text color={data.totalErrors > 0 ? "red" : "green"}>{data.totalErrors}</Text>
+        <Text color="gray"> err</Text>
+        <CacheHealthBadge
+          read={data.totalCacheReadTokens}
+          created={data.totalCacheCreationTokens}
+          input={data.totalInputTokens}
+        />
+        <Text color="gray">  ·  [q] quit</Text>
       </Box>
 
       {/* ── Inline prompt (edit / confirm) ──
@@ -1222,29 +1311,25 @@ function LiveDashboard({
         <Box>
           <Text bold>
             {" ACCOUNTS  "}
-            <Text color={healthyCount === data.accounts.length ? "green" : "yellow"}>
-              {healthyCount}/{data.accounts.length} healthy
+            <Text color={healthyCount === orderedAccounts.length ? "green" : "yellow"}>
+              {healthyCount}/{orderedAccounts.length} healthy
             </Text>
           </Text>
-          {shownAccounts < data.accounts.length && (
+          {shownAccounts < orderedAccounts.length && (
             <Text color="gray">
               {"  ·  showing "}{accountWindowTop + 1}–{accountWindowTop + shownAccounts}
             </Text>
           )}
-          <Text color="gray">{"   "}</Text>
-          <Text color={focus === "accounts" ? "white" : "gray"}>
-            [Tab] focus  [e] toggle  [a] Claude all  [o] OpenAI all  [w] 7d cap  [s] 5h cap  [n] add  [d] delete
-          </Text>
         </Box>
 
         <Box marginTop={1} flexDirection="column" ref={accountRowsRef}>
-          {data.accounts.slice(accountWindowTop, accountWindowTop + shownAccounts).map((a, i) => (
-            <AccountRow
-              key={a.id}
-              account={a}
-              selected={focus === "accounts" && accountWindowTop + i === selectedAccountIndex}
-            />
-          ))}
+          <AccountGroups
+            visible={orderedAccounts.slice(accountWindowTop, accountWindowTop + shownAccounts)}
+            fleet={orderedAccounts}
+            windowTop={accountWindowTop}
+            selectedIndex={selectedAccountIndex}
+            focused={focus === "accounts"}
+          />
         </Box>
       </Box>
 
@@ -1307,6 +1392,16 @@ function LiveDashboard({
         </Box>
       )}
 
+      <Box marginTop={1}>
+        <Text color="gray">
+          {focus === "accounts"
+            ? " [Tab]  [e] toggle  [n] add  [d] delete  [w] 7d  [s] 5h  [q]"
+            : focus === "models"
+              ? " [Tab]  [m/r] refresh  [c]/[o] default  [Esc] logs  [q]"
+              : " [Tab]  [m] models  [q] quit"}
+        </Text>
+      </Box>
+
     </Box>
     </Box>
   );
@@ -1318,50 +1413,20 @@ function OperationsPanel({ operational, baseUrl, focus }: { operational: Operati
   const claudeReady = operational.capabilities.anthropicMessages;
   const openAIReady = operational.capabilities.openAIResponses;
   const crossReady = operational.capabilities.crossProviderMessages;
-  const modelsReady = operational.capabilities.dynamicModels;
 
   return (
-    <Box flexDirection="column">
-      <Box>
-        <Text bold> OPERATIONS  </Text>
-        <Text color="gray">base </Text>
-        <Text color="cyan">{baseUrl}</Text>
-        <Text color="gray">  ·  auth </Text>
-        <Text color={authColor}>{authLabel}</Text>
-        <Text color="gray">  ·  models </Text>
-        <Text color={modelsReady ? "green" : "red"}>{modelsReady ? "dynamic" : "off"}</Text>
-      </Box>
-      <Box paddingLeft={2}>
-        <ProviderBadge label="Claude" status={operational.providers.anthropic} ready={claudeReady} />
-        <Text color="gray">  </Text>
-        <ProviderBadge label="OpenAI" status={operational.providers.openai} ready={openAIReady} />
-        <Text color="gray">  ·  cross-route </Text>
-        <Text color={crossReady ? "green" : "gray"}>{crossReady ? "ready" : "needs OpenAI"}</Text>
-      </Box>
-      <Box paddingLeft={2}>
-        <Text color="gray">endpoints </Text>
-        <Text color="white">{operational.endpoints.messages}</Text>
-        <Text color="gray"> </Text>
-        <Text color="white">{operational.endpoints.responses}</Text>
-        <Text color="gray"> </Text>
-        <Text color="white">{operational.endpoints.models}</Text>
-        <Text color="gray"> </Text>
-        <Text color="white">{operational.endpoints.accounts}</Text>
-      </Box>
-      <Box paddingLeft={2}>
-        <Text color="gray">routing </Text>
-        <Text color="white">claude={operational.routing.anthropicDefaultModel ?? "default"}</Text>
-        <Text color="gray"> aliases[{operational.routing.anthropicAliases.join(",") || "-"}]</Text>
-        <Text color="gray">  </Text>
-        <Text color="white">openai={operational.routing.openAIDefaultModel ?? "default"}</Text>
-        <Text color="gray"> aliases[{operational.routing.openAIAliases.join(",") || "-"}]</Text>
-      </Box>
-      <Box paddingLeft={2}>
-        <Text color="gray">models </Text>
-        <Text color={focus === "models" ? "white" : "cyan"}>[m] list/select</Text>
-        <Text color="gray">  change </Text>
-        <Text color={focus === "models" ? "white" : "cyan"}>[c] Claude [o] OpenAI</Text>
-      </Box>
+    <Box>
+      <Text bold> OPERATIONS  </Text>
+      <Text color="cyan">{baseUrl.replace(/^https?:\/\//, "")}</Text>
+      <Text color="gray">  ·  auth </Text>
+      <Text color={authColor}>{authLabel}</Text>
+      <Text color="gray">  ·  </Text>
+      <ProviderBadge label="Claude" status={operational.providers.anthropic} ready={claudeReady} />
+      <Text color="gray">  </Text>
+      <ProviderBadge label="ChatGPT" status={operational.providers.openai} ready={openAIReady} />
+      {crossReady && <Text color="gray">  ·  cross-route</Text>}
+      <Text color="gray">  ·  </Text>
+      <Text color={focus === "models" ? "white" : "cyan"}>[m]</Text>
     </Box>
   );
 }
@@ -1482,163 +1547,188 @@ function ProviderBadge({
 }) {
   const color = !status.configured ? "gray" : ready ? "green" : "yellow";
   const text = status.configured
-    ? `${label} ${status.healthy}/${status.accounts} healthy`
-    : `${label} not configured`;
+    ? `${label} ${status.healthy}/${status.accounts}`
+    : `${label} off`;
 
   return <Text color={color}>{text}</Text>;
 }
 
-// ─── Account row (two-line: status + utilization bars) ───────────────────────
+function AccountGroups({
+  visible,
+  fleet,
+  windowTop,
+  selectedIndex,
+  focused,
+}: {
+  visible: AccountStat[];
+  fleet: AccountStat[];
+  windowTop: number;
+  selectedIndex: number;
+  focused: boolean;
+}) {
+  const claudeVisible = visible.filter(account => !isOpenAIAccount(account));
+  const chatgptVisible = visible.filter(isOpenAIAccount);
+  const claudeFleet = fleet.filter(account => !isOpenAIAccount(account));
+  const chatgptFleet = fleet.filter(isOpenAIAccount);
+
+  if (visible.length === 0) {
+    return <Text color="gray">  No accounts</Text>;
+  }
+
+  const renderRows = (accounts: AccountStat[], offsetInVisible: number) =>
+    accounts.map((account, i) => (
+      <AccountRow
+        key={account.id}
+        account={account}
+        selected={focused && windowTop + offsetInVisible + i === selectedIndex}
+      />
+    ));
+
+  return (
+    <Box flexDirection="column">
+      {claudeVisible.length > 0 && (
+        <Box flexDirection="column">
+          <GroupHeader label="CLAUDE" accounts={claudeFleet} />
+          <ColumnLegend />
+          {renderRows(claudeVisible, 0)}
+        </Box>
+      )}
+      {chatgptVisible.length > 0 && (
+        <Box flexDirection="column">
+          {claudeVisible.length > 0 && <Box marginTop={1} />}
+          <GroupHeader label="CHATGPT" accounts={chatgptFleet} />
+          <ColumnLegend />
+          {renderRows(chatgptVisible, claudeVisible.length)}
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+function GroupHeader({ label, accounts }: { label: string; accounts: AccountStat[] }) {
+  const healthy = accounts.filter(account => account.healthy).length;
+  const weeklyFull = accounts.filter(isWeeklyLimited);
+  const color = healthy === accounts.length && weeklyFull.length === 0 ? "green" : "yellow";
+  const fableHint = label === "CLAUDE" ? exhaustedModelHint(accounts) : undefined;
+
+  return (
+    <Box>
+      <Text bold color="gray"> {label}  </Text>
+      <Text color={color}>{healthy}/{accounts.length} ok</Text>
+      {weeklyFull.length > 0 && <Text color="red">{`  ·  ${weeklyFull.length} 7d full`}</Text>}
+      {fableHint && <Text color="red">{`  ·  ${fableHint}`}</Text>}
+    </Box>
+  );
+}
+
+const COL = {
+  name: 22,
+  req: 5,
+  sess: 6,
+  pct: 4,
+  note: 22,
+  reset: 8,
+} as const;
+
+function ColumnLegend() {
+  return (
+    <Text color="gray">
+      {`  ${"".padEnd(COL.name)} ${"req".padStart(COL.req)}${"s·n".padStart(COL.sess)}  ${"5h".padStart(COL.pct)} ${"7d".padStart(COL.pct)}  ${"note".padEnd(COL.note)} ${"↻5h".padEnd(COL.reset)} ${"↻7d".padEnd(COL.reset)}`}
+    </Text>
+  );
+}
+
+function exhaustedModelHint(accounts: AccountStat[]): string | undefined {
+  const hits: string[] = [];
+  for (const account of accounts) {
+    for (const row of getAccountCapacityRows(account)) {
+      if ((row.utilization ?? 0) < 1 || row.color !== "red") continue;
+      hits.push(`${row.label} full`);
+    }
+  }
+  return hits[0];
+}
+
+// ─── Account row (one aligned line, no bars) ─────────────────────────────────
 
 function AccountRow({ account: a, selected }: { account: AccountStat; selected: boolean }) {
   const rl = a.rateLimits ?? EMPTY_RL;
   const usage = rl.usage;
   const globalCapacity = getGlobalCapacityView(rl);
-  const isOpenAI = a.provider === "openai_subscription";
-  const codex = a.codexRateLimits;
-  const codexDefaultWindows = getCodexDefaultWindows(codex);
-  const capacityRows = isOpenAI
-    ? getCodexCapacityRows(a.codexRateLimits, a.globalCooldownUntilMs)
-    : getAccountCapacityRows(a);
+  const isOpenAI = isOpenAIAccount(a);
   const isLimited = isOpenAI ? isCodexLimited(a.codexRateLimits) : rl.status === "rate_limited";
   const isDisabled = a.enabled === false;
+  const modelNote = isOpenAI ? undefined : noteModelLimit(a);
+  const extraCap = usage?.extraUsage;
+  const extraOff = extraCap !== undefined && extraCap.usable !== true
+    && (extraCap.spendLimitReached
+      || (modelNote !== undefined && modelNote.utilization >= 1 && extraCap.enabled === false));
+  const note = [
+    modelNote
+      ? `${modelNote.label} ${Math.round(modelNote.utilization * 100)}%`
+      : "",
+    extraOff ? "extra off" : "",
+  ].filter(Boolean).join(" · ");
+  const codexWindows = getCodexDefaultWindows(a.codexRateLimits);
+  const sessionWindow = codexWindows.find(window => window.kind === "session");
+  const weeklyWindow = codexWindows.find(window => window.kind === "weekly");
+  const hasClaudeQuota = !isOpenAI && (rl.lastUpdated > 0 || usage);
+  const fiveHour = isOpenAI
+    ? sessionWindow
+    : hasClaudeQuota ? globalCapacity.fiveHour : undefined;
+  const sevenDay = isOpenAI
+    ? weeklyWindow
+    : hasClaudeQuota ? globalCapacity.sevenDay : undefined;
 
   const dot = isDisabled ? "⊘" : isLimited ? "⊘" : a.busy ? "◌" : a.healthy ? "●" : "●";
   const dotColor = isDisabled ? "gray" : isLimited ? "red" : a.busy ? "yellow" : a.healthy ? "green" : "red";
-  const statusLabel = isDisabled ? "OFF    " : isLimited ? "LIMITED" : a.busy ? "busy   " : a.healthy ? "ok     " : "ERROR  ";
-  const statusColor = isDisabled ? "gray" : isLimited ? "red" : a.busy ? "yellow" : a.healthy ? "green" : "red";
-
-  const expiryLabel = a.expiresInMs > 0 ? formatMs(a.expiresInMs) : "EXPIRED";
-  const expiryColor = a.expiresInMs < 10 * 60 * 1000 ? "red"
-    : a.expiresInMs < 30 * 60 * 1000 ? "yellow"
-    : "white";
-
-  const providerTag = isOpenAI
-    ? ` [OpenAI${codex?.plan ? ` ${codex.plan}` : ""}]`
-    : rl.plan ? ` [${rl.plan}]` : "";
-
-  // User-defined caps hint
-  const s5 = a.sessionLimitPercent ?? 100;
-  const w7 = a.weeklyLimitPercent ?? 100;
-  const hasCaps = s5 < 100 || w7 < 100;
-  const capsHint = hasCaps
-    ? ` cap${s5 < 100 ? ` 5h≤${s5}%` : ""}${w7 < 100 ? ` 7d≤${w7}%` : ""}`
-    : "";
-
-  const pointer = selected ? "▶" : " ";
-  const nameColor = isDisabled ? "gray" : undefined;
-
-  const creditsLabel = codex?.credits
-    ? codex.credits.unlimited
-      ? "∞"
-      : codex.credits.balance !== undefined
-        ? codex.credits.balance
-        : codex.credits.hasCredits ? "yes" : "no"
-    : undefined;
+  const sessions = a.activeSessions ?? 0;
+  const inflight = a.inFlightRequests ?? 0;
+  const load = sessions <= 0 && inflight <= 0
+    ? ""
+    : inflight > 0
+      ? `${sessions}·${inflight}`
+      : String(sessions);
 
   return (
-    <Box flexDirection="column">
-      <Box>
-        <Text color={selected ? "cyan" : undefined}>{pointer}</Text>
-        <Text color={dotColor}> {dot} </Text>
-        {/* Pad one wider than the truncation so an id of exactly the cut length
-            still leaves a separator — `plus-developer-droidrun` rendered as
-            `plus-developer-droidLIMITED`. */}
-        <Text color={nameColor} dimColor={isDisabled}>{a.id.slice(0, 20).padEnd(21)}</Text>
-        <Text color={statusColor}>{statusLabel}</Text>
-        {providerTag && <Text color={isOpenAI ? "cyan" : "magenta"}>{providerTag.padEnd(10)}</Text>}
-        {!providerTag && <Text>{"".padEnd(10)}</Text>}
-        <Text color="gray"> req </Text>
-        <Text color="white">{String(a.requestCount).padStart(5)}</Text>
-        <Text color="gray">  err </Text>
-        <Text color={a.errorCount > 0 ? "red" : "gray"}>{String(a.errorCount).padStart(3)}</Text>
-        <Text color="gray">  tok </Text>
-        <Text color={expiryColor}>{expiryLabel.padEnd(8)}</Text>
-        <Text color="gray">  last </Text>
-        <Text color="gray">{formatAgo(a.lastUsedMs)}</Text>
-        <Text color="gray">  {a.activeSessions ?? 0} active / {a.inFlightRequests ?? 0} streams</Text>
-        {capsHint && <Text color="yellow">{capsHint}</Text>}
-        {a.credentialsPendingWrite && (
-          // The account still works — its rotated token is live in memory — but a
-          // restart before the pending write lands would need a re-login.
-          <Text color="yellow">{"  creds unsaved"}</Text>
-        )}
-      </Box>
-      {(rl.lastUpdated > 0 || usage) && (
-        <Box paddingLeft={4}>
-          <UtilBar
-            label="5h"
-            util={globalCapacity.fiveHour.utilization}
-            resetTs={globalCapacity.fiveHour.resetAt}
-            isActive={rl.claim === "five_hour"}
-            cap={s5}
-          />
-          <Text>   </Text>
-          <UtilBar
-            label="7d all-model"
-            util={globalCapacity.sevenDay.utilization}
-            resetTs={globalCapacity.sevenDay.resetAt}
-            isActive={rl.claim === "seven_day"}
-            cap={w7}
-          />
-          {usage && <Text color={globalCapacity.usageFetchStatus === "fresh" ? "gray" : "yellow"}>
-            {`  usage ${globalCapacity.usageFetchStatus} ${usage.fetchedAt > 0 ? formatAgo(usage.fetchedAt) : ""}`}
-          </Text>}
-        </Box>
-      )}
-      {isOpenAI && codexDefaultWindows.length > 0 && (
-        <Box paddingLeft={4}>
-          {codexDefaultWindows.map((window, index) => (
-            <React.Fragment key={window.label}>
-              {index > 0 && <Text>   </Text>}
-              <UtilBar
-                label={window.label}
-                util={window.utilization}
-                resetTs={window.resetAt}
-                isActive={false}
-                cap={window.kind === "weekly" ? w7 : s5}
-              />
-            </React.Fragment>
-          ))}
-          {creditsLabel !== undefined && <Text color="gray">{`  credits ${creditsLabel}`}</Text>}
-        </Box>
-      )}
-      {capacityRows.map((row, index) => (
-        <Box key={`${row.label}-${index}`} paddingLeft={4}>
-          <Text color={row.color}> {row.label}</Text>
-          <Text color="gray"> · {row.state}</Text>
-          {row.utilization !== undefined && <Text color={row.color}>{` ${Math.round(row.utilization * 100)}%`}</Text>}
-          {row.resetAt !== undefined && row.resetAt > 0 && (
-            <Text color="gray"> {`↻${formatResetIn(row.resetAt)}`}</Text>
-          )}
-        </Box>
-      ))}
+    <Box>
+      <Text color={selected ? "cyan" : undefined}>{selected ? "▶" : " "}</Text>
+      <Text color={dotColor}>{dot}</Text>
+      <Text color={selected ? "white" : isDisabled ? "gray" : undefined} dimColor={isDisabled}>
+        {` ${a.id.slice(0, COL.name).padEnd(COL.name)}`}
+      </Text>
+      <Text color="white">{String(a.requestCount).padStart(COL.req)}</Text>
+      <Text color="gray">{load.padStart(COL.sess)}</Text>
+      <Text>  </Text>
+      <QuotaCell util={fiveHour?.utilization} />
+      <Text> </Text>
+      <QuotaCell util={sevenDay?.utilization} />
+      <Text color={extraOff ? "yellow" : modelNote?.color ?? "gray"}>
+        {`  ${note.padEnd(COL.note)}`}
+      </Text>
+      <Text> </Text>
+      <ResetCell resetTs={fiveHour?.resetAt} />
+      <Text> </Text>
+      <ResetCell resetTs={sevenDay?.resetAt} />
+      {a.credentialsPendingWrite && <Text color="yellow">  unsaved</Text>}
     </Box>
   );
 }
 
-// ─── Utilization bar ─────────────────────────────────────────────────────────
-
-function UtilBar({ label, util, resetTs, isActive, cap }: { label: string; util: number; resetTs: number; isActive: boolean; cap: number }) {
+function QuotaCell({ util }: { util?: number }) {
+  if (util === undefined) {
+    return <Text color="gray">{"—".padStart(COL.pct)}</Text>;
+  }
   const pct = Math.round(util * 100);
-  const BAR_W = 12;
-  const filled = Math.round(util * BAR_W);
-  const capPos = Math.round((cap / 100) * BAR_W);
-  const bar = "█".repeat(Math.min(filled, BAR_W)) + "░".repeat(Math.max(BAR_W - filled, 0));
-  const color = pct >= cap ? "red" : pct >= 90 ? "red" : pct >= 70 ? "yellow" : "green";
+  const color = pct >= 90 ? "red" : pct >= 70 ? "yellow" : "green";
+  return <Text color={color}>{`${pct}%`.padStart(COL.pct)}</Text>;
+}
 
-  const resetLabel = resetTs > 0 ? formatResetIn(resetTs) : "";
-  const capLabel = cap < 100 ? ` cap ${cap}%` : "";
-
-  return (
-    <Box>
-      <Text color={isActive ? "white" : "gray"} bold={isActive}>{label} </Text>
-      <Text color={color}>{bar}</Text>
-      <Text color={color}>{String(pct).padStart(4)}%</Text>
-      {capLabel && <Text color="yellow">{capLabel}</Text>}
-      {resetLabel && <Text color="gray"> ↻{resetLabel}</Text>}
-    </Box>
-  );
+function ResetCell({ resetTs }: { resetTs?: number }) {
+  if (!resetTs || resetTs <= 0) {
+    return <Text color="gray">{"—".padEnd(COL.reset)}</Text>;
+  }
+  return <Text color="gray">{`↻${formatResetIn(resetTs)}`.padEnd(COL.reset)}</Text>;
 }
 
 function formatResetIn(unixSeconds: number): string {
@@ -1724,74 +1814,35 @@ function LogRow({ log, selected }: { log: LogEntry; selected: boolean }) {
 // ─── Detail panel ─────────────────────────────────────────────────────────────
 
 function DetailPanel({ log }: { log: LogEntry }) {
-  const time = new Date(log.ts).toLocaleString("en-GB", {
-    hour12: false,
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
-  const isError = log.type === "error";
-  const isWarn = log.type === "warn";
-  const statusLabel = log.statusCode === undefined ? "—"
+  const time = new Date(log.ts).toLocaleTimeString("en-GB", { hour12: false });
+  const statusLabel = log.statusCode === undefined ? ""
     : log.statusCode === 0 ? "connection error"
-    : `${log.statusCode} ${httpStatusText(log.statusCode)}`;
+    : String(log.statusCode);
   const statusColor = log.statusCode === undefined ? "gray"
     : log.statusCode === 0 ? "red"
     : log.statusCode >= 500 ? "red"
     : log.statusCode >= 400 ? "yellow"
     : "green";
+  const inputTok = (log.cacheReadTokens ?? 0) + (log.cacheCreationTokens ?? 0) + (log.inputTokens ?? 0);
+  const outputTok = log.outputTokens ?? 0;
+  const hitPct = inputTok > 0 ? Math.round(((log.cacheReadTokens ?? 0) / inputTok) * 100) : null;
 
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1}>
-      <Text bold color={isError ? "red" : isWarn ? "yellow" : "cyan"}> DETAILS </Text>
-      <Box marginTop={1} flexDirection="column" gap={0}>
-        <Box gap={2}>
-          <Field label="Time"    value={time} />
-          <Field label="Account" value={log.accountId} />
-        </Box>
-        <Box gap={2}>
-          <Field label="Method"  value={log.method ?? "—"} />
-          <Field label="Path"    value={log.path ?? "—"} />
-        </Box>
-        <Box gap={2}>
-          <FieldColored label="Status"   value={statusLabel} color={statusColor} />
-          <Field        label="Duration" value={log.durationMs !== undefined ? `${log.durationMs}ms` : "—"} />
-          <Field        label="Type"     value={log.type} />
-          <Field        label="Source"   value={sourceFullLabel(log.source)} />
-        </Box>
-        {log.details && (
-          <Box>
-            <Field label="Details" value={log.details} />
-          </Box>
-        )}
-        {log.cacheReadTokens !== undefined && (
-          <Box gap={2}>
-            <CacheBreakdown
-              read={log.cacheReadTokens}
-              created={log.cacheCreationTokens ?? 0}
-              input={log.inputTokens ?? 0}
-              output={log.outputTokens ?? 0}
-            />
-          </Box>
-        )}
+    <Box flexDirection="column" paddingLeft={2}>
+      <Box>
+        <Text color="gray">{time}  {log.accountId}</Text>
+        {log.method && log.path && <Text color="white">{`  ${log.method} ${log.path}`}</Text>}
+        {statusLabel !== "" && <Text color={statusColor}>{`  ${statusLabel}`}</Text>}
+        {log.durationMs !== undefined && <Text color="gray">{`  ${log.durationMs}ms`}</Text>}
+        <Text color="gray">{`  ${sourceFullLabel(log.source)}`}</Text>
+        {log.details && <Text color="gray">{`  ${log.details}`}</Text>}
       </Box>
-    </Box>
-  );
-}
-
-function Field({ label, value }: { label: string; value: string }) {
-  return (
-    <Box>
-      <Text color="gray">{label}: </Text>
-      <Text color="white">{value}</Text>
-    </Box>
-  );
-}
-
-function FieldColored({ label, value, color }: { label: string; value: string; color: string }) {
-  return (
-    <Box>
-      <Text color="gray">{label}: </Text>
-      <Text color={color}>{value}</Text>
+      {(inputTok > 0 || outputTok > 0) && (
+        <Text color="gray">
+          {`  ${fmtTok(inputTok)} in · ${fmtTok(outputTok)} out`}
+          {hitPct !== null ? ` · cache ${hitPct}%` : ""}
+        </Text>
+      )}
     </Box>
   );
 }
@@ -1812,29 +1863,6 @@ function CacheHealthBadge({ read, created, input }: { read: number; created: num
       <Text>cache </Text>
       <Text color={color}>{hitPct}% hit </Text>
       <Text color="gray">({label})</Text>
-    </>
-  );
-}
-
-// ─── Cache breakdown (per-request detail) ────────────────────────────────────
-
-function CacheBreakdown({ read, created, input, output }: { read: number; created: number; input: number; output: number }) {
-  const totalInput = read + created + input;
-  const hitPct = totalInput > 0 ? (read / totalInput) * 100 : 0;
-  const color = totalInput === 0 ? "gray" : hitPct >= 70 ? "green" : hitPct >= 30 ? "yellow" : "red";
-
-  return (
-    <>
-      <FieldColored
-        label="Cache hit"
-        value={totalInput > 0 ? `${fmtTok(read)} tok  (${hitPct.toFixed(1)}%)` : "—"}
-        color={color}
-      />
-      <Field label="Cache created" value={fmtTok(created) + " tok"} />
-      <Field label="Uncached"      value={fmtTok(input) + " tok"} />
-      <Field label="Total input"   value={fmtTok(totalInput) + " tok"} />
-      <Field label="Output"        value={fmtTok(output) + " tok"} />
-      <Field label="Total"         value={fmtTok(totalInput + output) + " tok"} />
     </>
   );
 }
@@ -1880,19 +1908,6 @@ function sourceFullLabel(source: LogEntry["source"]): string {
   return "—";
 }
 
-// ─── HTTP status text ─────────────────────────────────────────────────────────
-
-function httpStatusText(code: number): string {
-  const map: Record<number, string> = {
-    200: "OK", 201: "Created", 204: "No Content",
-    400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
-    404: "Not Found", 429: "Too Many Requests",
-    500: "Internal Server Error", 502: "Bad Gateway",
-    503: "Service Unavailable", 529: "Overloaded",
-  };
-  return map[code] ?? "";
-}
-
 // ─── Formatters ───────────────────────────────────────────────────────────────
 
 function formatUptime(seconds: number): string {
@@ -1902,18 +1917,4 @@ function formatUptime(seconds: number): string {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
-}
-
-function formatMs(ms: number): string {
-  const totalMin = Math.round(ms / 60_000);
-  if (totalMin >= 60) return `${Math.floor(totalMin / 60)}h ${totalMin % 60}m`;
-  return `${totalMin}m`;
-}
-
-function formatAgo(ts: number): string {
-  if (!ts) return "never";
-  const s = Math.round((Date.now() - ts) / 1_000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  return `${m}m ago`;
 }

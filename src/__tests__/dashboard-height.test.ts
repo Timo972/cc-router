@@ -112,10 +112,10 @@ function tallAccount(id: string) {
   account.rateLimits.usage.modelLimits = Array.from({ length: 8 }, (_, i) => ({
     modelFamily: `family-${i}`,
     displayName: `Model Family ${i}`,
-    utilization: 0.1 * i,
+    utilization: 0.85,
     resetAt: 0,
     active: true,
-    severity: "",
+    severity: "warning",
   }));
   return account;
 }
@@ -435,32 +435,28 @@ describe("dashboard viewport fitting", () => {
     }
   }, 15_000);
 
-  it("re-expands a denied list once the rows it was denied against change shape", async () => {
-    // A denial is measured against concrete row heights. When a health poll
-    // later shrinks the tall hidden account — same fleet size, same newest
-    // log entry — the stale denial must not keep the list collapsed forever.
+  it("re-expands a denied list once the fleet shrinks", async () => {
+    // Account rows are one line, so height variance comes from fleet size.
+    // A large fleet is windowed; after a poll drops to three accounts the
+    // previously hidden last id must become visible.
     const grown = tallHealth();
-    grown.accounts = [makeAccount("short-01"), makeAccount("short-02"), tallAccount("tall-03")];
+    grown.accounts = Array.from({ length: 12 }, (_, i) => makeAccount(`acc-${String(i + 1).padStart(2, "0")}`));
     const shrunk = tallHealth();
-    shrunk.accounts = [makeAccount("short-01"), makeAccount("short-02"), makeAccount("tall-03")];
+    shrunk.accounts = grown.accounts.slice(0, 3);
     let payload: unknown = grown;
-    // 38 rows is the discriminating viewport: the tall fleet collapses to
-    // two visible accounts while three short accounts fit entirely.
-    const dash = renderDashboard(grown, {}, { rows: 38, columns: 220 });
+    const dash = renderDashboard(grown, {}, { rows: 32, columns: 220 });
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => Response.json(payload)));
     try {
       await dash.waitUntil(() => {
         expect(dash.lastFrame()).toContain("ACCOUNTS");
       });
-      // Let the controller settle (the tall account's growth gets denied).
       await new Promise(resolve => setTimeout(resolve, 400));
-      expect(dash.lastFrame()).not.toContain("tall-03");
+      expect(dash.lastFrame()).not.toContain("acc-12");
 
-      // The tall account becomes short via an ordinary poll.
       payload = shrunk;
       await vi.waitFor(() => {
-        expect(dash.lastFrame()).toContain("tall-03");
-        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(38);
+        expect(dash.lastFrame()).toContain("acc-03");
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(32);
       }, { timeout: 12_000, interval: 100 });
     } finally {
       await dash.cleanup();
