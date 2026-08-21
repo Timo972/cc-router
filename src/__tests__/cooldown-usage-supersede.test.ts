@@ -927,6 +927,90 @@ describe("header rate_limited status superseded by a later usage snapshot", () =
     expect(recovered).toEqual(["recovery-gated-on-cooldown"]);
   });
 
+  it("announces recovery for a cooldown that expires before any sweep observes it", () => {
+    // A 529 without unified headers leaves no rate_limited flag behind, so the
+    // cooldown is the whole of the block — and unlike a flag or a spent
+    // window it erases itself at its expiry rather than waiting to be rolled
+    // over. If nothing routed or polled in between, the first sweep after it
+    // lapses already sees a clear account, and the log would show the cooldown
+    // starting and never ending.
+    const h = harness("cooldown-expired-unobserved");
+    const recovered: string[] = [];
+    h.pool.onCooldownExpired = a => recovered.push(a.id);
+
+    h.pool.setGlobalCooldownForAccount(h.account, 30_000);
+    const overloadUntil = h.now() + 30_000;
+
+    // Nothing observes the account while it is down.
+    h.jumpTo(overloadUntil + 1);
+    h.pool.sweepExpiredCooldowns();
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+    expect(recovered).toEqual(["cooldown-expired-unobserved"]);
+
+    h.pool.sweepExpiredCooldowns();
+    expect(recovered).toEqual(["cooldown-expired-unobserved"]);
+  });
+
+  it("announces recovery for an unobserved ambiguous cooldown too", () => {
+    const h = harness("ambiguous-expired-unobserved");
+    const recovered: string[] = [];
+    h.pool.onCooldownExpired = a => recovered.push(a.id);
+
+    h.pool.setAmbiguousGlobalCooldownForAccount(h.account, 30_000, "fable");
+    const until = h.now() + 30_000;
+
+    h.jumpTo(until + 1);
+    h.pool.sweepExpiredCooldowns();
+
+    expect(recovered).toEqual(["ambiguous-expired-unobserved"]);
+  });
+
+  it("does not announce recovery for a cooldown the setter rejected", () => {
+    // A zero or negative duration records nothing, so there is no block to
+    // recover from and no entry to write.
+    const h = harness("rejected-cooldown");
+    const recovered: string[] = [];
+    h.pool.onCooldownExpired = a => recovered.push(a.id);
+
+    h.pool.setGlobalCooldownForAccount(h.account, 0);
+    expect(h.pool.getCooldownSummary(h.account.id).globalUntilMs).toBe(0);
+
+    h.advance(1_000);
+    h.pool.sweepExpiredCooldowns();
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+    expect(recovered).toEqual([]);
+  });
+
+  it("does not announce recovery for a cooldown that is still running", () => {
+    const h = harness("cooldown-still-running");
+    const recovered: string[] = [];
+    h.pool.onCooldownExpired = a => recovered.push(a.id);
+
+    h.pool.setGlobalCooldownForAccount(h.account, 30_000);
+    h.advance(10_000);
+    h.pool.sweepExpiredCooldowns();
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+    expect(recovered).toEqual([]);
+  });
+
+  it("does not announce recovery for a model cooldown expiring unobserved", () => {
+    // Still not a rotation exit: the account served every other family
+    // throughout, so there is nothing to report rejoining.
+    const h = harness("model-cooldown-unobserved");
+    const recovered: string[] = [];
+    h.pool.onCooldownExpired = a => recovered.push(a.id);
+
+    h.pool.setModelCooldownForAccount(h.account, "fable", 30_000);
+    h.jumpTo(h.now() + 30_001);
+    h.pool.sweepExpiredCooldowns();
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+    expect(recovered).toEqual([]);
+  });
+
   it("never announces recovery for a model-scoped limit, which is not a rotation exit", () => {
     // A seven_day_<family> claim limits one family. The account keeps serving
     // everything else, so it never left the rotation and there is no rejoining

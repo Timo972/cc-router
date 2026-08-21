@@ -78,9 +78,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and because that flag only flips once, the moment it genuinely came back
   passed unannounced. The entry is now emitted when the last account-wide
   blocker clears — header status, global cooldown, or a spent account-wide
-  window — whichever that turns out to be. A model-scoped limit never emits
-  one, since the account kept serving every other family and so never left the
-  rotation to rejoin.
+  window — whichever that turns out to be, including a cooldown that lapses
+  during an idle stretch with nothing routing or polling in the meantime. A
+  model-scoped limit never emits one, since the account kept serving every
+  other family and so never left the rotation to rejoin.
 
 ---
 

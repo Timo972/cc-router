@@ -325,9 +325,22 @@ export class TokenPool implements AccountPool<Account> {
   private readonly cooldowns = new Map<Account, AccountCooldowns>();
   private readonly now: () => number;
   private readonly nextSequence: () => number;
-  /** Accounts last seen blocked for every model, so recovery is announced once
-   *  when the final blocker clears. Weak so a removed account is not retained
-   *  merely for having been blocked when it left. */
+  /**
+   * Accounts known to be blocked for every model, so recovery is announced
+   * once when the final blocker clears.
+   *
+   * Membership is seeded from two places, because the blockers differ in kind.
+   * A `rate_limited` flag or a spent window persists until something rolls it
+   * over, so observing the account is enough to notice it. A cooldown instead
+   * erases itself at its expiry: `globalUntil > now()` already reads false by
+   * the time the next sweep arrives, so an account left idle across a short
+   * cooldown would never be recorded as blocked and its recovery would go
+   * unreported. The account-global cooldown setters therefore record it when
+   * the cooldown is created. Model cooldowns deliberately do not — an account
+   * spent on one family is still serving the rest, so it never left rotation.
+   *
+   * Weak so an account removed while blocked is not retained.
+   */
   private readonly globallyBlocked = new WeakSet<Account>();
   private currentIndex = 0;
   private nextAmbiguousCooldownToken = 1;
@@ -446,6 +459,7 @@ export class TokenPool implements AccountPool<Account> {
       this.nextSequence(),
     ));
     this.recomputeGlobalUntil(state);
+    this.globallyBlocked.add(account);
   }
 
   /** Apply a model-family cooldown to the exact account incarnation routed. */
@@ -481,6 +495,7 @@ export class TokenPool implements AccountPool<Account> {
       ...(family ? { modelFamily: family } : {}),
     });
     this.recomputeGlobalUntil(state);
+    this.globallyBlocked.add(account);
     return token;
   }
 
