@@ -7,7 +7,7 @@ import type { Socket } from "net";
 import type { Request } from "express";
 import { TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
-import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, loadXaiAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
@@ -311,6 +311,28 @@ function publicXaiAccountView(account: GrokAccountSnapshot): HealthAccountView {
     lastRefreshMs: 0,
     ...(account.tier !== undefined ? { xai: { tier: account.tier } } : {}),
   };
+}
+
+function loadGrokHealthSnapshots(): GrokAccountSnapshot[] {
+  const overlay = loadGrokAccountSnapshots();
+  const liveSessions = overlay.reduce((sum, account) => Math.max(sum, account.activeSessions), 0);
+  const stored = loadXaiAccounts();
+  if (stored.length === 0) return overlay;
+  const now = Date.now();
+  return stored.map(account => ({
+    id: account.id,
+    provider: "xai_subscription" as const,
+    enabled: true as const,
+    healthy: account.enabled !== false && account.expiresAt > now,
+    busy: liveSessions > 0,
+    inFlightRequests: 0 as const,
+    activeSessions: liveSessions,
+    requestCount: 0,
+    errorCount: 0,
+    expiresInMs: account.expiresAt - now,
+    lastUsedMs: 0,
+    lastRefreshMs: 0,
+  }));
 }
 
 function publicAnthropicAccountView(
@@ -776,7 +798,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       openAIAccounts,
       resolveRoutingMetrics,
       createOpenAIRoutingResolver(),
-      loadGrokAccountSnapshots(),
+      loadGrokHealthSnapshots(),
     );
     const status = accountViews.some(a => a.healthy) ? "ok" : "degraded";
 
@@ -830,7 +852,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         openAIAccounts,
         resolveRoutingMetrics,
         createOpenAIRoutingResolver(),
-        loadGrokAccountSnapshots(),
+        loadGrokHealthSnapshots(),
       ),
     });
   });
@@ -1084,6 +1106,42 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       return;
     }
 
+    if (body.provider === "xai_subscription") {
+      try {
+        upsertAccountRecord({
+          id: body.id,
+          provider: "xai_subscription",
+          accessToken: body.accessToken,
+          refreshToken: body.refreshToken,
+          expiresAt: body.expiresAt,
+          scopes: Array.isArray(body.scopes) ? body.scopes : [],
+          enabled: body.enabled !== false,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
+        return;
+      }
+      const now = Date.now();
+      res.status(201).json({
+        account: publicXaiAccountView({
+          id: body.id,
+          provider: "xai_subscription",
+          enabled: true,
+          healthy: body.expiresAt > now,
+          busy: false,
+          inFlightRequests: 0,
+          activeSessions: 0,
+          requestCount: 0,
+          errorCount: 0,
+          expiresInMs: body.expiresAt - now,
+          lastUsedMs: 0,
+          lastRefreshMs: 0,
+        }),
+      });
+      return;
+    }
+
     if (body.provider === "openai_subscription") {
       let addedOpenAI;
       try {
@@ -1146,6 +1204,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     const existing = pool.findById(id);
     const openAIExisting = openAIAccounts.find(account => account.id === id);
     if (!existing && !openAIExisting) {
+      const removedXai = removeAccountRecordById(id);
+      if (removedXai?.provider === "xai_subscription") {
+        res.json({ deleted: id, remaining: pool.getAll().length + openAIAccounts.length });
+        return;
+      }
       res.status(404).json({ error: `Account "${id}" not found` });
       return;
     }

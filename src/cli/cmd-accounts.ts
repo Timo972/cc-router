@@ -1,11 +1,13 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { loadAccounts, loadOpenAIAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById, renameAccountRecordById, readConfig, serialize } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, loadXaiAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById, renameAccountRecordById, readConfig, serialize } from "../config/manager.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
 import { formatExpiry, redactToken } from "../utils/token-extractor.js";
 import { PROXY_PORT } from "../config/paths.js";
 import { createOpenAIAccountRecord } from "../providers/openai/account-record.js";
 import { loginOpenAIWithDeviceCode } from "../providers/openai/device-oauth.js";
+import { importGrokCliAuth } from "../providers/xai/import-auth.js";
+import { loginXaiWithDeviceCode } from "../providers/xai/device-oauth.js";
 import { isValidAccountId } from "../proxy/account-rename.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
@@ -31,13 +33,14 @@ export function registerAccounts(program: Command): void {
 
       const stored = loadAccounts();
       const openAIStored = loadOpenAIAccounts();
-      if (stored.length === 0 && openAIStored.length === 0) {
+      const xaiStored = loadXaiAccounts();
+      if (stored.length === 0 && openAIStored.length === 0 && xaiStored.length === 0) {
         console.log(chalk.yellow("accounts.json is empty. Run: cc-router setup"));
         return;
       }
 
       if (opts.json) {
-        console.log(JSON.stringify(liveStats ?? buildStoredAccountsJson(stored, openAIStored), null, 2));
+        console.log(JSON.stringify(liveStats ?? buildStoredAccountsJson(stored, openAIStored, xaiStored), null, 2));
         return;
       }
 
@@ -47,7 +50,7 @@ export function registerAccounts(program: Command): void {
       console.log(chalk.bold(
         liveStats
           ? `\n  Accounts (${liveStats.length} in the running proxy)\n`
-          : `\n  Accounts (${stored.length + openAIStored.length} configured)\n`,
+          : `\n  Accounts (${stored.length + openAIStored.length + xaiStored.length} configured)\n`,
       ));
 
       if (liveStats) {
@@ -55,7 +58,9 @@ export function registerAccounts(program: Command): void {
         for (const s of liveStats) {
           const provider = s.provider === "openai_subscription"
             ? chalk.cyan("openai".padEnd(9))
-            : chalk.gray("claude".padEnd(9));
+            : s.provider === "xai_subscription"
+              ? chalk.magenta("grok".padEnd(9))
+              : chalk.gray("claude".padEnd(9));
           const status = s.healthy
             ? chalk.green("✓ healthy")
             : chalk.red("✗ unhealthy");
@@ -80,7 +85,7 @@ export function registerAccounts(program: Command): void {
         // again.
         const { unpersisted, unloaded } = accountDrift(
           liveStats.map(s => s.id),
-          [...stored.map(a => a.id), ...openAIStored.map(a => a.id)],
+          [...stored.map(a => a.id), ...openAIStored.map(a => a.id), ...xaiStored.map(a => a.id)],
         );
         if (unpersisted.length > 0) {
           console.log(chalk.red(
@@ -119,6 +124,17 @@ export function registerAccounts(program: Command): void {
           console.log(
             `  ${chalk.bold(a.id.padEnd(24))}` +
             `  ${chalk.magenta("openai".padEnd(10))}` +
+            `  ${redactToken(a.accessToken).padEnd(26)}` +
+            `  expires: ${exp}`
+          );
+        }
+        for (const a of xaiStored) {
+          const exp = a.expiresAt > Date.now()
+            ? chalk.yellow(formatExpiry(a.expiresAt))
+            : chalk.red("EXPIRED");
+          console.log(
+            `  ${chalk.bold(a.id.padEnd(24))}` +
+            `  ${chalk.magenta("grok".padEnd(10))}` +
             `  ${redactToken(a.accessToken).padEnd(26)}` +
             `  expires: ${exp}`
           );
@@ -236,6 +252,64 @@ export function registerAccounts(program: Command): void {
       printAddOutcome(mode);
     });
 
+  // ── accounts add-grok ────────────────────────────────────────────────────
+  accounts
+    .command("add-grok")
+    .description("Import the Grok CLI login from ~/.grok/auth.json")
+    .action(async () => {
+      const { input } = await import("@inquirer/prompts");
+      let imported;
+      try {
+        imported = importGrokCliAuth();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.log(chalk.red(`\n✗ ${message}\n`));
+        console.log(chalk.gray("  Or sign in here: cc-router accounts login-grok\n"));
+        process.exit(1);
+      }
+
+      const id = await input({
+        message: "Grok account ID:",
+        default: imported.id,
+        validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
+      });
+      const record = { ...imported, id };
+      upsertAccountRecord(record);
+      console.log(chalk.green(`\n✓ Grok account "${record.id}" imported from ~/.grok.\n`));
+      printAddOutcome("stored");
+    });
+
+  // ── accounts login-grok ──────────────────────────────────────────────────
+  accounts
+    .command("login-grok")
+    .description("Sign in to a Grok / xAI account with device code")
+    .action(async () => {
+      const { input } = await import("@inquirer/prompts");
+      const accountId = await input({
+        message: "Grok account ID:",
+        default: `grok-account-${loadXaiAccounts().length + 1}`,
+        validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
+      });
+
+      console.log(chalk.cyan("\nGrok device login"));
+      console.log(chalk.gray("Approve the login in your browser. No local callback server is used.\n"));
+
+      const record = await loginXaiWithDeviceCode({
+        accountId,
+        onDeviceCode: (code) => {
+          console.log(chalk.bold("1. Open this URL:"));
+          console.log(`   ${chalk.cyan(code.verificationUrl)}`);
+          console.log(chalk.bold("2. Enter this code if the page does not fill it in:"));
+          console.log(`   ${chalk.cyan(code.userCode)}\n`);
+          console.log(chalk.gray("Waiting for authorization..."));
+        },
+      });
+
+      upsertAccountRecord(record);
+      console.log(chalk.green(`\n✓ Grok account "${record.id}" saved via device login.\n`));
+      printAddOutcome("stored");
+    });
+
   // ── accounts remove ───────────────────────────────────────────────────────
   accounts
     .command("remove <id>")
@@ -248,10 +322,12 @@ export function registerAccounts(program: Command): void {
 
       const anthropicAccounts = loadAccounts();
       const openAIAccounts = loadOpenAIAccounts();
+      const xaiAccounts = loadXaiAccounts();
       const { ids: existingIds, openAIIds } = mergeAccountInventory(
         anthropicAccounts.map(a => a.id),
         openAIAccounts.map(a => a.id),
         await fetchLiveStats(),
+        xaiAccounts.map(a => a.id),
       );
 
       if (!existingIds.includes(id)) {
@@ -276,7 +352,7 @@ export function registerAccounts(program: Command): void {
         process.exit(1);
       }
 
-      const remaining = loadAccounts().length + loadOpenAIAccounts().length;
+      const remaining = loadAccounts().length + loadOpenAIAccounts().length + loadXaiAccounts().length;
       const providerLabel = isOpenAI ? "OpenAI account" : "Account";
 
       console.log(chalk.green(`✓ Removed ${providerLabel} "${id}". ${remaining} account(s) remaining.`));
@@ -303,6 +379,7 @@ export function registerAccounts(program: Command): void {
         loadAccounts().map(a => a.id),
         loadOpenAIAccounts().map(a => a.id),
         await fetchLiveStats(),
+        loadXaiAccounts().map(a => a.id),
       );
       if (!existingIds.includes(id)) {
         console.log(chalk.red(`✗ Account "${id}" not found.`));
@@ -366,6 +443,7 @@ export function mergeAccountInventory(
   storedAnthropicIds: string[],
   storedOpenAIIds: string[],
   live: LiveAccountSummary[] | null,
+  storedXaiIds: string[] = [],
 ): { ids: string[]; openAIIds: Set<string> } {
   const openAIIds = new Set(storedOpenAIIds);
   for (const account of live ?? []) {
@@ -375,6 +453,7 @@ export function mergeAccountInventory(
     ids: [...new Set([
       ...storedAnthropicIds,
       ...storedOpenAIIds,
+      ...storedXaiIds,
       ...(live ?? []).map(account => account.id),
     ])],
     openAIIds,
@@ -404,9 +483,10 @@ export function accountDrift(
 export function buildStoredAccountsJson(
   anthropicAccounts: Account[],
   openAIAccounts: OpenAISubscriptionAccount[],
+  xaiAccounts: Array<{ id: string; expiresAt: number; enabled: boolean }> = [],
 ): Array<{
   id: string;
-  provider: "anthropic_subscription" | "openai_subscription";
+  provider: "anthropic_subscription" | "openai_subscription" | "xai_subscription";
   enabled: boolean;
   expiresAt: number;
   scopes?: string[];
@@ -422,6 +502,12 @@ export function buildStoredAccountsJson(
     ...openAIAccounts.map(a => ({
       id: a.id,
       provider: "openai_subscription" as const,
+      enabled: a.enabled !== false,
+      expiresAt: a.expiresAt,
+    })),
+    ...xaiAccounts.map(a => ({
+      id: a.id,
+      provider: "xai_subscription" as const,
       enabled: a.enabled !== false,
       expiresAt: a.expiresAt,
     })),
