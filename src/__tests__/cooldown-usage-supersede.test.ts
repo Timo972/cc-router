@@ -260,6 +260,35 @@ describe("global cooldowns superseded only within the scope that created them", 
     expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
   });
 
+  it("does not let a rolled-over window become reported headroom", () => {
+    // The snapshot carries a reset but no utilization. When that reset passes,
+    // the window rolls over — and if the rollover writes a zero, an unreported
+    // window turns into apparent headroom and retires a cooldown that runs
+    // past it. A figure we synthesized is not a figure the provider reported.
+    const h = harness("rolled-over-unreported");
+    h.pool.setGlobalCooldownForAccount(h.account, TWO_HOURS, "five_hour");
+    const cooldownUntil = h.now() + TWO_HOURS;
+
+    const windowResetSec = Math.floor(h.now() / 1000) + 60;
+    const withReset = snapshot({ requestedSeq: h.nextSeq(), omitWindows: true });
+    withReset.fiveHour = { resetAt: windowResetSec };
+    withReset.sevenDay = { resetAt: windowResetSec };
+    setUsage(h.account, withReset);
+
+    expect(h.pool.getCooldownSummary(h.account.id).globalUntilMs).toBe(cooldownUntil);
+
+    // Past the window's reset, but well short of the cooldown's own expiry.
+    h.jumpTo(windowResetSec * 1_000 + 1_000);
+    h.pool.sweepExpiredCooldowns();
+
+    expect(h.pool.getCooldownSummary(h.account.id).globalUntilMs).toBe(cooldownUntil);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+
+    // It still ends on its own terms.
+    h.jumpTo(cooldownUntil + 1);
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+  });
+
   it("keeps a cooldown against a real malformed payload end to end", () => {
     // The layers have to agree: the parser must not manufacture a zero, and
     // the pool must not read one as capacity. Driving the real parser proves
@@ -584,6 +613,75 @@ describe("ordering survives same-millisecond events", () => {
 
     expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
     expect(h.account.rateLimits.status).toBe("rate_limited");
+  });
+});
+
+describe("capacity source precedence", () => {
+  it("prefers whichever of headers and usage is newer in the event order", () => {
+    // The usage fetch starts, a response lands with exhausting headers while
+    // it is in flight, and the fetch finishes last. Its data is older than
+    // those headers however late its clock reading is, so the headers decide
+    // capacity — otherwise the fresher exhaustion signal is hidden behind a
+    // snapshot that never saw it.
+    const h = harness("headers-newer-than-usage");
+    h.pool.setGlobalCooldownForAccount(h.account, TWO_HOURS, "five_hour");
+
+    const refreshSeq = h.nextSeq();
+
+    h.advance(500);
+    h.account.rateLimits = {
+      ...h.account.rateLimits,
+      fiveHourUtil: 1,
+      fiveHourReset: Math.floor(h.now() / 1000) + 2 * 60 * 60,
+      lastUpdated: h.now(),
+      lastUpdatedSeq: h.nextSeq(),
+    };
+
+    h.advance(500);
+    setUsage(h.account, snapshot({
+      requestedSeq: refreshSeq,
+      fetchedAt: h.now(),
+      fiveHour: 0,
+      sevenDay: 0,
+    }));
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(false);
+  });
+
+  it("uses the usage snapshot once its own refresh is the newer event", () => {
+    const h = harness("usage-newer-than-headers");
+    h.account.rateLimits = {
+      ...h.account.rateLimits,
+      fiveHourUtil: 1,
+      fiveHourReset: Math.floor(h.now() / 1000) + 2 * 60 * 60,
+      lastUpdated: h.now(),
+      lastUpdatedSeq: h.nextSeq(),
+    };
+
+    h.advance(60_000);
+    setUsage(h.account, snapshot({
+      requestedSeq: h.nextSeq(),
+      fetchedAt: h.now(),
+      fiveHour: 0,
+      sevenDay: 0,
+    }));
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
+  });
+
+  it("falls back to timestamps for a snapshot with no ordering token", () => {
+    const h = harness("legacy-precedence");
+    h.account.rateLimits = {
+      ...h.account.rateLimits,
+      fiveHourUtil: 1,
+      fiveHourReset: Math.floor(h.now() / 1000) + 2 * 60 * 60,
+      lastUpdated: h.now(),
+    };
+
+    h.advance(60_000);
+    setUsage(h.account, snapshot({ fetchedAt: h.now(), fiveHour: 0, sevenDay: 0 }));
+
+    expect(h.pool.isEligible(h.account.id, FABLE)).toBe(true);
   });
 });
 

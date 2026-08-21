@@ -52,8 +52,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Relatedly, a usage window with no usable figure — `five_hour: {}`, a
   non-numeric utilization — no longer parses as `0`. It now arrives with the
   figure absent, so missing data can never read as proof of capacity and
-  retire a live cooldown. Blocking decisions still treat it as `0`, and the
-  dashboard still displays `0`, exactly as before.
+  retire a live cooldown. Rolling a spent window over past its reset likewise
+  clears the reading instead of writing a `0` nobody reported. Blocking
+  decisions still treat both as `0`, and the dashboard still displays `0`,
+  exactly as before.
+
+  Which of the response headers and the usage snapshot describes an account's
+  current capacity is now decided on the same event order, rather than on
+  `fetchedAt` against `lastUpdated`. A refresh that starts before a response
+  and finishes after it holds the older picture despite the later clock
+  reading, and preferring it hid a fresher exhaustion signal behind a snapshot
+  that never saw it — while cooldown release, already running on the event
+  order, disagreed about which source was current. Snapshots predating the
+  ordering tokens still fall back to the timestamp comparison.
 
   Within scope, releasing opens no hole: the same snapshot feeds the
   exhausted-window check, so an account with no real capacity stays blocked

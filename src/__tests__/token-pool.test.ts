@@ -639,7 +639,11 @@ describe("TokenPool — model-aware hard eligibility", () => {
     const pool = new TokenPool([a], { now: () => nowMs });
 
     expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
-    expect(a.rateLimits.usage?.modelLimits[0]).toMatchObject({ utilization: 0, resetAt: 0 });
+    // The window rolls over: its reset is cleared and the spent reading
+    // dropped. The reading is not replaced with a zero, which the provider
+    // never sent and which cooldown supersession would read as headroom.
+    expect(a.rateLimits.usage?.modelLimits[0]).toMatchObject({ resetAt: 0 });
+    expect(a.rateLimits.usage?.modelLimits[0]).not.toHaveProperty("utilization");
   });
 
   it("applies a matching model scope regardless of its display active flag", () => {

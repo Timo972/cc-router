@@ -208,6 +208,28 @@ function usageSupersedesRateLimitedStatus(r: AccountRateLimits): boolean {
   return false;
 }
 
+/**
+ * Whether the usage snapshot is the newer account of capacity than the last
+ * response headers, and so the one routing should believe.
+ *
+ * Decided on the event order for the same reason supersession is: a refresh
+ * that starts before a response and finishes after it carries the *older*
+ * picture despite the later clock reading. Preferring it there would hide a
+ * fresher exhaustion signal behind a snapshot that never saw it — and, since
+ * cooldown release already runs on sequences, would leave the two halves of
+ * the same decision disagreeing about which source is current. Snapshots
+ * predating the ordering tokens fall back to the timestamp comparison.
+ */
+function usageOutranksHeaders(r: AccountRateLimits): boolean {
+  const usage = r.usage;
+  if (!usage) return false;
+  const usageSeq = usage.requestedSeq;
+  if (typeof usageSeq === "number" && Number.isFinite(usageSeq) && r.lastUpdatedSeq !== undefined) {
+    return usageSeq > r.lastUpdatedSeq;
+  }
+  return usage.fetchedAt >= r.lastUpdated;
+}
+
 /** Accept only reset timestamps within the same bounded horizon as cooldown evidence. */
 function trustworthyResetMs(resetAtSeconds: unknown, nowMs: number): number | undefined {
   if (typeof resetAtSeconds !== "number" || !Number.isFinite(resetAtSeconds) || resetAtSeconds <= 0) {
@@ -249,17 +271,23 @@ function clearExpiredRateLimitWindows(a: Account, nowMs: number): void {
     r.sevenDayReset = 0;
   }
 
+  // A rolled-over window is no longer *known* to be spent, which is what
+  // unblocks routing — but we have not heard a new figure from the provider
+  // either. Clearing the reading rather than writing a zero keeps that
+  // distinction: safeUtilization() reads it as 0 for blocking decisions, while
+  // supersession, which releases cooldowns only on reported headroom, still
+  // sees nothing reported and leaves them to expire on their own terms.
   const usage = r.usage;
   if (usage) {
     for (const window of [usage.fiveHour, usage.sevenDay]) {
       if (window && window.resetAt > 0 && nowSec >= window.resetAt) {
-        window.utilization = 0;
+        delete window.utilization;
         window.resetAt = 0;
       }
     }
     for (const limit of usage.modelLimits) {
       if (limit.resetAt > 0 && nowSec >= limit.resetAt) {
-        limit.utilization = 0;
+        delete limit.utilization;
         limit.resetAt = 0;
       }
     }
@@ -602,7 +630,7 @@ export class TokenPool implements AccountPool<Account> {
       },
     ];
     const usage = account.rateLimits.usage;
-    if (!usage || usage.fetchStatus === "unavailable" || usage.fetchedAt < account.rateLimits.lastUpdated) {
+    if (!usage || usage.fetchStatus === "unavailable" || !usageOutranksHeaders(account.rateLimits)) {
       return headers;
     }
     return [
