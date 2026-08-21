@@ -385,6 +385,16 @@ export function noteModelLimit(
   };
 }
 
+/** ChatGPT accounts with a known plan but no usage windows (e.g. Pro). */
+export function openaiQuotaGapNote(
+  account: Pick<AccountStat, "provider" | "codexRateLimits">,
+): string | undefined {
+  if (!isOpenAIAccount(account)) return undefined;
+  if (getCodexDefaultWindows(account.codexRateLimits).length > 0) return undefined;
+  const plan = account.codexRateLimits?.plan?.trim();
+  return plan ? `${plan} · no quota` : "no quota";
+}
+
 export function isWeeklyLimited(account: Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">): boolean {
   if (isOpenAIAccount(account)) {
     return getCodexDefaultWindows(account.codexRateLimits).some(
@@ -1663,11 +1673,13 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
   const extraOff = extraCap !== undefined && extraCap.usable !== true
     && (extraCap.spendLimitReached
       || (modelNote !== undefined && modelNote.utilization >= 1 && extraCap.enabled === false));
+  const gapNote = openaiQuotaGapNote(a);
   const note = [
     modelNote
       ? `${modelNote.label} ${Math.round(modelNote.utilization * 100)}%`
       : "",
     extraOff ? "extra off" : "",
+    gapNote ?? "",
   ].filter(Boolean).join(" · ");
   const codexWindows = getCodexDefaultWindows(a.codexRateLimits);
   const sessionWindow = codexWindows.find(window => window.kind === "session");
@@ -1703,7 +1715,7 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
       <QuotaCell util={fiveHour?.utilization} />
       <Text> </Text>
       <QuotaCell util={sevenDay?.utilization} />
-      <Text color={extraOff ? "yellow" : modelNote?.color ?? "gray"}>
+      <Text color={extraOff || gapNote ? "yellow" : modelNote?.color ?? "gray"}>
         {`  ${note.padEnd(COL.note)}`}
       </Text>
       <Text> </Text>

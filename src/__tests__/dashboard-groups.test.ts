@@ -5,6 +5,7 @@ import {
   isOpenAIAccount,
   isWeeklyLimited,
   noteModelLimit,
+  openaiQuotaGapNote,
   orderAccountsForDashboard,
   visibleCapacityRows,
   type AccountCapacityRow,
@@ -90,6 +91,19 @@ describe("noteModelLimit", () => {
       },
     });
     expect(note).toMatchObject({ label: "Fable", utilization: 0.29, color: "green" });
+  });
+});
+
+describe("openaiQuotaGapNote", () => {
+  it("explains a Pro account with no usage windows", () => {
+    expect(openaiQuotaGapNote({
+      provider: "openai_subscription",
+      codexRateLimits: { status: "ok", plan: "pro", buckets: [], lastUpdated: 0 },
+    })).toBe("pro · no quota");
+  });
+
+  it("stays quiet when a weekly window exists", () => {
+    expect(openaiQuotaGapNote(chatgpt("info-droidrun", 0.96))).toBeUndefined();
   });
 });
 
