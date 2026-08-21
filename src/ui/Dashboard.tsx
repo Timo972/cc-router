@@ -906,6 +906,11 @@ function LiveDashboard({
   // ── Focus / mode ──────────────────────────────────────────────────────────
   const [focus, setFocus] = useState<Focus>("logs");
   const [mode, setMode] = useState<Mode>("view");
+  // Compact ("zen") view: hides TOTALS + RECENT ACTIVITY so the account list
+  // gets the whole vertical budget — the fix for a short terminal starving a
+  // long fleet (e.g. showing 1 of 11 accounts). Toggled with [z], view-only,
+  // never touches the default layout's carefully-tuned fit.
+  const [compact, setCompact] = useState(false);
 
   // Selected log by timestamp (existing)
   const [selectedTs, setSelectedTs] = useState<number | null>(null);
@@ -959,7 +964,7 @@ function LiveDashboard({
     // denial, re-enabling the grow/shrink oscillation. Geometry drift from
     // scrolling (like every other content mutation the key cannot see) is
     // covered by the denial TTL instead.
-    const fitKey = `${terminalRows}:${terminalColumns}:${orderedAccounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}`;
+    const fitKey = `${terminalRows}:${terminalColumns}:${orderedAccounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}:${compact}`;
     if (fitKeyRef.current !== fitKey) {
       fitKeyRef.current = fitKey;
       fitMemoryRef.current = { attempts: {}, denials: {} };
@@ -984,10 +989,12 @@ function LiveDashboard({
     // mechanics — each list got its own oscillation bug while the paths were
     // separate (tall accounts, wrapped activity details, wrapped model ids).
     const lists: FitList[] = [
-      {
+      // In compact view the activity list is not rendered, so it must not
+      // compete for rows — dropping it here hands the whole budget to accounts.
+      ...(compact ? [] : [{
         key: "logs", current: logVisible, min: MIN_LOG_VISIBLE, max: LOG_VISIBLE,
         avgRow: shownLogs > 0 ? Math.max(1, logsH / shownLogs) : 1,
-      },
+      }]),
       {
         key: "accounts", current: shownAccounts, min: 1, max: Math.max(1, orderedAccounts.length), growOne: true,
         avgRow: shownAccounts > 0 ? Math.max(1, accountsH / shownAccounts) : 2,
@@ -1239,6 +1246,8 @@ function LiveDashboard({
     }
 
     if (key.tab) {
+      // Compact view hides the activity list, so skip "logs" in the cycle.
+      if (compact) { setFocus(f => f === "models" ? "accounts" : "models"); return; }
       setFocus(f => f === "logs" ? "accounts" : f === "accounts" ? "models" : "logs");
       return;
     }
@@ -1322,6 +1331,17 @@ function LiveDashboard({
 
     if (input === "m") {
       void doLoadModels();
+      return;
+    }
+
+    // z = compact view — hide TOTALS + RECENT ACTIVITY so the account list
+    // gets the freed rows. On small terminals this is the difference between
+    // "showing 1–1" and the full fleet. Move focus off the (now hidden) logs.
+    if (input === "z") {
+      const next = !compact;
+      setCompact(next);
+      if (next && focus === "logs") setFocus("accounts");
+      showBanner(next ? "Compact on — activity & totals hidden" : "Compact off", "cyan");
       return;
     }
 
@@ -1458,6 +1478,7 @@ function LiveDashboard({
               {"  ·  showing "}{accountWindowTop + 1}–{accountWindowTop + shownAccounts}
             </Text>
           )}
+          {compact && <Text color="cyan">{"  ·  compact"}</Text>}
         </Box>
 
         <Box marginTop={1} flexDirection="column" ref={accountRowsRef}>
@@ -1478,52 +1499,59 @@ function LiveDashboard({
         </Box>
       )}
 
-      <Box marginTop={1} />
+      {/* ── Totals + activity title (hidden in compact view) ── */}
+      {!compact && (
+        <>
+          <Box marginTop={1} />
 
-      {/* ── Totals ── */}
-      <Box flexDirection="column">
-        <Box>
-          <Text bold> TOTALS  </Text>
-          <Text>requests </Text>
-          <Text color="cyan">{data.totalRequests}</Text>
-          <Text color="gray">  ·  </Text>
-          <Text>errors </Text>
-          <Text color={data.totalErrors > 0 ? "red" : "green"}>{data.totalErrors}</Text>
-          <Text color="gray">  ·  </Text>
-          <Text>refreshes </Text>
-          <Text color="yellow">{data.totalRefreshes}</Text>
-          <CacheHealthBadge
-            read={data.totalCacheReadTokens}
-            created={data.totalCacheCreationTokens}
-            input={data.totalInputTokens}
-          />
-        </Box>
-        <TokenSummary
-          cacheRead={data.totalCacheReadTokens}
-          cacheCreated={data.totalCacheCreationTokens}
-          uncached={data.totalInputTokens}
-          output={data.totalOutputTokens ?? 0}
-        />
-      </Box>
+          {/* ── Totals ── */}
+          <Box flexDirection="column">
+            <Box>
+              <Text bold> TOTALS  </Text>
+              <Text>requests </Text>
+              <Text color="cyan">{data.totalRequests}</Text>
+              <Text color="gray">  ·  </Text>
+              <Text>errors </Text>
+              <Text color={data.totalErrors > 0 ? "red" : "green"}>{data.totalErrors}</Text>
+              <Text color="gray">  ·  </Text>
+              <Text>refreshes </Text>
+              <Text color="yellow">{data.totalRefreshes}</Text>
+              <CacheHealthBadge
+                read={data.totalCacheReadTokens}
+                created={data.totalCacheCreationTokens}
+                input={data.totalInputTokens}
+              />
+            </Box>
+            <TokenSummary
+              cacheRead={data.totalCacheReadTokens}
+              cacheCreated={data.totalCacheCreationTokens}
+              uncached={data.totalInputTokens}
+              output={data.totalOutputTokens ?? 0}
+            />
+          </Box>
 
-      <Box marginTop={1} />
+          <Box marginTop={1} />
 
-      {/* ── Recent activity (title measures as "above", rows flex) ── */}
-      <Text bold> RECENT ACTIVITY</Text>
-      <Box marginTop={1} />
+          {/* ── Recent activity (title measures as "above", rows flex) ── */}
+          <Text bold> RECENT ACTIVITY</Text>
+          <Box marginTop={1} />
+        </>
+      )}
     </Box>
 
-      <Box flexDirection="column" ref={logRowsRef}>
-        {visibleLogs.length === 0
-          ? <Text color="gray">  No activity yet</Text>
-          : visibleLogs.map((log, i) => (
-              <LogRow key={`${log.ts}-${i}`} log={log} selected={focus === "logs" && logWindowTop + i === selectedLogIndex} />
-            ))
-        }
-      </Box>
+      {!compact && (
+        <Box flexDirection="column" ref={logRowsRef}>
+          {visibleLogs.length === 0
+            ? <Text color="gray">  No activity yet</Text>
+            : visibleLogs.map((log, i) => (
+                <LogRow key={`${log.ts}-${i}`} log={log} selected={focus === "logs" && logWindowTop + i === selectedLogIndex} />
+              ))
+          }
+        </Box>
+      )}
 
       {/* ── Detail panel ── */}
-      {focus === "logs" && selectedLog && (
+      {!compact && focus === "logs" && selectedLog && (
         <Box flexDirection="column">
           <Box marginTop={1} />
           <DetailPanel log={selectedLog} />
@@ -1533,10 +1561,10 @@ function LiveDashboard({
       <Box marginTop={1}>
         <Text color="gray">
           {focus === "accounts"
-            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [q]"
+            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [z] compact  [q]"
             : focus === "models"
-              ? " [Tab]  [m/r] refresh  [c]/[o] default  [Esc] logs  [q]"
-              : " [Tab]  [m] models  [q] quit"}
+              ? " [Tab]  [m/r] refresh  [c]/[o] default  [Esc] logs  [z] compact  [q]"
+              : " [Tab]  [m] models  [z] compact  [q] quit"}
         </Text>
       </Box>
 
