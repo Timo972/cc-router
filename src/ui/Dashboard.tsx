@@ -1829,96 +1829,39 @@ function LogRow({ log, selected }: { log: LogEntry; selected: boolean }) {
 // ─── Detail panel ─────────────────────────────────────────────────────────────
 
 function DetailPanel({ log }: { log: LogEntry }) {
-  const time = new Date(log.ts).toLocaleString("en-GB", {
-    hour12: false,
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
+  const time = new Date(log.ts).toLocaleTimeString("en-GB", { hour12: false });
   const isError = log.type === "error";
   const isWarn = log.type === "warn";
-  const statusLabel = log.statusCode === undefined ? "—"
+  const statusLabel = log.statusCode === undefined ? ""
     : log.statusCode === 0 ? "connection error"
-    : `${log.statusCode} ${httpStatusText(log.statusCode)}`;
+    : String(log.statusCode);
   const statusColor = log.statusCode === undefined ? "gray"
     : log.statusCode === 0 ? "red"
     : log.statusCode >= 500 ? "red"
     : log.statusCode >= 400 ? "yellow"
     : "green";
+  const inputTok = (log.cacheReadTokens ?? 0) + (log.cacheCreationTokens ?? 0) + (log.inputTokens ?? 0);
+  const outputTok = log.outputTokens ?? 0;
+  const hitPct = inputTok > 0 ? Math.round(((log.cacheReadTokens ?? 0) / inputTok) * 100) : null;
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1}>
       <Text bold color={isError ? "red" : isWarn ? "yellow" : "cyan"}> DETAILS </Text>
-      <Box marginTop={1} flexDirection="column" gap={0}>
-        <Box gap={2}>
-          <Field label="Time"    value={time} />
-          <Field label="Account" value={log.accountId} />
-        </Box>
-        <Box gap={2}>
-          <Field label="Method"  value={log.method ?? "—"} />
-          <Field label="Path"    value={log.path ?? "—"} />
-        </Box>
-        <Box gap={2}>
-          <FieldColored label="Status"   value={statusLabel} color={statusColor} />
-          <Field        label="Duration" value={log.durationMs !== undefined ? `${log.durationMs}ms` : "—"} />
-          <Field        label="Type"     value={log.type} />
-          <Field        label="Source"   value={sourceFullLabel(log.source)} />
-        </Box>
-        {log.details && (
-          <Box>
-            <Field label="Details" value={log.details} />
-          </Box>
-        )}
-        {log.cacheReadTokens !== undefined && (
-          <Box gap={2}>
-            <CacheBreakdown
-              read={log.cacheReadTokens}
-              created={log.cacheCreationTokens ?? 0}
-              input={log.inputTokens ?? 0}
-              output={log.outputTokens ?? 0}
-            />
-          </Box>
-        )}
+      <Box>
+        <Text color="gray">{time}  {log.accountId}</Text>
+        {log.method && log.path && <Text color="white">{`  ${log.method} ${log.path}`}</Text>}
+        {statusLabel !== "" && <Text color={statusColor}>{`  ${statusLabel}`}</Text>}
+        {log.durationMs !== undefined && <Text color="gray">{`  ${log.durationMs}ms`}</Text>}
+        <Text color="gray">{`  ${sourceFullLabel(log.source)}`}</Text>
+        {log.details && <Text color="gray">{`  ${log.details}`}</Text>}
       </Box>
+      {(inputTok > 0 || outputTok > 0) && (
+        <Text color="gray">
+          {`${fmtTok(inputTok)} in · ${fmtTok(outputTok)} out`}
+          {hitPct !== null ? ` · cache ${hitPct}%` : ""}
+        </Text>
+      )}
     </Box>
-  );
-}
-
-function Field({ label, value }: { label: string; value: string }) {
-  return (
-    <Box>
-      <Text color="gray">{label}: </Text>
-      <Text color="white">{value}</Text>
-    </Box>
-  );
-}
-
-function FieldColored({ label, value, color }: { label: string; value: string; color: string }) {
-  return (
-    <Box>
-      <Text color="gray">{label}: </Text>
-      <Text color={color}>{value}</Text>
-    </Box>
-  );
-}
-
-function CacheBreakdown({ read, created, input, output }: { read: number; created: number; input: number; output: number }) {
-  const totalInput = read + created + input;
-  const hitPct = totalInput > 0 ? (read / totalInput) * 100 : 0;
-  const color = totalInput === 0 ? "gray" : hitPct >= 70 ? "green" : hitPct >= 30 ? "yellow" : "red";
-
-  return (
-    <>
-      <FieldColored
-        label="Cache hit"
-        value={totalInput > 0 ? `${fmtTok(read)} tok  (${hitPct.toFixed(1)}%)` : "—"}
-        color={color}
-      />
-      <Field label="Cache created" value={fmtTok(created) + " tok"} />
-      <Field label="Uncached"      value={fmtTok(input) + " tok"} />
-      <Field label="Total input"   value={fmtTok(totalInput) + " tok"} />
-      <Field label="Output"        value={fmtTok(output) + " tok"} />
-      <Field label="Total"         value={fmtTok(totalInput + output) + " tok"} />
-    </>
   );
 }
 
@@ -1981,17 +1924,6 @@ function sourceFullLabel(source: LogEntry["source"]): string {
   if (source === "codex") return "Codex CLI";
   if (source === "api") return "API";
   return "—";
-}
-
-function httpStatusText(code: number): string {
-  const map: Record<number, string> = {
-    200: "OK", 201: "Created", 204: "No Content",
-    400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
-    404: "Not Found", 429: "Too Many Requests",
-    500: "Internal Server Error", 502: "Bad Gateway",
-    503: "Service Unavailable", 529: "Overloaded",
-  };
-  return map[code] ?? "";
 }
 
 // ─── Formatters ───────────────────────────────────────────────────────────────

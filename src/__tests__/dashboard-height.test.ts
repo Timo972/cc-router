@@ -506,14 +506,27 @@ describe("dashboard viewport fitting", () => {
   });
 
   it("shows the DETAILS box for the selected activity row", async () => {
-    const dash = renderDashboard(tallHealth(), {}, { rows: 120, columns: 220 });
+    const health = tallHealth();
+    health.accounts = [
+      ...health.accounts.slice(0, 2),
+      {
+        ...makeAccount("info-droidrun"),
+        id: "info-droidrun",
+        provider: "openai_subscription",
+      },
+    ];
+    const dash = renderDashboard(health, {}, { rows: 120, columns: 220 });
     try {
       await dash.waitUntil(() => {
         const frame = dash.lastFrame();
         expect(frame).toContain("DETAILS");
-        expect(frame).toContain("Account:");
-        expect(frame).toContain("Status:");
-        expect(frame).toContain("200 OK");
+        expect(frame).toContain("row01");
+        const claudeAt = frame.indexOf("CLAUDE");
+        const chatgptAt = frame.indexOf("CHATGPT");
+        expect(claudeAt).toBeGreaterThan(-1);
+        expect(chatgptAt).toBeGreaterThan(claudeAt);
+        expect(frame).toContain("account-01");
+        expect(frame).toContain("info-droidrun");
       });
     } finally {
       await dash.cleanup();
