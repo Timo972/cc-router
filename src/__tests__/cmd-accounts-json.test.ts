@@ -35,7 +35,11 @@ describe("buildStoredAccountsJson", () => {
       enabled: false,
     }];
 
-    const json = buildStoredAccountsJson(anthropic, openAI);
+    const json = buildStoredAccountsJson(anthropic, openAI, [{
+      id: "grok",
+      expiresAt: 1999999997000,
+      enabled: true,
+    }]);
 
     expect(json).toEqual([
       {
@@ -50,6 +54,12 @@ describe("buildStoredAccountsJson", () => {
         provider: "openai_subscription",
         enabled: false,
         expiresAt: 1999999998000,
+      },
+      {
+        id: "grok",
+        provider: "xai_subscription",
+        enabled: true,
+        expiresAt: 1999999997000,
       },
     ]);
     expect(JSON.stringify(json)).not.toContain("access");

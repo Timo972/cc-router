@@ -15,7 +15,7 @@ import type { OpenAISubscriptionAccount } from "../providers/openai/token-refres
 export function registerAccounts(program: Command): void {
   const accounts = program
     .command("accounts")
-    .description("Manage Claude Max accounts in the token pool");
+    .description("Manage Claude Max, ChatGPT/Codex, and Grok accounts");
 
   // ── accounts list ────────────────────────────────────────────────────────
   accounts
@@ -713,8 +713,22 @@ async function fetchLiveStats(): Promise<null | Array<{
       signal: AbortSignal.timeout(1_000),
     });
     if (!res.ok) return null;
-    const data = await res.json() as { accounts: unknown[] };
-    return data.accounts as typeof fetchLiveStats extends () => Promise<null | Array<infer T>> ? T[] : never;
+    const data = await res.json() as {
+      accounts: Array<{
+        id: string; provider?: string; healthy: boolean; busy: boolean;
+        requestCount: number; errorCount: number; expiresInMs: number;
+      }>;
+      operational?: {
+        providers: {
+          anthropic: { configured: boolean; accounts: number; healthy: number; enabled: number };
+          openai: { configured: boolean; accounts: number; healthy: number; enabled: number };
+          xai?: { configured: boolean; accounts: number; healthy: number; enabled: number };
+        };
+      };
+    };
+    if (!Array.isArray(data.accounts)) return null;
+    const { mergeGrokIntoHealth } = await import("../providers/xai/overview.js");
+    return mergeGrokIntoHealth(data).accounts;
   } catch {
     return null;
   }

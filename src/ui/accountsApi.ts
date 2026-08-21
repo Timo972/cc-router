@@ -20,7 +20,7 @@ type Severity = "" | "warning" | "critical" | "unknown";
 
 export interface AccountSafeView {
   id: string;
-  provider?: "anthropic_subscription" | "openai_subscription";
+  provider?: "anthropic_subscription" | "openai_subscription" | "xai_subscription";
   rateLimits?: {
     status: "allowed" | "rate_limited" | "unknown";
     fiveHourUtil: number;
@@ -57,7 +57,7 @@ export interface AccountsApi {
   /** Apply a partial update to an account. Throws on non-2xx or network error. */
   patch(id: string, patch: AccountPatch): Promise<void>;
   /** Enable or disable every configured account for a provider. */
-  setProviderEnabled(provider: "anthropic_subscription" | "openai_subscription", enabled: boolean): Promise<void>;
+  setProviderEnabled(provider: "anthropic_subscription" | "openai_subscription" | "xai_subscription", enabled: boolean): Promise<void>;
   /** Remove an account by id. Throws on non-2xx or network error. */
   remove(id: string): Promise<void>;
 }
@@ -104,7 +104,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function publicAccountSafeView(value: unknown): AccountSafeView[] {
   if (!isRecord(value) || typeof value.id !== "string") return [];
-  const provider = value.provider === "anthropic_subscription" || value.provider === "openai_subscription"
+  const provider = value.provider === "anthropic_subscription"
+    || value.provider === "openai_subscription"
+    || value.provider === "xai_subscription"
     ? value.provider
     : undefined;
   const rateLimits = publicRateLimits(value.rateLimits);

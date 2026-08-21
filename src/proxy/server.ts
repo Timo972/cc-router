@@ -842,8 +842,28 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   accountsRouter.patch("/providers/:provider", (req, res) => {
     const providerParam = req.params.provider;
-    if (providerParam !== "anthropic_subscription" && providerParam !== "openai_subscription") {
-      res.status(400).json({ error: "provider must be anthropic_subscription or openai_subscription" });
+    if (
+      providerParam !== "anthropic_subscription"
+      && providerParam !== "openai_subscription"
+      && providerParam !== "xai_subscription"
+    ) {
+      res.status(400).json({ error: "provider must be anthropic_subscription, openai_subscription, or xai_subscription" });
+      return;
+    }
+
+    if (providerParam === "xai_subscription") {
+      const body = (req.body ?? {}) as { enabled?: unknown };
+      if (typeof body.enabled !== "boolean") {
+        res.status(400).json({ error: "enabled must be boolean" });
+        return;
+      }
+      try {
+        const changed = setProviderAccountsEnabled("xai_subscription", body.enabled, accountsPath);
+        res.json({ provider: providerParam, enabled: body.enabled, changed });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
+      }
       return;
     }
 

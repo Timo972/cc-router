@@ -1021,11 +1021,17 @@ function LiveDashboard({
     }
   }, [selectedAccount, api, showBanner]);
 
-  const doToggleProvider = useCallback(async (provider: "anthropic_subscription" | "openai_subscription") => {
+  const doToggleProvider = useCallback(async (
+    provider: "anthropic_subscription" | "openai_subscription" | "xai_subscription",
+  ) => {
     const providerStatus = provider === "anthropic_subscription"
       ? data.operational?.providers.anthropic
-      : data.operational?.providers.openai;
-    const label = provider === "anthropic_subscription" ? "Claude" : "OpenAI";
+      : provider === "openai_subscription"
+        ? data.operational?.providers.openai
+        : data.operational?.providers.xai;
+    const label = provider === "anthropic_subscription" ? "Claude"
+      : provider === "openai_subscription" ? "OpenAI"
+        : "Grok";
     if (!providerStatus?.configured || providerStatus.accounts === 0) {
       showBanner(`${label} accounts are not configured`, "yellow");
       return;
@@ -1189,6 +1195,7 @@ function LiveDashboard({
       if (input === "e") { void doToggleEnabled(); return; }
       if (input === "a") { void doToggleProvider("anthropic_subscription"); return; }
       if (input === "o") { void doToggleProvider("openai_subscription"); return; }
+      if (input === "g") { void doToggleProvider("xai_subscription"); return; }
       if (input === "w") {
         if (selectedAccount && isXaiAccount(selectedAccount)) {
           showBanner("Grok has no 7d cap in cc-router", "yellow");
@@ -1444,7 +1451,7 @@ function LiveDashboard({
       <Box marginTop={1}>
         <Text color="gray">
           {focus === "accounts"
-            ? " [Tab]  [e] toggle  [n] add  [d] delete  [w] 7d  [s] 5h  [q]"
+            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [q]"
             : focus === "models"
               ? " [Tab]  [m/r] refresh  [c]/[o] default  [Esc] logs  [q]"
               : " [Tab]  [m] models  [q] quit"}
