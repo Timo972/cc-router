@@ -8,6 +8,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Status dashboard `rst` column shows Codex banked usage-limit reset count
+  (`0` = none available); Claude cells are `—`.
+
 ---
 
 ## [0.10.1] — 2026-08-20

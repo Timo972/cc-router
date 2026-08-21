@@ -74,6 +74,7 @@ export interface CodexRateLimitsView {
     cooldownUntilMs: number;
   }>;
   credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  resetCredits?: { available: number };
   lastUpdated: number;
 }
 
@@ -346,6 +347,14 @@ export function isXaiAccount(account: Pick<AccountStat, "provider">): boolean {
 
 export function isClaudeAccount(account: Pick<AccountStat, "provider">): boolean {
   return !isOpenAIAccount(account) && !isXaiAccount(account);
+}
+
+/** Compact `rst` column: banked Codex usage-limit resets. Claude is an em dash. */
+export function resetCreditsColumnLabel(
+  account: Pick<AccountStat, "provider" | "codexRateLimits">,
+): string {
+  if (!isOpenAIAccount(account)) return "—";
+  return String(account.codexRateLimits?.resetCredits?.available ?? 0);
 }
 
 export function isLimitedAccount(
@@ -1728,12 +1737,13 @@ const COL = {
   pct: 4,
   note: 22,
   reset: 8,
+  rst: 5,
 } as const;
 
 function ColumnLegend() {
   return (
     <Text color="gray">
-      {`  ${"".padEnd(COL.name)} ${"req".padStart(COL.req)}${"s·n".padStart(COL.sess)}  ${"5h".padStart(COL.pct)} ${"7d".padStart(COL.pct)}  ${"note".padEnd(COL.note)} ${"↻5h".padEnd(COL.reset)} ${"↻7d".padEnd(COL.reset)}`}
+      {`  ${"".padEnd(COL.name)} ${"req".padStart(COL.req)}${"s·n".padStart(COL.sess)}  ${"5h".padStart(COL.pct)} ${"7d".padStart(COL.pct)}  ${"note".padEnd(COL.note)} ${"↻5h".padEnd(COL.reset)} ${"↻7d".padEnd(COL.reset)} ${"rst".padStart(COL.rst)}`}
     </Text>
   );
 }
@@ -1784,6 +1794,7 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
   const sevenDay = isOpenAI
     ? weeklyWindow
     : hasClaudeQuota ? globalCapacity.sevenDay : undefined;
+  const creditsLabel = resetCreditsColumnLabel(a);
 
   const dot = isDisabled ? "⊘" : isLimited ? "⊘" : a.busy ? "◌" : a.healthy ? "●" : "●";
   const dotColor = isDisabled ? "gray" : isLimited ? "red" : a.busy ? "yellow" : a.healthy ? "green" : "red";
@@ -1815,6 +1826,8 @@ function AccountRow({ account: a, selected }: { account: AccountStat; selected: 
       <ResetCell resetTs={fiveHour?.resetAt} />
       <Text> </Text>
       <ResetCell resetTs={sevenDay?.resetAt} />
+      <Text> </Text>
+      <Text color="gray">{creditsLabel.padStart(COL.rst)}</Text>
       {a.credentialsPendingWrite && <Text color="yellow">  unsaved</Text>}
     </Box>
   );

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  resetCreditsColumnLabel,
   earliestWeeklyReset,
   grokQuotaNote,
   isClaudeAccount,
@@ -177,6 +178,39 @@ describe("grokQuotaNote", () => {
       provider: "xai_subscription",
       healthy: false,
     })).toBe("expired");
+  });
+});
+
+describe("resetCreditsColumnLabel", () => {
+  it("is an em dash for Claude and 0 for ChatGPT without resetCredits", () => {
+    expect(resetCreditsColumnLabel(claude("max-account-1"))).toBe("—");
+    expect(resetCreditsColumnLabel(chatgpt("no-reset-credits-field"))).toBe("0");
+  });
+
+  it("prints the banked usage-limit reset count when present", () => {
+    const withZero = {
+      ...chatgpt("plus"),
+      codexRateLimits: {
+        ...chatgpt("plus").codexRateLimits,
+        resetCredits: { available: 0 },
+      },
+    };
+    expect(resetCreditsColumnLabel(withZero)).toBe("0");
+    expect(resetCreditsColumnLabel({
+      ...withZero,
+      codexRateLimits: { ...withZero.codexRateLimits, resetCredits: { available: 2 } },
+    })).toBe("2");
+  });
+
+  it("ignores billing credits and still shows 0 without resetCredits", () => {
+    const billingOnly = {
+      ...chatgpt("plus"),
+      codexRateLimits: {
+        ...chatgpt("plus").codexRateLimits,
+        credits: { hasCredits: true, unlimited: false },
+      },
+    };
+    expect(resetCreditsColumnLabel(billingOnly)).toBe("0");
   });
 });
 

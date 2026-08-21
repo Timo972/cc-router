@@ -186,7 +186,10 @@ export function applyCodexRateLimits(
     limits.buckets.set(bucket.limitId, merged);
   }
   if (update.credits) limits.credits = update.credits;
-  if (update.buckets.length > 0 || update.credits) limits.lastUpdated = nowMs;
+  if (update.resetCredits) limits.resetCredits = update.resetCredits;
+  if (update.buckets.length > 0 || update.credits || update.resetCredits) {
+    limits.lastUpdated = nowMs;
+  }
 }
 
 function normalizeModelSlug(model: string | undefined): string | undefined {
