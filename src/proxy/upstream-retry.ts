@@ -32,6 +32,50 @@ export function isRetryableUpstreamStatus(status: number): boolean {
 }
 
 /**
+ * Longest the retry loop will wait for a failover account's token refresh
+ * while an upstream failure response sits ready to relay. Refreshes normally
+ * settle within a couple of seconds; the refresh fetch itself carries no
+ * deadline, and the pre-response proxy timeout was already disarmed when the
+ * failure's headers arrived — so without this bound a stalled OAuth endpoint
+ * could withhold a ready 429/5xx for minutes. Generous on purpose: the
+ * fallback is relaying a failure the client may not recover from, so a slow
+ * but working refresh deserves the extra seconds.
+ */
+export const RETRY_REFRESH_TIMEOUT_MS = 15_000;
+
+/**
+ * Await `work` for at most `ms`, resolving to `fallback` when the deadline
+ * passes or `signal` aborts first. `work` is NOT cancelled — a token refresh
+ * that settles late still updates its account for future requests — the
+ * caller merely stops waiting for it, and a late rejection is swallowed so
+ * abandoning the wait can never surface an unhandled rejection. A rejection
+ * inside the deadline also resolves to `fallback`; callers that need to tell
+ * failure from timeout map their promise to a value before waiting.
+ */
+export function boundedWait<T, F>(
+  work: Promise<T>,
+  ms: number,
+  fallback: F,
+  signal?: AbortSignal,
+): Promise<T | F> {
+  return new Promise<T | F>(resolve => {
+    let settled = false;
+    const finish = (value: T | F) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = () => finish(fallback);
+    const timer = setTimeout(() => finish(fallback), ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    work.then(finish, () => finish(fallback));
+  });
+}
+
+/**
  * Resolve after `ms`, or as soon as `signal` aborts — a client that hung up
  * must not keep a retry pending. Never rejects.
  */

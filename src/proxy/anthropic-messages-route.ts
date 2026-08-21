@@ -23,7 +23,9 @@ import type { LogEntry } from "./stats.js";
 import { logError, logRoute } from "./logger.js";
 import {
   MAX_UPSTREAM_ATTEMPTS,
+  RETRY_REFRESH_TIMEOUT_MS,
   SAME_ACCOUNT_RETRY_DELAY_MS,
+  boundedWait,
   isRetryableUpstreamStatus,
   retryDelay,
 } from "./upstream-retry.js";
@@ -71,6 +73,9 @@ export interface AnthropicMessagesRouteOptions {
   maxAttempts?: number;
   /** Delay before re-sending to the SAME account (test override). */
   sameAccountRetryDelayMs?: number;
+  /** Longest a failover account's token refresh may hold the ready-to-relay
+   *  upstream failure (test override; default 15s). */
+  retryRefreshTimeoutMs?: number;
   now?: () => number;
 }
 
@@ -216,6 +221,7 @@ export function mountAnthropicMessagesRoute(
   const now = opts.now ?? Date.now;
   const maxAttempts = Math.max(1, opts.maxAttempts ?? MAX_UPSTREAM_ATTEMPTS);
   const sameAccountDelayMs = opts.sameAccountRetryDelayMs ?? SAME_ACCOUNT_RETRY_DELAY_MS;
+  const retryRefreshTimeoutMs = opts.retryRefreshTimeoutMs ?? RETRY_REFRESH_TIMEOUT_MS;
 
   // Only requests whose raw body was buffered by the cross-provider dispatch
   // can be retried (and re-sent at all) — anything else falls through to the
@@ -412,16 +418,36 @@ export function mountAnthropicMessagesRoute(
           next = undefined;
         }
         if (next && opts.needsRefresh(next.route.account)) {
-          let refreshed = false;
-          try {
-            refreshed = await opts.refresh(next.route.account);
-          } catch {
-            refreshed = false;
-          }
-          if (!refreshed) {
+          // The held failure is ready to relay RIGHT NOW; preparing a better
+          // answer must not hold it hostage. The refresh fetch carries no
+          // deadline of its own and the pre-response socket timeout was
+          // disarmed when the failure's headers arrived, so an unbounded
+          // await here could withhold a ready 429/5xx for minutes — past a
+          // client disconnect, even. The refresh is not cancelled: a late
+          // success still readies the account for the next request.
+          const outcome = await boundedWait(
+            opts.refresh(next.route.account).then(
+              ok => ok ? "refreshed" as const : "failed" as const,
+              () => "failed" as const,
+            ),
+            retryRefreshTimeoutMs,
+            "still-pending" as const,
+            clientGone.signal,
+          );
+          if (outcome === "failed") {
             // The callback owns error stats/logging, exactly as it does for
-            // the refresh middleware on the first attempt.
+            // the refresh middleware on the first attempt. A timed-out
+            // refresh is deliberately NOT reported as a failure — it may yet
+            // succeed in the background.
             opts.onRefreshFailure(next.route.account);
+          } else if (outcome === "still-pending" && !clientGone.signal.aborted) {
+            logError(
+              next.route.account.id,
+              0,
+              `failover token refresh still pending after ${retryRefreshTimeoutMs}ms — relaying held upstream failure`,
+            );
+          }
+          if (outcome !== "refreshed") {
             next.release();
             next = undefined;
           }

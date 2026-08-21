@@ -14,7 +14,9 @@ import type { SessionRouter, RoutedAccountLease } from "./session-router.js";
 import { acquireRequestRoute, routeReasonDetails, routeFailureDetails } from "./lease-lifecycle.js";
 import {
   MAX_UPSTREAM_ATTEMPTS,
+  RETRY_REFRESH_TIMEOUT_MS,
   SAME_ACCOUNT_RETRY_DELAY_MS,
+  boundedWait,
   isRetryableUpstreamStatus,
   retryDelay,
 } from "./upstream-retry.js";
@@ -176,6 +178,9 @@ export interface OpenAIIngressOptions {
   maxAttempts?: number;
   /** Delay before re-sending to the SAME account (test override). */
   sameAccountRetryDelayMs?: number;
+  /** Longest a failover account's token refresh may hold the ready-to-relay
+   *  upstream failure (test override; default 15s). */
+  retryRefreshTimeoutMs?: number;
 }
 
 /**
@@ -255,6 +260,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   const startedAt = now();
   const maxAttempts = Math.max(1, opts.maxAttempts ?? MAX_UPSTREAM_ATTEMPTS);
   const sameAccountDelayMs = opts.sameAccountRetryDelayMs ?? SAME_ACCOUNT_RETRY_DELAY_MS;
+  const retryRefreshTimeoutMs = opts.retryRefreshTimeoutMs ?? RETRY_REFRESH_TIMEOUT_MS;
 
   /**
    * Refresh a routed account's token if needed. On failure this applies the
@@ -456,7 +462,29 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       next.release();
       break;
     }
-    if (!(await prepareRoute(next))) break;
+    // Same bound as the Anthropic route: the held failure is ready to relay
+    // and the refresh fetch has no deadline of its own, so an unbounded wait
+    // here could withhold it for minutes. The refresh is not cancelled — a
+    // late outcome still runs prepareRoute's own bookkeeping in the
+    // background and readies (or cools down) the account for later requests.
+    const prepared = await boundedWait(
+      prepareRoute(next),
+      retryRefreshTimeoutMs,
+      "still-pending" as const,
+      clientGone.signal,
+    );
+    if (prepared === "still-pending") {
+      if (!clientGone.signal.aborted) {
+        logError(
+          next.route.account.id,
+          0,
+          `failover token refresh still pending after ${retryRefreshTimeoutMs}ms — relaying held upstream failure`,
+        );
+      }
+      next.release();
+      break;
+    }
+    if (!prepared) break;
 
     // Committed: record the failed attempt and abandon its response.
     stats.totalErrors++;

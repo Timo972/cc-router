@@ -38,6 +38,9 @@ export interface ResponsesRoutesOptions {
   maxAttempts?: number;
   /** Delay before re-sending to the SAME account (test override). */
   sameAccountRetryDelayMs?: number;
+  /** Longest a failover account's token refresh may hold the ready-to-relay
+   *  upstream failure (test override; default 15s). */
+  retryRefreshTimeoutMs?: number;
 }
 
 const RESPONSES_ENVELOPE: OpenAIIngressEnvelope = {
@@ -187,6 +190,9 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
       ...(opts.sameAccountRetryDelayMs !== undefined
         ? { sameAccountRetryDelayMs: opts.sameAccountRetryDelayMs }
+        : {}),
+      ...(opts.retryRefreshTimeoutMs !== undefined
+        ? { retryRefreshTimeoutMs: opts.retryRefreshTimeoutMs }
         : {}),
       relay: async (upstream, res, entry, report) => {
         if (body.stream === true) {

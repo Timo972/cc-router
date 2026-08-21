@@ -55,6 +55,9 @@ export interface MessagesCrossProviderRouteOptions {
   maxAttempts?: number;
   /** Delay before re-sending to the SAME account (test override). */
   sameAccountRetryDelayMs?: number;
+  /** Longest a failover account's token refresh may hold the ready-to-relay
+   *  upstream failure (test override; default 15s). */
+  retryRefreshTimeoutMs?: number;
 }
 
 const MESSAGES_ENVELOPE: OpenAIIngressEnvelope = {
@@ -469,6 +472,9 @@ export function mountMessagesCrossProviderRoute(
         ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
         ...(opts.sameAccountRetryDelayMs !== undefined
           ? { sameAccountRetryDelayMs: opts.sameAccountRetryDelayMs }
+          : {}),
+        ...(opts.retryRefreshTimeoutMs !== undefined
+          ? { retryRefreshTimeoutMs: opts.retryRefreshTimeoutMs }
           : {}),
         relay: (upstream, res, entry, report) =>
           sendOpenAIAsAnthropic(upstream, res, requestedStream, entry, report),

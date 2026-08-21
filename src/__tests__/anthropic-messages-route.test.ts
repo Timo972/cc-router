@@ -379,6 +379,45 @@ describe("mountAnthropicMessagesRoute", () => {
     expect(onRefreshFailure).toHaveBeenCalledTimes(1);
   });
 
+  it("relays the held failure when the failover account's refresh stalls", async () => {
+    // The failover account's OAuth refresh never settles. Without the
+    // bounded wait, the ready-to-relay 429 would be withheld for as long as
+    // the refresh fetch takes — the client must instead get the 429 shortly
+    // after the deadline.
+    const { server, calls } = scriptedUpstream((_call, _req, res) => {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": "60" });
+      res.end("{\"type\":\"error\"}");
+    });
+    const upstreamPort = await listen(server);
+    const onRefreshFailure = vi.fn();
+    const refresh = vi.fn((): Promise<boolean> =>
+      refresh.mock.calls.length === 1 ? Promise.resolve(true) : new Promise(() => {}));
+    const { app } = mountRoute([makeAccount("a"), makeAccount("b")], upstreamPort, {
+      needsRefresh: () => true,
+      refresh,
+      onRefreshFailure,
+      retryRefreshTimeoutMs: 50,
+    });
+
+    try {
+      await withApp(app, async baseUrl => {
+        const start = Date.now();
+        const response = await postMessages(baseUrl, { "x-claude-code-session-id": "session-1" });
+        expect(response.status).toBe(429);
+        expect(response.headers.get("retry-after")).toBe("60");
+        expect(Date.now() - start).toBeLessThan(5_000);
+      });
+    } finally {
+      await close(server);
+    }
+
+    expect(calls).toHaveLength(1);
+    expect(refresh).toHaveBeenCalledTimes(2);
+    // A timed-out refresh is not a failed refresh — it may still succeed in
+    // the background, so the failure bookkeeping must not run.
+    expect(onRefreshFailure).not.toHaveBeenCalled();
+  }, 10_000);
+
   it("does not forward a retry for a client that disconnected during the delay", async () => {
     const { server, calls } = scriptedUpstream((_call, _req, res) => {
       res.writeHead(500, { "content-type": "application/json" });

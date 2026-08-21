@@ -184,6 +184,35 @@ describe("runOpenAIIngress upstream retry", () => {
     expect(activity[2]!.details).not.toContain(":will-retry");
   });
 
+  it("relays the held failure when the failover account's prepare stalls", async () => {
+    const attempts: string[] = [];
+    const forward: ForwardOpenAI = async ({ account }) => {
+      attempts.push(account.id);
+      return jsonResponse(429, { error: { message: "rate limited" } }, { "retry-after": "60" });
+    };
+    const prepare = vi.fn((): Promise<boolean> =>
+      prepare.mock.calls.length === 1 ? Promise.resolve(true) : new Promise(() => {}));
+    const { app, activity } = mountWithPool(
+      [makeRuntimeAccount("openai-a"), makeRuntimeAccount("openai-b")],
+      forward,
+      { prepareOpenAIAccount: prepare, retryRefreshTimeoutMs: 50 },
+    );
+
+    await withServer(app, async baseUrl => {
+      const start = Date.now();
+      const res = await postResponses(baseUrl, {});
+      expect(res.status).toBe(429);
+      expect(res.headers.get("retry-after")).toBe("60");
+      expect(Date.now() - start).toBeLessThan(5_000);
+    });
+
+    // The idle second account was acquired, but its stalled token prepare
+    // must not withhold the ready 429 — one upstream attempt, relayed as-is.
+    expect(attempts).toHaveLength(1);
+    expect(prepare).toHaveBeenCalledTimes(2);
+    expect(activity.at(-1)).toEqual(expect.objectContaining({ type: "error", statusCode: 429 }));
+  }, 10_000);
+
   it("relays every failure unchanged when maxAttempts is 1 (autoFailover: false)", async () => {
     const attempts: string[] = [];
     const forward: ForwardOpenAI = async ({ account }) => {
