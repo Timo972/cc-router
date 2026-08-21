@@ -425,24 +425,31 @@ export function mountAnthropicMessagesRoute(
           // await here could withhold a ready 429/5xx for minutes — past a
           // client disconnect, even. The refresh is not cancelled: a late
           // success still readies the account for the next request.
+          const failoverAccount = next.route.account;
+          const refreshOutcome = opts.refresh(failoverAccount).then(
+            ok => ok ? "refreshed" as const : "failed" as const,
+            () => "failed" as const,
+          );
+          // The failure booking hangs off the refresh's own settlement, not
+          // off the bounded wait below: a refresh that fails AFTER the
+          // deadline is the same operational failure as one that fails
+          // inside it, and this single continuation on a once-settling
+          // promise can neither miss it nor report it twice. The callback
+          // owns error stats/logging, exactly as it does for the refresh
+          // middleware on the first attempt; a refresh that eventually
+          // succeeds books nothing.
+          void refreshOutcome.then(settled => {
+            if (settled === "failed") opts.onRefreshFailure(failoverAccount);
+          });
           const outcome = await boundedWait(
-            opts.refresh(next.route.account).then(
-              ok => ok ? "refreshed" as const : "failed" as const,
-              () => "failed" as const,
-            ),
+            refreshOutcome,
             retryRefreshTimeoutMs,
             "still-pending" as const,
             clientGone.signal,
           );
-          if (outcome === "failed") {
-            // The callback owns error stats/logging, exactly as it does for
-            // the refresh middleware on the first attempt. A timed-out
-            // refresh is deliberately NOT reported as a failure — it may yet
-            // succeed in the background.
-            opts.onRefreshFailure(next.route.account);
-          } else if (outcome === "still-pending" && !clientGone.signal.aborted) {
+          if (outcome === "still-pending" && !clientGone.signal.aborted) {
             logError(
-              next.route.account.id,
+              failoverAccount.id,
               0,
               `failover token refresh still pending after ${retryRefreshTimeoutMs}ms — relaying held upstream failure`,
             );

@@ -413,9 +413,49 @@ describe("mountAnthropicMessagesRoute", () => {
 
     expect(calls).toHaveLength(1);
     expect(refresh).toHaveBeenCalledTimes(2);
-    // A timed-out refresh is not a failed refresh — it may still succeed in
-    // the background, so the failure bookkeeping must not run.
+    // A refresh that never settles is not a failed refresh — it may still
+    // succeed in the background, so no failure bookkeeping runs.
     expect(onRefreshFailure).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it("books a refresh failure that settles only after the deadline, exactly once", async () => {
+    const { server, calls } = scriptedUpstream((_call, _req, res) => {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": "60" });
+      res.end("{\"type\":\"error\"}");
+    });
+    const upstreamPort = await listen(server);
+    const onRefreshFailure = vi.fn();
+    let settleLate!: (ok: boolean) => void;
+    const refresh = vi.fn((): Promise<boolean> =>
+      refresh.mock.calls.length === 1
+        ? Promise.resolve(true)
+        : new Promise(resolve => { settleLate = resolve; }));
+    const { app } = mountRoute([makeAccount("a"), makeAccount("b")], upstreamPort, {
+      needsRefresh: () => true,
+      refresh,
+      onRefreshFailure,
+      retryRefreshTimeoutMs: 50,
+    });
+
+    try {
+      await withApp(app, async baseUrl => {
+        const response = await postMessages(baseUrl, { "x-claude-code-session-id": "session-1" });
+        // The held 429 was relayed at the deadline, before the refresh settled.
+        expect(response.status).toBe(429);
+        expect(onRefreshFailure).not.toHaveBeenCalled();
+
+        // The refresh now fails, long after the response went out — the same
+        // operational failure an in-deadline settle books must still be
+        // booked, once.
+        settleLate(false);
+        await vi.waitFor(() => expect(onRefreshFailure).toHaveBeenCalledTimes(1));
+      });
+    } finally {
+      await close(server);
+    }
+
+    expect(calls).toHaveLength(1);
+    expect(onRefreshFailure).toHaveBeenCalledTimes(1);
   }, 10_000);
 
   it("does not forward a retry for a client that disconnected during the delay", async () => {
