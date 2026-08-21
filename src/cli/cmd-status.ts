@@ -74,7 +74,18 @@ async function jsonOutput(port: number): Promise<void> {
       console.error(chalk.red(`Proxy returned HTTP ${res.status}`));
       process.exit(1);
     }
-    console.log(JSON.stringify(await res.json(), null, 2));
+    const { mergeGrokIntoHealth } = await import("../providers/xai/overview.js");
+    const health = await res.json() as {
+      accounts: Array<{ provider?: string }>;
+      operational?: {
+        providers: {
+          anthropic: { configured: boolean; accounts: number; healthy: number; enabled: number };
+          openai: { configured: boolean; accounts: number; healthy: number; enabled: number };
+          xai?: { configured: boolean; accounts: number; healthy: number; enabled: number };
+        };
+      };
+    };
+    console.log(JSON.stringify(mergeGrokIntoHealth(health), null, 2));
   } catch {
     console.error(chalk.red(`Cannot connect to proxy at ${healthUrl}`));
     const cfg = readConfig();

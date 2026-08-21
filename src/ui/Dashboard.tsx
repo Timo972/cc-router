@@ -7,6 +7,7 @@ import type { AccountsApi } from "./accountsApi.js";
 import { createModelsApi } from "./modelsApi.js";
 import type { ModelEntry, ModelsApi, ModelsStatus } from "./modelsApi.js";
 import { getCurrentVersion } from "../utils/self-update.js";
+import { mergeGrokIntoHealth } from "../providers/xai/overview.js";
 
 const POLL_INTERVAL_MS = 2_000;
 /** Most activity rows the dashboard will show — the list shrinks below this
@@ -765,7 +766,7 @@ export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps
         });
         if (cancelled) return;
         if (res.ok) {
-          setData(await res.json() as HealthData);
+          setData(mergeGrokIntoHealth(await res.json() as HealthData));
           setConnectError(null);
           setLastUpdate(Date.now());
           setRetryCount(0);

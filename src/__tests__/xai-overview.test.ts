@@ -84,3 +84,57 @@ describe("loadGrokAccountSnapshots", () => {
     expect(views[0]).toMatchObject({ id: "grok", healthy: false, busy: false, activeSessions: 0 });
   });
 });
+
+describe("mergeGrokIntoHealth", () => {
+  it("appends Grok when the proxy health payload has none", async () => {
+    const { mergeGrokIntoHealth } = await import("../providers/xai/overview.js");
+    const merged = mergeGrokIntoHealth({
+      accounts: [{ provider: "anthropic_subscription" as const }],
+      operational: {
+        providers: {
+          anthropic: { configured: true, accounts: 1, healthy: 1, enabled: 1 },
+          openai: { configured: false, accounts: 0, healthy: 0, enabled: 0 },
+        },
+      },
+    }, [{
+      id: "grok",
+      provider: "xai_subscription",
+      enabled: true,
+      healthy: true,
+      busy: true,
+      inFlightRequests: 0,
+      activeSessions: 2,
+      requestCount: 0,
+      errorCount: 0,
+      expiresInMs: 60_000,
+      lastUsedMs: 0,
+      lastRefreshMs: 0,
+      tier: 1,
+    }]);
+    expect(merged.accounts).toHaveLength(2);
+    expect(merged.accounts[1]).toMatchObject({
+      provider: "xai_subscription",
+      id: "grok",
+      xai: { tier: 1 },
+      activeSessions: 2,
+    });
+    expect(merged.operational?.providers.xai).toEqual({
+      configured: true, accounts: 1, healthy: 1, enabled: 1,
+    });
+  });
+
+  it("does not duplicate Grok when the proxy already sent it", async () => {
+    const { mergeGrokIntoHealth } = await import("../providers/xai/overview.js");
+    const health = {
+      accounts: [{ provider: "xai_subscription" as const, id: "grok" }],
+      operational: {
+        providers: {
+          anthropic: { configured: false, accounts: 0, healthy: 0, enabled: 0 },
+          openai: { configured: false, accounts: 0, healthy: 0, enabled: 0 },
+          xai: { configured: true, accounts: 1, healthy: 1, enabled: 1 },
+        },
+      },
+    };
+    expect(mergeGrokIntoHealth(health, [])).toBe(health);
+  });
+});

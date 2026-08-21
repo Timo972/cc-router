@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "fs";
 import os from "os";
 import path from "path";
+import { loadXaiAccounts } from "../../config/manager.js";
 
 /**
  * Read-only Grok CLI overview for the status dashboard.
@@ -88,6 +89,94 @@ export function loadGrokAccountSnapshots(opts: GrokOverviewOptions = {}): GrokAc
     if (snapshot) snapshots.push(snapshot);
   }
   return snapshots;
+}
+
+/** Stored xAI accounts if any, otherwise the live Grok CLI login. */
+export function loadGrokHealthSnapshots(opts: GrokOverviewOptions = {}): GrokAccountSnapshot[] {
+  const overlay = loadGrokAccountSnapshots(opts);
+  const liveSessions = overlay.reduce((sum, account) => Math.max(sum, account.activeSessions), 0);
+  const stored = loadXaiAccounts();
+  if (stored.length === 0) return overlay;
+  const now = (opts.now ?? Date.now)();
+  return stored.map(account => {
+    const tier = grokTierFromAccessToken(account.accessToken);
+    return {
+      id: account.id,
+      provider: "xai_subscription" as const,
+      enabled: true as const,
+      healthy: account.enabled !== false && account.expiresAt > now,
+      busy: liveSessions > 0,
+      inFlightRequests: 0 as const,
+      activeSessions: liveSessions,
+      requestCount: 0,
+      errorCount: 0,
+      expiresInMs: account.expiresAt - now,
+      lastUsedMs: 0,
+      lastRefreshMs: 0,
+      ...(tier !== undefined ? { tier } : {}),
+    };
+  });
+}
+
+export function grokSnapshotAsHealthAccount(snapshot: GrokAccountSnapshot): {
+  id: string;
+  provider: "xai_subscription";
+  enabled: true;
+  healthy: boolean;
+  busy: boolean;
+  inFlightRequests: 0;
+  activeSessions: number;
+  requestCount: number;
+  errorCount: number;
+  expiresInMs: number;
+  lastUsedMs: number;
+  lastRefreshMs: number;
+  xai?: { tier: number };
+} {
+  return {
+    id: snapshot.id,
+    provider: "xai_subscription",
+    enabled: true,
+    healthy: snapshot.healthy,
+    busy: snapshot.busy,
+    inFlightRequests: 0,
+    activeSessions: snapshot.activeSessions,
+    requestCount: snapshot.requestCount,
+    errorCount: snapshot.errorCount,
+    expiresInMs: snapshot.expiresInMs,
+    lastUsedMs: snapshot.lastUsedMs,
+    lastRefreshMs: snapshot.lastRefreshMs,
+    ...(snapshot.tier !== undefined ? { xai: { tier: snapshot.tier } } : {}),
+  };
+}
+
+export function mergeGrokIntoHealth<T extends {
+  accounts: Array<{ provider?: string }>;
+  operational?: {
+    providers: {
+      anthropic: { configured: boolean; accounts: number; healthy: number; enabled: number };
+      openai: { configured: boolean; accounts: number; healthy: number; enabled: number };
+      xai?: { configured: boolean; accounts: number; healthy: number; enabled: number };
+    };
+  };
+}>(health: T, snapshots: GrokAccountSnapshot[] = loadGrokHealthSnapshots()): T {
+  if (health.accounts.some(account => account.provider === "xai_subscription")) return health;
+  const grokAccounts = snapshots.map(grokSnapshotAsHealthAccount);
+  if (grokAccounts.length === 0) return health;
+  const healthy = grokAccounts.filter(account => account.healthy).length;
+  const xai = {
+    configured: true,
+    accounts: grokAccounts.length,
+    healthy,
+    enabled: grokAccounts.length,
+  };
+  return {
+    ...health,
+    accounts: [...health.accounts, ...grokAccounts],
+    ...(health.operational
+      ? { operational: { ...health.operational, providers: { ...health.operational.providers, xai } } }
+      : {}),
+  };
 }
 
 function snapshotFromAuthEntry(

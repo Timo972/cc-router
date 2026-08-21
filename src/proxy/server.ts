@@ -7,7 +7,7 @@ import type { Socket } from "net";
 import type { Request } from "express";
 import { TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
-import { loadAccounts, loadOpenAIAccounts, loadXaiAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
@@ -15,7 +15,7 @@ import { logRoute, logError, logStartup } from "./logger.js";
 import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
-import { grokTierFromAccessToken, loadGrokAccountSnapshots, type GrokAccountSnapshot } from "../providers/xai/overview.js";
+import { loadGrokHealthSnapshots, type GrokAccountSnapshot } from "../providers/xai/overview.js";
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
@@ -312,32 +312,6 @@ function publicXaiAccountView(account: GrokAccountSnapshot): HealthAccountView {
     lastRefreshMs: 0,
     ...(account.tier !== undefined ? { xai: { tier: account.tier } } : {}),
   };
-}
-
-function loadGrokHealthSnapshots(): GrokAccountSnapshot[] {
-  const overlay = loadGrokAccountSnapshots();
-  const liveSessions = overlay.reduce((sum, account) => Math.max(sum, account.activeSessions), 0);
-  const stored = loadXaiAccounts();
-  if (stored.length === 0) return overlay;
-  const now = Date.now();
-  return stored.map(account => {
-    const tier = grokTierFromAccessToken(account.accessToken);
-    return {
-      id: account.id,
-      provider: "xai_subscription" as const,
-      enabled: true as const,
-      healthy: account.enabled !== false && account.expiresAt > now,
-      busy: liveSessions > 0,
-      inFlightRequests: 0 as const,
-      activeSessions: liveSessions,
-      requestCount: 0,
-      errorCount: 0,
-      expiresInMs: account.expiresAt - now,
-      lastUsedMs: 0,
-      lastRefreshMs: 0,
-      ...(tier !== undefined ? { tier } : {}),
-    };
-  });
 }
 
 function publicAnthropicAccountView(
