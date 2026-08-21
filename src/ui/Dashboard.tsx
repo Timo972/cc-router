@@ -1740,17 +1740,23 @@ function AccountGroups({
       />
     ));
 
+  // Render a group whenever its provider has ANY account — even when the scroll
+  // window currently shows none of its rows. A fully-clipped group still emits
+  // its header + count so a tail provider (e.g. a single Grok account behind
+  // many Claude/ChatGPT ones on a short terminal) never vanishes without a
+  // trace. `offset` advances by VISIBLE rows only, so selection indexing is
+  // unaffected by header-only groups.
   const groups: Array<{ key: string; visible: AccountStat[]; fleet: AccountStat[]; offset: number }> = [];
   let offset = 0;
-  if (claudeVisible.length > 0) {
+  if (claudeFleet.length > 0) {
     groups.push({ key: "CLAUDE", visible: claudeVisible, fleet: claudeFleet, offset });
     offset += claudeVisible.length;
   }
-  if (chatgptVisible.length > 0) {
+  if (chatgptFleet.length > 0) {
     groups.push({ key: "CHATGPT", visible: chatgptVisible, fleet: chatgptFleet, offset });
     offset += chatgptVisible.length;
   }
-  if (grokVisible.length > 0) {
+  if (grokFleet.length > 0) {
     groups.push({ key: "GROK", visible: grokVisible, fleet: grokFleet, offset });
   }
 
@@ -1759,7 +1765,7 @@ function AccountGroups({
       {groups.map((group, index) => (
         <Box key={group.key} flexDirection="column" marginTop={index === 0 ? 0 : 1}>
           <GroupHeader label={group.key} accounts={group.fleet} />
-          <ColumnLegend />
+          {group.visible.length > 0 && <ColumnLegend />}
           {renderRows(group.visible, group.offset)}
         </Box>
       ))}
@@ -1772,6 +1778,9 @@ function GroupHeader({ label, accounts }: { label: string; accounts: AccountStat
   const weeklyFull = accounts.filter(isWeeklyLimited);
   const color = healthy === accounts.length && weeklyFull.length === 0 ? "green" : "yellow";
   const fableHint = label === "CLAUDE" ? exhaustedModelHint(accounts) : undefined;
+  // Grok has no usage windows, so surface its plan ("GrokPro") in the header —
+  // this is the one signal a clipped-out Grok row would otherwise hide.
+  const grokPlan = label === "GROK" && accounts[0] ? grokQuotaNote(accounts[0]) : undefined;
 
   return (
     <Box>
@@ -1779,6 +1788,7 @@ function GroupHeader({ label, accounts }: { label: string; accounts: AccountStat
       <Text color={color}>{healthy}/{accounts.length} ok</Text>
       {weeklyFull.length > 0 && <Text color="red">{`  ·  ${weeklyFull.length} 7d full`}</Text>}
       {fableHint && <Text color="red">{`  ·  ${fableHint}`}</Text>}
+      {grokPlan && <Text color="gray">{`  ·  ${grokPlan}`}</Text>}
     </Box>
   );
 }
