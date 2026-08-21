@@ -8,6 +8,81 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- An account whose quota refills early — upgrading a Claude plan being the
+  common case — is returned to rotation as soon as the usage endpoint says
+  so, instead of staying benched for the rest of the pre-upgrade window. A
+  429 records a cooldown whose expiry comes from the reset timestamps on
+  that response, and both that cooldown and the header-derived
+  `rate_limited` flag were released only by the wall clock. Nothing
+  reconnected them to the usage refresher, so a plan upgrade produced an
+  account reporting `0%` on every window, `usage fresh`, and `busy` with a
+  multi-hour cooldown — and because it was benched, no new response could
+  ever arrive to correct it. In the reported case one stale cooldown on the
+  only account with capacity left the whole pool answering
+  `429 no-eligible`.
+
+  A usage snapshot now supersedes both blockers, under two conditions that
+  keep it from unbenching an account that is still limited.
+
+  The refresh must have been *initiated* after the block was recorded.
+  `fetchedAt` cannot answer that — it is stamped after the response body is
+  parsed, so a refresh already on the wire when a 429 lands completes
+  afterwards while describing the account as it was before. Neither can
+  wall-clock milliseconds: the 429, the headers taken from it, and the
+  refresh the router starts in response all happen in one event-loop turn
+  and read the same millisecond (measured at 199 ties in 200 runs), which
+  would have made that immediate refresh useless. Ordering now runs on a
+  process-wide monotonic sequence, with tokens on the usage snapshot, the
+  header snapshot, and each cooldown entry.
+
+  And the snapshot must report on the scope that caused the block: only the
+  claimed window releases a global cooldown, and only the matching family
+  releases a model cooldown. Blocks for limits no snapshot describes — an
+  upstream 529 overload, the `seven_day_oauth_apps` quota, an unattributed
+  claim — stay purely time-based. Cooldowns are grouped by scope — global by
+  limiting window, model by family — and within each scope every expiry keeps
+  the sequence of the event that produced it, so overlapping blocks neither
+  merge nor cancel each other: releasing a quota cooldown leaves a concurrent
+  overload running, a brief overload does not make a multi-hour cooldown
+  permanent, and a later shorter 429 cannot revive an expiry a refresh had
+  already retired.
+
+  Relatedly, a usage window with no usable figure — `five_hour: {}`, a
+  non-numeric utilization — no longer parses as `0`. It now arrives with the
+  figure absent, so missing data can never read as proof of capacity and
+  retire a live cooldown. Rolling a spent window over past its reset likewise
+  clears the reading instead of writing a `0` nobody reported. Blocking
+  decisions still treat both as `0`, and the dashboard still displays `0`,
+  exactly as before.
+
+  Which of the response headers and the usage snapshot describes an account's
+  current capacity is now decided on the same event order, rather than on
+  `fetchedAt` against `lastUpdated`. A refresh that starts before a response
+  and finishes after it holds the older picture despite the later clock
+  reading, and preferring it hid a fresher exhaustion signal behind a snapshot
+  that never saw it — while cooldown release, already running on the event
+  order, disagreed about which source was current. Snapshots predating the
+  ordering tokens still fall back to the timestamp comparison.
+
+  Within scope, releasing opens no hole: the same snapshot feeds the
+  exhausted-window check, so an account with no real capacity stays blocked
+  on its own merits.
+
+- The activity log's "cooldown expired — rate limit cleared" entry now marks
+  the moment an account is actually routable again. It hung off the
+  header `rate_limited` flag alone, which both over- and under-reports as soon
+  as anything else can block the account: a 429 overlapping a 529 announced
+  recovery while the overload cooldown still kept the account out of rotation,
+  and because that flag only flips once, the moment it genuinely came back
+  passed unannounced. The entry is now emitted when the last account-wide
+  blocker clears — header status, global cooldown, or a spent account-wide
+  window — whichever that turns out to be, including a cooldown that lapses
+  during an idle stretch with nothing routing or polling in the meantime. A
+  model-scoped limit never emits one, since the account kept serving every
+  other family and so never left the rotation to rejoin.
+
 ---
 
 ## [0.10.1] — 2026-08-20

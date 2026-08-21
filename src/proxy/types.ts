@@ -15,6 +15,10 @@ export interface AccountRateLimits {
   plan: string;              // "Pro" | "Max 5x" | "Max 20x" | ""
   requestsLimit: number;     // per-minute RPM from anthropic-ratelimit-requests-limit
   lastUpdated: number;       // Unix timestamp in ms
+  /** Event-sequence token for the response these headers came from (see
+   *  event-sequence.ts). Orders them against a usage refresh that may have
+   *  been initiated in the same millisecond. Absent means unorderable. */
+  lastUpdatedSeq?: number;
   /** Detailed usage from the OAuth usage endpoint, when available. */
   usage?: AccountUsageSnapshot;
 }
@@ -32,7 +36,11 @@ export const DEFAULT_RATE_LIMITS: AccountRateLimits = {
 };
 
 export interface RateLimitWindow {
-  utilization: number;
+  /** Absent when the provider reported no usable figure. Consumers deciding
+   *  whether to *block* treat that as 0 (see TokenPool.safeUtilization);
+   *  consumers deciding whether to *release* a block must not — missing data
+   *  is not evidence of capacity. */
+  utilization?: number;
   resetAt: number;
 }
 
@@ -42,7 +50,9 @@ export interface ModelRateLimit {
   modelId?: string;
   modelFamily: string;
   displayName: string;
-  utilization: number;
+  /** Absent when the provider reported no usable figure — see
+   *  RateLimitWindow.utilization. */
+  utilization?: number;
   resetAt: number;
   active: boolean;
   severity: string;
@@ -58,11 +68,22 @@ export interface ExtraUsageState {
   limitMinor?: number;
 }
 
+/** The account-wide usage windows the OAuth usage endpoint reports. Quotas it
+ *  does not report (OAuth-apps limits, upstream overload) deliberately have no
+ *  member here: nothing in a snapshot can speak for them. */
+export type UsageWindowScope = "five_hour" | "seven_day";
+
 export interface AccountUsageSnapshot {
   fiveHour?: RateLimitWindow;
   sevenDay?: RateLimitWindow;
   modelLimits: ModelRateLimit[];
   extraUsage?: ExtraUsageState;
+  /** Event-sequence token claimed when the refresh was *initiated* (see
+   *  event-sequence.ts). `fetchedAt` is stamped after the response body is
+   *  parsed, so it can post-date a limit the request never saw; and wall-clock
+   *  ms ties for events in one event-loop turn. Only this token orders the
+   *  snapshot's data against other events. Absent means unorderable. */
+  requestedSeq?: number;
   fetchedAt: number;
   fetchStatus: "fresh" | "stale" | "unavailable";
 }

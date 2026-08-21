@@ -97,12 +97,31 @@ describe("parseAnthropicUsage", () => {
     expect(parseAnthropicUsage(null, FETCHED_AT)).toBeNull();
     expect(parseAnthropicUsage([], FETCHED_AT)).toBeNull();
     expect(parseAnthropicUsage({}, FETCHED_AT)).toBeNull();
-    expect(parseAnthropicUsage({ five_hour: { utilization: -5 }, seven_day: { utilization: null } }, FETCHED_AT))
+    // A figure the provider actually sent is kept, clamped into range.
+    expect(parseAnthropicUsage({ five_hour: { utilization: -5 } }, FETCHED_AT))
       .toEqual(expect.objectContaining({ fiveHour: { utilization: 0, resetAt: 0 } }));
-    expect(parseAnthropicUsage({ five_hour: {} }, FETCHED_AT))
-      .toEqual(expect.objectContaining({ fiveHour: { utilization: 0, resetAt: 0 } }));
-    expect(parseAnthropicUsage({ five_hour: { utilization: "bad" }, limits: [{ kind: "weekly_scoped", model_name: "Sonnet", utilization: null }] }, FETCHED_AT))
-      .toEqual(expect.objectContaining({ modelLimits: [expect.objectContaining({ utilization: 0 })] }));
+  });
+
+  it("leaves utilization unreported rather than defaulting it to zero", () => {
+    // A window with no usable figure must not read as 0% headroom: callers
+    // that release a cooldown on reported headroom would take missing data as
+    // proof of capacity and unbench an account that is still being limited.
+    const windowOf = (payload: unknown) =>
+      parseAnthropicUsage(payload as never, FETCHED_AT)?.fiveHour;
+
+    expect(windowOf({ five_hour: {} })).toEqual({ resetAt: 0 });
+    expect(windowOf({ five_hour: {} })).not.toHaveProperty("utilization");
+    expect(windowOf({ five_hour: { utilization: "bad" } })).not.toHaveProperty("utilization");
+    expect(windowOf({ five_hour: { utilization: null } })).not.toHaveProperty("utilization");
+    // A real zero is still a real zero.
+    expect(windowOf({ five_hour: { utilization: 0 } })).toEqual({ utilization: 0, resetAt: 0 });
+
+    const modelLimit = parseAnthropicUsage(
+      { limits: [{ kind: "weekly_scoped", model_name: "Sonnet", utilization: null }] } as never,
+      FETCHED_AT,
+    )?.modelLimits[0];
+    expect(modelLimit).toBeDefined();
+    expect(modelLimit).not.toHaveProperty("utilization");
   });
 
   it("normalizes enabled and exhausted extra usage", () => {
