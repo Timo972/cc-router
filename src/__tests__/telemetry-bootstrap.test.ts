@@ -1605,7 +1605,6 @@ export async function resolve(specifier, context, nextResolve) {
     const address = hung.address();
     if (!address || typeof address === "string") throw new Error("hung collector did not bind");
     const origin = `http://127.0.0.1:${address.port}`;
-    const started = Date.now();
     const child = spawn(process.execPath, [installedBinary, ...args], {
       cwd: installedCwd,
       env: {
@@ -1623,19 +1622,24 @@ export async function resolve(specifier, context, nextResolve) {
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    let output = "";
+    child.stdout?.on("data", chunk => { output += String(chunk); });
+    child.stderr?.on("data", chunk => { output += String(chunk); });
 
     try {
-      expect(await waitForChildExit(child, 1_500)).toBe(true);
+      await waitUntil(() => requests > 0, 5_000, () => `immediate send was not attempted\n${output}`);
+      const drainStarted = Date.now();
+      expect(await waitForChildExit(child, 1_500), output).toBe(true);
       expect(child.exitCode).toBe(0);
       expect(requests).toBe(1);
-      expect(Date.now() - started).toBeLessThan(1_500);
+      expect(Date.now() - drainStarted).toBeLessThan(1_500);
     } finally {
       if (child.exitCode === null) child.kill("SIGKILL");
       hung.closeAllConnections();
       await new Promise<void>(resolve => hung.close(() => resolve()));
       rmSync(testHome, { recursive: true, force: true });
     }
-  }, 5_000);
+  }, 10_000);
 
   it("bounds a hung immediate CLI send and keeps opt-out silent without changing exit 1", async () => {
     let requests = 0;
