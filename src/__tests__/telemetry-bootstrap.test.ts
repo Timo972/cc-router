@@ -156,6 +156,14 @@ function hasEnvironmentTargetOperations(requests: Array<{ url: string; rawBody: 
     && countOccurrences(wire, "@opentelemetry/instrumentation-http") >= 2;
 }
 
+function hasTraceSignals(
+  requests: Array<{ url: string; rawBody: Buffer }>,
+  signals: readonly string[],
+): boolean {
+  const wire = traceWire(requests);
+  return signals.every(signal => wire.includes(signal));
+}
+
 interface HttpObservation {
   status: number;
   headers: Record<string, string | string[] | undefined>;
@@ -910,19 +918,22 @@ export async function resolve(specifier, context, nextResolve) {
           forwardedBody: targetBodies.at(-1)!,
         });
         if (mode.name === "enabled") {
+          const expectedSignals = [
+            "@opentelemetry/instrumentation-express",
+            "@opentelemetry/instrumentation-undici",
+            "proxy.request",
+            "provider.inference",
+          ] as const;
           await waitUntil(
-            () => isolatedCapture.requests.some(request => request.url === "/i/v1/traces"),
+            () => hasTraceSignals(isolatedCapture.requests, expectedSignals),
             8_000,
-            () => `installed package exported no traces\n${running.output()}`,
+            () => `installed package did not export all expected traces\n${running.output()}`,
           );
           const decodedPayloads = isolatedCapture.requests.map(request => request.json
             ?? decodeOtlpProtobuf(request.rawBody, request.url.endsWith("traces") ? "traces" : "logs"));
           const decodedValues = semanticStrings(decodedPayloads);
           const capturedWire = Buffer.concat(isolatedCapture.requests.map(request => request.rawBody));
-          expect(decodedValues).toContain("@opentelemetry/instrumentation-express");
-          expect(decodedValues).toContain("@opentelemetry/instrumentation-undici");
-          expect(decodedValues).toContain("proxy.request");
-          expect(decodedValues).toContain("provider.inference");
+          for (const signal of expectedSignals) expect(decodedValues).toContain(signal);
           for (const canary of Object.values(TELEMETRY_CANARY)) {
             expect(decodedValues.some(value => value.includes(canary)), canary).toBe(false);
             for (const representation of telemetryWireRepresentations(canary)) {
