@@ -360,7 +360,7 @@ describe("typed telemetry facade", () => {
 
     expect(facade.recordApplicationStart()).toBeUndefined();
     expect(facade.recordProxyStarted(4)).toBeUndefined();
-    expect(facade.startProxyHeartbeat(4)).toBeUndefined();
+    expect(facade.startProxyHeartbeat(() => 4)).toBeUndefined();
     expect(facade.recordSafeLog({
       operation: "proxy.request",
       reason: "network_failure",
@@ -487,6 +487,7 @@ describe("typed telemetry facade", () => {
     let heartbeat: (() => void) | undefined;
     let intervalMs = 0;
     let unrefs = 0;
+    let accountCount = -20;
     const facade = createTelemetryFacade({
       getSnapshot: () => snapshot(),
       claimFirstStart: () => undefined,
@@ -512,12 +513,18 @@ describe("typed telemetry facade", () => {
     });
 
     facade.recordProxyStarted(50_000);
-    facade.startProxyHeartbeat(-20);
+    facade.startProxyHeartbeat(() => accountCount);
+    heartbeat?.();
+    accountCount = 50_000;
     heartbeat?.();
 
     expect(intervalMs).toBe(60 * 60 * 1_000);
     expect(unrefs).toBe(1);
-    expect(events.map(event => event.event)).toEqual(["proxy.started", "proxy.heartbeat"]);
+    expect(events.map(event => event.event)).toEqual([
+      "proxy.started",
+      "proxy.heartbeat",
+      "proxy.heartbeat",
+    ]);
     expect(events.map(event => event.properties)).toEqual([
       {
         serviceVersion: "0.8.2",
@@ -530,6 +537,12 @@ describe("typed telemetry facade", () => {
         osFamily: "macos",
         runtimeMode: "daemon",
         accountPoolSize: 0,
+      },
+      {
+        serviceVersion: "0.8.2",
+        osFamily: "macos",
+        runtimeMode: "daemon",
+        accountPoolSize: 10_000,
       },
     ]);
   });

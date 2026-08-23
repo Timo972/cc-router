@@ -12,6 +12,7 @@ import { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { applyCodexRateLimits, createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
 import { parseCodexRateLimits } from "../providers/openai/usage.js";
 import { stats, type LogEntry } from "../proxy/stats.js";
+import { MAX_CODEX_STREAM_EVENT_BYTES } from "../protocol/openai-responses-collect.js";
 
 type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean; signal?: AbortSignal }) => Promise<Response>;
 
@@ -260,7 +261,7 @@ describe("mountResponsesRoutes", () => {
 
   it("relays an oversized frame byte-for-byte while the bounded observer recovers for a later terminal", async () => {
     let upstreamCancelled = false;
-    const oversized = `data: ${"x".repeat(64 * 1024 + 1)}\n`;
+    const oversized = `data: ${"x".repeat(MAX_CODEX_STREAM_EVENT_BYTES + 1)}\n`;
     const terminal = 'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n';
     const { app, activity } = mountWithPool(
       [makeRuntimeAccount("openai-victor")],

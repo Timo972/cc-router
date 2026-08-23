@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { TelemetrySnapshot } from "../config/telemetry.js";
+import { MAX_CODEX_STREAM_EVENT_BYTES } from "../protocol/openai-responses-collect.js";
 import {
   decodeOtlpProtobuf,
   startTransportCaptureServer,
@@ -973,7 +974,8 @@ describe("proxy runtime sampling and propagation", () => {
     const { mountMessagesCrossProviderRoute } = await import("../proxy/messages-cross-route.js");
     const { flushTelemetryWithin } = await import("../telemetry/facade.js");
     const privateFrame = 'data: {"type":"response.output_text.delta","delta":"'
-      + TELEMETRY_CANARY.prompt.repeat(8_192);
+      + TELEMETRY_CANARY.prompt
+      + "x".repeat(MAX_CODEX_STREAM_EVENT_BYTES);
     const app = express();
     const routing = await createOpenAIRoutingOptions();
     mountMessagesCrossProviderRoute(app, {

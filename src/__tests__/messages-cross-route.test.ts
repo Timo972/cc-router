@@ -6,6 +6,7 @@ import type { Response as ExpressResponse } from "express";
 import { ReadableStream } from "stream/web";
 import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.js";
 import type { MessagesCrossProviderRouteOptions } from "../proxy/messages-cross-route.js";
+import { MAX_CODEX_STREAM_EVENT_BYTES } from "../protocol/openai-responses-collect.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
 import { SessionRouter } from "../proxy/session-router.js";
 import { OpenAITokenPool } from "../providers/openai/token-pool.js";
@@ -643,9 +644,9 @@ describe("mountMessagesCrossProviderRoute", () => {
     expect(JSON.stringify(records)).not.toContain(privateFailure);
   });
 
-  it("cancels an unterminated collected SSE frame after 64 KiB", async () => {
+  it("cancels an unterminated collected SSE frame after 10 MiB", async () => {
     const frame = 'data: {"type":"response.output_text.delta","delta":"PRIVATE_FRAME_'
-      + "x".repeat(64 * 1024);
+      + "x".repeat(MAX_CODEX_STREAM_EVENT_BYTES);
     const upstream = cancellableChunkedResponse(
       [new TextEncoder().encode(frame)],
       { status: 200, headers: { "content-type": "text/event-stream" } },
@@ -828,9 +829,9 @@ describe("mountMessagesCrossProviderRoute", () => {
     expect(upstream.cancel).not.toHaveBeenCalled();
   });
 
-  it("cancels a streaming translation whose pending SSE frame exceeds 64 KiB", async () => {
+  it("cancels a streaming translation whose pending SSE frame exceeds 10 MiB", async () => {
     const frame = 'data: {"type":"response.output_text.delta","delta":"PRIVATE_STREAM_FRAME_'
-      + "x".repeat(64 * 1024);
+      + "x".repeat(MAX_CODEX_STREAM_EVENT_BYTES);
     const upstream = cancellableChunkedResponse(
       [new TextEncoder().encode(frame)],
       { status: 200, headers: { "content-type": "text/event-stream" } },
@@ -847,6 +848,41 @@ describe("mountMessagesCrossProviderRoute", () => {
     });
     expect(upstream.cancel).toHaveBeenCalledOnce();
     expect(activity).toContainEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+  });
+
+  it("accepts a streaming terminal response larger than 64 KiB and emits message_stop", async () => {
+    const terminal = `data: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_1",
+        model: "gpt-5.5",
+        usage: { input_tokens: 3, output_tokens: 1 },
+        output: [{ type: "message", content: "x".repeat(128 * 1024) }],
+      },
+    })}\n\n`;
+    const upstream = cancellableChunkedResponse([
+      new TextEncoder().encode('data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n'),
+      new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"Hi"}\n\n'),
+      new TextEncoder().encode(terminal),
+    ], {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const { app, activity } = mountWithPool(
+      [makeRuntimeAccount("openai-victor")],
+      async () => upstream.response,
+    );
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      const body = await res.text();
+
+      expect(res.status).toBe(200);
+      expect(body).toContain("Hi");
+      expect(body).toContain('"type":"message_stop"');
+    });
+    expect(upstream.cancel).not.toHaveBeenCalled();
+    expect(activity).toContainEqual(expect.objectContaining({ type: "route", statusCode: 200 }));
   });
 
   it("collapses OpenAI Responses SSE ending in response.incomplete into Anthropic-shaped JSON with its usage, not a 502", async () => {

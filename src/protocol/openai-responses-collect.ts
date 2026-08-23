@@ -31,8 +31,8 @@ export interface CodexResponseTerminalObserver {
   finish(): CodexResponseTerminal;
 }
 
-export const MAX_CODEX_STREAM_EVENT_BYTES = 64 * 1024;
 export const MAX_CODEX_COLLECTED_RESPONSE_BYTES = 10 * 1024 * 1024;
+export const MAX_CODEX_STREAM_EVENT_BYTES = MAX_CODEX_COLLECTED_RESPONSE_BYTES;
 
 function upstreamError(message: string): CollectedCodexResponse {
   return { kind: "json", status: 502, body: { error: { type: "upstream_error", message } } };
@@ -335,6 +335,12 @@ export async function collectCodexResponseStream(
 
   const observer = createBoundedTerminalObserver(MAX_CODEX_COLLECTED_RESPONSE_BYTES, true);
   let totalBytes = 0;
+  let upstreamFailureReported = false;
+  const reportUpstreamFailure = (): void => {
+    if (upstreamFailureReported) return;
+    upstreamFailureReported = true;
+    onUpstreamFailure?.();
+  };
 
   try {
     while (true) {
@@ -347,6 +353,9 @@ export async function collectCodexResponseStream(
         return upstreamError(RESPONSE_SIZE_ERROR);
       }
       const terminal = observer.push(value);
+      if (terminal?.kind === "failed" || terminal?.kind === "error") {
+        reportUpstreamFailure();
+      }
       if (terminal?.kind === "overflow") {
         void reader.cancel().catch(() => undefined);
         return upstreamError(RESPONSE_SIZE_ERROR);
@@ -364,7 +373,7 @@ export async function collectCodexResponseStream(
   if (terminal.kind === "overflow") return upstreamError(RESPONSE_SIZE_ERROR);
   if (terminal.kind === "malformed") return upstreamError("Malformed upstream stream");
   if (terminal.kind === "failed" || terminal.kind === "error") {
-    onUpstreamFailure?.();
+    reportUpstreamFailure();
     return upstreamError(terminal.message ?? (terminal.kind === "failed" ? "Response failed" : "Upstream error event"));
   }
   if (terminal.kind === "missing" || terminal.response === undefined) {

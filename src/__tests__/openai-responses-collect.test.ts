@@ -3,6 +3,8 @@ import {
   collectCodexResponseStream,
   createCodexResponseTerminalObserver,
   createCodexUsageObserver,
+  MAX_CODEX_COLLECTED_RESPONSE_BYTES,
+  MAX_CODEX_STREAM_EVENT_BYTES,
   readBodyWithinLimit,
   usageFromResponseBody,
 } from "../protocol/openai-responses-collect.js";
@@ -204,6 +206,36 @@ describe("collectCodexResponseStream", () => {
     });
   });
 
+  it("reports an explicit failure before a later body read rejects", async () => {
+    const encoder = new TextEncoder();
+    let pulls = 0;
+    const upstream = new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulls++ === 0) {
+          controller.enqueue(encoder.encode(
+            'data: {"type":"response.failed","response":{"error":{"message":"boom"}}}\n\n',
+          ));
+          return;
+        }
+        controller.error(new Error("PRIVATE_LATE_READ_FAILURE"));
+      },
+    }, { highWaterMark: 0 }) as BodyInit, {
+      headers: { "content-type": "text/event-stream" },
+    });
+    let upstreamFailures = 0;
+
+    const result = await collectCodexResponseStream(upstream, () => {
+      upstreamFailures++;
+    });
+
+    expect(result).toEqual({
+      kind: "json",
+      status: 502,
+      body: { error: { type: "upstream_error", message: "Malformed upstream stream" } },
+    });
+    expect(upstreamFailures).toBe(1);
+  });
+
   it("reassembles a response.completed event split across chunks", async () => {
     const upstream = sseResponse([
       'data: {"type":"response.completed","response":{"id":"split"',
@@ -290,11 +322,23 @@ describe("collectCodexResponseStream", () => {
     expect(second).toEqual(secondBefore);
   });
 
+  it("accepts a valid terminal response larger than the former 64 KiB frame cap", () => {
+    const observer = createCodexResponseTerminalObserver();
+    const event = `data: ${JSON.stringify({
+      type: "response.completed",
+      response: { id: "long-response", output: "x".repeat(128 * 1024) },
+    })}\n\n`;
+
+    observer.push(new TextEncoder().encode(event));
+
+    expect(observer.finish()).toEqual({ kind: "completed" });
+  });
+
   it.each([
-    ["a no-newline data field", `data: ${"x".repeat(64 * 1024 + 1)}`],
+    ["a no-newline data field", `data: ${"x".repeat(MAX_CODEX_STREAM_EVENT_BYTES + 1)}`],
     ["an oversized terminal event", `data: ${JSON.stringify({
       type: "response.completed",
-      response: { id: "oversized", output: "x".repeat(64 * 1024) },
+      response: { id: "oversized", output: "x".repeat(MAX_CODEX_STREAM_EVENT_BYTES) },
     })}\n\n`],
   ])("classifies %s as overflow with bounded framing state", (_name, input) => {
     const observer = createCodexResponseTerminalObserver();
@@ -307,7 +351,7 @@ describe("collectCodexResponseStream", () => {
     const encoder = new TextEncoder();
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.enqueue(encoder.encode("x".repeat(10 * 1024 * 1024 + 1)));
+        controller.enqueue(encoder.encode("x".repeat(MAX_CODEX_COLLECTED_RESPONSE_BYTES + 1)));
       },
       cancel() {
         cancelled = true;
@@ -386,7 +430,7 @@ describe("createCodexUsageObserver", () => {
 
   it("drops an oversized frame and still observes a later bounded terminal", () => {
     const observer = createCodexUsageObserver();
-    observer.push(encoder.encode(`data: ${"x".repeat(64 * 1024 + 1)}\n`));
+    observer.push(encoder.encode(`data: ${"x".repeat(MAX_CODEX_STREAM_EVENT_BYTES + 1)}\n`));
     observer.push(encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":8,"output_tokens":3}}}\n\n'));
 
     expect(observer.finish()).toEqual({ inputTokens: 8, cachedInputTokens: 0, outputTokens: 3 });

@@ -156,7 +156,7 @@ export interface TelemetryFacadeDependencies {
 export interface TelemetryFacade {
   recordApplicationStart(): void;
   recordProxyStarted(accountCount: number): void;
-  startProxyHeartbeat(accountCount: number): void;
+  startProxyHeartbeat(getAccountCount: () => number): void;
   recordSafeLog(input: SafeRuntimeLogInput): void;
   recordSetupStage(input: SetupStageInput): void;
   recordSetupStageFailure(input: ExpectedSetupFailureInput): void;
@@ -574,7 +574,7 @@ export function createTelemetryFacade(
       });
     },
 
-    startProxyHeartbeat(accountCount): void {
+    startProxyHeartbeat(getAccountCount): void {
       if (!enabledSnapshot()) return;
       try {
         const timer = dependencies.setInterval(() => {
@@ -584,7 +584,7 @@ export function createTelemetryFacade(
             if (!snapshot || !common) return;
             captureAnalytics(snapshot, "proxy.heartbeat", {
               ...common,
-              accountPoolSize: clampedAccountCount(accountCount),
+              accountPoolSize: clampedAccountCount(getAccountCount()),
             });
           } catch {
             // Timer callbacks remain failure-isolated.

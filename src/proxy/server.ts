@@ -1694,6 +1694,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       : chalk.gray("  Auto-failover: off — upstream failures pass through; clients own retries"));
 
     recordProxyStarted(totalAccountCount);
-    startProxyHeartbeat(totalAccountCount);
+    startProxyHeartbeat(() => pool.getAll().length + openAIPool.getAll().length);
   });
 }
