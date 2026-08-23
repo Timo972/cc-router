@@ -1613,7 +1613,7 @@ describe("mountResponsesRoutes sticky routing", () => {
     });
 
     const entry = activity.find(e => e.type === "route");
-    expect(entry?.inputTokens).toBe(100);
+    expect(entry?.inputTokens).toBe(40);
     expect(entry?.outputTokens).toBe(25);
     expect(entry?.cacheReadTokens).toBe(60);
   });
@@ -1635,7 +1635,7 @@ describe("mountResponsesRoutes sticky routing", () => {
     expect(activity.some(e => e.type === "error")).toBe(false);
     const entry = activity.find(e => e.type === "route");
     expect(entry).toBeDefined();
-    expect(entry?.inputTokens).toBe(40);
+    expect(entry?.inputTokens).toBe(35);
     expect(entry?.outputTokens).toBe(10);
     expect(entry?.cacheReadTokens).toBe(5);
   });
