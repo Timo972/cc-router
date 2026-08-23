@@ -179,6 +179,26 @@ export function removeAccountRecordById(id: string): AccountRecord | null {
   return removed;
 }
 
+/**
+ * Rename a stored account record in place, keeping every other field. The
+ * uniqueness check spans ALL providers — both live in one accounts.json and
+ * one URL namespace, so two records sharing an id would be unaddressable.
+ * Returns the renamed record, or null if no record has `oldId`.
+ */
+export function renameAccountRecordById(oldId: string, newId: string): AccountRecord | null {
+  ensureConfigDir();
+  const existing = readAccountsRaw() as AccountRecord[];
+  const target = existing.find(a => a.id === oldId) ?? null;
+  if (!target) return null;
+  if (newId !== oldId && existing.some(a => a.id === newId)) {
+    throw new Error(`An account named "${newId}" already exists`);
+  }
+
+  target.id = newId;
+  writeAccountsAtomicToPath(ACCOUNTS_PATH, existing);
+  return target;
+}
+
 export type AccountProvider = "anthropic_subscription" | "openai_subscription";
 
 function normalizeAccountProvider(record: AccountRecord): AccountProvider {
@@ -313,6 +333,10 @@ export interface ProxyConfig {
   /** Auto-update on patch/minor releases. Default: false (notify-only). Set to true to
    *  opt in to unattended installs from the npm registry. */
   autoUpdate?: boolean;
+  /** Router-side failover/retry of upstream 429/5xx responses before the first
+   *  relayed byte. Default: true. Set to false to opt out — every upstream
+   *  failure then passes through unchanged and the client owns all retries. */
+  autoFailover?: boolean;
   /** Default and alias model routing for Claude and OpenAI subscription providers. */
   modelRouting?: ModelRoutingConfig;
   /** Present only when this machine is in "client" mode (connected to a remote CC-Router) */
@@ -368,6 +392,16 @@ export function getProxyRequestTimeoutMs(): number {
   return typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
     ? timeoutMs
     : DEFAULT_PROXY_REQUEST_TIMEOUT_MS;
+}
+
+/**
+ * Whether the router may retry upstream 429/5xx failures itself. Enabled
+ * unless the config explicitly says `"autoFailover": false` — a missing or
+ * malformed value keeps the default on, matching how the other optional
+ * proxy settings degrade.
+ */
+export function getAutoFailoverEnabled(): boolean {
+  return readConfig().autoFailover !== false;
 }
 
 function normalizeProxyConfig(cfg: ProxyConfig): ProxyConfig {

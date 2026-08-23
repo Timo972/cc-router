@@ -4,11 +4,11 @@ import { ServerResponse } from "http";
 import { timingSafeEqual } from "crypto";
 import type { IncomingMessage } from "http";
 import type { Socket } from "net";
-import type { Request } from "express";
-import { TokenPool } from "./token-pool.js";
+import type { Request, Response } from "express";
+import { EmptyPoolError, NoEligibleAccountError, TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
-import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
-import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner } from "../utils/self-update.js";
+import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
+import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
 import {
   annotateActiveSpan,
   classifyExpectedRuntimeFailure,
@@ -21,10 +21,13 @@ import {
 import { logRoute, logError, logStartup } from "./logger.js";
 import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
+import { applyRateLimitHeaders } from "../providers/anthropic/rate-limit-headers.js";
+import { mountAnthropicMessagesRoute, withOAuthBeta } from "./anthropic-messages-route.js";
 import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
+import { AccountRenameConflictError, renameAccountTransaction } from "./account-rename.js";
 import {
   hasPendingCredentialWrite,
   markOpenAICredentialsPersisted,
@@ -48,6 +51,8 @@ import { SessionRouter } from "./session-router.js";
 import type { RoutedAccountLease } from "./session-router.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
+import { OpenAIUsageRefresher } from "../providers/openai/usage-fetch.js";
+import { attachAnthropicResponseCapture } from "./anthropic-response-capture.js";
 import { canUseExtraUsage } from "../providers/anthropic/usage.js";
 import {
   applyUpstreamFailureRoutingDetailed,
@@ -364,7 +369,9 @@ function publicUsageSnapshot(usage: NonNullable<AccountRateLimits["usage"]>): Pu
   };
 }
 
-function publicWindow(window: { utilization: number; resetAt: number }): PublicRateLimitWindow {
+// An unreported utilization surfaces as 0 here, which is what the dashboard
+// has always shown for it; only release decisions need the distinction.
+function publicWindow(window: { utilization?: number; resetAt: number }): PublicRateLimitWindow {
   return { utilization: publicUtilization(window.utilization), resetAt: publicTimestamp(window.resetAt) };
 }
 
@@ -521,24 +528,6 @@ function providerStatus(accounts: HealthAccountView[]): ProviderOperationalStatu
   };
 }
 
-// Mutates entry and updates aggregate counters with token usage from Anthropic's
-// response. Called asynchronously after the log entry is already stored,
-// so the dashboard picks up the values on the next poll.
-function applyInputUsage(entry: LogEntry, usage: Record<string, number>): void {
-  entry.cacheReadTokens = usage["cache_read_input_tokens"] ?? 0;
-  entry.cacheCreationTokens = usage["cache_creation_input_tokens"] ?? 0;
-  entry.inputTokens = usage["input_tokens"] ?? 0;
-
-  stats.totalCacheReadTokens += entry.cacheReadTokens;
-  stats.totalCacheCreationTokens += entry.cacheCreationTokens;
-  stats.totalInputTokens += entry.inputTokens;
-}
-
-function applyOutputUsage(entry: LogEntry, usage: Record<string, number>): void {
-  entry.outputTokens = usage["output_tokens"] ?? 0;
-  stats.totalOutputTokens += entry.outputTokens;
-}
-
 function runtimeModelFamily(value: unknown): "fable" | "sonnet" | "opus" | "haiku" | "other" {
   return value === "fable" || value === "sonnet" || value === "opus" || value === "haiku"
     ? value
@@ -556,46 +545,9 @@ function runtimeResponseReason(status: number): "unauthorized" | "forbidden" | "
   if (status === 429) return "rate_limited";
   return status >= 500 ? "upstream_5xx" : "upstream_4xx";
 }
-
-// ─── Rate limit header extraction ──────────────────────────────────────────
-
-function inferPlan(requestsLimit: number): string {
-  if (requestsLimit <= 0) return "";
-  if (requestsLimit <= 100) return "Pro";
-  if (requestsLimit <= 500) return "Max 5x";
-  return "Max 20x";
-}
-
-function extractRateLimits(headers: Record<string, string | string[] | undefined>): AccountRateLimits | null {
-  const h = (name: string) => String(headers[name] ?? "");
-  const status = h("anthropic-ratelimit-unified-status");
-  if (!status) return null; // No unified headers in this response
-
-  const requestsLimit = parseInt(h("anthropic-ratelimit-requests-limit"), 10) || 0;
-
-  return {
-    status: status === "rate_limited" ? "rate_limited" : "allowed",
-    fiveHourUtil: parseFloat(h("anthropic-ratelimit-unified-5h-utilization")) || 0,
-    fiveHourReset: parseInt(h("anthropic-ratelimit-unified-5h-reset"), 10) || 0,
-    sevenDayUtil: parseFloat(h("anthropic-ratelimit-unified-7d-utilization")) || 0,
-    sevenDayReset: parseInt(h("anthropic-ratelimit-unified-7d-reset"), 10) || 0,
-    claim: h("anthropic-ratelimit-unified-representative-claim"),
-    plan: inferPlan(requestsLimit),
-    requestsLimit,
-    lastUpdated: Date.now(),
-  };
-}
-
-/** Apply upstream rate-limit headers without discarding the usage snapshot. */
-export function applyRateLimitHeaders(
-  account: Account,
-  headers: Record<string, string | string[] | undefined>,
-): boolean {
-  const rateLimits = extractRateLimits(headers);
-  if (!rateLimits) return false;
-  account.rateLimits = { ...account.rateLimits, ...rateLimits };
-  return true;
-}
+// Re-exported so existing importers keep working; the implementation moved to
+// providers/anthropic so both Anthropic transports share it.
+export { applyRateLimitHeaders };
 
 /**
  * Build the single function through which this server writes OpenAI accounts.
@@ -712,9 +664,25 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const stopOpenAIRefreshLoop = startOpenAIRefreshLoop(openAIAccounts, persistOpenAIAccounts);
   const usageRefresher = new AnthropicUsageRefresher(pool);
   usageRefresher.start();
+  // Codex usage otherwise arrives only on response headers, so a freshly
+  // restarted daemon showed empty OpenAI bars until the first request
+  // happened to route there. Poll the usage endpoint the Codex CLI itself
+  // uses, so `cc-router status` is populated immediately — mirroring the
+  // Anthropic refresher above.
+  const openAIUsageRefresher = new OpenAIUsageRefresher(openAIPool, {
+    prepare: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
+  });
+  openAIUsageRefresher.start();
 
   const app = express();
   const proxyRequestTimeoutMs = getProxyRequestTimeoutMs();
+  // Router-side 429 failover / 5xx retry is on by default; `"autoFailover":
+  // false` in config.json opts out for anyone who cannot work with the
+  // trade-off (a committed retry abandons the original failure response).
+  // A single-attempt budget IS the off switch: both transports then relay
+  // every upstream failure unchanged, exactly as before the feature existed.
+  const autoFailover = getAutoFailoverEnabled();
+  const upstreamAttempts = autoFailover ? {} : { maxAttempts: 1 };
 
   // ─── Proxy auth middleware ─────────────────────────────────────────────────
   // If a proxySecret is configured, all requests must present it as EITHER
@@ -781,6 +749,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     res.json({
       status,
+      // The version of the code this daemon actually runs — not what is
+      // installed on disk. A service manager can keep an old build alive
+      // long after an upgrade (launchd pins the versioned pnpm store path
+      // in its plist), and without this field no client can tell.
+      version: getCurrentVersion(),
       mode,
       target,
       operational: createOperationalStatus({
@@ -933,6 +906,53 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       return;
     }
     const patch = validation.patch;
+
+    // A rename is a transaction over pool + session router + disk, not a
+    // field write (see account-rename.ts) — validation already guarantees it
+    // arrives alone. The two pools share one id namespace, so uniqueness is
+    // checked across both regardless of which provider owns the account.
+    if (patch.id !== undefined) {
+      const newId = patch.id;
+      const takenIds = new Set([
+        ...pool.getAll().map(a => a.id),
+        ...openAIAccounts.map(a => a.id),
+      ]);
+      const inAnthropic = pool.findById(id) !== null;
+      if (!inAnthropic && !openAIAccounts.some(a => a.id === id)) {
+        res.status(404).json({ error: `Account "${id}" not found` });
+        return;
+      }
+      try {
+        renameAccountTransaction(id, newId, takenIds, inAnthropic
+          ? {
+              rename: (oldId, nextId) => pool.renameAccount(oldId, nextId) !== null,
+              renameSessions: (oldId, nextId) => { sessionRouter.renameAccount(oldId, nextId); },
+              persist: () => saveAccounts(pool.getAll()),
+            }
+          : {
+              rename: (oldId, nextId) => openAIPool.renameAccount(oldId, nextId) !== null,
+              renameSessions: (oldId, nextId) => { openAIRouter.renameAccount(oldId, nextId); },
+              persist: () => persistOpenAIAccounts(openAIAccounts),
+            });
+      } catch (err) {
+        if (err instanceof AccountRenameConflictError) {
+          res.status(409).json({ error: err.message });
+          return;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        logError("accounts", 0, `Failed to persist accounts.json: ${message}`);
+        res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
+        return;
+      }
+      if (inAnthropic) {
+        const account = pool.findById(newId)!;
+        res.json({ account: publicAnthropicAccountView(account, createRoutingMetricsResolver()(account.id)) });
+      } else {
+        const account = openAIAccounts.find(a => a.id === newId)!;
+        res.json({ account: publicOpenAIAccountView(account, resolveOpenAIRouting(account.id)) });
+      }
+      return;
+    }
 
     // Snapshot the previous values so we can roll back on persistence failure
     const existing = pool.findById(id);
@@ -1174,6 +1194,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     prepareOpenAIAccountOwnsDiagnostics: true,
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
+    ...upstreamAttempts,
   });
 
   mountMessagesCrossProviderRoute(app, {
@@ -1183,6 +1204,78 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     prepareOpenAIAccountOwnsDiagnostics: true,
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
+    ...upstreamAttempts,
+  });
+
+  // Shared between the retrying /v1/messages route and the generic /v1 chain
+  // so a locally rejected request is reported identically on both.
+  const onAnthropicEmptyPool = (err: EmptyPoolError, _req: Request, res: Response) => {
+    stats.totalErrors++;
+    logError("proxy", 503, err.message);
+    recordSafeLog({
+      operation: "proxy.request",
+      provider: "anthropic",
+      reason: "other",
+      outcome: "upstream_error",
+      httpStatusCode: 503,
+      accountPoolSize: 0,
+      severity: "warn",
+    });
+    res.status(503).json({
+      type: "error",
+      error: { type: "no_accounts", message: err.message },
+    });
+  };
+  const onAnthropicNoEligibleAccount = (err: NoEligibleAccountError, req: Request) => {
+    stats.totalErrors++;
+    const entry = createLocalRoutingErrorLog(err.reason, req._ccRouteContext?.modelFamily);
+    stats.addLog(entry);
+    logError(entry.accountId, entry.statusCode ?? 0, entry.details ?? "no-eligible");
+    recordSafeLog({
+      operation: "proxy.request",
+      provider: "anthropic",
+      reason: err.reason === "rate_limited" ? "rate_limited" : "other",
+      outcome: err.reason === "rate_limited" ? "rate_limited" : "upstream_error",
+      httpStatusCode: entry.statusCode,
+      accountPoolSize: pool.getAll().length,
+      severity: "warn",
+    });
+  };
+  const onAnthropicRefreshFailure = (account: Account) => {
+    stats.totalErrors++;
+    logError(account.id, 401, "Token refresh failed");
+  };
+
+  // Claude-bound POST /v1/messages goes through its own transport with
+  // router-side 429 failover and 5xx retry; every other /v1 endpoint stays on
+  // the generic byte-transparent proxy below.
+  mountAnthropicMessagesRoute(app, {
+    target,
+    timeoutMs: proxyRequestTimeoutMs,
+    pool,
+    sessionRouter,
+    ...upstreamAttempts,
+    needsRefresh,
+    refresh: account => refreshAccountIfCurrent(account, pool),
+    onRefreshFailure: onAnthropicRefreshFailure,
+    onEmptyPool: onAnthropicEmptyPool,
+    onNoEligibleAccount: onAnthropicNoEligibleAccount,
+    // A relayed 401 means the token is stale — refresh in the background so
+    // the next request succeeds without making this client wait on it.
+    onUpstream401: account => {
+      void refreshAccountIfCurrent(account, pool).catch(console.error);
+    },
+    // Refresh in the background to narrow only ambiguity-owned global state
+    // when fresh usage proves a requested-model exhaustion.
+    onRateLimited: (route, ambiguousCooldownToken) => {
+      queueMicrotask(() => {
+        void usageRefresher.refreshAfterCurrent(route.account).then(result => {
+          if (result.ok) {
+            reconcileAmbiguousRateLimitCooldown(route, pool, ambiguousCooldownToken);
+          }
+        });
+      });
+    },
   });
 
   // ─── Proxy middleware ──────────────────────────────────────────────────────
@@ -1215,15 +1308,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // CRITICAL: api.anthropic.com requires the "oauth-2025-04-20" beta flag to
         // accept OAuth tokens (sk-ant-oat01-*). Without it the request is rejected
         // with "OAuth authentication is currently not supported."
-        // APPEND — do NOT replace — so existing betas (tools, computer-use, etc.) are preserved.
-        const existingBeta = proxyReq.getHeader("anthropic-beta");
-        const betas = existingBeta
-          ? String(existingBeta).split(",").map(b => b.trim()).filter(Boolean)
-          : [];
-        if (!betas.includes("oauth-2025-04-20")) {
-          betas.push("oauth-2025-04-20");
-          proxyReq.setHeader("anthropic-beta", betas.join(","));
-        }
+        // APPEND — do NOT replace — so existing betas (tools, computer-use, etc.)
+        // are preserved. Shared with the retrying /v1/messages transport.
+        proxyReq.setHeader("anthropic-beta", withOAuthBeta(proxyReq.getHeader("anthropic-beta")));
 
         // All other headers are forwarded automatically by http-proxy-middleware:
         //   anthropic-version         — required by Anthropic API
@@ -1331,6 +1418,24 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             ? routeFailureDetails(route, "service-overloaded")
             : "service-overloaded";
           logError(account.id, 529, "Service overloaded — cooldown 30s");
+        } else if (status >= 500) {
+          // Any other upstream 5xx passes through byte-transparent — but it
+          // must not pass through the DIAGNOSTICS silently: an overnight
+          // Anthropic 500 stopped an unattended Claude session while this
+          // log showed nothing and the stats reported a clean night. The
+          // question "did the proxy or the upstream fail?" was only
+          // answerable by cross-referencing the client's own transcript.
+          // Unlike 429/529 this takes no cooldown: a plain 5xx says nothing
+          // about the account's capacity and can even be request-specific,
+          // so cooling the account down would punish it for upstream's (or
+          // the request's) problem.
+          stats.totalErrors++;
+          account.errorCount++;
+          pendingLog.type = "error";
+          pendingLog.details = route
+            ? routeFailureDetails(route, "upstream-error")
+            : "upstream-error";
+          logError(account.id, status, "Upstream server error (passed through)");
         }
 
         // ── Capture rate limit utilization from response headers ────────────
@@ -1340,80 +1445,25 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         stats.addLog(entry);
 
         // ── Capture token usage from Anthropic response body ─────────────────
-        // SSE streams carry usage across two events:
-        //   message_start  → input_tokens, cache_read/creation_input_tokens
-        //   message_delta   → output_tokens
-        // Non-streaming JSON carries all fields in a single usage object.
-        // We use incremental line parsing (not buffering) so we can capture
-        // both events without holding the full stream in memory.
-        const contentType = String(proxyRes.headers["content-type"] ?? "");
-        const encoding = String(proxyRes.headers["content-encoding"] ?? "");
-        const isCompressed = /gzip|br|deflate/.test(encoding);
-        const streamTracker = createStreamLifecycleTracker(
+        // Passive stream-lifecycle + token-usage taps, shared with the
+        // retrying /v1/messages transport (see anthropic-response-capture.ts).
+        attachAnthropicResponseCapture(
+          proxyRes,
+          response,
+          entry,
           (req as Request)._startTime ?? Date.now(),
-          !isCompressed && contentType.includes("text/event-stream"),
-          Date.now,
-          terminal => {
-            annotateActiveSpan("provider.inference", {
-              streamOutcome: contentType.includes("text/event-stream") ? terminal.outcome : undefined,
-              inputTokens: entry.inputTokens,
-              outputTokens: entry.outputTokens,
-              operationDurationMs: terminal.durationMs,
-            });
+          {
+            now: Date.now,
+            onTerminal: terminal => {
+              annotateActiveSpan("provider.inference", {
+                streamOutcome: terminal.outcome,
+                inputTokens: entry.inputTokens,
+                outputTokens: entry.outputTokens,
+                operationDurationMs: terminal.durationMs,
+              });
+            },
           },
         );
-        entry.streamLifecycle = streamTracker.state;
-        streamTracker.attach(proxyRes, response);
-        proxyRes.on("data", (chunk: Buffer) => streamTracker.observeChunk(chunk));
-
-        if (!isCompressed && (contentType.includes("text/event-stream") || contentType.includes("application/json"))) {
-          const isSSE = contentType.includes("text/event-stream");
-
-          if (isSSE) {
-            let lineBuf = "";
-            let gotInput = false;
-            let gotOutput = false;
-
-            proxyRes.on("data", (chunk: Buffer) => {
-              if (gotInput && gotOutput) return;
-              lineBuf += chunk.toString("utf8");
-              const lines = lineBuf.split("\n");
-              lineBuf = lines.pop() ?? ""; // keep incomplete last line
-
-              for (const line of lines) {
-                if (!line.startsWith("data: ")) continue;
-                try {
-                  const evt = JSON.parse(line.slice(6)) as {
-                    type?: string;
-                    message?: { usage?: Record<string, number> };
-                    usage?: Record<string, number>;
-                  };
-                  if (!gotInput && evt.type === "message_start" && evt.message?.usage) {
-                    applyInputUsage(entry, evt.message.usage);
-                    gotInput = true;
-                  }
-                  if (!gotOutput && evt.type === "message_delta" && evt.usage) {
-                    applyOutputUsage(entry, evt.usage);
-                    gotOutput = true;
-                  }
-                } catch { /* partial JSON across chunk boundary — next chunk will complete it */ }
-              }
-            });
-          } else {
-            // Non-streaming JSON: buffer full body then parse once
-            let buf = "";
-            proxyRes.on("data", (chunk: Buffer) => { buf += chunk.toString("utf8"); });
-            proxyRes.on("end", () => {
-              try {
-                const body = JSON.parse(buf) as { usage?: Record<string, number> };
-                if (body.usage) {
-                  applyInputUsage(entry, body.usage);
-                  applyOutputUsage(entry, body.usage);
-                }
-              } catch { /* ignore */ }
-            });
-          }
-        }
       },
 
       error: (err: Error, _req: IncomingMessage, res: ServerResponse | Socket) => {
@@ -1480,45 +1530,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // and breaks SSE streaming passthrough.
   app.use("/v1", createAnthropicRoutingMiddleware({
     sessionRouter,
-    onEmptyPool: (err, _req, res) => {
-      stats.totalErrors++;
-      logError("proxy", 503, err.message);
-      recordSafeLog({
-        operation: "proxy.request",
-        provider: "anthropic",
-        reason: "other",
-        outcome: "upstream_error",
-        httpStatusCode: 503,
-        accountPoolSize: 0,
-        severity: "warn",
-      });
-      res.status(503).json({
-        type: "error",
-        error: { type: "no_accounts", message: err.message },
-      });
-    },
-    onNoEligibleAccount: (err, req) => {
-      stats.totalErrors++;
-      const entry = createLocalRoutingErrorLog(err.reason, req._ccRouteContext?.modelFamily);
-      stats.addLog(entry);
-      logError(entry.accountId, entry.statusCode ?? 0, entry.details ?? "no-eligible");
-      recordSafeLog({
-        operation: "proxy.request",
-        provider: "anthropic",
-        reason: "other",
-        outcome: "upstream_error",
-        httpStatusCode: entry.statusCode,
-        accountPoolSize: pool.getAll().length,
-        severity: "warn",
-      });
-    },
+    onEmptyPool: onAnthropicEmptyPool,
+    onNoEligibleAccount: onAnthropicNoEligibleAccount,
   }), createAnthropicRefreshMiddleware({
     needsRefresh,
     refresh: account => refreshAccountIfCurrent(account, pool),
-    onRefreshFailure: (account) => {
-      stats.totalErrors++;
-      logError(account.id, 401, "Token refresh failed");
-    },
+    onRefreshFailure: onAnthropicRefreshFailure,
   }), (req, _res, next) => {
     const route = req._ccRoute!;
     const account = route.account;
@@ -1572,7 +1589,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       listener?.close();
       console.log(chalk.yellow("\nShutting down — saving tokens..."));
     },
-    stopUsageRefresh: () => usageRefresher.stop(),
+    stopUsageRefresh: () => {
+      usageRefresher.stop();
+      openAIUsageRefresher.stop();
+    },
     removePid: () => {
       if (managesPidFile()) removePid();
     },
@@ -1669,6 +1689,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     console.log(autoUpdate
       ? chalk.gray("  Auto-update: enabled (patch/minor)")
       : chalk.gray("  Auto-update: off (notify-only) — run 'cc-router update' to install"));
+    console.log(autoFailover
+      ? chalk.gray("  Auto-failover: on — 429/5xx retried across accounts before the first relayed byte")
+      : chalk.gray("  Auto-failover: off — upstream failures pass through; clients own retries"));
 
     recordProxyStarted(totalAccountCount);
     startProxyHeartbeat(totalAccountCount);

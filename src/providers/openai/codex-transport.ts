@@ -18,6 +18,8 @@ export interface ForwardOpenAICodexResponseOptions {
   /** Aborted when the client disconnects, so a request nobody is waiting for
    *  stops occupying an upstream slot on the account. */
   signal?: AbortSignal;
+  /** One-based router attempt for failover/retry correlation. */
+  attempt?: number;
 }
 
 export async function forwardOpenAICodexResponse(
@@ -29,6 +31,7 @@ export async function forwardOpenAICodexResponse(
     route: "responses",
     modelFamily: codexModelFamily(opts.body.model),
     streaming: opts.stream,
+    attempt: opts.attempt,
   }, async () => {
     try {
       const body = toCodexBackendRequest(opts.body);

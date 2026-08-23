@@ -1,4 +1,4 @@
-import type { AccountUsageSnapshot, RouteContext } from "./types.js";
+import type { AccountUsageSnapshot, RouteContext, UsageWindowScope } from "./types.js";
 import { canUseExtraUsage, normalizeModelFamily } from "../providers/anthropic/usage.js";
 
 export interface ResponseLifecycle {
@@ -33,7 +33,11 @@ export interface BindingInvalidator {
 
 export interface CooldownSetter<TAccount extends { readonly id: string }> {
   setCooldownForAccount(account: TAccount, durationMs: number): void;
-  setGlobalCooldownForAccount?(account: TAccount, durationMs: number): void;
+  setGlobalCooldownForAccount?(
+    account: TAccount,
+    durationMs: number,
+    usageWindow?: UsageWindowScope,
+  ): void;
   setModelCooldownForAccount?(account: TAccount, modelFamily: string, durationMs: number): void;
   setAmbiguousGlobalCooldownForAccount?(
     account: TAccount,
@@ -126,6 +130,11 @@ interface CooldownClassification {
   readonly ambiguous: boolean;
   readonly modelFamily?: string;
   readonly usageResetAtMs?: number;
+  /** The usage window this cooldown's limit belongs to, when the usage endpoint
+   *  reports one for it. Absent for limits no snapshot describes — the
+   *  OAuth-apps quota, and any claim we could not attribute — so those stay
+   *  purely time-based. */
+  readonly usageWindow?: UsageWindowScope;
 }
 
 function asHeaders(value: unknown): FailureHeaders {
@@ -186,6 +195,16 @@ function matchingModelLimit(
   );
 }
 
+/** A reported figure strictly inside the normalized headroom range. */
+function withinHeadroomRange(value: number | undefined): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value < 1;
+}
+
+/** A reported figure at or above its limit. Unreported is never "at limit". */
+function atReportedLimit(value: number | undefined): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value >= 1;
+}
+
 function classifyCooldown(
   claimValue: unknown,
   route: FailureRoute<FailureAccount>,
@@ -195,17 +214,22 @@ function classifyCooldown(
   const usage = route.account.rateLimits?.usage;
 
   if (claim === "five_hour" || claim === "seven_day" || claim === "seven_day_oauth_apps") {
-    const usageWindow = claim === "five_hour" ? usage?.fiveHour : claim === "seven_day" ? usage?.sevenDay : undefined;
+    // seven_day_oauth_apps is a distinct quota the usage endpoint does not
+    // report, so it gets no window and can never be superseded by one.
+    const scope: UsageWindowScope | undefined =
+      claim === "five_hour" ? "five_hour" : claim === "seven_day" ? "seven_day" : undefined;
+    const usageWindow = scope === "five_hour" ? usage?.fiveHour : scope === "seven_day" ? usage?.sevenDay : undefined;
     return {
       kind: "global",
       ambiguous: false,
+      ...(scope ? { usageWindow: scope } : {}),
       ...(usageWindow ? { usageResetAtMs: usageWindow.resetAt * 1_000 } : {}),
     };
   }
 
   if (claim === "seven_day_overage_included") {
     const matching = matchingModelLimit(route.account, requestedFamily);
-    if (requestedFamily && matching?.active === true && matching.utilization >= 1) {
+    if (requestedFamily && matching?.active === true && atReportedLimit(matching.utilization)) {
       return {
         kind: "model",
         ambiguous: false,
@@ -255,11 +279,12 @@ function setGlobalCooldown<TAccount extends { readonly id: string }>(
   durationMs: number,
   ambiguous: boolean,
   modelFamily?: string,
+  usageWindow?: UsageWindowScope,
 ): number | undefined {
   if (ambiguous && pool.setAmbiguousGlobalCooldownForAccount) {
     return pool.setAmbiguousGlobalCooldownForAccount(account, durationMs, modelFamily);
   } else if (pool.setGlobalCooldownForAccount) {
-    pool.setGlobalCooldownForAccount(account, durationMs);
+    pool.setGlobalCooldownForAccount(account, durationMs, usageWindow);
   } else {
     pool.setCooldownForAccount(account, durationMs);
   }
@@ -277,17 +302,11 @@ export function reconcileAmbiguousRateLimitCooldown<TAccount extends FailureAcco
   const usage = route.account.rateLimits?.usage;
   if (token === undefined || !family || !usage || usage.fetchStatus !== "fresh") return false;
   if (!usage.fiveHour || !usage.sevenDay) return false;
-  if (!Number.isFinite(usage.fiveHour.utilization) ||
-    !Number.isFinite(usage.sevenDay.utilization) ||
-    usage.fiveHour.utilization < 0 ||
-    usage.sevenDay.utilization < 0 ||
-    usage.fiveHour.utilization >= 1 ||
-    usage.sevenDay.utilization >= 1) return false;
+  if (!withinHeadroomRange(usage.fiveHour.utilization) ||
+    !withinHeadroomRange(usage.sevenDay.utilization)) return false;
   if (canUseExtraUsage(usage.extraUsage)) return false;
   const matching = matchingModelLimit(route.account, family);
-  if (!matching || !matching.active || !Number.isFinite(matching.utilization) || matching.utilization < 1) {
-    return false;
-  }
+  if (!matching || !matching.active || !atReportedLimit(matching.utilization)) return false;
   if (!pool.reconcileAmbiguousGlobalCooldownForAccount) return false;
 
   const nowMs = now();
@@ -346,6 +365,7 @@ export function applyUpstreamFailureRoutingDetailed<TAccount extends FailureAcco
         durationMs,
         classification.ambiguous,
         route.modelFamily,
+        classification.usageWindow,
       );
     }
     return {

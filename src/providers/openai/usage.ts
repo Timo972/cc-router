@@ -196,6 +196,125 @@ export function parseCodexRateLimits(
   return { buckets, ...(credits ? { credits } : {}) };
 }
 
+// ─── Usage endpoint payload (GET chatgpt.com/backend-api/wham/usage) ─────────
+// The JSON twin of the `x-codex-*` header family: the same window fields
+// (used_percent / limit_window_seconds / reset_after_seconds / reset_at)
+// under `rate_limit.{primary,secondary}_window`, named buckets under
+// `additional_rate_limits`, and a `credits` object. Parsed with the same
+// trust rules as the headers — the payload is upstream-controlled data
+// either way.
+
+function usageNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function usageWindowFromJson(value: unknown, nowMs: number): CodexRateWindow | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const window = value as Record<string, unknown>;
+  const percent = usageNumber(window["used_percent"]);
+  if (percent === undefined) return undefined;
+
+  const nowSec = Math.floor(nowMs / 1000);
+  const horizonSec = nowSec + MAX_TRUSTED_RATE_LIMIT_HORIZON_SEC;
+  let resetAt = 0;
+  const absolute = usageNumber(window["reset_at"]);
+  if (absolute !== undefined && absolute > 0) {
+    const seconds = absolute > MS_TIMESTAMP_THRESHOLD ? Math.floor(absolute / 1000) : Math.floor(absolute);
+    if (seconds > nowSec && seconds <= horizonSec) resetAt = seconds;
+  }
+  if (resetAt === 0) {
+    // Same fallback the header parser applies: an unusable absolute reset
+    // must not discard a usable relative one (see parseResetAtSeconds).
+    const relative = usageNumber(window["reset_after_seconds"]);
+    if (relative !== undefined && relative > 0) {
+      const candidate = nowSec + Math.floor(relative);
+      if (candidate <= horizonSec) resetAt = candidate;
+    }
+  }
+
+  const windowSeconds = usageNumber(window["limit_window_seconds"]);
+  return {
+    utilization: Math.max(0, Math.min(1, percent / 100)),
+    resetAt,
+    windowMinutes: windowSeconds !== undefined && windowSeconds > 0
+      ? Math.min(Math.floor(windowSeconds / 60), MAX_TRUSTED_WINDOW_MINUTES)
+      : 0,
+  };
+}
+
+function usageBucketFromJson(
+  limitId: string,
+  limitName: string | undefined,
+  rateLimit: unknown,
+  nowMs: number,
+): CodexLimitBucket | undefined {
+  if (typeof rateLimit !== "object" || rateLimit === null) return undefined;
+  const windows = rateLimit as Record<string, unknown>;
+  const primary = usageWindowFromJson(windows["primary_window"], nowMs);
+  const secondary = usageWindowFromJson(windows["secondary_window"], nowMs);
+  if (!primary && !secondary) return undefined;
+  return {
+    limitId,
+    ...(limitName ? { limitName: limitName.slice(0, 64) } : {}),
+    ...(primary ? { primary } : {}),
+    ...(secondary ? { secondary } : {}),
+  };
+}
+
+/**
+ * Parse a usage-endpoint response body into the same update shape the
+ * response-header parser produces, so both feed `applyCodexRateLimits`
+ * identically. Returns null when the body is not a usage payload at all
+ * (e.g. an error object) — as opposed to a payload with no windows, which
+ * is a valid empty update.
+ */
+export function parseCodexUsagePayload(value: unknown, nowMs: number): CodexRateLimitsUpdate | null {
+  if (typeof value !== "object" || value === null) return null;
+  const payload = value as Record<string, unknown>;
+  if (typeof payload["rate_limit"] !== "object" || payload["rate_limit"] === null) return null;
+
+  const buckets: CodexLimitBucket[] = [];
+  const defaultBucket = usageBucketFromJson(DEFAULT_CODEX_LIMIT_ID, undefined, payload["rate_limit"], nowMs);
+  if (defaultBucket) buckets.push(defaultBucket);
+
+  const additional = payload["additional_rate_limits"];
+  if (Array.isArray(additional)) {
+    for (const entry of additional) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const record = entry as Record<string, unknown>;
+      const limitName = typeof record["limit_name"] === "string" ? record["limit_name"].trim() : undefined;
+      const idSource = typeof record["metered_feature"] === "string" && record["metered_feature"].trim()
+        ? record["metered_feature"]
+        : limitName;
+      if (!idSource) continue;
+      const limitId = normalizeCodexLimitId(idSource);
+      if (!/^[a-z0-9_]{1,64}$/.test(limitId) || limitId === DEFAULT_CODEX_LIMIT_ID) continue;
+      const bucket = usageBucketFromJson(limitId, limitName, record["rate_limit"], nowMs);
+      if (bucket) buckets.push(bucket);
+    }
+  }
+
+  let credits: CodexCredits | undefined;
+  const rawCredits = payload["credits"];
+  if (typeof rawCredits === "object" && rawCredits !== null) {
+    const record = rawCredits as Record<string, unknown>;
+    const hasCredits = typeof record["has_credits"] === "boolean" ? record["has_credits"] : undefined;
+    const unlimited = typeof record["unlimited"] === "boolean" ? record["unlimited"] : undefined;
+    if (hasCredits !== undefined || unlimited !== undefined) {
+      const balance = typeof record["balance"] === "string"
+        ? record["balance"].replace(CONTROL_CHAR_PATTERN, "").trim()
+        : undefined;
+      credits = {
+        hasCredits: hasCredits === true,
+        unlimited: unlimited === true,
+        ...(balance ? { balance: balance.slice(0, 32) } : {}),
+      };
+    }
+  }
+
+  return { buckets, ...(credits ? { credits } : {}) };
+}
+
 export function resolveActiveLimit(headers: Record<string, unknown>): string | undefined {
   const raw = headerString(headers, "x-codex-active-limit")?.trim();
   if (!raw) return undefined;

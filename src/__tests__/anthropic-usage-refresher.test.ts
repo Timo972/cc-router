@@ -6,6 +6,7 @@ import {
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import { DEFAULT_RATE_LIMITS, type Account } from "../proxy/types.js";
+import { UsageRefresher } from "../proxy/usage-refresher.js";
 
 function account(id: string): Account {
   return {
@@ -51,11 +52,16 @@ describe("fetchAnthropicUsage", () => {
       json: async () => ({ five_hour: { utilization: 25 } }),
     }) as Response);
 
-    await expect(fetchAnthropicUsage(a, { fetch, now: () => 123 })).resolves.toEqual({
+    await expect(fetchAnthropicUsage(a, {
+      fetch,
+      now: () => 123,
+      nextSequence: () => 7,
+    })).resolves.toEqual({
       ok: true,
       snapshot: {
         fiveHour: { utilization: 0.25, resetAt: 0 },
         modelLimits: [],
+        requestedSeq: 7,
         fetchedAt: 123,
         fetchStatus: "fresh",
       },
@@ -68,6 +74,43 @@ describe("fetchAnthropicUsage", () => {
       },
       signal: expect.any(AbortSignal),
     }));
+  });
+
+  it("claims its ordering token before the request goes out", async () => {
+    // Callers order a snapshot's data by requestedSeq, so it must be claimed
+    // before the request: a refresh in flight while a limit is hit completes
+    // afterwards but describes the account as it was before. A token claimed
+    // after the response would order it after that limit and licence a
+    // wrongful release.
+    let seq = 0;
+    let clock = 100;
+    const seenDuringRequest: number[] = [];
+    const fetch = vi.fn(async () => {
+      seenDuringRequest.push(seq);
+      clock = 500;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => {
+          clock = 900;
+          return { five_hour: { utilization: 25 } };
+        },
+      } as Response;
+    });
+
+    const result = await fetchAnthropicUsage(account("a"), {
+      fetch,
+      now: () => clock,
+      nextSequence: () => ++seq,
+    });
+
+    // The token existed by the time the request was issued...
+    expect(seenDuringRequest).toEqual([1]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // ...and it is the one the snapshot carries, not a later one.
+    expect(result.snapshot.requestedSeq).toBe(1);
+    expect(result.snapshot.fetchedAt).toBe(900);
   });
 
   it.each([401, 429, 500])("returns a sanitized HTTP failure for %i", async status => {
@@ -167,6 +210,26 @@ describe("AnthropicUsageRefresher", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(a.rateLimits.usage).toEqual({ modelLimits: [], fetchedAt: 99, fetchStatus: "unavailable" });
     refresher.stop();
+  });
+
+  it("keeps telemetry classification failures outside refresh behavior", async () => {
+    const current = { id: "a", usage: 0 };
+    const expected = { ok: true as const, usage: 42 };
+    const refresher = new UsageRefresher({
+      getAll: () => [current],
+      findById: () => current,
+    }, {
+      fetchUsage: async () => expected,
+      applyResult: (account, result) => { account.usage = result.usage; },
+      cancelledResult: () => ({ ok: false as const, usage: 0 }),
+      telemetry: {
+        provider: "anthropic",
+        classifyResult: () => { throw new Error("telemetry failure"); },
+      },
+    });
+
+    await expect(refresher.refreshNow(current)).resolves.toBe(expected);
+    expect(current.usage).toBe(42);
   });
 
   it("joins an exact-account in-flight request and discards a stale replacement result", async () => {

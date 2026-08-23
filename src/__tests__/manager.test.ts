@@ -26,6 +26,7 @@ import {
   writeAnthropicAccountsPreservingOtherProviders,
   upsertAccountRecord,
   removeAccountRecordById,
+  renameAccountRecordById,
   saveOpenAIAccounts,
   saveOpenAIAccountsToPath,
   migrateLegacyAccountProviders,
@@ -35,6 +36,7 @@ import {
   loadOpenAIAccounts,
   readAccountsFromPath,
   writeConfig,
+  getAutoFailoverEnabled,
   getProxyRequestTimeoutMs,
 } from "../config/manager.js";
 
@@ -693,6 +695,39 @@ describe("readAccountsFromPath", () => {
   });
 });
 
+describe("getAutoFailoverEnabled", () => {
+  it("defaults to enabled when config.json does not exist", () => {
+    expect(getAutoFailoverEnabled()).toBe(true);
+  });
+
+  it("defaults to enabled when config.json does not mention autoFailover", () => {
+    writeConfig({ proxySecret: "secret" });
+
+    expect(getAutoFailoverEnabled()).toBe(true);
+  });
+
+  it("stays enabled on an explicit true", () => {
+    writeConfig({ autoFailover: true });
+
+    expect(getAutoFailoverEnabled()).toBe(true);
+  });
+
+  it("disables only on an explicit false", () => {
+    writeConfig({ autoFailover: false });
+
+    expect(getAutoFailoverEnabled()).toBe(false);
+  });
+
+  it("treats a malformed value as the enabled default", () => {
+    fs.writeFileSync(
+      `${MOCK_DIR}/config.json`,
+      JSON.stringify({ autoFailover: "no" }),
+    );
+
+    expect(getAutoFailoverEnabled()).toBe(true);
+  });
+});
+
 describe("getProxyRequestTimeoutMs", () => {
   it("reads proxyRequestTimeoutMs from config.json", () => {
     writeConfig({ proxyRequestTimeoutMs: 120_000 });
@@ -744,5 +779,58 @@ describe("getProxyRequestTimeoutMs", () => {
       anthropicAliases: { "claude/sonnet": "claude-sonnet-4-6" },
       openAIAliases: { codex: "gpt-5-codex" },
     });
+  });
+});
+
+describe("renameAccountRecordById", () => {
+  it("renames a record in place, preserving every other field and record", () => {
+    writeAccountsAtomic([
+      sampleRecord,
+      {
+        id: "openai-primary",
+        provider: "openai_subscription",
+        accessToken: "openai-access",
+        refreshToken: "openai-refresh",
+        expiresAt: 1999999999000,
+        scopes: ["openid"],
+        enabled: true,
+      },
+    ]);
+
+    const renamed = renameAccountRecordById("max-account-1", "max-renamed");
+
+    expect(renamed?.id).toBe("max-renamed");
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0].id).toBe("max-renamed");
+    expect(parsed[0].accessToken).toBe(sampleRecord.accessToken);
+    expect(parsed[1].id).toBe("openai-primary");
+  });
+
+  it("returns null for an unknown id without touching the file", () => {
+    writeAccountsAtomic([sampleRecord]);
+    expect(renameAccountRecordById("missing", "whatever")).toBeNull();
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].id).toBe("max-account-1");
+  });
+
+  it("refuses a new id that any record already uses, across providers", () => {
+    writeAccountsAtomic([
+      sampleRecord,
+      {
+        id: "openai-primary",
+        provider: "openai_subscription",
+        accessToken: "openai-access",
+        refreshToken: "openai-refresh",
+        expiresAt: 1999999999000,
+        scopes: ["openid"],
+        enabled: true,
+      },
+    ]);
+
+    expect(() => renameAccountRecordById("max-account-1", "openai-primary"))
+      .toThrow(/already exists/);
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].id).toBe("max-account-1");
   });
 });

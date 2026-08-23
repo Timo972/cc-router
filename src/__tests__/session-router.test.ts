@@ -499,3 +499,29 @@ describe("SessionRouter over a non-Anthropic AccountPool", () => {
     expect(pool.acquired).toEqual(["openai-a", "sticky:openai-a"]);
   });
 });
+
+describe("renameAccount", () => {
+  it("keeps sticky bindings and session counts attached across a rename", () => {
+    const pool = new TokenPool([makeAccount("old-name"), makeAccount("other")]);
+    const router = new SessionRouter(pool);
+
+    const first = router.acquire("session-a");
+    expect(first.account.id).toBe("old-name");
+    first.release();
+    expect(router.getActiveSessionCount("old-name")).toBe(1);
+
+    pool.renameAccount("old-name", "new-name");
+    const moved = router.renameAccount("old-name", "new-name");
+
+    expect(moved).toBe(1);
+    // The binding must follow the id, or the sticky re-acquire would miss
+    // (tryAcquire("old-name") finds nothing) and the session would silently
+    // fail over to another account.
+    const sticky = router.acquire("session-a");
+    expect(sticky.account.id).toBe("new-name");
+    expect(sticky.reason).toBe("sticky");
+    sticky.release();
+    expect(router.getActiveSessionCount("new-name")).toBe(1);
+    expect(router.getActiveSessionCount("old-name")).toBe(0);
+  });
+});

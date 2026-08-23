@@ -463,16 +463,21 @@ describe("proxy runtime sampling and propagation", () => {
       expect(await anthropicRefresh.refreshAccountToken(anthropicAccount)).toBe(false);
       localError.mockRestore();
 
+      let usageRefreshTraceId: string | undefined;
       const usageRefresher = new usage.AnthropicUsageRefresher({
         getAll: () => [anthropicAccount],
         findById: () => anthropicAccount,
       }, {
-        fetchUsage: async () => ({
-          ok: true,
-          snapshot: { modelLimits: [], fetchedAt: 1, fetchStatus: "fresh" },
-        }),
+        fetchUsage: async () => {
+          usageRefreshTraceId = trace.getActiveSpan()?.spanContext().traceId;
+          return {
+            ok: true,
+            snapshot: { modelLimits: [], fetchedAt: 1, fetchStatus: "fresh" },
+          };
+        },
       });
       await usageRefresher.refreshNow(anthropicAccount);
+      expect(usageRefreshTraceId).toBe(SAMPLED_TRACE_ID);
       expect(await discovery.fetchAnthropicModels(anthropicAccount, async () => new Response(
         JSON.stringify({ data: [{ id: "claude-sonnet-4-5" }] }),
         { status: 200, headers: { "content-type": "application/json" } },

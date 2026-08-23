@@ -186,32 +186,47 @@ export async function killPortAndWait(
 const DEATH_POLL_MS = 200;
 const POST_KILL_GRACE_MS = 500;
 
+/**
+ * PIDs that should die when the proxy on `port` is killed by port: the
+ * process LISTENING on it — never connected clients. A bare `lsof -ti :port`
+ * lists BOTH ends of every connection, which included the stop CLI itself
+ * (its health-check fetch leaves a keep-alive socket open) and any live
+ * Claude Code / Codex session talking to the proxy; `cc-router stop` then
+ * SIGTERMed all of them, itself included (`zsh: terminated`).
+ */
+export async function listListeningPids(port: number): Promise<number[]> {
+  const { execFile } = await import("child_process");
+  const { promisify } = await import("util");
+  const execFileAsync = promisify(execFile);
+  try {
+    if (isWindows()) {
+      const { stdout } = await execFileAsync("netstat", ["-ano"]);
+      const match = stdout
+        .split("\n")
+        .find(line => line.includes(`:${port}`) && line.includes("LISTENING"));
+      if (!match) return [];
+      const pid = Number(match.trim().split(/\s+/).at(-1));
+      return Number.isNaN(pid) ? [] : [pid];
+    }
+    const { stdout } = await execFileAsync("lsof", ["-ti", `tcp:${port}`, "-sTCP:LISTEN"]);
+    return stdout.trim().split("\n").filter(Boolean).map(Number)
+      .filter(n => !Number.isNaN(n))
+      // Belt and braces: whatever the listing says, killing by port must
+      // never target the process doing the killing.
+      .filter(pid => pid !== process.pid);
+  } catch {
+    return [];
+  }
+}
+
 async function killByPort(port: number): Promise<boolean> {
   const { execFile } = await import("child_process");
   const { promisify } = await import("util");
   const execFileAsync = promisify(execFile);
 
-  const listPids = async (p: number): Promise<number[]> => {
-    try {
-      if (isWindows()) {
-        const { stdout } = await execFileAsync("netstat", ["-ano"]);
-        const match = stdout
-          .split("\n")
-          .find(line => line.includes(`:${p}`) && line.includes("LISTENING"));
-        if (!match) return [];
-        const pid = Number(match.trim().split(/\s+/).at(-1));
-        return Number.isNaN(pid) ? [] : [pid];
-      }
-      const { stdout } = await execFileAsync("lsof", ["-ti", `:${p}`]);
-      return stdout.trim().split("\n").filter(Boolean).map(Number).filter(n => !Number.isNaN(n));
-    } catch {
-      return [];
-    }
-  };
-
   try {
     return await killPortAndWait(port, {
-      listPids,
+      listPids: listListeningPids,
       // Windows has no signals: taskkill /F is the only lever, so both the
       // graceful and forced step map onto it.
       kill: (pid, signal) => {

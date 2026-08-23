@@ -639,7 +639,11 @@ describe("TokenPool — model-aware hard eligibility", () => {
     const pool = new TokenPool([a], { now: () => nowMs });
 
     expect(pool.acquireBest(new Map(), SONNET_CONTEXT).account.id).toBe("a");
-    expect(a.rateLimits.usage?.modelLimits[0]).toMatchObject({ utilization: 0, resetAt: 0 });
+    // The window rolls over: its reset is cleared and the spent reading
+    // dropped. The reading is not replaced with a zero, which the provider
+    // never sent and which cooldown supersession would read as headroom.
+    expect(a.rateLimits.usage?.modelLimits[0]).toMatchObject({ resetAt: 0 });
+    expect(a.rateLimits.usage?.modelLimits[0]).not.toHaveProperty("utilization");
   });
 
   it("applies a matching model scope regardless of its display active flag", () => {
@@ -1193,5 +1197,33 @@ describe("TokenPool — user caps", () => {
     pool.getNext();
     expect(bypassed).not.toBeNull();
     expect(bypassed!.id).toBe("a");
+  });
+});
+
+describe("renameAccount", () => {
+  it("carries in-flight load to the new id and releases against it", () => {
+    const pool = new TokenPool([makeAccount("old-name"), makeAccount("other")]);
+    const lease = pool.tryAcquire("old-name");
+    expect(lease).not.toBeNull();
+    expect(pool.getInFlight("old-name")).toBe(1);
+
+    const renamed = pool.renameAccount("old-name", "new-name");
+
+    expect(renamed?.id).toBe("new-name");
+    expect(pool.findById("old-name")).toBeNull();
+    expect(pool.findById("new-name")).toBe(renamed);
+    // The load counter must move with the id, or the release after the
+    // rename would decrement a key that was never incremented.
+    expect(pool.getInFlight("new-name")).toBe(1);
+    expect(pool.getInFlight("old-name")).toBe(0);
+
+    lease!.release();
+    expect(pool.getInFlight("new-name")).toBe(0);
+  });
+
+  it("returns null for an unknown id and changes nothing", () => {
+    const pool = new TokenPool([makeAccount("a")]);
+    expect(pool.renameAccount("missing", "b")).toBeNull();
+    expect(pool.findById("a")).not.toBeNull();
   });
 });

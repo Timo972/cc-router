@@ -8,8 +8,263 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Privacy-safe OpenTelemetry and PostHog EU telemetry: sampled proxy
+  waterfalls, closed-schema setup/runtime diagnostics, lifecycle analytics,
+  and sanitized Error Tracking with diagnostic IDs. Fresh installs default
+  on; persisted and environment opt-outs gate every signal. Usage polling and
+  retrying provider requests retain provider and attempt-level visibility
+  without exporting prompts, bodies, headers, URLs, account IDs, or raw errors.
+  See [docs/telemetry.md](docs/telemetry.md) for the exhaustive inventory.
+
+- Automatic upstream failover and retry on both providers. A 429 or 5xx
+  received before any response byte is relayed no longer passes straight
+  through to the client: the router applies the existing cooldown/affinity
+  bookkeeping and retries the request itself, up to 3 upstream attempts
+  per request. A 429 (or an overload the provider cools down: Anthropic
+  529; Codex 503/529) always fails over to a *different* account; any
+  other 5xx keeps a session-bound request on its own account, retrying
+  after a short pause, while a session-less request re-routes the way a
+  fresh request would.
+  Covers Claude `/v1/messages`, Codex `/v1/responses`, and cross-routed
+  `/v1/messages`. When nothing is eligible or the budget is exhausted, the
+  last failed upstream response is relayed unchanged, exactly as before;
+  401s still pass through with a background token refresh, and the router
+  still never retries after response bytes have started. Failed attempts
+  show up in the activity log with a `:will-retry` suffix. On by
+  default — set `"autoFailover": false` in `~/.cc-router/config.json`
+  (restart required) to opt out and restore pure pass-through behavior.
+  Note that current Claude Code builds no longer retry 429s themselves,
+  so with failover off a rate limit surfaces directly in the session.
+
+### Changed
+
+- Aptabase telemetry has been replaced by a reconstructive, closed-schema
+  PostHog EU boundary with no Person profiles, disabled GeoIP enrichment, and
+  immediate late opt-out checks. Existing persisted opt-outs remain disabled.
+
+- Claude-bound POST `/v1/messages` moved from the generic proxy middleware
+  to a dedicated transport (same byte-transparent relay contract: verbatim
+  status/headers, raw body bytes, no synthesized events) so the router can
+  decide to retry at upstream response headers. Every other `/v1` endpoint
+  stays on the generic proxy. Claude activity rows now record the requested
+  model and the full `/v1/messages` path.
+
 ### Fixed
 
+- Shared Anthropic and OpenAI usage polling now exports its allowlisted
+  `provider.usage_refresh` spans with terminal status and duration, while
+  telemetry classification failures remain isolated from refresh behavior.
+
+- An account whose quota refills early — upgrading a Claude plan being the
+  common case — is returned to rotation as soon as the usage endpoint says
+  so, instead of staying benched for the rest of the pre-upgrade window. A
+  429 records a cooldown whose expiry comes from the reset timestamps on
+  that response, and both that cooldown and the header-derived
+  `rate_limited` flag were released only by the wall clock. Nothing
+  reconnected them to the usage refresher, so a plan upgrade produced an
+  account reporting `0%` on every window, `usage fresh`, and `busy` with a
+  multi-hour cooldown — and because it was benched, no new response could
+  ever arrive to correct it. In the reported case one stale cooldown on the
+  only account with capacity left the whole pool answering
+  `429 no-eligible`.
+
+  A usage snapshot now supersedes both blockers, under two conditions that
+  keep it from unbenching an account that is still limited.
+
+  The refresh must have been *initiated* after the block was recorded.
+  `fetchedAt` cannot answer that — it is stamped after the response body is
+  parsed, so a refresh already on the wire when a 429 lands completes
+  afterwards while describing the account as it was before. Neither can
+  wall-clock milliseconds: the 429, the headers taken from it, and the
+  refresh the router starts in response all happen in one event-loop turn
+  and read the same millisecond (measured at 199 ties in 200 runs), which
+  would have made that immediate refresh useless. Ordering now runs on a
+  process-wide monotonic sequence, with tokens on the usage snapshot, the
+  header snapshot, and each cooldown entry.
+
+  And the snapshot must report on the scope that caused the block: only the
+  claimed window releases a global cooldown, and only the matching family
+  releases a model cooldown. Blocks for limits no snapshot describes — an
+  upstream 529 overload, the `seven_day_oauth_apps` quota, an unattributed
+  claim — stay purely time-based. Cooldowns are grouped by scope — global by
+  limiting window, model by family — and within each scope every expiry keeps
+  the sequence of the event that produced it, so overlapping blocks neither
+  merge nor cancel each other: releasing a quota cooldown leaves a concurrent
+  overload running, a brief overload does not make a multi-hour cooldown
+  permanent, and a later shorter 429 cannot revive an expiry a refresh had
+  already retired.
+
+  Relatedly, a usage window with no usable figure — `five_hour: {}`, a
+  non-numeric utilization — no longer parses as `0`. It now arrives with the
+  figure absent, so missing data can never read as proof of capacity and
+  retire a live cooldown. Rolling a spent window over past its reset likewise
+  clears the reading instead of writing a `0` nobody reported. Blocking
+  decisions still treat both as `0`, and the dashboard still displays `0`,
+  exactly as before.
+
+  Which of the response headers and the usage snapshot describes an account's
+  current capacity is now decided on the same event order, rather than on
+  `fetchedAt` against `lastUpdated`. A refresh that starts before a response
+  and finishes after it holds the older picture despite the later clock
+  reading, and preferring it hid a fresher exhaustion signal behind a snapshot
+  that never saw it — while cooldown release, already running on the event
+  order, disagreed about which source was current. Snapshots predating the
+  ordering tokens still fall back to the timestamp comparison.
+
+  Within scope, releasing opens no hole: the same snapshot feeds the
+  exhausted-window check, so an account with no real capacity stays blocked
+  on its own merits.
+
+- The activity log's "cooldown expired — rate limit cleared" entry now marks
+  the moment an account is actually routable again. It hung off the
+  header `rate_limited` flag alone, which both over- and under-reports as soon
+  as anything else can block the account: a 429 overlapping a 529 announced
+  recovery while the overload cooldown still kept the account out of rotation,
+  and because that flag only flips once, the moment it genuinely came back
+  passed unannounced. The entry is now emitted when the last account-wide
+  blocker clears — header status, global cooldown, or a spent account-wide
+  window — whichever that turns out to be, including a cooldown that lapses
+  during an idle stretch with nothing routing or polling in the meantime. A
+  model-scoped limit never emits one, since the account kept serving every
+  other family and so never left the rotation to rejoin.
+
+---
+
+## [0.10.1] — 2026-08-20
+
+### Fixed
+
+- A passed-through upstream 5xx on the Anthropic path is logged and counted.
+  The proxy is byte-transparent and only special-cased 401/429/529, so a
+  plain upstream 500 left no trace: an overnight Anthropic 500 stopped an
+  unattended Claude session while the daemon log showed nothing and the
+  stats reported a clean night. It now produces an `[ERROR]` line, an
+  activity entry (`upstream-error`), and error counts — with no cooldown,
+  since a plain 5xx says nothing about the account's capacity and can even
+  be request-specific.
+- A client-cancelled stream abort is no longer logged as an error on the
+  OpenAI path. The Codex CLI aborts streams routinely, and each abort
+  rejects the relay's body read — the log printed an `[ERROR] ... relay
+  failed` line for every one (eight hours of them in one overnight
+  session) while the stats correctly classified them as cancellations. The
+  log line now waits for the cancellation check, so it fires only for real
+  relay failures.
+
+---
+
+## [0.10.0] — 2026-08-19
+
+### Added
+
+- OpenAI/Codex account usage is fetched proactively, so `cc-router status`
+  shows the 5h/weekly bars immediately after a restart — matching how
+  Anthropic accounts already behaved. Codex usage previously arrived only on
+  `x-codex-*` response headers, so a freshly restarted daemon rendered empty
+  OpenAI bars until the first request happened to route there. The daemon now
+  polls the usage endpoint the Codex CLI itself reads
+  (`GET chatgpt.com/backend-api/wham/usage`) on the same bounded scheduler the
+  Anthropic usage refresher uses (staggered startup, 5-minute cadence, failure
+  backoff, identity-owned application), feeding the JSON — the payload twin of
+  the response headers, parsed under the same trust rules — through the exact
+  merge the headers go through. A failed poll keeps whatever the account
+  already knew; an expired access token is refreshed before the first fetch
+  rather than 401-ing until traffic happens to fix it.
+- `cc-router accounts rename <id> <new-id>`. An account's id is the key its
+  routing state hangs off — in-flight counters and sticky session bindings are
+  both id-keyed — so on a running proxy the rename runs as a transaction
+  (`PATCH /cc-router/accounts/:id` with `{"id": ...}`): pool, session router,
+  and accounts.json move together, and are rolled back together if persistence
+  fails. Sticky sessions keep their prompt-cache affinity through the rename.
+  With no proxy running the record is renamed on disk. A proxy from before
+  this feature answers the PATCH with 200 having silently ignored the field —
+  that is detected and reported as an error rather than falling back to a disk
+  write its refresh loop would overwrite. The id namespace is shared across
+  both providers, so a rename onto any existing account name is refused (409).
+
+- The health endpoint reports the daemon's version, and the dashboard shows a
+  version-mismatch banner when the daemon runs a different build than the CLI
+  rendering it. A service manager can keep an old build alive long after an
+  upgrade — launchd pins the versioned pnpm store path in its plist, so the
+  daemon silently stays on the old version across upgrades and even reboots —
+  and every log row and account view on the dashboard comes from that build.
+  Until now nothing surfaced this: a fix could ship, the package could update,
+  and the dashboard would still render the old daemon's output as if the new
+  version were broken. A daemon that reports no version at all predates the
+  field, which is itself proof it is outdated, and banners the same way.
+- The activity list scrolls to follow its selection. The dashboard renders the
+  newest 20 of up to 50 entries, but the arrow keys would walk the selection
+  through all 50 — past row 20 the highlight left the screen while the detail
+  panel kept updating for rows that were not visible. The window now shifts by
+  one row when the selection steps past its bottom or top edge, stays put while
+  the selection moves inside it, and re-clamps when new entries push the
+  selected row (which is timestamp-anchored) out of the stored window.
+- OpenAI/Codex sticky session routing: sessions pin to one account for prompt-cache
+  locality (`session_id` → `x-claude-code-session-id` → `prompt_cache_key`), with
+  load- and headroom-aware selection for new sessions.
+- Codex usage tracking from `x-codex-*` response headers: default 5h/weekly windows
+  plus dynamically discovered model-scoped metered buckets, credits, and plan.
+- Scoped cooldowns on upstream failures: bucket-scoped via `x-codex-active-limit`,
+  account-global otherwise; local 429/503 responses when no account is eligible.
+- Dashboard: OpenAI accounts now show 5h/weekly bars, per-bucket rows, credits,
+  plan, request/error/in-flight/session counts, and cooldown state.
+- Unprefixed `gpt-*` models route to OpenAI. The Codex CLI writes the bare slug
+  from its own registry — `model = "gpt-5.6-sol"` in `config.toml`, or whatever
+  its `/model` picker selects — and an unprefixed name went to the Claude path,
+  where `/v1/responses` answers `501 Not Implemented`. No configuration could
+  redirect it, because `openAIAliases` is only consulted for names that are
+  already prefixed; those aliases now apply to the bare form as well. Every
+  other unprefixed model still routes to Claude.
+
+### Changed
+
+- OpenAI account records persist `scopes`, `sessionLimitPercent`, and
+  `weeklyLimitPercent`.
+- The stateless OpenAI round-robin picker was removed in favor of
+  `OpenAITokenPool`.
+
+### Fixed
+
+- The dashboard fits the terminal. The frame had a fixed shape — 20 activity
+  rows, a detail panel, and every account expanded — which with a real fleet
+  of accounts rendered ~70 lines. Ink can only erase as many lines as the
+  viewport holds, so on any shorter terminal every 2-second poll re-appended
+  the frame and scrolled the header and OPERATIONS panel permanently out of
+  view (the "jumps back down" effect, especially in split panes). The layout
+  is now height-aware: the activity list absorbs the deficit first (down to 3
+  rows), and if the chrome alone still exceeds the viewport the frame is
+  clipped at the bottom — the header always wins over the detail panel. The
+  fit tracks terminal resizes.
+
+- Anthropic activity rows show their cache rate and token counts. The proxy
+  captures usage by passively parsing the response body, but skipped any
+  compressed response — and since the proxy is byte-transparent, the client's
+  own `accept-encoding` makes upstream compress essentially every response, so
+  no `/messages` row ever carried token fields while Codex rows (whose relay
+  decompresses anyway) did. The capture now decompresses its own copy of the
+  stream (gzip/brotli/deflate) purely for parsing, stops paying for the
+  stream once both usage events have been seen, and remains strictly
+  best-effort: a corrupt or unsupported coding ends the capture, never the
+  response.
+- `cc-router stop` no longer terminates itself — or your editor sessions —
+  when it falls back to killing by port. The fallback listed every process
+  with a socket on the proxy port (`lsof -ti :port` reports both ends of
+  every connection), which included the stop CLI itself (its health-check
+  fetch leaves a keep-alive socket open) and any live Claude Code or Codex
+  session talking to the proxy. All of them received SIGTERM alongside the
+  daemon; the shell reported the stop command as `zsh: terminated`. The
+  listing now selects only the process LISTENING on the port, and killing by
+  port additionally never targets the process doing the killing.
+- Service-mode `cc-router start` no longer reports "nothing is answering" for
+  a service that comes up moments later. The post-bootstrap health wait was
+  10 seconds, but a stop→start restart re-bootstraps a label whose process
+  exited moments earlier, and launchd throttles that spawn by up to ~10s
+  (default ThrottleInterval) before the daemon even begins booting — so the
+  window regularly closed right as throttled spawns landed, and the very
+  next `cc-router status` connected fine. The wait now outlasts the throttle
+  (30s), says what it is waiting for, and a genuine timeout points to
+  `cc-router status` before suggesting the logs.
 - OpenAI activity rows carry the same columns as Claude ones. The OpenAI ingress
   recorded a path but no method and no client, and the dashboard needs both
   `method` and `path` to render the request — so those rows fell back to the
@@ -59,49 +314,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on `CC_ROUTER_DAEMON`, which the LaunchAgent and systemd unit never set —
   they set `CC_ROUTER_SERVICE` — so every service-managed instance left no PID
   behind and took the weaker port-based stop path.
-
----
-
-## [0.10.0] — 2026-08-18
-
-### Added
-
-- Privacy-safe OpenTelemetry and PostHog EU telemetry: 10% sampled proxy
-  waterfalls, unsampled closed-schema setup/runtime diagnostics, lifecycle
-  analytics, and sanitized Error Tracking with diagnostic IDs. Fresh installs
-  default on; persisted and environment opt-outs gate every signal. See
-  [docs/telemetry.md](docs/telemetry.md) for the exhaustive inventory.
-
-- OpenAI/Codex sticky session routing: sessions pin to one account for prompt-cache
-  locality (`session_id` → `x-claude-code-session-id` → `prompt_cache_key`), with
-  load- and headroom-aware selection for new sessions.
-- Codex usage tracking from `x-codex-*` response headers: default 5h/weekly windows
-  plus dynamically discovered model-scoped metered buckets, credits, and plan.
-- Scoped cooldowns on upstream failures: bucket-scoped via `x-codex-active-limit`,
-  account-global otherwise; local 429/503 responses when no account is eligible.
-- Dashboard: OpenAI accounts now show 5h/weekly bars, per-bucket rows, credits,
-  plan, request/error/in-flight/session counts, and cooldown state.
-- Unprefixed `gpt-*` models route to OpenAI. The Codex CLI writes the bare slug
-  from its own registry — `model = "gpt-5.6-sol"` in `config.toml`, or whatever
-  its `/model` picker selects — and an unprefixed name went to the Claude path,
-  where `/v1/responses` answers `501 Not Implemented`. No configuration could
-  redirect it, because `openAIAliases` is only consulted for names that are
-  already prefixed; those aliases now apply to the bare form as well. Every
-  other unprefixed model still routes to Claude.
-
-### Changed
-
-- Aptabase telemetry has been replaced by a reconstructive, closed-schema
-  PostHog EU boundary with no Person profiles, disabled GeoIP enrichment, and
-  immediate late opt-out checks. Existing persisted opt-outs remain disabled.
-
-- OpenAI account records persist `scopes`, `sessionLimitPercent`, and
-  `weeklyLimitPercent`.
-- The stateless OpenAI round-robin picker was removed in favor of
-  `OpenAITokenPool`.
-
-### Fixed
-
 - A refresh token the OAuth server rejects as terminally expired
   (`400 invalid_grant`) is no longer retried forever. Every rejection was
   treated as transient, so the five-minute refresh loop kept re-POSTing a token

@@ -319,7 +319,12 @@ export function withTelemetrySpan<T>(
 
     return trace.getTracer("cc-router").startActiveSpan(
       safe.operation,
-      { attributes: otelSpanAttributes(safe.attributes) },
+      {
+        attributes: {
+          "cc_router.operation": safe.operation,
+          ...otelSpanAttributes(safe.attributes),
+        },
+      },
       span => {
         callbackStarted = true;
         try {

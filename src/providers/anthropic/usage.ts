@@ -5,6 +5,7 @@ import type {
   ModelRateLimit,
   RateLimitWindow,
 } from "../../proxy/types.js";
+import { nextEventSequence } from "../../proxy/event-sequence.js";
 
 const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA_HEADER = "oauth-2025-04-20";
@@ -44,9 +45,19 @@ function numberValue(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function utilization(value: unknown): number {
+/**
+ * Normalize a reported percentage into a 0–1 fraction, or undefined when the
+ * provider reported nothing usable.
+ *
+ * The distinction matters downstream: a *reported* 0 is proof of capacity and
+ * can retire a cooldown, while a missing or non-numeric figure is only absence
+ * of information. Collapsing the two to 0 would let a malformed payload —
+ * `five_hour: {}`, `utilization: null` — unbench an account that is still
+ * being rate limited.
+ */
+function utilization(value: unknown): number | undefined {
   const number = numberValue(value);
-  if (number === undefined) return 0;
+  if (number === undefined) return undefined;
   return Math.max(0, Math.min(1, number / 100));
 }
 
@@ -68,8 +79,9 @@ function getFirst(record: UnknownRecord, keys: string[]): unknown {
 
 function parseWindow(value: unknown): RateLimitWindow | undefined {
   if (!isRecord(value)) return undefined;
+  const reported = utilization(getFirst(value, ["utilization", "percentage", "percent"]));
   return {
-    utilization: utilization(getFirst(value, ["utilization", "percentage", "percent"])),
+    ...(reported === undefined ? {} : { utilization: reported }),
     resetAt: resetAt(getFirst(value, ["resets_at", "reset_at", "resetAt"])),
   };
 }
@@ -113,11 +125,12 @@ function parseModelLimit(value: unknown): ModelRateLimit | undefined {
   const model = modelDetails(value);
   if (!model) return undefined;
   const active = getFirst(value, ["active", "is_active"]);
+  const reported = utilization(getFirst(value, ["utilization", "percentage", "percent"]));
   return {
     kind: "weekly_scoped",
     group: stringValue(value.group) ?? "weekly",
     ...model,
-    utilization: utilization(getFirst(value, ["utilization", "percentage", "percent"])),
+    ...(reported === undefined ? {} : { utilization: reported }),
     resetAt: resetAt(getFirst(value, ["resets_at", "reset_at", "resetAt"])),
     active: typeof active === "boolean" ? active : true,
     severity: stringValue(value.severity) ?? "",
@@ -159,7 +172,11 @@ function legacyModelLimit(family: string, value: unknown): ModelRateLimit | unde
 }
 
 /** Parse the OAuth usage endpoint without retaining its provider-specific payload. */
-export function parseAnthropicUsage(value: unknown, fetchedAt: number): AccountUsageSnapshot | null {
+export function parseAnthropicUsage(
+  value: unknown,
+  fetchedAt: number,
+  requestedSeq?: number,
+): AccountUsageSnapshot | null {
   if (!isRecord(value) || !Object.keys(value).some((key) => USAGE_FIELDS.has(key))) return null;
 
   const limits = Array.isArray(value.limits) ? value.limits : undefined;
@@ -175,6 +192,7 @@ export function parseAnthropicUsage(value: unknown, fetchedAt: number): AccountU
     fetchedAt,
     fetchStatus: "fresh",
   };
+  if (requestedSeq !== undefined) snapshot.requestedSeq = requestedSeq;
   const fiveHour = parseWindow(value.five_hour);
   const sevenDay = parseWindow(value.seven_day);
   const extraUsage = parseExtraUsage(value.extra_usage);
@@ -203,6 +221,7 @@ export async function fetchAnthropicUsage(
   options: {
     fetch?: typeof globalThis.fetch;
     now?: () => number;
+    nextSequence?: () => number;
     timeoutMs?: number;
   } = {},
 ): Promise<UsageFetchResult> {
@@ -211,6 +230,10 @@ export async function fetchAnthropicUsage(
   const timeoutMs = Math.max(0, options.timeoutMs ?? DEFAULT_USAGE_TIMEOUT_MS);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  // Claimed before the request goes out: the response describes the account no
+  // earlier than this point in the event order, which is what lets a caller
+  // order the snapshot against events that happened while it was in flight.
+  const requestedSeq = options.nextSequence?.() ?? nextEventSequence();
 
   try {
     const response = await request(ANTHROPIC_USAGE_ENDPOINT, {
@@ -230,7 +253,7 @@ export async function fetchAnthropicUsage(
       return { ok: false, reason: "invalid_json" };
     }
 
-    const snapshot = parseAnthropicUsage(body, now());
+    const snapshot = parseAnthropicUsage(body, now(), requestedSeq);
     return snapshot
       ? { ok: true, snapshot }
       : { ok: false, reason: "invalid_schema" };
