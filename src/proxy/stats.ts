@@ -115,10 +115,10 @@ export function applyAnthropicOutputUsage(entry: LogEntry, usage: Record<string,
 /** Record Codex token usage on both the request's log entry and the running totals. */
 export function applyCodexUsage(entry: LogEntry, usage: CodexUsageTotals | undefined): void {
   if (!usage) return;
-  entry.inputTokens = usage.inputTokens;
+  entry.inputTokens = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
   entry.outputTokens = usage.outputTokens;
   entry.cacheReadTokens = usage.cachedInputTokens;
-  stats.totalInputTokens += usage.inputTokens;
+  stats.totalInputTokens += entry.inputTokens;
   stats.totalOutputTokens += usage.outputTokens;
   stats.totalCacheReadTokens += usage.cachedInputTokens;
 }
