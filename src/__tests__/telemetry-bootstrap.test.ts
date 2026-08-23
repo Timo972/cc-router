@@ -1594,6 +1594,49 @@ export async function resolve(specifier, context, nextResolve) {
     }
   }, 10_000);
 
+  it.each([
+    ["version", ["--version"]],
+    ["telemetry status", ["telemetry", "status"]],
+  ])("bounds a hung first-start send for %s", async (_name, args) => {
+    const testHome = mkdtempSync(join(tmpdir(), "cc-router-cli-first-start-"));
+    let requests = 0;
+    const hung = createServer(() => { requests += 1; });
+    await listen(hung);
+    const address = hung.address();
+    if (!address || typeof address === "string") throw new Error("hung collector did not bind");
+    const origin = `http://127.0.0.1:${address.port}`;
+    const started = Date.now();
+    const child = spawn(process.execPath, [installedBinary, ...args], {
+      cwd: installedCwd,
+      env: {
+        ...process.env,
+        HOME: testHome,
+        TELEMETRY_PATH: join(testHome, "fresh-telemetry.json"),
+        NODE_ENV: "test",
+        CC_ROUTER_TEST_OTLP_LOG_URL: `${origin}/i/v1/logs`,
+        CC_ROUTER_EU_GUARD_MODE: "offline-test",
+        CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: origin,
+        CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: origin,
+        NODE_OPTIONS: `--import=${pathToFileURL(join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs")).href}`,
+        NO_UPDATE_NOTIFIER: "1",
+        CI: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    try {
+      expect(await waitForChildExit(child, 1_500)).toBe(true);
+      expect(child.exitCode).toBe(0);
+      expect(requests).toBe(1);
+      expect(Date.now() - started).toBeLessThan(1_500);
+    } finally {
+      if (child.exitCode === null) child.kill("SIGKILL");
+      hung.closeAllConnections();
+      await new Promise<void>(resolve => hung.close(() => resolve()));
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  }, 5_000);
+
   it("bounds a hung immediate CLI send and keeps opt-out silent without changing exit 1", async () => {
     let requests = 0;
     const hung = createServer(() => { requests += 1; });

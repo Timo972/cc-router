@@ -24,6 +24,11 @@ export interface StreamTerminalTelemetry {
   durationMs: number;
 }
 
+export interface StreamLifecycleOptions {
+  requireSseTerminal?: boolean;
+  beforeTerminal?: () => Promise<void>;
+}
+
 export const MAX_RETAINED_SSE_LINE_BYTES = 64 * 1024;
 
 export function createStreamLifecycleTracker(
@@ -31,6 +36,7 @@ export function createStreamLifecycleTracker(
   inspectSse: boolean,
   now: () => number = Date.now,
   onTerminal?: (terminal: StreamTerminalTelemetry) => void,
+  options: StreamLifecycleOptions = {},
 ): StreamLifecycleTracker {
   const state: StreamLifecycleState = {
     sawMessageStop: false,
@@ -42,7 +48,7 @@ export function createStreamLifecycleTracker(
   };
   let lineBuffer = Buffer.alloc(0);
   let discardingOversizedLine = false;
-  let terminalReported = false;
+  let terminalStarted = false;
   const clearParserState = () => {
     lineBuffer = Buffer.alloc(0);
     discardingOversizedLine = false;
@@ -61,17 +67,35 @@ export function createStreamLifecycleTracker(
     }
   };
   const terminal = (
-    outcome?: StreamTerminalTelemetry["outcome"],
+    outcome?: StreamTerminalTelemetry["outcome"] | (() => StreamTerminalTelemetry["outcome"]),
   ) => {
-    clearParserState();
-    state.bodyDurationMs = Math.max(0, now() - startedAt);
-    if (!outcome || terminalReported) return;
-    terminalReported = true;
-    try {
-      onTerminal?.({ outcome, durationMs: state.bodyDurationMs });
-    } catch {
-      // Observability callbacks cannot change streaming lifecycle behavior.
+    const durationMs = Math.max(0, now() - startedAt);
+    state.bodyDurationMs = durationMs;
+    if (!outcome) {
+      if (!options.beforeTerminal) clearParserState();
+      return;
     }
+    if (terminalStarted) return;
+    terminalStarted = true;
+    const report = (): void => {
+      clearParserState();
+      try {
+        onTerminal?.({
+          outcome: typeof outcome === "function" ? outcome() : outcome,
+          durationMs,
+        });
+      } catch {
+        // Observability callbacks cannot change streaming lifecycle behavior.
+      }
+    };
+    if (!options.beforeTerminal) {
+      report();
+      return;
+    }
+    void Promise.resolve()
+      .then(options.beforeTerminal)
+      .catch(() => undefined)
+      .then(report);
   };
   return {
     state,
@@ -124,7 +148,9 @@ export function createStreamLifecycleTracker(
       });
       downstream.once("finish", () => {
         state.downstreamFinish = true;
-        terminal(inspectSse && !state.sawMessageStop ? "other" : "complete");
+        terminal(() => (options.requireSseTerminal ?? inspectSse) && !state.sawMessageStop
+          ? "other"
+          : "complete");
       });
       downstream.once("close", () => {
         state.downstreamClose = true;

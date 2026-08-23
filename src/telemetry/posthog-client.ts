@@ -305,10 +305,16 @@ export function createPostHogTelemetryClient(
   let shutdownStarted = false;
   let captureGeneration = 0;
   const preparedCaptures = new Map<string, { generation: number; consentGeneration: string }>();
+  const activeTransportControllers = new Set<AbortController>();
+  const abortActiveTransports = (): void => {
+    for (const controller of activeTransportControllers) controller.abort();
+    activeTransportControllers.clear();
+  };
 
   const discardPendingInternal = (): void => {
     captureGeneration += 1;
     preparedCaptures.clear();
+    abortActiveTransports();
     const client = sdkClient;
     if (!client) return;
     for (const key of QUEUE_KEYS) {
@@ -408,10 +414,23 @@ export function createPostHogTelemetryClient(
         return noOpResponse();
       }
 
-      const response = await transport(url, {
-        ...fetchOptions,
-        body: JSON.stringify({ ...payload, batch: activeBatch }),
-      });
+      const controller = new AbortController();
+      const inheritedSignal = fetchOptions.signal;
+      const forwardAbort = (): void => { controller.abort(); };
+      if (inheritedSignal?.aborted) controller.abort();
+      else inheritedSignal?.addEventListener("abort", forwardAbort, { once: true });
+      activeTransportControllers.add(controller);
+      let response: Awaited<ReturnType<PostHogTransport>>;
+      try {
+        response = await transport(url, {
+          ...fetchOptions,
+          body: JSON.stringify({ ...payload, batch: activeBatch }),
+          signal: controller.signal,
+        });
+      } finally {
+        inheritedSignal?.removeEventListener("abort", forwardAbort);
+        activeTransportControllers.delete(controller);
+      }
       const path = new URL(url).pathname;
       const accepted = response.status >= 200 && (path === "/batch/" ? response.status < 400 : response.status < 300);
       if (accepted) {
@@ -553,6 +572,7 @@ export function createPostHogTelemetryClient(
       shutdownStarted = true;
       if (!client) return;
       await settleWithin(() => client.shutdown(boundedDeadline(deadlineMs)), deadlineMs);
+      abortActiveTransports();
       preparedCaptures.clear();
       sdkClient = undefined;
     },

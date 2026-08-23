@@ -1,4 +1,4 @@
-import { Command } from "commander";
+import { Command, CommanderError } from "commander";
 import { registerSetup } from "./cmd-setup.js";
 import { registerStart } from "./cmd-start.js";
 import { registerStop, registerRevert } from "./cmd-stop.js";
@@ -15,6 +15,7 @@ import { getCurrentVersion, checkForUpdate, printUpdateBanner } from "../utils/s
 import { recordApplicationStart } from "../telemetry/facade.js";
 
 const program = new Command();
+program.exitOverride();
 
 program
   .name("cc-router")
@@ -65,5 +66,13 @@ if (!process.env["NO_UPDATE_NOTIFIER"] && !process.env["CI"]) {
 
 export async function runCli(): Promise<void> {
   recordApplicationStart();
-  await program.parseAsync();
+  try {
+    await program.parseAsync();
+  } catch (error) {
+    if (error instanceof CommanderError) {
+      process.exitCode = error.exitCode;
+      return;
+    }
+    throw error;
+  }
 }

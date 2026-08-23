@@ -25,11 +25,15 @@ export interface AnthropicUsageCaptureOptions {
   /** message_delta usage (output tokens), or the sole usage object of a
    *  non-streaming JSON body. */
   onOutputUsage(usage: Record<string, number>): void;
+  /** Decoded bytes for terminal SSE inspection. Never receives compressed
+   *  source bytes. */
+  onDecodedChunk?(chunk: Buffer): void;
 }
 
 export interface AnthropicUsageCapture {
   write(chunk: Buffer): void;
   end(): void;
+  readonly finished: Promise<void>;
 }
 
 /** Non-streaming bodies are buffered for one parse at end-of-stream; a body
@@ -59,10 +63,19 @@ export function createAnthropicUsageCapture(
   if (decoder === undefined) return null;
 
   let dead = false;
+  let resolveFinished!: () => void;
+  let finishedSettled = false;
+  const finished = new Promise<void>(resolve => { resolveFinished = resolve; });
+  const settleFinished = (): void => {
+    if (finishedSettled) return;
+    finishedSettled = true;
+    resolveFinished();
+  };
   const die = () => {
     if (dead) return;
     dead = true;
     decoder?.destroy();
+    settleFinished();
   };
 
   // ── SSE: incremental line parsing, stop once both events were seen ────────
@@ -89,9 +102,9 @@ export function createAnthropicUsageCapture(
           options.onOutputUsage(evt.usage);
           gotOutput = true;
         }
-        // Everything of interest has been seen — stop paying for the rest of
-        // the stream (and free the decompressor's zlib state).
-        if (gotInput && gotOutput) die();
+        // Without a terminal observer, everything of interest has been seen:
+        // stop paying for the rest and free the decompressor's zlib state.
+        if (gotInput && gotOutput && !options.onDecodedChunk) die();
       } catch { /* partial JSON across chunk boundary — next chunk completes it */ }
     }
   };
@@ -110,6 +123,7 @@ export function createAnthropicUsageCapture(
 
   const consume = (chunk: Buffer): void => {
     if (dead) return;
+    try { options.onDecodedChunk?.(chunk); } catch { /* passive observer */ }
     if (isSSE) {
       parseSSEChunk(chunk.toString("utf8"));
       return;
@@ -124,12 +138,14 @@ export function createAnthropicUsageCapture(
     if (dead) return;
     if (isJSON) parseJSONBody();
     dead = true;
+    settleFinished();
   };
 
   if (!decoder) {
     return {
       write: (chunk) => consume(chunk),
       end: () => finish(),
+      finished,
     };
   }
 
@@ -141,11 +157,12 @@ export function createAnthropicUsageCapture(
   return {
     write: (chunk) => {
       if (dead) return;
-      decoder.write(chunk);
+      try { decoder.write(chunk); } catch { die(); }
     },
     end: () => {
       if (dead) return;
-      decoder.end();
+      try { decoder.end(); } catch { die(); }
     },
+    finished,
   };
 }

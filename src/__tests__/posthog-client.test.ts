@@ -457,6 +457,26 @@ describe("gated PostHog EU client", () => {
     releaseTransport?.();
   });
 
+  it("aborts an immediate transport when bounded shutdown expires", async () => {
+    let transportSignal: AbortSignal | undefined;
+    const transport: PostHogTransport = (_url, options) => new Promise((_resolve, reject) => {
+      transportSignal = options.signal ?? undefined;
+      transportSignal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      if (transportSignal?.aborted) reject(new Error("aborted"));
+    });
+    const client = createPostHogTelemetryClient({
+      getSnapshot: () => snapshot(),
+      transport,
+    });
+    const capture = client.captureAnalyticsImmediate(analyticsEvent(), CONSENT_GENERATION);
+    await vi.waitFor(() => expect(transportSignal).toBeDefined());
+
+    await client.shutdownWithin(10);
+
+    expect(transportSignal?.aborted).toBe(true);
+    await expect(capture).resolves.toBeUndefined();
+  });
+
   it.each([
     ["analytics", "throw"],
     ["analytics", "http_error"],

@@ -40,22 +40,34 @@ export function attachAnthropicResponseCapture(
   const contentType = String(upstream.headers["content-type"] ?? "");
   const encoding = String(upstream.headers["content-encoding"] ?? "");
   const isCompressed = /gzip|br|deflate/.test(encoding);
-  const streamTracker = createStreamLifecycleTracker(
-    startedAt,
-    !isCompressed && contentType.includes("text/event-stream"),
-    options.now,
-    options.onTerminal,
-  );
-  entry.streamLifecycle = streamTracker.state;
-  streamTracker.attach(upstream, downstream);
-  upstream.on("data", (chunk: Buffer) => streamTracker.observeChunk(chunk));
-
+  const isEventStream = contentType.includes("text/event-stream");
+  let streamTracker!: ReturnType<typeof createStreamLifecycleTracker>;
   const usageCapture = createAnthropicUsageCapture({
     contentType,
     contentEncoding: encoding,
     onInputUsage: usage => applyAnthropicInputUsage(entry, usage),
     onOutputUsage: usage => applyAnthropicOutputUsage(entry, usage),
+    ...(isEventStream ? { onDecodedChunk: (chunk: Buffer) => streamTracker.observeChunk(chunk) } : {}),
   });
+  streamTracker = createStreamLifecycleTracker(
+    startedAt,
+    isEventStream && usageCapture !== null,
+    options.now,
+    options.onTerminal,
+    {
+      requireSseTerminal: isEventStream,
+      ...(isCompressed && usageCapture
+        ? {
+            beforeTerminal: async () => {
+              usageCapture.end();
+              await usageCapture.finished;
+            },
+          }
+        : {}),
+    },
+  );
+  entry.streamLifecycle = streamTracker.state;
+  streamTracker.attach(upstream, downstream);
   if (usageCapture) {
     upstream.on("data", (chunk: Buffer) => usageCapture.write(chunk));
     upstream.on("end", () => usageCapture.end());

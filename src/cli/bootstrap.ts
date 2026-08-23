@@ -45,16 +45,14 @@ try {
       // A flush failure must not change the command's exit status.
     }
   }
-  if (cliTelemetryCommand) {
-    try {
-      const { wasCliTelemetryHandedOffToProxy } = await import("../telemetry/cli-runtime.js");
-      if (!wasCliTelemetryHandedOffToProxy()) {
-        const { shutdownTelemetryWithin } = await import("../telemetry/facade.js");
-        await shutdownTelemetryWithin(cliTelemetryPrepared ? 500 : 250);
-      }
-    } catch {
-      // Combined CLI shutdown must not change the command's exit status.
+  try {
+    const { wasCliTelemetryHandedOffToProxy } = await import("../telemetry/cli-runtime.js");
+    if (!wasCliTelemetryHandedOffToProxy()) {
+      const { shutdownTelemetryWithin } = await import("../telemetry/facade.js");
+      await shutdownTelemetryWithin(cliTelemetryCommand && cliTelemetryPrepared ? 500 : 250);
     }
+  } catch {
+    // Combined CLI shutdown must not change the command's exit status.
   }
   process.exitCode = commandExitCode;
 }
