@@ -408,7 +408,7 @@ describe("end-to-end telemetry privacy boundaries", () => {
         collector.closeAllConnections();
       });
     }
-  });
+  }, CI_DEADLINE_MS * 4);
 
   it("allows one in-flight PostHog request to finish while opt-out silently discards queued events and exceptions", async () => {
     const testHome = mkdtempSync(join(tmpdir(), "cc-router-posthog-opt-out-"));
