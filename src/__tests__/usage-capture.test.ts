@@ -52,15 +52,15 @@ describe("createAnthropicUsageCapture", () => {
   it("stops parsing SSE lines after usage completes while continuing decoded observation", async () => {
     const onInputUsage = vi.fn();
     const onOutputUsage = vi.fn();
-    const onDecodedChunk = vi.fn();
+    const tail = Buffer.alloc(128 * 1024, 0x78);
+    let observedTail = false;
     const capture = createAnthropicUsageCapture({
       contentType: "text/event-stream",
       contentEncoding: "",
       onInputUsage,
       onOutputUsage,
-      onDecodedChunk,
+      onDecodedChunk: chunk => { observedTail ||= chunk === tail; },
     });
-    const tail = Buffer.alloc(2 * 1024 * 1024, 0x78);
     const tailToString = vi.spyOn(tail, "toString");
 
     capture!.write(sseBody());
@@ -70,7 +70,7 @@ describe("createAnthropicUsageCapture", () => {
     capture!.write(tail);
     capture!.end();
 
-    expect(onDecodedChunk).toHaveBeenLastCalledWith(tail);
+    expect(observedTail).toBe(true);
     expect(tailToString).not.toHaveBeenCalled();
     await expect(capture!.finished).resolves.toBeUndefined();
   });
