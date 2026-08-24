@@ -4,7 +4,7 @@ import {
   fetchOpenAICodexModels,
 } from "../providers/model-discovery.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
-import type { ModelRoutingConfig } from "../protocol/model-ref.js";
+import { isBareOpenAIModel, type ModelRoutingConfig } from "../protocol/model-ref.js";
 import { buildModelRoutingUpdate } from "../protocol/model-routing-config.js";
 import type { Account } from "./types.js";
 
@@ -108,6 +108,7 @@ async function discoverModelList(
     models.set(model.id, model);
   }
   addConfiguredAliases(models, currentModelRouting(opts));
+  addBareOpenAIEntries(models);
 
   return [...models.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
@@ -164,6 +165,23 @@ function addConfiguredAliases(models: Map<string, OpenAIModel>, config: ModelRou
   }
   if (config?.openAIDefaultModel && models.has(`openai/${config.openAIDefaultModel}`)) {
     models.set("openai/default", modelEntry("openai/default", "openai_subscription"));
+  }
+}
+
+/**
+ * Routing already claims bare `gpt-*` slugs for OpenAI (isBareOpenAIModel in
+ * model-ref.ts), because the Codex CLI writes those bare slugs into its own
+ * config. Without a matching metadata entry here, Codex warns "Model
+ * metadata not found" and falls back to generic defaults for a model the
+ * router routes correctly.
+ */
+function addBareOpenAIEntries(models: Map<string, OpenAIModel>): void {
+  for (const model of [...models.values()]) {
+    if (model.owned_by !== "openai_subscription") continue;
+    const bare = model.id.startsWith("openai/") ? model.id.slice("openai/".length) : model.id;
+    if (isBareOpenAIModel(bare) && !models.has(bare)) {
+      models.set(bare, modelEntry(bare, "openai_subscription"));
+    }
   }
 }
 
