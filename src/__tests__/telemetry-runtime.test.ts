@@ -61,6 +61,32 @@ async function waitForRequest(
   }, { timeout: 2_000 });
 }
 
+function traceSpansNamed(
+  capture: TransportCaptureServer,
+  from: number,
+  name: string,
+): Array<Record<string, unknown>> {
+  return capture.requests
+    .slice(from)
+    .filter(request => request.url === "/i/v1/traces")
+    .map(request => decodeOtlpProtobuf(request.rawBody, "traces"))
+    .flatMap(payload => (payload.resourceSpans ?? []).flatMap(resource =>
+      ((resource as { scopeSpans?: Array<{ spans?: Array<Record<string, unknown>> }> }).scopeSpans ?? [])
+        .flatMap(scope => scope.spans ?? [])
+        .filter(span => span.name === name)
+    ));
+}
+
+async function waitForTraceSpan(
+  capture: TransportCaptureServer,
+  from: number,
+  name: string,
+): Promise<void> {
+  await vi.waitFor(() => {
+    expect(traceSpansNamed(capture, from, name)).not.toHaveLength(0);
+  }, { timeout: 2_000 });
+}
+
 async function createOpenAIRoutingOptions(
   overrides: Partial<{
     id: string;
@@ -957,17 +983,8 @@ describe("proxy runtime sampling and propagation", () => {
       }
 
       await flushTelemetryWithin(500);
-      await waitForRequest(capture, "/i/v1/traces", started);
-      const decoded = capture.requests
-        .slice(started)
-        .filter(request => request.url === "/i/v1/traces")
-        .map(request => decodeOtlpProtobuf(request.rawBody, "traces"));
-      const proxySpans = decoded.flatMap(payload => (payload.resourceSpans ?? []).flatMap(resource =>
-        ((resource as { scopeSpans?: Array<{ spans?: Array<Record<string, unknown>> }> }).scopeSpans ?? [])
-          .flatMap(scope => scope.spans ?? [])
-          .filter(span => span.name === "proxy.request")
-      ));
-      expect(proxySpans).not.toHaveLength(0);
+      await waitForTraceSpan(capture, started, "proxy.request");
+      const proxySpans = traceSpansNamed(capture, started, "proxy.request");
       const attributes = proxySpans.at(-1)?.attributes as Record<string, unknown>;
       expect(attributes["cc_router.stream_outcome"]).toBe(testCase.expectedOutcome);
       expect(attributes["cc_router.outcome"]).toBe(testCase.expectedOutcome);
