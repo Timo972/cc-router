@@ -38,7 +38,7 @@ export function attachAnthropicResponseCapture(
   } = {},
 ): void {
   const contentType = String(upstream.headers["content-type"] ?? "");
-  const encoding = String(upstream.headers["content-encoding"] ?? "");
+  const encoding = String(upstream.headers["content-encoding"] ?? "").toLowerCase();
   const isCompressed = /gzip|br|deflate/.test(encoding);
   const isEventStream = contentType.includes("text/event-stream");
   let streamTracker!: ReturnType<typeof createStreamLifecycleTracker>;

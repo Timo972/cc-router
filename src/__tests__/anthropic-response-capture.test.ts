@@ -36,6 +36,8 @@ function entry(): LogEntry {
 describe("attachAnthropicResponseCapture", () => {
   it.each([
     ["gzip", gzipSync],
+    ["GZIP", gzipSync],
+    ["GZip", gzipSync],
     ["br", brotliCompressSync],
     ["deflate", deflateSync],
   ])("waits for %s usage and message_stop before reporting completion", async (encoding, compress) => {

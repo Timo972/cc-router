@@ -60,6 +60,13 @@ export interface RuntimeTelemetryMetadata {
   runtimeMode: RuntimeMode;
 }
 
+export type TelemetrySpanStatus = "ok" | "error";
+
+export interface TelemetrySpanHandle {
+  annotate(attributes: SafeSpanAttributes): void;
+  end(status: TelemetrySpanStatus): void;
+}
+
 export interface SafeRuntimeLogInput {
   operation: Operation;
   reason: SetupReason;
@@ -301,6 +308,54 @@ function reconstructedSpan(
 }
 
 const automaticSpanConsent = createTelemetryConsentGate();
+const NOOP_TELEMETRY_SPAN: TelemetrySpanHandle = {
+  annotate: () => undefined,
+  end: () => undefined,
+};
+
+/**
+ * Start a closed-schema span whose lifetime is owned by an event-driven body.
+ * The returned handle never exposes the underlying OTel span or accepts
+ * arbitrary attributes.
+ */
+export function startTelemetrySpan(
+  operation: Operation,
+  attributes: SafeSpanAttributes,
+): TelemetrySpanHandle {
+  try {
+    if (!automaticSpanConsent.getSnapshot()) return NOOP_TELEMETRY_SPAN;
+    const safe = reconstructedSpan(operation, attributes);
+    if (!safe) return NOOP_TELEMETRY_SPAN;
+    const span = trace.getTracer("cc-router").startSpan(safe.operation, {
+      attributes: {
+        "cc_router.operation": safe.operation,
+        ...otelSpanAttributes(safe.attributes),
+      },
+    });
+    let ended = false;
+    return {
+      annotate(nextAttributes): void {
+        if (ended) return;
+        try {
+          const next = reconstructedSpan(operation, nextAttributes);
+          if (next) span.setAttributes(otelSpanAttributes(next.attributes));
+        } catch {
+          // Body telemetry never changes response handling.
+        }
+      },
+      end(status): void {
+        if (ended) return;
+        ended = true;
+        finalizeSpanBestEffort(
+          span,
+          status === "error" ? SpanStatusCode.ERROR : SpanStatusCode.OK,
+        );
+      },
+    };
+  } catch {
+    return NOOP_TELEMETRY_SPAN;
+  }
+}
 
 /**
  * Run one closed runtime operation in the active OTel context. The callback is

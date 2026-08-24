@@ -644,6 +644,47 @@ describe("proxy runtime sampling and propagation", () => {
     }
   });
 
+  it("exports body terminal attributes after the parent context has ended", async () => {
+    const facade = await import("../telemetry/facade.js");
+    const started = capture.requests.length;
+    let bodySpan: ReturnType<typeof facade.startTelemetrySpan> | undefined;
+
+    facade.withTelemetrySpan("proxy.request", { provider: "anthropic" }, () => {
+      bodySpan = facade.startTelemetrySpan("provider.inference", {
+        provider: "anthropic",
+        route: "messages",
+        streaming: true,
+      });
+    });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    bodySpan?.annotate({
+      streamOutcome: "complete",
+      inputTokens: 12,
+      outputTokens: 42,
+    });
+    bodySpan?.end("ok");
+
+    await facade.flushTelemetryWithin(500);
+    await waitForRequest(capture, "/i/v1/traces", started);
+    const decoded = capture.requests
+      .slice(started)
+      .filter(request => request.url === "/i/v1/traces")
+      .map(request => decodeOtlpProtobuf(request.rawBody, "traces"));
+    const providerSpans = decoded.flatMap(payload => (payload.resourceSpans ?? []).flatMap(resource =>
+      ((resource as { scopeSpans?: Array<{ spans?: Array<Record<string, unknown>> }> }).scopeSpans ?? [])
+        .flatMap(scope => scope.spans ?? [])
+        .filter(span => span.name === "provider.inference")
+    ));
+    const attributes = providerSpans
+      .map(span => span.attributes as Record<string, unknown>)
+      .find(candidate => candidate["cc_router.stream_outcome"] === "complete");
+    expect(attributes).toMatchObject({
+      "cc_router.stream_outcome": "complete",
+      "cc_router.input_tokens": 12,
+      "cc_router.output_tokens": 42,
+    });
+  });
+
   it("records the effective 502 when non-streaming Responses collection rejects malformed SSE", async () => {
     const express = (await import("express")).default;
     const { createServer } = await import("node:http");

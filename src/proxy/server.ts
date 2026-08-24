@@ -16,6 +16,7 @@ import {
   recordUnexpectedException,
   recordProxyStarted,
   shutdownTelemetryWithin,
+  startTelemetrySpan,
   startProxyHeartbeat,
 } from "../telemetry/facade.js";
 import { logRoute, logError, logStartup } from "./logger.js";
@@ -1443,6 +1444,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
         const entry = pendingLog as LogEntry;
         stats.addLog(entry);
+        const bodySpan = startTelemetrySpan("provider.inference", {
+          provider: "anthropic",
+          route: "messages",
+          modelFamily: runtimeModelFamily((req as Request)._ccRouteContext?.modelFamily),
+          streaming: (req as Request)._ccTelemetryStreaming,
+          httpStatusCode: status,
+          outcome,
+        });
 
         // ── Capture token usage from Anthropic response body ─────────────────
         // Passive stream-lifecycle + token-usage taps, shared with the
@@ -1455,12 +1464,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           {
             now: Date.now,
             onTerminal: terminal => {
-              annotateActiveSpan("provider.inference", {
+              bodySpan.annotate({
                 streamOutcome: terminal.outcome,
                 inputTokens: entry.inputTokens,
                 outputTokens: entry.outputTokens,
                 operationDurationMs: terminal.durationMs,
               });
+              bodySpan.end(terminal.outcome === "complete" && status < 400 ? "ok" : "error");
             },
           },
         );

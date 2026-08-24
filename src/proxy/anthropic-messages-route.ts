@@ -34,6 +34,8 @@ import {
   classifyExpectedRuntimeFailure,
   recordSafeLog,
   recordUnexpectedException,
+  startTelemetrySpan,
+  type TelemetrySpanHandle,
   withTelemetrySpan,
 } from "../telemetry/facade.js";
 import type { SafeExceptionContext, SafeSpanAttributes } from "../telemetry/contracts.js";
@@ -109,12 +111,14 @@ export interface AnthropicMessagesRouteOptions {
 
 export interface AnthropicMessagesRouteTelemetry {
   annotateActiveSpan(operation: "proxy.request" | "provider.inference", attributes: SafeSpanAttributes): void;
+  startTelemetrySpan(operation: "provider.inference", attributes: SafeSpanAttributes): TelemetrySpanHandle;
   recordSafeLog(input: Parameters<typeof recordSafeLog>[0]): void;
   recordUnexpectedException(error: unknown, context: SafeExceptionContext): void;
 }
 
 const DEFAULT_ANTHROPIC_MESSAGES_TELEMETRY: AnthropicMessagesRouteTelemetry = {
   annotateActiveSpan,
+  startTelemetrySpan,
   recordSafeLog,
   recordUnexpectedException,
 };
@@ -687,6 +691,16 @@ export function mountAnthropicMessagesRoute(
       // same contract as the generic proxy path.
       recordActivity(entry);
       finishTelemetry(status, telemetryOutcome(status), attempt);
+      const bodySpan = telemetry.startTelemetrySpan("provider.inference", {
+        provider: "anthropic",
+        route: "messages",
+        modelFamily,
+        requestSource: source,
+        streaming,
+        attempt,
+        httpStatusCode: status,
+        outcome: telemetryOutcome(status),
+      });
       attachAnthropicResponseCapture(
         upstream,
         res,
@@ -695,12 +709,15 @@ export function mountAnthropicMessagesRoute(
         {
           now,
           onTerminal: terminal => {
-            observeTelemetry(() => telemetry.annotateActiveSpan("proxy.request", {
+            observeTelemetry(() => bodySpan.annotate({
               streamOutcome: streaming ? terminal.outcome : undefined,
               inputTokens: entry.inputTokens,
               outputTokens: entry.outputTokens,
               operationDurationMs: terminal.durationMs,
             }));
+            observeTelemetry(() => bodySpan.end(
+              terminal.outcome === "complete" && status < 400 ? "ok" : "error",
+            ));
           },
         },
       );
