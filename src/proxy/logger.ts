@@ -4,12 +4,13 @@ function ts(): string {
   return new Date().toISOString().slice(11, 19); // HH:MM:SS
 }
 
-export function logRoute(accountId: string, requestCount: number, expiresInMin: number): void {
+export function logRoute(accountId: string, requestCount: number, expiresInMin: number, reason?: string): void {
   console.log(
     chalk.gray(`[${ts()}]`) +
     chalk.green(` → ${accountId}`) +
     chalk.gray(` req#${requestCount}`) +
-    chalk.yellow(` exp=${expiresInMin}min`)
+    chalk.yellow(` exp=${expiresInMin}min`) +
+    (reason ? chalk.cyan(` ${reason}`) : "")
   );
 }
 

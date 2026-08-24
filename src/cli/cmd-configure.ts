@@ -47,9 +47,11 @@ export function registerConfigure(program: Command): void {
           return;
         }
         const port = parseInt(opts.port, 10);
+        // Local routing has no auth in front of the proxy, so no env_key is
+        // written — Codex would otherwise hard-abort on startup if that env
+        // var isn't set.
         const result = writeCodexRouterConfig({
           baseUrl: `http://localhost:${port}/v1`,
-          tokenEnvKey: "CC_ROUTER_TOKEN",
           defaultModel: opts.model,
         });
         console.log(chalk.green(`✓ Updated ${result.path}`));
@@ -57,7 +59,7 @@ export function registerConfigure(program: Command): void {
         if (opts.model) console.log(chalk.gray(`    model          = ${opts.model}`));
         console.log(chalk.gray("    model_provider = cc-router"));
         console.log(chalk.gray(`    base_url       = http://localhost:${port}/v1`));
-        console.log(chalk.gray("    env_key        = CC_ROUTER_TOKEN"));
+        if (result.tokenEnvKey) console.log(chalk.gray(`    env_key        = ${result.tokenEnvKey}`));
         return;
       }
 
