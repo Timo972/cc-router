@@ -1,7 +1,7 @@
 import chalk from "chalk";
 
 function ts(): string {
-  return new Date().toISOString().slice(11, 19); // HH:MM:SS
+  return new Date().toISOString().slice(0, 19).replace("T", " "); // YYYY-MM-DD HH:MM:SS
 }
 
 export function logRoute(accountId: string, requestCount: number, expiresInMin: number, reason?: string): void {
