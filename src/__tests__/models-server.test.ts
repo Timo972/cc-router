@@ -46,6 +46,8 @@ describe("mountModelsRoute", () => {
         supported_reasoning_levels: expect.any(Array),
         input_modalities: ["text"],
         supported_in_api: true,
+        context_window: 272_000,
+        max_context_window: 1_050_000,
       }),
       expect.objectContaining({
         slug: "openai/gpt-5.4-mini",
@@ -53,6 +55,28 @@ describe("mountModelsRoute", () => {
         supported_reasoning_levels: expect.any(Array),
         input_modalities: ["text"],
         supported_in_api: true,
+        context_window: 272_000,
+        max_context_window: 1_050_000,
+      }),
+    ]);
+  });
+
+  it("uses the standard Claude context window for Anthropic models", async () => {
+    const app = express();
+
+    mountModelsRoute(app, {
+      getAnthropicAccounts: () => [makeAnthropicAccount()],
+      getOpenAIAccounts: () => [],
+      fetchAnthropicModels: async () => ["claude-sonnet-4-6"],
+    });
+
+    const body = await getJson(app, "/v1/models");
+
+    expect(body.models).toEqual([
+      expect.objectContaining({
+        slug: "anthropic/claude-sonnet-4-6",
+        context_window: 200_000,
+        max_context_window: 200_000,
       }),
     ]);
   });

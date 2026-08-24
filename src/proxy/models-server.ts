@@ -192,6 +192,17 @@ function modelEntry(
   return { id, object: "model", owned_by: ownedBy };
 }
 
+/**
+ * Codex's hardcoded skills-context budget (2%) is carved out of
+ * context_window, so an undersized value here starves it. Use the
+ * official per-family windows instead of one shared guess.
+ */
+function contextWindowFor(ownedBy: OpenAIModel["owned_by"]): { context_window: number; max_context_window: number } {
+  return ownedBy === "openai_subscription"
+    ? { context_window: 272_000, max_context_window: 1_050_000 }
+    : { context_window: 200_000, max_context_window: 200_000 };
+}
+
 function toCodexCliModel(model: OpenAIModel): CodexCliModel {
   return {
     prefer_websockets: true,
@@ -207,8 +218,7 @@ function toCodexCliModel(model: OpenAIModel): CodexCliModel {
     multi_agent_version: null,
     use_responses_lite: false,
     auto_review_model_override: null,
-    context_window: 128_000,
-    max_context_window: 128_000,
+    ...contextWindowFor(model.owned_by),
     auto_compact_token_limit: null,
     reasoning_summary_format: "experimental",
     default_reasoning_summary: "none",
