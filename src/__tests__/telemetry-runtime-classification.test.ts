@@ -8,11 +8,9 @@ describe("runtime automatic span classification", () => {
     else process.env["NODE_ENV"] = originalNodeEnv;
   });
 
-  it("classifies only the real provider hosts for every approved operation", async () => {
+  it("classifies only automatic operations and leaves provider attempts to retained manual spans", async () => {
     const { classifyOutgoingTelemetryOperation } = await import("../telemetry/runtime.js");
     const approved = [
-      ["api.anthropic.com", "/v1/messages", "POST", "provider.inference"],
-      ["chatgpt.com", "/backend-api/codex/responses", "POST", "provider.inference"],
       ["auth.openai.com", "/oauth/token", "POST", "oauth.refresh"],
       ["claude.ai", "/v1/oauth/token", "POST", "oauth.refresh"],
       ["api.anthropic.com", "/api/oauth/usage", "GET", "provider.usage_refresh"],
@@ -22,6 +20,16 @@ describe("runtime automatic span classification", () => {
     for (const [host, path, method, operation] of approved) {
       expect(classifyOutgoingTelemetryOperation(host, path, method)?.operation).toBe(operation);
     }
+    expect(classifyOutgoingTelemetryOperation(
+      "api.anthropic.com",
+      "/v1/messages",
+      "POST",
+    )).toBeUndefined();
+    expect(classifyOutgoingTelemetryOperation(
+      "chatgpt.com",
+      "/backend-api/codex/responses",
+      "POST",
+    )).toBeUndefined();
 
     const decoyPaths = [
       ["/v1/messages", "POST"],
@@ -43,7 +51,7 @@ describe("runtime automatic span classification", () => {
       "/v1/messages",
       "POST",
       "explicit-proxy.internal",
-    )?.operation).toBe("provider.inference");
+    )).toBeUndefined();
     expect(classifyOutgoingTelemetryOperation(
       "decoy.invalid",
       "/v1/messages",
@@ -56,8 +64,6 @@ describe("runtime automatic span classification", () => {
     const { classifyOutgoingTelemetryOperation } = await import("../telemetry/runtime.js");
     process.env["NODE_ENV"] = "test";
     const loopbackOperations = [
-      ["127.0.0.1", "/v1/messages", "POST", "provider.inference"],
-      ["127.0.0.1", "/backend-api/codex/responses", "POST", "provider.inference"],
       ["127.0.0.1", "/oauth/token", "POST", "oauth.refresh"],
       ["::1", "/v1/oauth/token", "POST", "oauth.refresh"],
       ["::1", "/api/oauth/usage", "GET", "provider.usage_refresh"],
@@ -71,7 +77,7 @@ describe("runtime automatic span classification", () => {
       "[::1]:4318",
       "/backend-api/codex/responses",
       "POST",
-    )?.operation).toBe("provider.inference");
+    )).toBeUndefined();
     expect(classifyOutgoingTelemetryOperation("127.0.0.1", "/i/v1/traces", "POST")).toBeUndefined();
     expect(classifyOutgoingTelemetryOperation("127.0.0.1", "/i/v1/logs", "POST")).toBeUndefined();
     expect(classifyOutgoingTelemetryOperation("127.0.0.1", "/batch/", "POST")).toBeUndefined();

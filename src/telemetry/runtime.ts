@@ -188,7 +188,7 @@ function isTestLoopbackHostname(hostname: string | undefined): boolean {
 }
 
 interface AutomaticSpanClassification {
-  operation: "proxy.request" | "provider.inference" | "oauth.refresh" | "provider.usage_refresh" | "model.discovery";
+  operation: "proxy.request" | "oauth.refresh" | "provider.usage_refresh" | "model.discovery";
   provider?: "anthropic" | "openai";
   route?: "messages" | "responses";
 }
@@ -206,21 +206,12 @@ export function classifyOutgoingTelemetryOperation(
   trustedProviderHostname?: string,
 ): AutomaticSpanClassification | undefined {
   const host = normalizedHostname(hostname);
-  const trusted = normalizedHostname(trustedProviderHostname);
   const testLoopback = isTestLoopbackHostname(host);
   const normalizedMethod = method?.toUpperCase();
-  if (normalizedMethod === "POST" && path === "/v1/messages"
-    && (host === "api.anthropic.com" || (trusted !== undefined && host === trusted) || testLoopback)) {
-    return { operation: "provider.inference", provider: "anthropic", route: "messages" };
-  }
-  if (normalizedMethod === "POST" && path === "/v1/responses"
-    && (host === "api.openai.com" || (trusted !== undefined && host === trusted) || testLoopback)) {
-    return { operation: "provider.inference", provider: "openai", route: "responses" };
-  }
-  if (normalizedMethod === "POST" && path === "/backend-api/codex/responses"
-    && (host === "chatgpt.com" || testLoopback)) {
-    return { operation: "provider.inference", provider: "openai", route: "responses" };
-  }
+  // Provider request bodies outlive response headers, so the routing layers
+  // retain one manual provider.inference span through terminal body capture.
+  // Leaving these POSTs unclassified prevents HTTP/Undici header spans from
+  // duplicating that attempt and reporting a contradictory shorter duration.
   if (normalizedMethod === "POST" && (
     (host === "claude.ai" && path === "/v1/oauth/token")
     || (host === "auth.openai.com" && path === "/oauth/token")

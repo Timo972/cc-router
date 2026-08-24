@@ -1,10 +1,8 @@
 import type { OpenAIResponsesRequest } from "../../protocol/openai-responses-types.js";
 import {
-  annotateActiveSpan,
   classifyExpectedRuntimeFailure,
   recordSafeLog,
   recordUnexpectedException,
-  withTelemetrySpan,
 } from "../../telemetry/facade.js";
 import type { OpenAISubscriptionAccount } from "./token-refresher.js";
 
@@ -26,77 +24,56 @@ export async function forwardOpenAICodexResponse(
   opts: ForwardOpenAICodexResponseOptions,
 ): Promise<Response> {
   const startedAt = Date.now();
-  return withTelemetrySpan("provider.inference", {
-    provider: "openai",
-    route: "responses",
-    modelFamily: codexModelFamily(opts.body.model),
-    streaming: opts.stream,
-    attempt: opts.attempt,
-  }, async () => {
-    try {
-      const body = toCodexBackendRequest(opts.body);
-      const upstream = await fetch(CODEX_RESPONSES_ENDPOINT, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${opts.account.accessToken}`,
-          "content-type": "application/json",
-          accept: "text/event-stream",
-        },
-        body: JSON.stringify(body),
-        ...(opts.signal ? { signal: opts.signal } : {}),
-      });
-      const outcome = responseOutcome(upstream.status);
-      annotateActiveSpan("provider.inference", {
+  try {
+    const body = toCodexBackendRequest(opts.body);
+    const upstream = await fetch(CODEX_RESPONSES_ENDPOINT, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${opts.account.accessToken}`,
+        "content-type": "application/json",
+        accept: "text/event-stream",
+      },
+      body: JSON.stringify(body),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
+    const outcome = responseOutcome(upstream.status);
+    if (upstream.status === 401 || upstream.status === 403
+      || upstream.status === 429 || upstream.status >= 500) {
+      recordSafeLog({
+        operation: "provider.inference",
+        provider: "openai",
+        reason: responseReason(upstream.status),
+        outcome,
         httpStatusCode: upstream.status,
-        outcome,
+        attempt: opts.attempt,
         operationDurationMs: Date.now() - startedAt,
+        severity: "warn",
       });
-      if (upstream.status === 401 || upstream.status === 403
-        || upstream.status === 429 || upstream.status === 529) {
-        recordSafeLog({
-          operation: "provider.inference",
-          provider: "openai",
-          reason: responseReason(upstream.status),
-          outcome,
-          httpStatusCode: upstream.status,
-          operationDurationMs: Date.now() - startedAt,
-          severity: "warn",
-        });
-      }
-      return ensureEventStreamContentType(upstream);
-    } catch (error) {
-      const reason = classifyExpectedRuntimeFailure(error);
-      const outcome = reason === "timeout" ? "timeout" : "upstream_error";
-      annotateActiveSpan("provider.inference", {
-        outcome,
-        operationDurationMs: Date.now() - startedAt,
-      });
-      if (reason) {
-        recordSafeLog({
-          operation: "provider.inference",
-          provider: "openai",
-          reason,
-          outcome,
-          operationDurationMs: Date.now() - startedAt,
-          severity: "error",
-        });
-      } else {
-        recordUnexpectedException(error, {
-          category: "runtime",
-          reason: "other",
-          operation: "provider.inference",
-          provider: "openai",
-        });
-      }
-      throw error;
     }
-  });
-}
-
-function codexModelFamily(model: string): "codex" | "other" {
-  return model.toLowerCase().includes("codex") || model.toLowerCase().startsWith("gpt-")
-    ? "codex"
-    : "other";
+    return ensureEventStreamContentType(upstream);
+  } catch (error) {
+    const reason = classifyExpectedRuntimeFailure(error);
+    const outcome = reason === "timeout" ? "timeout" : "upstream_error";
+    if (reason) {
+      recordSafeLog({
+        operation: "provider.inference",
+        provider: "openai",
+        reason,
+        outcome,
+        attempt: opts.attempt,
+        operationDurationMs: Date.now() - startedAt,
+        severity: "error",
+      });
+    } else {
+      recordUnexpectedException(error, {
+        category: "runtime",
+        reason: "other",
+        operation: "provider.inference",
+        provider: "openai",
+      });
+    }
+    throw error;
+  }
 }
 
 function responseOutcome(status: number): "complete" | "rate_limited" | "upstream_error" {

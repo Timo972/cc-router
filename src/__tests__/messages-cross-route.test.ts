@@ -76,6 +76,7 @@ function captureIngressTelemetry() {
   const records: unknown[] = [];
   const telemetry: OpenAIIngressTelemetry = {
     annotateActiveSpan: (...values) => { records.push(["span", ...values]); },
+    startTelemetrySpan: () => ({ annotate: () => undefined, end: () => undefined }),
     recordSafeLog: (...values) => { records.push(["log", ...values]); },
     recordUnexpectedException: (...values) => { records.push(["exception", ...values]); },
   };

@@ -489,7 +489,6 @@ describe("proxy runtime sampling and propagation", () => {
       await waitForRequest(capture, "/i/v1/traces", operationStart);
       const operationWire = wireFor(capture, "/i/v1/traces", operationStart).toString("utf8");
       for (const operation of [
-        "provider.inference",
         "oauth.refresh",
         "provider.usage_refresh",
         "model.discovery",
@@ -729,6 +728,22 @@ describe("proxy runtime sampling and propagation", () => {
 
       const traceWire = wireFor(capture, "/i/v1/traces", started).toString("utf8");
       expect(traceWire).toContain("upstream_error");
+      const decoded = capture.requests
+        .slice(started)
+        .filter(request => request.url === "/i/v1/traces")
+        .map(request => decodeOtlpProtobuf(request.rawBody, "traces"));
+      const providerSpans = decoded.flatMap(payload => (payload.resourceSpans ?? []).flatMap(resource =>
+        ((resource as { scopeSpans?: Array<{ spans?: Array<Record<string, unknown>> }> }).scopeSpans ?? [])
+          .flatMap(scope => scope.spans ?? [])
+          .filter(span => span.name === "provider.inference")
+      ));
+      expect(providerSpans).toHaveLength(1);
+      expect(providerSpans[0]?.attributes).toMatchObject({
+        "http.response.status_code": 502,
+        "cc_router.outcome": "upstream_error",
+        "cc_router.stream_outcome": "upstream_error",
+        "cc_router.attempt": 1,
+      });
       const logWire = wireFor(capture, "/i/v1/logs", started).toString("utf8");
       expect(logWire).toContain("upstream_5xx");
       expect(logWire).toContain("502");
@@ -737,6 +752,43 @@ describe("proxy runtime sampling and propagation", () => {
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
       server.closeAllConnections();
+    }
+  });
+
+  it("logs every Codex upstream server error from the diagnostics-owning transport", async () => {
+    const { forwardOpenAICodexResponse } = await import("../providers/openai/codex-transport.js");
+    const { flushTelemetryWithin } = await import("../telemetry/facade.js");
+    const started = capture.requests.length;
+
+    try {
+      for (const status of [500, 502, 503, 504]) {
+        codexStatus = status;
+        const response = await forwardOpenAICodexResponse({
+          account: {
+            id: TELEMETRY_CANARY.accountId,
+            provider: "openai_subscription",
+            accessToken: TELEMETRY_CANARY.bearerToken,
+            refreshToken: "private-refresh",
+            expiresAt: Date.now() + 60_000,
+            enabled: true,
+          },
+          body: { model: "gpt-5-codex", input: [] },
+          stream: true,
+        });
+        expect(response.status).toBe(status);
+        await response.arrayBuffer();
+      }
+      await flushTelemetryWithin(500);
+      await waitForRequest(capture, "/i/v1/logs", started);
+
+      const logWire = wireFor(capture, "/i/v1/logs", started).toString("utf8");
+      expect(countOccurrences(logWire, "runtime.failure")).toBe(4);
+      expect(logWire).toContain("upstream_5xx");
+      for (const status of [500, 502, 503, 504]) expect(logWire).toContain(String(status));
+      expect(logWire).not.toContain(TELEMETRY_CANARY.accountId);
+      expect(logWire).not.toContain("private codex response");
+    } finally {
+      codexStatus = 200;
     }
   });
 

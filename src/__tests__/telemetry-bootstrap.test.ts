@@ -153,7 +153,7 @@ function hasEnvironmentTargetOperations(requests: Array<{ url: string; rawBody: 
   const wire = traceWire(requests);
   return countOccurrences(wire, "proxy.request") >= 2
     && wire.includes("provider.inference")
-    && countOccurrences(wire, "@opentelemetry/instrumentation-http") >= 2;
+    && countOccurrences(wire, "@opentelemetry/instrumentation-http") >= 1;
 }
 
 function hasTraceSignals(
@@ -490,7 +490,6 @@ describe("compiled bootstrap harness portability", () => {
         "proxy.request",
         "proxy.request",
         "provider.inference",
-        "@opentelemetry/instrumentation-http",
         "@opentelemetry/instrumentation-http",
       ].join("\0")),
     }];
@@ -920,7 +919,6 @@ export async function resolve(specifier, context, nextResolve) {
         if (mode.name === "enabled") {
           const expectedSignals = [
             "@opentelemetry/instrumentation-express",
-            "@opentelemetry/instrumentation-undici",
             "proxy.request",
             "provider.inference",
           ] as const;
@@ -1358,7 +1356,7 @@ export async function resolve(specifier, context, nextResolve) {
     for (const snapshot of snapshots.slice(1)) expect(snapshot).toEqual(snapshots[0]);
   }, 60_000);
 
-  it("uses an environment LiteLLM target for both forwarding and outgoing span trust", async () => {
+  it("uses an environment LiteLLM target while retaining one manual provider span", async () => {
     const before = telemetry.requests.length;
     const environmentTargetPaths: string[] = [];
     const environmentTargetServer = createServer((request, response) => {
@@ -1411,7 +1409,7 @@ export async function resolve(specifier, context, nextResolve) {
       expect(environmentTargetPaths).toContain("/v1/messages");
       expect(countOccurrences(wire, "proxy.request")).toBeGreaterThanOrEqual(2);
       expect(wire).toContain("provider.inference");
-      expect(countOccurrences(wire, "@opentelemetry/instrumentation-http")).toBeGreaterThanOrEqual(2);
+      expect(countOccurrences(wire, "@opentelemetry/instrumentation-http")).toBeGreaterThanOrEqual(1);
       expect(wire).not.toContain("PRIVATE_ENV_TARGET_PROMPT");
       expect(wire).not.toContain("test-anthropic-access-token");
     } finally {

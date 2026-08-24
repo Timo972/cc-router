@@ -83,8 +83,17 @@ async function postResponses(baseUrl: string, body: Record<string, unknown>): Pr
 describe("runOpenAIIngress upstream retry", () => {
   it("fails a 429 over to a different account and relays only the successful response", async () => {
     const telemetryRecords: unknown[] = [];
+    const attemptSpans: Array<{ annotations: unknown[]; endings: unknown[] }> = [];
     const telemetry: OpenAIIngressTelemetry = {
       annotateActiveSpan: (...values) => telemetryRecords.push(["span", ...values]),
+      startTelemetrySpan: (_operation, attributes) => {
+        const span = { annotations: [attributes] as unknown[], endings: [] as unknown[] };
+        attemptSpans.push(span);
+        return {
+          annotate: value => span.annotations.push(value),
+          end: status => span.endings.push(status),
+        };
+      },
       recordSafeLog: value => telemetryRecords.push(["log", value]),
       recordUnexpectedException: (...values) => telemetryRecords.push(["exception", ...values]),
     };
@@ -137,6 +146,21 @@ describe("runOpenAIIngress upstream retry", () => {
       "proxy.request",
       expect.objectContaining({ httpStatusCode: 200, outcome: "complete", attempt: 2 }),
     ]);
+    expect(attemptSpans).toHaveLength(2);
+    expect(attemptSpans[0]).toMatchObject({
+      annotations: [
+        expect.objectContaining({ attempt: 1 }),
+        expect.objectContaining({ httpStatusCode: 429, outcome: "rate_limited" }),
+      ],
+      endings: ["error"],
+    });
+    expect(attemptSpans[1]).toMatchObject({
+      annotations: [
+        expect.objectContaining({ attempt: 2 }),
+        expect.objectContaining({ httpStatusCode: 200, outcome: "complete" }),
+      ],
+      endings: ["ok"],
+    });
     expect(JSON.stringify(telemetryRecords)).not.toContain("openai-a");
     expect(JSON.stringify(telemetryRecords)).not.toContain("openai-b");
   });

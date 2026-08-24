@@ -17,6 +17,8 @@ import {
   classifyExpectedRuntimeFailure,
   recordSafeLog,
   recordUnexpectedException,
+  startTelemetrySpan,
+  type TelemetrySpanHandle,
 } from "../telemetry/facade.js";
 import type { RequestSource, SafeExceptionContext, SafeSpanAttributes } from "../telemetry/contracts.js";
 import {
@@ -159,18 +161,36 @@ export interface OpenAIRelayReport {
 /** Narrow observer contract keeps routing independent from telemetry runtime ownership. */
 export interface OpenAIIngressTelemetry {
   annotateActiveSpan(operation: "proxy.request", attributes: SafeSpanAttributes): void;
+  startTelemetrySpan(operation: "provider.inference", attributes: SafeSpanAttributes): TelemetrySpanHandle;
   recordSafeLog(input: Parameters<typeof recordSafeLog>[0]): void;
   recordUnexpectedException(error: unknown, context: SafeExceptionContext): void;
 }
 
 const DEFAULT_OPENAI_INGRESS_TELEMETRY: OpenAIIngressTelemetry = {
   annotateActiveSpan,
+  startTelemetrySpan,
   recordSafeLog,
   recordUnexpectedException,
 };
 
 function observeTelemetry(observer: () => void): void {
   try { observer(); } catch { /* telemetry must never alter routing */ }
+}
+
+const NOOP_TELEMETRY_SPAN: TelemetrySpanHandle = {
+  annotate: () => undefined,
+  end: () => undefined,
+};
+
+function startObservedTelemetrySpan(
+  telemetry: OpenAIIngressTelemetry,
+  attributes: SafeSpanAttributes,
+): TelemetrySpanHandle {
+  try {
+    return telemetry.startTelemetrySpan("provider.inference", attributes);
+  } catch {
+    return NOOP_TELEMETRY_SPAN;
+  }
 }
 
 function openAIModelFamily(model: string): "codex" | "other" {
@@ -440,11 +460,36 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   let details: string;
   let accountFailureCounted: boolean;
   let attemptCount = 0;
+  let attemptSpan = NOOP_TELEMETRY_SPAN;
+  let attemptStartedAt = startedAt;
+
+  const finishAttemptSpan = (
+    httpStatusCode: number,
+    outcome: "complete" | "rate_limited" | "timeout" | "upstream_error" | "cancelled",
+    extra: SafeSpanAttributes = {},
+  ): void => {
+    observeTelemetry(() => attemptSpan.annotate({
+      ...extra,
+      httpStatusCode,
+      outcome,
+      attempt: attemptCount,
+      operationDurationMs: now() - attemptStartedAt,
+    }));
+    observeTelemetry(() => attemptSpan.end(outcome === "complete" ? "ok" : "error"));
+  };
 
   for (let attempt = 1; ; attempt++) {
     attemptCount = attempt;
     const account = selected.route.account;
-    const attemptStartedAt = now();
+    attemptStartedAt = now();
+    attemptSpan = startObservedTelemetrySpan(telemetry, {
+      provider: "openai",
+      route: telemetryBase.route,
+      modelFamily: telemetryBase.modelFamily,
+      requestSource: telemetryBase.requestSource,
+      streaming: telemetryBase.streaming,
+      attempt,
+    });
     try {
       upstream = await forwardOpenAI({
         account,
@@ -463,6 +508,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       // pre-forward disconnect branch above, which also just releases and stops.
       if (clientGone.signal.aborted || responseTerminated(res)) {
         selected.release();
+        finishAttemptSpan(499, "cancelled", { streamOutcome: "cancelled" });
         finishTelemetry(499, "cancelled", { attempt, streamOutcome: "cancelled" });
         return;
       }
@@ -505,6 +551,10 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
         }
       }
       res.status(502).json(envelope.wrap("upstream_error", `OpenAI request failed: ${message}`));
+      const reason = classifyExpectedRuntimeFailure(error);
+      finishAttemptSpan(502, reason === "timeout" ? "timeout" : "upstream_error", {
+        streamOutcome: reason === "timeout" ? "timeout" : "upstream_error",
+      });
       finishTelemetry(502, "upstream_error", { attempt });
       return;
     }
@@ -641,6 +691,11 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     if (!prepared) break;
 
     // Committed: record the failed attempt and abandon its response.
+    finishAttemptSpan(
+      upstream.status,
+      upstream.status === 429 ? "rate_limited" : "upstream_error",
+      { streamOutcome: "upstream_error" },
+    );
     stats.totalErrors++;
     recordActivity({
       ts: attemptStartedAt,
@@ -784,6 +839,20 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   entry.statusCode = finalStatus;
   entry.durationMs = now() - startedAt;
   recordActivity(entry);
+  const providerOutcome = clientCancelled ? "cancelled"
+    : finalStatus === 429 ? "rate_limited"
+    : failedFinal ? "upstream_error"
+    : "complete";
+  finishAttemptSpan(
+    clientCancelled ? 499 : finalStatus,
+    providerOutcome,
+    {
+      streamOutcome: clientCancelled ? "cancelled" : failedFinal ? "upstream_error" : "complete",
+      ...(entry.inputTokens !== undefined ? { inputTokens: entry.inputTokens } : {}),
+      ...(entry.outputTokens !== undefined ? { outputTokens: entry.outputTokens } : {}),
+      concurrency: openAIPool.getInFlight(account.id),
+    },
+  );
   finishTelemetry(
     finalStatus,
     clientCancelled ? "cancelled"
