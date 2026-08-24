@@ -23,12 +23,28 @@ function fakeResponse() {
 }
 
 describe("extractCodexSessionKey", () => {
-  it("prefers the Codex session_id header", () => {
+  it("prefers the Codex session-id (dashed) header", () => {
     const request = fakeRequest({
-      "session_id": ["codex-session"],
+      "session-id": ["codex-session"],
       "x-claude-code-session-id": ["claude-session"],
     });
     expect(extractCodexSessionKey(request, { prompt_cache_key: "cache-key" })).toBe("codex-session");
+  });
+
+  it("prefers the dashed header over the legacy underscore header when both are present", () => {
+    const request = fakeRequest({
+      "session-id": ["dashed-session"],
+      "session_id": ["underscore-session"],
+    });
+    expect(extractCodexSessionKey(request, {})).toBe("dashed-session");
+  });
+
+  it("falls back to the legacy session_id header when the dashed header is absent", () => {
+    const request = fakeRequest({
+      "session_id": ["underscore-session"],
+      "x-claude-code-session-id": ["claude-session"],
+    });
+    expect(extractCodexSessionKey(request, { prompt_cache_key: "cache-key" })).toBe("underscore-session");
   });
 
   it("falls back to x-claude-code-session-id, then prompt_cache_key", () => {
@@ -41,6 +57,14 @@ describe("extractCodexSessionKey", () => {
   });
 
   it("ignores duplicated and oversized headers", () => {
+    expect(extractCodexSessionKey(
+      fakeRequest({ "session-id": ["one", "two"] }),
+      {},
+    )).toBeUndefined();
+    expect(extractCodexSessionKey(
+      fakeRequest({ "session-id": ["x".repeat(300)] }),
+      {},
+    )).toBeUndefined();
     expect(extractCodexSessionKey(
       fakeRequest({ "session_id": ["one", "two"] }),
       {},
