@@ -1614,6 +1614,27 @@ describe("mountResponsesRoutes sticky routing", () => {
     expect(entry?.cacheReadTokens).toBe(60);
   });
 
+  it("logs the routed request with its route reason on the success path", async () => {
+    const account = makeRuntimeAccount("openai-a");
+    const { app } = mountWithPool([account], vi.fn(async () => sseResponse()));
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await withServer(app, async baseUrl => {
+      const response = await post(baseUrl, {});
+      expect(await response.text()).toBe(SSE_BODY);
+    });
+
+    // Mirrors the Anthropic path's per-request route log (server.ts) —
+    // previously the OpenAI/Responses ingress logged nothing at all for a
+    // successful route, making routing decisions invisible on this path.
+    const routeLines = logSpy.mock.calls
+      .map(call => call.map(String).join(" "))
+      .filter(line => line.includes(account.id) && line.includes("req#"));
+    expect(routeLines.length).toBeGreaterThan(0);
+    // The reason must be one of the router's own (session-id-free) labels.
+    expect(routeLines[0]).toMatch(/sticky|new-session|unscoped|failover/);
+  });
+
   it("streams a response.incomplete terminal event byte-for-byte and records it as a successful route with usage, not a 502", async () => {
     const account = makeRuntimeAccount("openai-a");
     const forwardOpenAI = vi.fn(async () => new Response(INCOMPLETE_SSE_BODY, {

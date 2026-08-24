@@ -8,7 +8,7 @@ import { needsOpenAIRefresh } from "../providers/openai/token-refresher.js";
 import type { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { stats, boundModelId, createLocalRoutingErrorLog } from "./stats.js";
 import type { LogEntry } from "./stats.js";
-import { logError } from "./logger.js";
+import { logError, logRoute } from "./logger.js";
 import { EmptyPoolError, NoEligibleAccountError } from "./account-pool.js";
 import type { SessionRouter, RoutedAccountLease } from "./session-router.js";
 import { acquireRequestRoute, routeReasonDetails, routeFailureDetails } from "./lease-lifecycle.js";
@@ -241,6 +241,17 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   }
 
   const account = selected.route.account;
+  // Mirrors the Anthropic path's route log (server.ts) — without this the
+  // OpenAI/Responses ingress made every routing decision (sticky/new-session/
+  // failover) invisible, unlike the Anthropic path which logs every routed
+  // request. `selected.details` is the pool's preformatted, session-id-free
+  // reason string — keep it that way.
+  logRoute(
+    account.id,
+    account.requestCount,
+    Math.round((account.expiresAt - now()) / 60_000),
+    selected.details,
+  );
   const startedAt = now();
   const needed = needsOpenAIRefresh(account);
   let ready: boolean;
