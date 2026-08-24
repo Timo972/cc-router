@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import os from "os";
+import { parse as parseToml } from "smol-toml";
 import type { ProxyConfig } from "../config/manager.js";
 import { CODEX_CONFIG_PATH } from "../config/paths.js";
 
@@ -82,103 +83,161 @@ function countOccurrences(line: string, needle: string): number {
   return count;
 }
 
+/** Root-level keys the managed block ever supersedes (bare or quoted). */
+const SUPERSEDABLE_KEYS = ["model_provider", "model"] as const;
+
+/** Builds a regex matching `key = ` with `key` optionally `"quoted"`/`'quoted'`. */
+function assignmentPattern(key: string): RegExp {
+  return new RegExp(`^\\s*(?:"${key}"|'${key}'|${key})\\s*=`);
+}
+
+/**
+ * Reduces a line to its "structural" code: comment tails and single-line
+ * quoted-string bodies are stripped out (never inspected), while a `"""`/
+ * `'''` delimiter that is NOT nested inside a single-line `"…"`/`'…'` string
+ * is preserved verbatim. This is deliberately char-by-char rather than a
+ * full TOML parser, but — unlike a naive quote-state toggle — it correctly
+ * leaves literal `"""`/`'''` text INSIDE an ordinary single-line string
+ * (e.g. `hint = 'use """ here'`) out of the output entirely, so callers
+ * scanning for multiline-string delimiters never mistake it for one.
+ * Escaped quotes (`\"`) inside basic (`"…"`) strings are honored; literal
+ * strings (`'…'`) have no escapes, per TOML.
+ */
+function codeOnly(line: string): string {
+  let out = "";
+  let i = 0;
+  while (i < line.length) {
+    const three = line.slice(i, i + 3);
+    if (three === '"""' || three === "'''") {
+      out += three;
+      i += 3;
+      continue;
+    }
+    const ch = line[i];
+    if (ch === "#") break;
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < line.length && line[j] !== '"') {
+        if (line[j] === "\\") j++;
+        j++;
+      }
+      i = j < line.length ? j + 1 : line.length;
+      continue;
+    }
+    if (ch === "'") {
+      let j = i + 1;
+      while (j < line.length && line[j] !== "'") j++;
+      i = j < line.length ? j + 1 : line.length;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+interface TomlLineScan {
+  /** Whether line `i` starts already inside an open multiline string. */
+  insideMultilineString: boolean[];
+  /** Unclosed `[`/`]` array-bracket depth at the START of line `i`. */
+  bracketDepthAtLineStart: number[];
+}
+
+/**
+ * Walks every line once, tracking `"""`/`'''` multiline-string open/close
+ * state AND `[`/`]` array-bracket nesting depth (deliberately not a full
+ * TOML parser), against `codeOnly`'s output so neither comments nor
+ * single-line string content can be mistaken for real delimiters/brackets.
+ * This is the single shared lexical pass used by `findFirstTableHeaderLine`
+ * and `supersedeTopLevelKey` so they never disagree about what counts as
+ * "inside a multiline string" or "inside an unclosed array".
+ */
+function scanTomlLines(lines: string[]): TomlLineScan {
+  const insideMultilineString: boolean[] = [];
+  const bracketDepthAtLineStart: number[] = [];
+  let openDelim: '"""' | "'''" | null = null;
+  let depth = 0;
+  for (const line of lines) {
+    insideMultilineString.push(openDelim !== null);
+    bracketDepthAtLineStart.push(depth);
+    if (openDelim) {
+      if (countOccurrences(line, openDelim) % 2 === 1) openDelim = null;
+      continue;
+    }
+    const code = codeOnly(line);
+    for (const ch of code) {
+      if (ch === "[") depth++;
+      else if (ch === "]") depth = Math.max(0, depth - 1);
+    }
+    if (countOccurrences(code, '"""') % 2 === 1) {
+      openDelim = '"""';
+    } else if (countOccurrences(code, "'''") % 2 === 1) {
+      openDelim = "'''";
+    }
+  }
+  return { insideMultilineString, bracketDepthAtLineStart };
+}
+
+/**
+ * A line is only a real top-level table-header CANDIDATE when it is not
+ * inside a multiline string, bracket depth is 0 at its start (i.e. it is
+ * not a continuation line of a still-open multiline array — see F2: a
+ * `[1, 2],` row inside `matrix = [ … ]` must never be mistaken for a table
+ * header), and the trimmed line structurally starts with `[`.
+ */
 function isTableHeaderLine(line: string): boolean {
   return /^\s*\[/.test(line);
 }
 
 /**
- * Strips a line down to the part that precedes any `#` comment, tracking
- * single-line `"`/`'` quote state so a `#` inside a quoted value is never
- * mistaken for a comment start. Deliberately char-by-char rather than a
- * TOML parser: a `"""`/`'''` run toggles this same quote state three times
- * (open, close, open) and so is naturally left "inside a quote" afterwards
- * — which is also the correct outcome for multiline-string open detection,
- * so the same helper serves both callers below.
- */
-function stripCommentTail(line: string): string {
-  let quote: '"' | "'" | null = null;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (quote) {
-      if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      continue;
-    }
-    if (ch === "#") {
-      return line.slice(0, i);
-    }
-  }
-  return line;
-}
-
-/**
- * Walks every line once, tracking `"""`/`'''` multiline-string open/close
- * state (deliberately not a full TOML parser), and returns — per line —
- * whether that line's content is opaque multiline-string data (i.e. we were
- * already inside an open multiline string when the line started). Delimiter
- * counting runs against `stripCommentTail`'s output so a `"""`/`'''` inside
- * a `#` comment is never mistaken for a real delimiter (would otherwise
- * wrongly flip string-mode and hide real table headers / assignments after
- * it). This is the single shared lexical pass used by both
- * `findFirstTableHeaderLine` and `supersedeTopLevelKey` so they never
- * disagree about what counts as "inside a multiline string".
- */
-function scanTomlLines(lines: string[]): boolean[] {
-  const insideMultilineString: boolean[] = [];
-  let openDelim: '"""' | "'''" | null = null;
-  for (const line of lines) {
-    insideMultilineString.push(openDelim !== null);
-    if (openDelim) {
-      if (countOccurrences(line, openDelim) % 2 === 1) openDelim = null;
-      continue;
-    }
-    const effective = stripCommentTail(line);
-    if (countOccurrences(effective, '"""') % 2 === 1) {
-      openDelim = '"""';
-    } else if (countOccurrences(effective, "'''") % 2 === 1) {
-      openDelim = "'''";
-    }
-  }
-  return insideMultilineString;
-}
-
-/**
  * Line index of the first top-level table header (`[section]` / `[[array]]`),
- * or `undefined` if the file has none. Ignores lines inside a multiline
- * string value (per `scanTomlLines`) so a `[`-looking content line there is
- * never mistaken for a header.
+ * or `undefined` if the file has none.
  */
-function findFirstTableHeaderLine(lines: string[], insideMultilineString: boolean[]): number | undefined {
+function findFirstTableHeaderLine(lines: string[], scan: TomlLineScan): number | undefined {
   for (let i = 0; i < lines.length; i++) {
-    if (insideMultilineString[i]) continue;
+    if (scan.insideMultilineString[i]) continue;
+    if (scan.bracketDepthAtLineStart[i] !== 0) continue;
     if (isTableHeaderLine(lines[i])) return i;
   }
   return undefined;
 }
 
-/** Reverses `SUPERSEDED_PREFIX` commenting on every line that carries it. */
+/**
+ * Reverses `SUPERSEDED_PREFIX` commenting, but only on lines with clear
+ * provenance: outside a multiline string (per `scanTomlLines`), and whose
+ * remainder (after stripping the prefix) parses as an assignment of one of
+ * `SUPERSEDABLE_KEYS` — the only keys this module ever supersedes. Any other
+ * line that happens to start with the same text (e.g. a user's own comment,
+ * or the literal marker text sitting inside an unrelated multiline string)
+ * is left byte-identical.
+ */
 function restoreSupersededLines(text: string): string {
-  return text
-    .split("\n")
-    .map(line => (line.startsWith(SUPERSEDED_PREFIX) ? line.slice(SUPERSEDED_PREFIX.length) : line))
+  const lines = text.split("\n");
+  const scan = scanTomlLines(lines);
+  return lines
+    .map((line, i) => {
+      if (scan.insideMultilineString[i]) return line;
+      if (!line.startsWith(SUPERSEDED_PREFIX)) return line;
+      const remainder = line.slice(SUPERSEDED_PREFIX.length);
+      const isManagedKeyAssignment = SUPERSEDABLE_KEYS.some(key => assignmentPattern(key).test(remainder));
+      return isManagedKeyAssignment ? remainder : line;
+    })
     .join("\n");
 }
 
 /**
  * Comments out (in place) every top-level `key = ...` assignment among
  * `lines[0, scopeEnd)` — i.e. before the managed block's insertion point —
- * so the block's own value for that key is the only one TOML sees. Already
- * `SUPERSEDED_PREFIX`-marked lines are left untouched: re-running this on an
- * already-commented line must not double-comment it. Lines inside a
- * multiline string value (per `scanTomlLines`) are skipped too — a `key = `
- * looking line THERE is opaque string content, not a live assignment, and
- * must never be mutated.
+ * so the block's own value for that key is the only one TOML sees. Matches
+ * `key` bare or quoted (`"key"`/`'key'` — TOML permits both for root keys).
+ * Already `SUPERSEDED_PREFIX`-marked lines are left untouched: re-running
+ * this on an already-commented line must not double-comment it. Lines
+ * inside a multiline string value (per `scanTomlLines`) are skipped too — a
+ * `key = ` looking line THERE is opaque string content, not a live
+ * assignment, and must never be mutated.
  */
 function supersedeTopLevelKey(lines: string[], key: string, scopeEnd: number, insideMultilineString: boolean[]): void {
-  const assignment = new RegExp(`^\\s*${key}\\s*=`);
+  const assignment = assignmentPattern(key);
   for (let i = 0; i < scopeEnd; i++) {
     if (insideMultilineString[i]) continue;
     const line = lines[i];
@@ -222,12 +281,12 @@ function stripManagedBlock(existing: string): { next: string; removed: boolean }
 function replaceManagedBlock(existing: string, block: string, keysToSupersede: string[]): string {
   const { next: base } = stripManagedBlock(existing);
   const lines = base.length > 0 ? base.split("\n") : [];
-  const insideMultilineString = scanTomlLines(lines);
-  const headerLine = findFirstTableHeaderLine(lines, insideMultilineString);
+  const scan = scanTomlLines(lines);
+  const headerLine = findFirstTableHeaderLine(lines, scan);
   const scopeEnd = headerLine ?? lines.length;
 
   for (const key of keysToSupersede) {
-    supersedeTopLevelKey(lines, key, scopeEnd, insideMultilineString);
+    supersedeTopLevelKey(lines, key, scopeEnd, scan.insideMultilineString);
   }
 
   if (headerLine === undefined) {
@@ -243,6 +302,55 @@ function replaceManagedBlock(existing: string, block: string, keysToSupersede: s
 function quotedTomlValue(block: string, key: string): string | undefined {
   const match = block.match(new RegExp(`^${key}\\s*=\\s*"([^"]*)"`, "m"));
   return match?.[1];
+}
+
+/**
+ * Safety net (F0): the line-based scanner above is deliberately not a full
+ * TOML parser and can have blind spots. Before any write actually touches
+ * disk, the candidate content is parsed with a real TOML parser and checked
+ * against the invariants the write is supposed to establish. Any violation
+ * throws — loudly refusing to write — rather than silently corrupting the
+ * user's `~/.codex/config.toml`.
+ */
+function assertValidManagedWrite(next: string, defaultModel: string | undefined): void {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = parseToml(next) as Record<string, unknown>;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `cc-router refused to write ~/.codex/config.toml: the rewritten config failed TOML validation (${detail}). Your config was NOT modified.`,
+    );
+  }
+  if (parsed.model_provider !== "cc-router") {
+    throw new Error(
+      "cc-router refused to write ~/.codex/config.toml: the rewritten config failed TOML validation " +
+        "(top-level model_provider is not \"cc-router\" after write). Your config was NOT modified.",
+    );
+  }
+  if (defaultModel !== undefined && parsed.model !== defaultModel) {
+    throw new Error(
+      "cc-router refused to write ~/.codex/config.toml: the rewritten config failed TOML validation " +
+        "(top-level model does not match the configured default model). Your config was NOT modified.",
+    );
+  }
+}
+
+/**
+ * Safety net (F0) for the remove/strip path: the result of removing the
+ * managed block and restoring superseded lines must still be valid TOML.
+ * On failure, throw instead of writing — same loud-refusal contract as
+ * `assertValidManagedWrite`.
+ */
+function assertParsesAsToml(next: string): void {
+  try {
+    parseToml(next);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `cc-router refused to update ~/.codex/config.toml: the rewritten config failed TOML validation (${detail}). Your config was NOT modified.`,
+    );
+  }
 }
 
 export interface RemoveCodexRouterConfigOptions {
@@ -290,6 +398,7 @@ export function writeCodexRouterConfig(opts: WriteCodexRouterConfigOptions): Wri
     : "";
   const keysToSupersede = ["model_provider", ...(opts.defaultModel ? ["model"] : [])];
   const next = replaceManagedBlock(existing, managedBlock(opts.baseUrl, tokenEnvKey, opts.defaultModel), keysToSupersede);
+  assertValidManagedWrite(next, opts.defaultModel);
   fs.writeFileSync(configPath, next, "utf-8");
 
   return { path: configPath, tokenEnvKey };
@@ -304,7 +413,10 @@ export function removeCodexRouterConfig(
 
   const existing = fs.readFileSync(configPath, "utf-8");
   const { next, removed } = stripManagedBlock(existing);
-  if (removed) fs.writeFileSync(configPath, next, "utf-8");
+  if (removed) {
+    assertParsesAsToml(next);
+    fs.writeFileSync(configPath, next, "utf-8");
+  }
   return { path: configPath, removed };
 }
 

@@ -1,5 +1,6 @@
 import { join } from "path";
 import { describe, expect, it, vi } from "vitest";
+import { parse } from "smol-toml";
 import {
   codexBaseUrlFromRouterUrl,
   writeCodexRouterConfig,
@@ -440,6 +441,173 @@ describe("writeCodexRouterConfig", () => {
       "",
       "",
     ].join("\n"));
+  });
+
+  it("F1: a single-line string containing a literal \"\"\" does not falsely open multiline-string mode", () => {
+    const writeFileSync = vi.fn();
+    const existing = [
+      "hint = 'use \"\"\" here'",
+      "",
+      "[profiles.work]",
+      "model = \"gpt-5-codex\"",
+      "",
+    ].join("\n");
+
+    writeCodexRouterConfig({
+      homeDir: "/tmp/home",
+      baseUrl: "http://localhost:3456/v1",
+      fs: {
+        existsSync: () => true,
+        readFileSync: () => existing,
+        writeFileSync,
+        mkdirSync: vi.fn(),
+      },
+    });
+
+    const written = String(writeFileSync.mock.calls[0][1]);
+    expect(written).toContain("hint = 'use \"\"\" here'");
+    const lines = written.split("\n");
+    const startLine = lines.findIndex(l => l === "# cc-router:start");
+    const headerLine = lines.findIndex(l => l === "[profiles.work]");
+    // A literal `"""` inside an ordinary single-line string must not be
+    // mistaken for a multiline-string delimiter — the scanner must still
+    // find the REAL table header and insert the block before it.
+    expect(startLine).toBeGreaterThanOrEqual(0);
+    expect(headerLine).toBeGreaterThanOrEqual(0);
+    expect(startLine).toBeLessThan(headerLine);
+  });
+
+  it("F2: a multiline array's continuation lines are never mistaken for table headers", () => {
+    const writeFileSync = vi.fn();
+    const existing = [
+      "matrix = [",
+      "  [1, 2],",
+      "  [3, 4],",
+      "]",
+      "",
+      "[profiles.work]",
+      "model = \"gpt-5-codex\"",
+      "",
+    ].join("\n");
+
+    writeCodexRouterConfig({
+      homeDir: "/tmp/home",
+      baseUrl: "http://localhost:3456/v1",
+      fs: {
+        existsSync: () => true,
+        readFileSync: () => existing,
+        writeFileSync,
+        mkdirSync: vi.fn(),
+      },
+    });
+
+    const written = String(writeFileSync.mock.calls[0][1]);
+    // The point of F2: verify via the real parser, not line-position
+    // assertions, that the write produced a structurally valid document
+    // with model_provider correctly at the top level (i.e. the block was
+    // never inserted INSIDE the array).
+    const parsed = parse(written) as Record<string, unknown>;
+    expect(parsed.model_provider).toBe("cc-router");
+    expect(parsed.matrix).toEqual([[1, 2], [3, 4]]);
+
+    const lines = written.split("\n");
+    const startLine = lines.findIndex(l => l === "# cc-router:start");
+    const realHeaderLine = lines.findIndex(l => l === "[profiles.work]");
+    const fakeHeaderLine = lines.findIndex(l => l.trim() === "[1, 2],");
+    expect(startLine).toBeGreaterThanOrEqual(0);
+    // Must land before the real header, and never land in the middle of
+    // the still-open array (i.e. not immediately after a `[1, 2],` row).
+    expect(startLine).toBeLessThan(realHeaderLine);
+    expect(lines[startLine - 1]?.trim()).not.toBe(fakeHeaderLine >= 0 ? lines[fakeHeaderLine].trim() : "__never__");
+  });
+
+  it("F3: a pre-existing quoted top-level key is superseded without creating a duplicate", () => {
+    const writeFileSync = vi.fn();
+    const existing = [
+      "\"model_provider\" = \"x\"",
+      "",
+      "[profiles.work]",
+      "model = \"gpt-5-codex\"",
+      "",
+    ].join("\n");
+
+    writeCodexRouterConfig({
+      homeDir: "/tmp/home",
+      baseUrl: "http://localhost:3456/v1",
+      fs: {
+        existsSync: () => true,
+        readFileSync: () => existing,
+        writeFileSync,
+        mkdirSync: vi.fn(),
+      },
+    });
+
+    const written = String(writeFileSync.mock.calls[0][1]);
+    expect(written).toContain("# cc-router:superseded \"model_provider\" = \"x\"");
+    const parsed = parse(written) as Record<string, unknown>;
+    expect(parsed.model_provider).toBe("cc-router");
+  });
+
+  it("F4: restore only touches lines with clear managed-key provenance", () => {
+    // One line carrying SUPERSEDED_PREFIX text sits inside a multiline
+    // string (never a live assignment); another is a free-floating comment
+    // that merely happens to start with the same prefix text but names an
+    // unrelated key. Neither has provenance as an actual superseded
+    // `model`/`model_provider` assignment, so remove must leave both
+    // byte-identical.
+    let stored = [
+      "description = \"\"\"",
+      "# cc-router:superseded some_random = \"y\"",
+      "\"\"\"",
+      "# cc-router:start",
+      "model_provider = \"cc-router\"",
+      "# cc-router:end",
+      "# cc-router:superseded some_random = \"y\"",
+      "",
+    ].join("\n");
+    const fs = {
+      existsSync: () => true,
+      readFileSync: () => stored,
+      writeFileSync: (_path: string, data: string) => {
+        stored = data;
+      },
+      mkdirSync: vi.fn(),
+    };
+
+    removeCodexRouterConfig({ homeDir: "/tmp/home", fs });
+
+    // Both lines carry the SUPERSEDED_PREFIX text, but neither is a
+    // managed-key assignment (`model`/`model_provider`) — one sits inside a
+    // multiline string, the other is an unrelated free-floating comment.
+    // Both must be left untouched by remove.
+    expect(stored).toContain("# cc-router:superseded some_random = \"y\"");
+    expect(stored).not.toContain("\nsome_random = \"y\"");
+  });
+
+  it("F0: removeCodexRouterConfig refuses to write when the result would not be valid TOML", () => {
+    // Constructs the scanner blind spot the F0 safety net exists for: the
+    // START/END markers are found by plain substring search
+    // (`managedBlockBounds`), so if that literal text happens to appear
+    // inside what looks like a multiline-string value, slicing the file at
+    // those byte offsets can produce a structurally broken remainder —
+    // here, an orphaned bare word with no `=`/`[`/`#`. The parser-backed
+    // validator must catch this and throw rather than write it.
+    const existing = [
+      "# cc-router:start",
+      "foo = \"\"\"",
+      "# cc-router:end",
+      "bar",
+    ].join("\n");
+
+    expect(() => removeCodexRouterConfig({
+      homeDir: "/tmp/home",
+      fs: {
+        existsSync: () => true,
+        readFileSync: () => existing,
+        writeFileSync: vi.fn(),
+        mkdirSync: vi.fn(),
+      },
+    })).toThrow("failed TOML validation");
   });
 });
 

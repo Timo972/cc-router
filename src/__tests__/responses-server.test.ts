@@ -1631,8 +1631,45 @@ describe("mountResponsesRoutes sticky routing", () => {
       .map(call => call.map(String).join(" "))
       .filter(line => line.includes(account.id) && line.includes("req#"));
     expect(routeLines.length).toBeGreaterThan(0);
-    // The reason must be one of the router's own (session-id-free) labels.
-    expect(routeLines[0]).toMatch(/sticky|new-session|unscoped|failover/);
+    // The reason segment must be EXACTLY one of the router's own
+    // (session-id-free) labels, with nothing appended beyond the known
+    // segments — account id / req# / exp= / reason. A prior version of this
+    // assertion only checked that one of these keywords appeared *anywhere*
+    // in the line, which would also pass for a leaked `sticky session=<id>`.
+    expect(routeLines[0]).toMatch(
+      new RegExp(`^\\[[^\\]]+\\] → ${account.id} req#\\d+ exp=\\d+min (sticky|new-session|unscoped|failover)(:fallback)?$`),
+    );
+  });
+
+  it("never logs the client-supplied session identifier, even for a sticky-routed second request", async () => {
+    // A distinct account id (not the "openai-a" reused by neighboring tests
+    // in this file) so a trailing async log tail from another test can never
+    // bleed into this test's route-line filter — see drainedErrorTotal()
+    // above for the same race in the error-count case.
+    const account = makeRuntimeAccount("openai-privacy-check");
+    const { app } = mountWithPool([account], vi.fn(async () => sseResponse()));
+    const sessionId = "session-privacy-check-do-not-leak";
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await withServer(app, async baseUrl => {
+      const first = await post(baseUrl, {}, { "session_id": sessionId });
+      await first.text();
+      const second = await post(baseUrl, {}, { "session_id": sessionId });
+      await second.text();
+    });
+
+    const routeLines = logSpy.mock.calls
+      .map(call => call.map(String).join(" "))
+      .filter(line => line.includes(account.id) && line.includes("req#"));
+    expect(routeLines.length).toBe(2);
+    // The second request on the same session must route "sticky" ...
+    expect(routeLines[1]).toMatch(
+      new RegExp(`^\\[[^\\]]+\\] → ${account.id} req#\\d+ exp=\\d+min (sticky)(:fallback)?$`),
+    );
+    // ... and the session identifier itself must never appear in any logged
+    // line — that is the privacy invariant this test exists to guard.
+    const allLoggedText = logSpy.mock.calls.map(call => call.map(String).join(" ")).join("\n");
+    expect(allLoggedText).not.toContain(sessionId);
   });
 
   it("streams a response.incomplete terminal event byte-for-byte and records it as a successful route with usage, not a 502", async () => {
