@@ -98,9 +98,11 @@ export function setCodexRouting(enabled: boolean, opts: { port?: number; model?:
       path: result.path,
     };
   }
+  // Local routing has no auth in front of the proxy, so no env_key is
+  // written — Codex would otherwise hard-abort on startup if that env var
+  // isn't set.
   const result = writeCodexRouterConfig({
     baseUrl: `http://localhost:${port}/v1`,
-    tokenEnvKey: "CC_ROUTER_TOKEN",
     defaultModel: opts.model,
   });
   return {

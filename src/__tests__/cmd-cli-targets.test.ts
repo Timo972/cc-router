@@ -80,9 +80,10 @@ describe("cc-router cli claude/codex", () => {
 
   it("enables and then disables Codex routing", async () => {
     await parse(["cli", "codex", "start"]);
+    // Local routing has no auth in front of the proxy, so no env_key is
+    // passed — Codex would otherwise hard-abort on startup if unset.
     expect(mocks.writeCodexRouterConfig).toHaveBeenCalledWith({
       baseUrl: "http://localhost:3456/v1",
-      tokenEnvKey: "CC_ROUTER_TOKEN",
       defaultModel: undefined,
     });
 
