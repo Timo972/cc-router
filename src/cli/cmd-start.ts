@@ -19,6 +19,7 @@ import { startProxyTelemetry } from "../telemetry/runtime.js";
 import { handoffCliTelemetryToProxyWithin } from "../telemetry/facade.js";
 import { markCliTelemetryHandedOffToProxy } from "../telemetry/cli-runtime.js";
 import type { RuntimeMode } from "../telemetry/contracts.js";
+import { CliExitError, exitCli } from "./errors.js";
 
 /**
  * How long service-mode start waits for the proxy to answer after the
@@ -286,14 +287,17 @@ async function maybeUpdate(): Promise<void> {
         stdio: "inherit",
         env: process.env,
       });
-      child.on("exit", (code) => process.exit(code ?? 0));
-      child.on("error", (err) => {
-        console.error(chalk.red(`  Failed to restart after update: ${err.message}`));
-        process.exit(1);
+      const childExitCode = await new Promise<number>(resolve => {
+        child.once("exit", code => resolve(code ?? 0));
+        child.once("error", err => {
+          console.error(chalk.red(`  Failed to restart after update: ${err.message}`));
+          resolve(1);
+        });
       });
-      await new Promise(() => {});
+      exitCli(childExitCode);
     }
   } catch (err) {
+    if (err instanceof CliExitError) throw err;
     console.error(chalk.yellow(`  ⚠ Update failed: ${(err as Error).message}`));
     console.log(chalk.gray("  Continuing with current version.\n"));
   }
@@ -400,7 +404,7 @@ async function ensureLiteLLMRunning(): Promise<void> {
   } catch {
     console.error(chalk.red("✗ Docker is not running. Start Docker Desktop first."));
     console.error(chalk.gray("  Or pass a custom LiteLLM URL: cc-router start --litellm http://your-host:4000"));
-    process.exit(1);
+    exitCli(1);
   }
 
   try {
@@ -413,6 +417,6 @@ async function ensureLiteLLMRunning(): Promise<void> {
     console.log(chalk.green(`✓ LiteLLM starting at ${litellmUrl}/ui`));
   } catch (err) {
     console.error(chalk.red("✗ Failed to start LiteLLM:"), (err as Error).message);
-    process.exit(1);
+    exitCli(1);
   }
 }

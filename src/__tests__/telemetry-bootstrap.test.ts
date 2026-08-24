@@ -1594,6 +1594,64 @@ export async function resolve(specifier, context, nextResolve) {
     }
   }, 10_000);
 
+  it("routes status --json failure through bootstrap before preserving exit 1", async () => {
+    const testHome = mkdtempSync(join(tmpdir(), "cc-router-cli-status-exit-"));
+    let release!: () => void;
+    let requests = 0;
+    const held = createServer((_request, response) => {
+      requests += 1;
+      release = () => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end("{}\n");
+      };
+    });
+    await listen(held);
+    auxiliaryServers.push(held);
+    const address = held.address();
+    if (!address || typeof address === "string") throw new Error("held collector did not bind");
+    const origin = `http://127.0.0.1:${address.port}`;
+    const unavailableProxyPort = await reserveLoopbackPort();
+    const child = spawn(process.execPath, [
+      installedBinary,
+      "status",
+      "--json",
+      "--port",
+      String(unavailableProxyPort),
+    ], {
+      cwd: installedCwd,
+      env: {
+        ...process.env,
+        HOME: testHome,
+        TELEMETRY_PATH: join(testHome, "fresh-telemetry.json"),
+        NODE_ENV: "test",
+        CC_ROUTER_TEST_OTLP_LOG_URL: `${origin}/i/v1/logs`,
+        CC_ROUTER_EU_GUARD_MODE: "offline-test",
+        CC_ROUTER_EU_OFFLINE_CAPTURE_ORIGIN: origin,
+        CC_ROUTER_EU_LOOPBACK_PROVIDER_ORIGIN: origin,
+        NODE_OPTIONS: `--import=${pathToFileURL(join(PROJECT_ROOT, "scripts", "telemetry-eu-network-guard.mjs")).href}`,
+        NO_UPDATE_NOTIFIER: "1",
+        CI: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout?.on("data", chunk => { output += String(chunk); });
+    child.stderr?.on("data", chunk => { output += String(chunk); });
+    try {
+      await waitUntil(() => requests > 0, 5_000, () => `immediate send was not attempted\n${output}`);
+      await waitUntil(() => output.includes("Cannot connect to proxy"), 5_000, () => output);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(child.exitCode).toBeNull();
+      release();
+      expect(await waitForChildExit(child, 2_000), output).toBe(true);
+      expect(child.exitCode).toBe(1);
+      expect(requests).toBe(1);
+    } finally {
+      if (child.exitCode === null) child.kill("SIGKILL");
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   it.each([
     ["version", ["--version"]],
     ["telemetry status", ["telemetry", "status"]],

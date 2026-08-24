@@ -49,6 +49,32 @@ describe("createAnthropicUsageCapture", () => {
     });
   });
 
+  it("stops parsing SSE lines after usage completes while continuing decoded observation", async () => {
+    const onInputUsage = vi.fn();
+    const onOutputUsage = vi.fn();
+    const onDecodedChunk = vi.fn();
+    const capture = createAnthropicUsageCapture({
+      contentType: "text/event-stream",
+      contentEncoding: "",
+      onInputUsage,
+      onOutputUsage,
+      onDecodedChunk,
+    });
+    const tail = Buffer.alloc(2 * 1024 * 1024, 0x78);
+    const tailToString = vi.spyOn(tail, "toString");
+
+    capture!.write(sseBody());
+    expect(onInputUsage).toHaveBeenCalledWith(INPUT_USAGE);
+    expect(onOutputUsage).toHaveBeenCalledWith(OUTPUT_USAGE);
+
+    capture!.write(tail);
+    capture!.end();
+
+    expect(onDecodedChunk).toHaveBeenLastCalledWith(tail);
+    expect(tailToString).not.toHaveBeenCalled();
+    await expect(capture!.finished).resolves.toBeUndefined();
+  });
+
   it("parses usage from a gzip-compressed SSE stream", async () => {
     // The whole point of this module: the proxy is byte-transparent, so the
     // client's accept-encoding makes upstream compress — and before this

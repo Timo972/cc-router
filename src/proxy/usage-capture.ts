@@ -82,7 +82,9 @@ export function createAnthropicUsageCapture(
   let lineBuf = "";
   let gotInput = false;
   let gotOutput = false;
+  let usageComplete = false;
   const parseSSEChunk = (text: string): void => {
+    if (usageComplete) return;
     lineBuf += text;
     const lines = lineBuf.split("\n");
     lineBuf = lines.pop() ?? ""; // keep incomplete last line
@@ -102,9 +104,14 @@ export function createAnthropicUsageCapture(
           options.onOutputUsage(evt.usage);
           gotOutput = true;
         }
-        // Without a terminal observer, everything of interest has been seen:
-        // stop paying for the rest and free the decompressor's zlib state.
-        if (gotInput && gotOutput && !options.onDecodedChunk) die();
+        if (gotInput && gotOutput) {
+          usageComplete = true;
+          lineBuf = "";
+          // Without a terminal observer, everything of interest has been seen:
+          // stop paying for the rest and free the decompressor's zlib state.
+          if (!options.onDecodedChunk) die();
+          return;
+        }
       } catch { /* partial JSON across chunk boundary — next chunk completes it */ }
     }
   };
@@ -125,7 +132,7 @@ export function createAnthropicUsageCapture(
     if (dead) return;
     try { options.onDecodedChunk?.(chunk); } catch { /* passive observer */ }
     if (isSSE) {
-      parseSSEChunk(chunk.toString("utf8"));
+      if (!usageComplete) parseSSEChunk(chunk.toString("utf8"));
       return;
     }
     if (jsonBuf.length + chunk.length > MAX_JSON_BODY_BYTES) {

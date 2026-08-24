@@ -38,6 +38,7 @@ import {
   withSetupTelemetryFlush,
 } from "../telemetry/setup-diagnostics.js";
 import { flushTelemetryWithin } from "../telemetry/facade.js";
+import { exitCli } from "./errors.js";
 
 export interface OpenAIManualAccountSetupDependencies {
   collectInput(): Promise<CreateOpenAIAccountRecordInput>;
@@ -417,7 +418,7 @@ export function registerAccounts(program: Command): void {
       if (!existingIds.includes(id)) {
         console.log(chalk.red(`✗ Account "${id}" not found.`));
         console.log(chalk.gray(`  Available: ${existingIds.join(", ")}`));
-        process.exit(1);
+        exitCli(1);
       }
 
       const { confirm } = await import("@inquirer/prompts");
@@ -433,7 +434,7 @@ export function registerAccounts(program: Command): void {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.log(chalk.red(`✗ Could not remove "${id}": ${message}`));
-        process.exit(1);
+        exitCli(1);
       }
 
       const remaining = loadAccounts().length + loadOpenAIAccounts().length;
@@ -456,7 +457,7 @@ export function registerAccounts(program: Command): void {
       if (!isValidAccountId(newId)) {
         console.log(chalk.red(`✗ "${newId}" is not a valid account name.`));
         console.log(chalk.gray("  1-64 characters: alphanumeric start, then letters, digits, dots, underscores, or dashes."));
-        process.exit(1);
+        exitCli(1);
       }
 
       const { ids: existingIds } = mergeAccountInventory(
@@ -467,7 +468,7 @@ export function registerAccounts(program: Command): void {
       if (!existingIds.includes(id)) {
         console.log(chalk.red(`✗ Account "${id}" not found.`));
         console.log(chalk.gray(`  Available: ${existingIds.join(", ")}`));
-        process.exit(1);
+        exitCli(1);
       }
       if (id === newId) {
         console.log(chalk.gray(`Account is already named "${newId}".`));
@@ -475,7 +476,7 @@ export function registerAccounts(program: Command): void {
       }
       if (existingIds.includes(newId)) {
         console.log(chalk.red(`✗ An account named "${newId}" already exists.`));
-        process.exit(1);
+        exitCli(1);
       }
 
       let result: Awaited<ReturnType<typeof renameAccountRuntimeAware>>;
@@ -484,7 +485,7 @@ export function registerAccounts(program: Command): void {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.log(chalk.red(`✗ Could not rename "${id}": ${message}`));
-        process.exit(1);
+        exitCli(1);
       }
 
       console.log(chalk.green(`✓ Renamed "${id}" → "${newId}".`));

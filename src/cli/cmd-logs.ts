@@ -86,10 +86,10 @@ async function tailFollow(initialLines: number): Promise<void> {
     } catch { /* file may have been removed */ }
   });
 
-  process.on("SIGINT", () => {
-    watcher.close();
-    process.exit(0);
+  await new Promise<void>(resolve => {
+    process.once("SIGINT", () => {
+      watcher.close();
+      resolve();
+    });
   });
-
-  await new Promise(() => {}); // never resolves
 }

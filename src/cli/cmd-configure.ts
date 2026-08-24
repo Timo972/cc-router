@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { writeClaudeSettings, removeClaudeSettings, readClaudeProxySettings } from "../utils/claude-config.js";
+import { exitCli } from "./errors.js";
 import { writeCodexRouterConfig } from "../utils/codex-config.js";
 import { readConfig, writeConfig, generateProxySecret } from "../config/manager.js";
 import { PROXY_PORT, CLAUDE_SETTINGS_PATH } from "../config/paths.js";
@@ -54,7 +55,7 @@ export function registerConfigure(program: Command): void {
       if (target === "models") {
         if (!opts.claudeModel && !opts.openaiModel) {
           console.error(chalk.red("Provide at least one model: --claude-model or --openai-model"));
-          process.exit(1);
+          exitCli(1);
         }
         const cfg = readConfig();
         const modelRouting = buildModelRoutingUpdate(cfg.modelRouting, {
@@ -71,7 +72,7 @@ export function registerConfigure(program: Command): void {
 
       if (target !== undefined) {
         console.error(chalk.red(`Unknown configure target: ${target}`));
-        process.exit(1);
+        exitCli(1);
       }
 
       if (opts.show) {
@@ -132,7 +133,7 @@ export function registerConfigure(program: Command): void {
         const secret = opts.setPassword.trim();
         if (!secret) {
           console.error(chalk.red("Secret cannot be empty."));
-          process.exit(1);
+          exitCli(1);
         }
         writeConfig({ ...readConfig(), proxySecret: secret });
         const { baseUrl } = readClaudeProxySettings();

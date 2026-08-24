@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { PROXY_PORT } from "../config/paths.js";
+import { CliExitError, exitCli } from "./errors.js";
 import { readConfig } from "../config/manager.js";
 import type { SetupSingleAccountResult } from "./cmd-setup.js";
 import {
@@ -80,10 +81,11 @@ async function jsonOutput(port: number): Promise<void> {
     });
     if (!res.ok) {
       console.error(chalk.red(`Proxy returned HTTP ${res.status}`));
-      process.exit(1);
+      exitCli(1);
     }
     console.log(JSON.stringify(await res.json(), null, 2));
-  } catch {
+  } catch (error) {
+    if (error instanceof CliExitError) throw error;
     console.error(chalk.red(`Cannot connect to proxy at ${healthUrl}`));
     const cfg = readConfig();
     if (cfg.client) {
@@ -91,7 +93,7 @@ async function jsonOutput(port: number): Promise<void> {
     } else {
       console.error(chalk.gray("Is it running? Start with: cc-router start"));
     }
-    process.exit(1);
+    exitCli(1);
   }
 }
 

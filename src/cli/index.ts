@@ -13,6 +13,7 @@ import { registerLogs } from "./cmd-logs.js";
 import { registerModels } from "./cmd-models.js";
 import { getCurrentVersion, checkForUpdate, printUpdateBanner } from "../utils/self-update.js";
 import { recordApplicationStart } from "../telemetry/facade.js";
+import { CliExitError } from "./errors.js";
 
 const program = new Command();
 program.exitOverride();
@@ -69,7 +70,7 @@ export async function runCli(): Promise<void> {
   try {
     await program.parseAsync();
   } catch (error) {
-    if (error instanceof CommanderError) {
+    if (error instanceof CommanderError || error instanceof CliExitError) {
       process.exitCode = error.exitCode;
       return;
     }
