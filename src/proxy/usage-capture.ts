@@ -40,6 +40,7 @@ export interface AnthropicUsageCapture {
  *  past this size stops being buffered (usage is best-effort diagnostics —
  *  unbounded buffering of a pathological body is not worth it). */
 const MAX_JSON_BODY_BYTES = 20 * 1024 * 1024;
+const MAX_SSE_USAGE_LINE_BYTES = 64 * 1024;
 
 function createDecoder(contentEncoding: string): Transform | null | undefined {
   const encoding = contentEncoding.trim().toLowerCase();
@@ -83,36 +84,56 @@ export function createAnthropicUsageCapture(
   let gotInput = false;
   let gotOutput = false;
   let usageComplete = false;
+  let usageParsingStopped = false;
+  let lineBufBytes = 0;
+  const stopUsageParsing = (): void => {
+    usageParsingStopped = true;
+    lineBuf = "";
+    lineBufBytes = 0;
+    if (!options.onDecodedChunk) die();
+  };
+  const parseSSELine = (line: string): void => {
+    if (!line.startsWith("data: ")) return;
+    try {
+      const evt = JSON.parse(line.slice(6)) as {
+        type?: string;
+        message?: { usage?: Record<string, number> };
+        usage?: Record<string, number>;
+      };
+      if (!gotInput && evt.type === "message_start" && evt.message?.usage) {
+        options.onInputUsage(evt.message.usage);
+        gotInput = true;
+      }
+      if (!gotOutput && evt.type === "message_delta" && evt.usage) {
+        options.onOutputUsage(evt.usage);
+        gotOutput = true;
+      }
+      if (gotInput && gotOutput) {
+        usageComplete = true;
+        stopUsageParsing();
+      }
+    } catch { /* malformed complete data lines are irrelevant to usage capture */ }
+  };
   const parseSSEChunk = (text: string): void => {
-    if (usageComplete) return;
-    lineBuf += text;
-    const lines = lineBuf.split("\n");
-    lineBuf = lines.pop() ?? ""; // keep incomplete last line
-    for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
-      try {
-        const evt = JSON.parse(line.slice(6)) as {
-          type?: string;
-          message?: { usage?: Record<string, number> };
-          usage?: Record<string, number>;
-        };
-        if (!gotInput && evt.type === "message_start" && evt.message?.usage) {
-          options.onInputUsage(evt.message.usage);
-          gotInput = true;
-        }
-        if (!gotOutput && evt.type === "message_delta" && evt.usage) {
-          options.onOutputUsage(evt.usage);
-          gotOutput = true;
-        }
-        if (gotInput && gotOutput) {
-          usageComplete = true;
-          lineBuf = "";
-          // Without a terminal observer, everything of interest has been seen:
-          // stop paying for the rest and free the decompressor's zlib state.
-          if (!options.onDecodedChunk) die();
-          return;
-        }
-      } catch { /* partial JSON across chunk boundary — next chunk completes it */ }
+    if (usageComplete || usageParsingStopped) return;
+    let offset = 0;
+    while (offset < text.length) {
+      const newlineAt = text.indexOf("\n", offset);
+      const fragmentEnd = newlineAt === -1 ? text.length : newlineAt;
+      const fragment = text.slice(offset, fragmentEnd);
+      const fragmentBytes = Buffer.byteLength(fragment, "utf8");
+      if (lineBufBytes + fragmentBytes > MAX_SSE_USAGE_LINE_BYTES) {
+        stopUsageParsing();
+        return;
+      }
+      lineBuf += fragment;
+      lineBufBytes += fragmentBytes;
+      if (newlineAt === -1) return;
+      parseSSELine(lineBuf);
+      lineBuf = "";
+      lineBufBytes = 0;
+      if (usageComplete || usageParsingStopped) return;
+      offset = newlineAt + 1;
     }
   };
 
@@ -132,7 +153,7 @@ export function createAnthropicUsageCapture(
     if (dead) return;
     try { options.onDecodedChunk?.(chunk); } catch { /* passive observer */ }
     if (isSSE) {
-      if (!usageComplete) parseSSEChunk(chunk.toString("utf8"));
+      if (!usageComplete && !usageParsingStopped) parseSSEChunk(chunk.toString("utf8"));
       return;
     }
     if (jsonBuf.length + chunk.length > MAX_JSON_BODY_BYTES) {

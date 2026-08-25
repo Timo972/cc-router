@@ -157,7 +157,62 @@ function postMessages(
 }
 
 describe("mountAnthropicMessagesRoute", () => {
-  it("keeps a body span open until compressed terminal usage is captured", async () => {
+  it("starts the Anthropic attempt span before response headers arrive", async () => {
+    const spanRecords: unknown[] = [];
+    const telemetry: AnthropicMessagesRouteTelemetry = {
+      annotateActiveSpan: vi.fn(),
+      recordSafeLog: vi.fn(),
+      recordUnexpectedException: vi.fn(),
+      startTelemetrySpan: (operation, attributes) => {
+        spanRecords.push(["start", operation, attributes]);
+        return {
+          annotate: (next: unknown) => { spanRecords.push(["annotate", next]); },
+          end: (status: unknown) => { spanRecords.push(["end", status]); },
+        };
+      },
+    };
+    let releaseHeaders: (() => void) | undefined;
+    const { server, calls } = scriptedUpstream((_call, _req, res) => {
+      releaseHeaders = () => {
+        if (res.headersSent) return;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"id":"msg_1","usage":{"input_tokens":12,"output_tokens":42}}');
+      };
+    });
+    const upstreamPort = await listen(server);
+    const { app } = mountRoute([makeAccount("a")], upstreamPort, { telemetry });
+
+    try {
+      await withApp(app, async baseUrl => {
+        const responsePromise = postMessages(baseUrl);
+        let assertionError: unknown;
+        try {
+          await vi.waitFor(() => {
+            expect(calls).toHaveLength(1);
+            expect(releaseHeaders).toBeTypeOf("function");
+          });
+          expect(spanRecords).toContainEqual([
+            "start",
+            "provider.inference",
+            expect.objectContaining({ attempt: 1 }),
+          ]);
+        } catch (error) {
+          assertionError = error;
+        } finally {
+          releaseHeaders?.();
+        }
+        const response = await responsePromise;
+        expect(response.status).toBe(200);
+        await response.arrayBuffer();
+        if (assertionError) throw assertionError;
+      });
+    } finally {
+      releaseHeaders?.();
+      await close(server);
+    }
+  });
+
+  it("keeps the attempt span open until compressed terminal usage is captured", async () => {
     const spanRecords: unknown[] = [];
     const telemetry: AnthropicMessagesRouteTelemetry = {
       annotateActiveSpan: vi.fn(),
@@ -215,8 +270,11 @@ describe("mountAnthropicMessagesRoute", () => {
             provider: "anthropic",
             route: "messages",
             streaming: true,
-            httpStatusCode: 200,
           }),
+        ]);
+        expect(spanRecords).toContainEqual([
+          "annotate",
+          expect.objectContaining({ httpStatusCode: 200, outcome: "complete" }),
         ]);
         expect(spanRecords).toContainEqual(["end", "ok"]);
         expect(spanRecords.filter(record => Array.isArray(record) && record[0] === "end"))
@@ -231,7 +289,14 @@ describe("mountAnthropicMessagesRoute", () => {
     const telemetryRecords: unknown[] = [];
     const telemetry: AnthropicMessagesRouteTelemetry = {
       annotateActiveSpan: (...values) => telemetryRecords.push(["span", ...values]),
-      startTelemetrySpan: () => ({ annotate: vi.fn(), end: vi.fn() }),
+      startTelemetrySpan: (_operation, attributes) => {
+        const attempt = attributes.attempt;
+        telemetryRecords.push(["attempt-start", attempt]);
+        return {
+          annotate: next => telemetryRecords.push(["attempt-annotate", attempt, next]),
+          end: status => telemetryRecords.push(["attempt-end", attempt, status]),
+        };
+      },
       recordSafeLog: value => telemetryRecords.push(["log", value]),
       recordUnexpectedException: (...values) => telemetryRecords.push(["exception", ...values]),
     };
@@ -258,6 +323,12 @@ describe("mountAnthropicMessagesRoute", () => {
 
         expect(calls).toHaveLength(2);
         expect(calls[1]!.authorization).not.toBe(calls[0]!.authorization);
+        await vi.waitFor(() => {
+          expect(telemetryRecords.filter(record => Array.isArray(record) && record[0] === "attempt-start"))
+            .toEqual([["attempt-start", 1], ["attempt-start", 2]]);
+          expect(telemetryRecords.filter(record => Array.isArray(record) && record[0] === "attempt-end"))
+            .toEqual([["attempt-end", 1, "error"], ["attempt-end", 2, "ok"]]);
+        });
         const failedId = calls[0]!.authorization.endsWith("-a") ? "a" : "b";
         expect(pool.isEligible(failedId, { modelFamily: "sonnet" })).toBe(false);
 

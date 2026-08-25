@@ -36,7 +36,6 @@ import {
   recordUnexpectedException,
   startTelemetrySpan,
   type TelemetrySpanHandle,
-  withTelemetrySpan,
 } from "../telemetry/facade.js";
 import type { SafeExceptionContext, SafeSpanAttributes } from "../telemetry/contracts.js";
 
@@ -121,6 +120,11 @@ const DEFAULT_ANTHROPIC_MESSAGES_TELEMETRY: AnthropicMessagesRouteTelemetry = {
   startTelemetrySpan,
   recordSafeLog,
   recordUnexpectedException,
+};
+
+const NOOP_TELEMETRY_SPAN: TelemetrySpanHandle = {
+  annotate: () => undefined,
+  end: () => undefined,
 };
 
 function observeTelemetry(observer: () => void): void {
@@ -347,6 +351,37 @@ export function mountAnthropicMessagesRoute(
     for (let attempt = 1; ; attempt++) {
       const account = route.account;
       const attemptStartedAt = now();
+      let attemptSpan = NOOP_TELEMETRY_SPAN;
+      let attemptSpanEnded = false;
+      observeTelemetry(() => {
+        attemptSpan = telemetry.startTelemetrySpan("provider.inference", {
+          provider: "anthropic",
+          route: "messages",
+          modelFamily,
+          requestSource: source,
+          streaming,
+          attempt,
+        });
+      });
+      const annotateAttemptSpan = (attributes: SafeSpanAttributes): void => {
+        observeTelemetry(() => attemptSpan.annotate(attributes));
+      };
+      const finishAttemptSpan = (
+        httpStatusCode: number,
+        outcome: NonNullable<SafeSpanAttributes["outcome"]>,
+        extra: SafeSpanAttributes = {},
+      ): void => {
+        if (attemptSpanEnded) return;
+        attemptSpanEnded = true;
+        annotateAttemptSpan({
+          ...extra,
+          httpStatusCode,
+          outcome,
+          attempt,
+          operationDurationMs: now() - attemptStartedAt,
+        });
+        observeTelemetry(() => attemptSpan.end(outcome === "complete" ? "ok" : "error"));
+      };
       req._ccAccount = account;
       logRoute(
         account.id,
@@ -356,72 +391,35 @@ export function mountAnthropicMessagesRoute(
 
       let upstream: IncomingMessage;
       try {
-        upstream = await withTelemetrySpan("provider.inference", {
-          provider: "anthropic",
-          route: "messages",
-          modelFamily,
-          requestSource: source,
-          streaming,
-          attempt,
-        }, async () => {
-          const forwarded = forwardAttempt({
-            target,
-            path,
-            method: req.method,
-            headers: buildUpstreamHeaders(req, target, account, rawBody.byteLength),
-            body: rawBody,
-            timeoutMs: opts.timeoutMs,
-          });
-          inFlight = forwarded.request;
-          try {
-            const response = await forwarded.response;
-            const status = response.statusCode ?? 0;
-            const outcome = telemetryOutcome(status);
-            observeTelemetry(() => telemetry.annotateActiveSpan("provider.inference", {
-              httpStatusCode: status,
-              outcome,
-              operationDurationMs: now() - attemptStartedAt,
-            }));
-            if (status === 401 || status === 403 || status === 429 || status >= 500) {
-              observeTelemetry(() => telemetry.recordSafeLog({
-                operation: "provider.inference",
-                provider: "anthropic",
-                reason: telemetryReason(status),
-                outcome,
-                httpStatusCode: status,
-                attempt,
-                operationDurationMs: now() - attemptStartedAt,
-                severity: "warn",
-              }));
-            }
-            return response;
-          } catch (error) {
-            const reason = classifyExpectedRuntimeFailure(error);
-            observeTelemetry(() => telemetry.annotateActiveSpan("provider.inference", {
-              outcome: reason === "timeout" ? "timeout" : "upstream_error",
-              operationDurationMs: now() - attemptStartedAt,
-            }));
-            if (reason) {
-              observeTelemetry(() => telemetry.recordSafeLog({
-                operation: "provider.inference",
-                provider: "anthropic",
-                reason,
-                outcome: reason === "timeout" ? "timeout" : "upstream_error",
-                attempt,
-                operationDurationMs: now() - attemptStartedAt,
-                severity: "error",
-              }));
-            } else if (!clientGone.signal.aborted) {
-              observeTelemetry(() => telemetry.recordUnexpectedException(error, {
-                category: "runtime",
-                reason: "other",
-                operation: "provider.inference",
-                provider: "anthropic",
-              }));
-            }
-            throw error;
-          }
+        const forwarded = forwardAttempt({
+          target,
+          path,
+          method: req.method,
+          headers: buildUpstreamHeaders(req, target, account, rawBody.byteLength),
+          body: rawBody,
+          timeoutMs: opts.timeoutMs,
         });
+        inFlight = forwarded.request;
+        upstream = await forwarded.response;
+        const status = upstream.statusCode ?? 0;
+        const outcome = telemetryOutcome(status);
+        annotateAttemptSpan({
+          httpStatusCode: status,
+          outcome,
+          operationDurationMs: now() - attemptStartedAt,
+        });
+        if (status === 401 || status === 403 || status === 429 || status >= 500) {
+          observeTelemetry(() => telemetry.recordSafeLog({
+            operation: "provider.inference",
+            provider: "anthropic",
+            reason: telemetryReason(status),
+            outcome,
+            httpStatusCode: status,
+            attempt,
+            operationDurationMs: now() - attemptStartedAt,
+            severity: "warn",
+          }));
+        }
       } catch (error) {
         release();
         // A hung-up client rejects this await through the abort above. That
@@ -429,8 +427,28 @@ export function mountAnthropicMessagesRoute(
         // left to receive a 502, and the generic proxy does not log client
         // resets either.
         if (clientGone.signal.aborted || res.writableEnded) {
+          finishAttemptSpan(499, "cancelled", { streamOutcome: "cancelled" });
           finishTelemetry(499, "cancelled", attempt);
           return;
+        }
+        const reason = classifyExpectedRuntimeFailure(error);
+        if (reason) {
+          observeTelemetry(() => telemetry.recordSafeLog({
+            operation: "provider.inference",
+            provider: "anthropic",
+            reason,
+            outcome: reason === "timeout" ? "timeout" : "upstream_error",
+            attempt,
+            operationDurationMs: now() - attemptStartedAt,
+            severity: "error",
+          }));
+        } else {
+          observeTelemetry(() => telemetry.recordUnexpectedException(error, {
+            category: "runtime",
+            reason: "other",
+            operation: "provider.inference",
+            provider: "anthropic",
+          }));
         }
         const message = error instanceof Error ? error.message : String(error);
         stats.totalErrors++;
@@ -455,6 +473,9 @@ export function mountAnthropicMessagesRoute(
             error: { type: "proxy_error", message },
           });
         }
+        finishAttemptSpan(502, reason === "timeout" ? "timeout" : "upstream_error", {
+          streamOutcome: reason === "timeout" ? "timeout" : "upstream_error",
+        });
         finishTelemetry(502, "upstream_error", attempt);
         return;
       }
@@ -605,6 +626,7 @@ export function mountAnthropicMessagesRoute(
           next?.release();
           release();
           upstream.destroy();
+          finishAttemptSpan(499, "cancelled", { streamOutcome: "cancelled" });
           finishTelemetry(499, "cancelled", attempt);
           return;
         }
@@ -612,6 +634,11 @@ export function mountAnthropicMessagesRoute(
           // Committed: record the failed attempt and abandon its response.
           entry.details = `${entry.details}:will-retry`;
           recordActivity(entry);
+          finishAttemptSpan(
+            status,
+            status === 429 ? "rate_limited" : "upstream_error",
+            { streamOutcome: "upstream_error" },
+          );
           upstream.destroy();
           release();
           const sameAccount = next.route.account.id === account.id;
@@ -655,6 +682,7 @@ export function mountAnthropicMessagesRoute(
         recordActivity(entry);
         upstream.destroy();
         release();
+        finishAttemptSpan(499, "cancelled", { streamOutcome: "cancelled" });
         finishTelemetry(499, "cancelled", attempt);
         return;
       }
@@ -681,6 +709,7 @@ export function mountAnthropicMessagesRoute(
             message: `Upstream ${status} response was lost before it could be relayed`,
           },
         });
+        finishAttemptSpan(502, "upstream_error", { streamOutcome: "upstream_error" });
         finishTelemetry(502, "upstream_error", attempt);
         return;
       }
@@ -691,16 +720,6 @@ export function mountAnthropicMessagesRoute(
       // same contract as the generic proxy path.
       recordActivity(entry);
       finishTelemetry(status, telemetryOutcome(status), attempt);
-      const bodySpan = telemetry.startTelemetrySpan("provider.inference", {
-        provider: "anthropic",
-        route: "messages",
-        modelFamily,
-        requestSource: source,
-        streaming,
-        attempt,
-        httpStatusCode: status,
-        outcome: telemetryOutcome(status),
-      });
       attachAnthropicResponseCapture(
         upstream,
         res,
@@ -709,15 +728,16 @@ export function mountAnthropicMessagesRoute(
         {
           now,
           onTerminal: terminal => {
-            observeTelemetry(() => bodySpan.annotate({
+            const finalOutcome = terminal.outcome === "complete" && status < 400
+              ? telemetryOutcome(status)
+              : terminal.outcome === "cancelled"
+              ? "cancelled"
+              : "upstream_error";
+            finishAttemptSpan(status, finalOutcome, {
               streamOutcome: streaming ? terminal.outcome : undefined,
               inputTokens: entry.inputTokens,
               outputTokens: entry.outputTokens,
-              operationDurationMs: terminal.durationMs,
-            }));
-            observeTelemetry(() => bodySpan.end(
-              terminal.outcome === "complete" && status < 400 ? "ok" : "error",
-            ));
+            });
           },
         },
       );
