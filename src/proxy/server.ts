@@ -546,6 +546,10 @@ function runtimeResponseReason(status: number): "unauthorized" | "forbidden" | "
   if (status === 429) return "rate_limited";
   return status >= 500 ? "upstream_5xx" : "upstream_4xx";
 }
+
+export function shouldRecordAnthropicRuntimeFailure(status: number): boolean {
+  return status === 401 || status === 403 || status === 429 || status >= 500;
+}
 // Re-exported so existing importers keep working; the implementation moved to
 // providers/anthropic so both Anthropic transports share it.
 export { applyRateLimitHeaders };
@@ -1340,7 +1344,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           outcome,
           operationDurationMs: durationMs,
         });
-        if (status === 401 || status === 403 || status === 429 || status === 529) {
+        if (shouldRecordAnthropicRuntimeFailure(status)) {
           recordSafeLog({
             operation: "provider.inference",
             provider: "anthropic",

@@ -728,10 +728,13 @@ export function mountAnthropicMessagesRoute(
         {
           now,
           onTerminal: terminal => {
-            const finalOutcome = terminal.outcome === "complete" && status < 400
-              ? telemetryOutcome(status)
-              : terminal.outcome === "cancelled"
+            const statusOutcome = telemetryOutcome(status);
+            const finalOutcome = terminal.outcome === "cancelled"
               ? "cancelled"
+              : statusOutcome === "rate_limited"
+              ? "rate_limited"
+              : terminal.outcome === "complete" && status < 400
+              ? "complete"
               : "upstream_error";
             finishAttemptSpan(status, finalOutcome, {
               streamOutcome: streaming ? terminal.outcome : undefined,

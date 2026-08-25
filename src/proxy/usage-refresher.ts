@@ -194,9 +194,11 @@ export class UsageRefresher<TAccount extends { id: string }, TResult extends { o
       const startedAt = this.now();
       const refreshUsage = async (): Promise<TResult> => {
         let result: TResult;
+        let fetchThrew = false;
         try {
           result = await this.hooks.fetchUsage(account);
         } catch (error) {
+          fetchThrew = true;
           const duration = Math.max(0, this.now() - startedAt);
           const provider = this.hooks.telemetry?.provider;
           if (provider) {
@@ -224,7 +226,7 @@ export class UsageRefresher<TAccount extends { id: string }, TResult extends { o
           result = this.hooks.cancelledResult();
         }
 
-        if (this.hooks.telemetry) {
+        if (this.hooks.telemetry && !fetchThrew) {
           try {
             const duration = Math.max(0, this.now() - startedAt);
             const classification = this.hooks.telemetry.classifyResult(result);

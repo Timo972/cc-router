@@ -777,9 +777,21 @@ describe("mountAnthropicMessagesRoute", () => {
       res.writeHead(429, { "content-type": "application/json", "retry-after": "60" });
       res.end("{\"type\":\"error\"}");
     });
+    const attemptAnnotations: Array<Record<string, unknown>> = [];
+    const attemptEnd = vi.fn();
+    const telemetry: AnthropicMessagesRouteTelemetry = {
+      annotateActiveSpan: vi.fn(),
+      recordSafeLog: vi.fn(),
+      recordUnexpectedException: vi.fn(),
+      startTelemetrySpan: () => ({
+        annotate: attributes => { attemptAnnotations.push(attributes); },
+        end: attemptEnd,
+      }),
+    };
     const upstreamPort = await listen(server);
     const { app, activity } = mountRoute([makeAccount("a"), makeAccount("b")], upstreamPort, {
       maxAttempts: 1,
+      telemetry,
     });
 
     try {
@@ -796,6 +808,11 @@ describe("mountAnthropicMessagesRoute", () => {
     expect(calls).toHaveLength(1);
     expect(activity).toHaveLength(1);
     expect(activity[0]!.details).not.toContain(":will-retry");
+    expect(attemptEnd).toHaveBeenCalledWith("error");
+    expect(attemptAnnotations.at(-1)).toEqual(expect.objectContaining({
+      httpStatusCode: 429,
+      outcome: "rate_limited",
+    }));
   });
 
   it("retries an unscoped plain 5xx wherever a fresh request would route", async () => {
