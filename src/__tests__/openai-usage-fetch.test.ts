@@ -177,12 +177,12 @@ describe("fetchCodexUsage", () => {
     const unauthorized = await fetchCodexUsage(account, {
       fetch: vi.fn(async () => new Response("denied", { status: 401 })),
     });
-    expect(unauthorized).toEqual({ ok: false, reason: "auth" });
+    expect(unauthorized).toEqual({ ok: false, reason: "auth", status: 401 });
 
     const overloaded = await fetchCodexUsage(account, {
       fetch: vi.fn(async () => new Response("busy", { status: 503 })),
     });
-    expect(overloaded).toEqual({ ok: false, reason: "http" });
+    expect(overloaded).toEqual({ ok: false, reason: "http", status: 503 });
 
     const offline = await fetchCodexUsage(account, {
       fetch: vi.fn(async () => { throw new Error("ECONNREFUSED"); }),
@@ -233,7 +233,7 @@ describe("OpenAIUsageRefresher", () => {
 
     const result = await refresher.refreshNow(account);
 
-    expect(result).toEqual({ ok: false, reason: "auth" });
+    expect(result).toEqual({ ok: false, reason: "auth", status: 401 });
     // A failed token refresh must not reach the endpoint with a dead token...
     expect(fetchUsage).not.toHaveBeenCalled();
     // ...and must not erase what the account already knew.

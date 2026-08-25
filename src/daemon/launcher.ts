@@ -10,7 +10,7 @@ import { isWindows } from "../utils/platform.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const CLI_ENTRY = join(__dirname, "..", "cli", "index.js");
+const CLI_ENTRY = join(__dirname, "..", "cli", "bootstrap.js");
 
 export interface LaunchOptions {
   port?: number;

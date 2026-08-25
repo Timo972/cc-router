@@ -9,8 +9,16 @@ import { EmptyPoolError, NoEligibleAccountError, TokenPool } from "./token-pool.
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
-import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
-import { loadTelemetryState } from "../config/telemetry.js";
+import {
+  annotateActiveSpan,
+  classifyExpectedRuntimeFailure,
+  recordSafeLog,
+  recordUnexpectedException,
+  recordProxyStarted,
+  shutdownTelemetryWithin,
+  startTelemetrySpan,
+  startProxyHeartbeat,
+} from "../telemetry/facade.js";
 import { logRoute, logError, logStartup } from "./logger.js";
 import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
@@ -64,6 +72,15 @@ import {
   createAnthropicRefreshMiddleware,
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
+import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
+import {
+  createProxyExitCoordinator,
+  scheduleProcessExit,
+  saveProviderAccountsOnShutdown,
+} from "./shutdown-persistence.js";
+
+const TELEMETRY_SHUTDOWN_DEADLINE_MS = 500;
+const REFRESH_SHUTDOWN_DEADLINE_MS = 500;
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
@@ -512,9 +529,30 @@ function providerStatus(accounts: HealthAccountView[]): ProviderOperationalStatu
   };
 }
 
+function runtimeModelFamily(value: unknown): "fable" | "sonnet" | "opus" | "haiku" | "other" {
+  return value === "fable" || value === "sonnet" || value === "opus" || value === "haiku"
+    ? value
+    : "other";
+}
+
+function runtimeResponseOutcome(status: number): "complete" | "rate_limited" | "upstream_error" {
+  if (status >= 200 && status < 400) return "complete";
+  return status === 429 ? "rate_limited" : "upstream_error";
+}
+
+function runtimeResponseReason(status: number): "unauthorized" | "forbidden" | "rate_limited" | "upstream_4xx" | "upstream_5xx" {
+  if (status === 401) return "unauthorized";
+  if (status === 403) return "forbidden";
+  if (status === 429) return "rate_limited";
+  return status >= 500 ? "upstream_5xx" : "upstream_4xx";
+}
+
+export function shouldRecordAnthropicRuntimeFailure(status: number): boolean {
+  return status === 401 || status === 403 || status === 429 || status >= 500;
+}
 // Re-exported so existing importers keep working; the implementation moved to
 // providers/anthropic so both Anthropic transports share it.
-export { applyRateLimitHeaders } from "../providers/anthropic/rate-limit-headers.js";
+export { applyRateLimitHeaders };
 
 /**
  * Build the single function through which this server writes OpenAI accounts.
@@ -627,8 +665,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stats.addLog({ ts: Date.now(), accountId: a.id, model: "-", type: "route", details: `${a.id} cooldown expired — rate limit cleared` });
   };
 
-  startRefreshLoop(accounts);
-  startOpenAIRefreshLoop(openAIAccounts, persistOpenAIAccounts);
+  const stopAnthropicRefreshLoop = startRefreshLoop(accounts);
+  const stopOpenAIRefreshLoop = startOpenAIRefreshLoop(openAIAccounts, persistOpenAIAccounts);
   const usageRefresher = new AnthropicUsageRefresher(pool);
   usageRefresher.start();
   // Codex usage otherwise arrives only on response headers, so a freshly
@@ -1158,6 +1196,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     openAIRouter,
     openAIPool,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
+    prepareOpenAIAccountOwnsDiagnostics: true,
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
     ...upstreamAttempts,
@@ -1167,6 +1206,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     openAIRouter,
     openAIPool,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
+    prepareOpenAIAccountOwnsDiagnostics: true,
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
     ...upstreamAttempts,
@@ -1177,6 +1217,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const onAnthropicEmptyPool = (err: EmptyPoolError, _req: Request, res: Response) => {
     stats.totalErrors++;
     logError("proxy", 503, err.message);
+    recordSafeLog({
+      operation: "proxy.request",
+      provider: "anthropic",
+      reason: "other",
+      outcome: "upstream_error",
+      httpStatusCode: 503,
+      accountPoolSize: 0,
+      severity: "warn",
+    });
     res.status(503).json({
       type: "error",
       error: { type: "no_accounts", message: err.message },
@@ -1187,6 +1236,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     const entry = createLocalRoutingErrorLog(err.reason, req._ccRouteContext?.modelFamily);
     stats.addLog(entry);
     logError(entry.accountId, entry.statusCode ?? 0, entry.details ?? "no-eligible");
+    recordSafeLog({
+      operation: "proxy.request",
+      provider: "anthropic",
+      reason: err.reason === "rate_limited" ? "rate_limited" : "other",
+      outcome: err.reason === "rate_limited" ? "rate_limited" : "upstream_error",
+      httpStatusCode: entry.statusCode,
+      accountPoolSize: pool.getAll().length,
+      severity: "warn",
+    });
   };
   const onAnthropicRefreshFailure = (account: Account) => {
     stats.totalErrors++;
@@ -1236,6 +1294,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const account = (req as Request)._ccAccount;
         if (!account) return;
 
+        annotateActiveSpan("provider.inference", {
+          provider: "anthropic",
+          route: "messages",
+          modelFamily: runtimeModelFamily((req as Request)._ccRouteContext?.modelFamily),
+          streaming: (req as Request)._ccTelemetryStreaming,
+        });
+
         // Replace the placeholder/proxy auth token with the real OAuth token.
         // Claude Code sends ANTHROPIC_AUTH_TOKEN as "Authorization: Bearer proxy-managed".
         // We replace it with the real OAuth token for this account.
@@ -1271,6 +1336,25 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const durationMs = (req as Request)._startTime
           ? Date.now() - (req as Request)._startTime!
           : undefined;
+        const outcome = runtimeResponseOutcome(status);
+        annotateActiveSpan("provider.inference", {
+          provider: "anthropic",
+          route: "messages",
+          httpStatusCode: status,
+          outcome,
+          operationDurationMs: durationMs,
+        });
+        if (shouldRecordAnthropicRuntimeFailure(status)) {
+          recordSafeLog({
+            operation: "provider.inference",
+            provider: "anthropic",
+            reason: runtimeResponseReason(status),
+            outcome,
+            httpStatusCode: status,
+            operationDurationMs: durationMs,
+            severity: "warn",
+          });
+        }
 
         // Complete the pending log entry with response info
         const pendingLog = (req as Request)._pendingLog ?? {
@@ -1364,6 +1448,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
         const entry = pendingLog as LogEntry;
         stats.addLog(entry);
+        const bodySpan = startTelemetrySpan("provider.inference", {
+          provider: "anthropic",
+          route: "messages",
+          modelFamily: runtimeModelFamily((req as Request)._ccRouteContext?.modelFamily),
+          streaming: (req as Request)._ccTelemetryStreaming,
+          httpStatusCode: status,
+          outcome,
+        });
 
         // ── Capture token usage from Anthropic response body ─────────────────
         // Passive stream-lifecycle + token-usage taps, shared with the
@@ -1373,14 +1465,52 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           response,
           entry,
           (req as Request)._startTime ?? Date.now(),
+          {
+            now: Date.now,
+            onTerminal: terminal => {
+              bodySpan.annotate({
+                streamOutcome: terminal.outcome,
+                inputTokens: entry.inputTokens,
+                outputTokens: entry.outputTokens,
+                operationDurationMs: terminal.durationMs,
+              });
+              bodySpan.end(terminal.outcome === "complete" && status < 400 ? "ok" : "error");
+            },
+          },
         );
       },
 
       error: (err: Error, _req: IncomingMessage, res: ServerResponse | Socket) => {
         const request = _req as Request;
+        const reason = classifyExpectedRuntimeFailure(err);
+        const durationMs = request._startTime ? Date.now() - request._startTime : undefined;
+        annotateActiveSpan("provider.inference", {
+          provider: "anthropic",
+          route: "messages",
+          outcome: reason === "timeout" ? "timeout" : "upstream_error",
+          streamOutcome: reason === "timeout" ? "timeout" : "upstream_error",
+          operationDurationMs: durationMs,
+        });
+        if (reason) {
+          recordSafeLog({
+            operation: "provider.inference",
+            provider: "anthropic",
+            reason,
+            outcome: reason === "timeout" ? "timeout" : "upstream_error",
+            operationDurationMs: durationMs,
+            severity: "error",
+          });
+          logError("proxy", 0, err.message);
+        } else {
+          recordUnexpectedException(err, {
+            category: "runtime",
+            reason: "other",
+            operation: "provider.inference",
+            provider: "anthropic",
+          });
+        }
         request._ccReleaseLease?.();
         stats.totalErrors++;
-        logError("proxy", 0, err.message);
 
         // Complete the pending log entry for connection-level errors
         const pendingLog = request._pendingLog;
@@ -1430,6 +1560,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       ? "desktop" as const
       : "api" as const;
 
+    annotateActiveSpan("proxy.request", {
+      provider: "anthropic",
+      route: "messages",
+      modelFamily: runtimeModelFamily(route.modelFamily),
+      requestSource: source,
+      accountPoolSize: pool.getAll().length,
+      concurrency: pool.getInFlight(account.id),
+    });
+
     req._pendingLog = {
       ts: Date.now(),
       accountId: account.id,
@@ -1458,15 +1597,33 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   }));
 
   // ─── Graceful shutdown ────────────────────────────────────────────────────
+  let listener: ReturnType<typeof app.listen> | undefined;
+  const exitCoordinator = createProxyExitCoordinator({
+    stopAccepting: () => {
+      listener?.close();
+      console.log(chalk.yellow("\nShutting down — saving tokens..."));
+    },
+    stopUsageRefresh: () => {
+      usageRefresher.stop();
+      openAIUsageRefresher.stop();
+    },
+    removePid: () => {
+      if (managesPidFile()) removePid();
+    },
+    drainRefresh: async () => {
+      await Promise.all([
+        stopAnthropicRefreshLoop(REFRESH_SHUTDOWN_DEADLINE_MS),
+        stopOpenAIRefreshLoop(REFRESH_SHUTDOWN_DEADLINE_MS),
+      ]);
+    },
+    persistAccounts: () => saveProviderAccountsOnShutdown(pool.getAll(), openAIAccounts, {
+      saveAnthropic: saveAccounts,
+      saveOpenAI: persistOpenAIAccounts,
+    }),
+    shutdownTelemetry: () => shutdownTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS),
+  });
   const shutdown = () => {
-    console.log(chalk.yellow("\nShutting down — saving tokens..."));
-    usageRefresher.stop();
-    openAIUsageRefresher.stop();
-    saveAccounts(pool.getAll());
-    if (managesPidFile()) {
-      removePid();
-    }
-    process.exit(0);
+    void exitCoordinator.finish(() => scheduleProcessExit(0));
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
@@ -1491,8 +1648,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const ok = await performUpdate(check.latest);
         if (ok) {
           console.log(chalk.green("[auto-update] Restarting with new version..."));
-          saveAccounts(pool.getAll());
-          restartSelf();
+          await exitCoordinator.finish(restartSelf);
         }
       } catch (err) {
         console.error(chalk.gray(`[auto-update] Check failed: ${(err as Error).message}`));
@@ -1533,7 +1689,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  app.listen(port, host, () => {
+  listener = app.listen(port, host, () => {
     // Write PID for daemon/service process management
     if (managesPidFile()) {
       writePid(process.pid);
@@ -1551,21 +1707,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       ? chalk.gray("  Auto-failover: on — 429/5xx retried across accounts before the first relayed byte")
       : chalk.gray("  Auto-failover: off — upstream failures pass through; clients own retries"));
 
-    // Anonymous telemetry — fire-and-forget, never blocks proxy startup.
-    try {
-      const telemetryState = loadTelemetryState();
-      // First-run detection: if the install is brand new, emit app_started too
-      const firstRunAge = Date.now() - new Date(telemetryState.firstRunAt).getTime();
-      if (firstRunAge < 5 * 60 * 1000) {
-        void trackEvent("app_started", { first_run: true });
-      }
-      void trackEvent("proxy_started", {
-        account_count: totalAccountCount,
-        mode,
-      });
-      startHeartbeat(totalAccountCount);
-    } catch {
-      // never let telemetry break the proxy
-    }
+    recordProxyStarted(totalAccountCount);
+    startProxyHeartbeat(() => pool.getAll().length + openAIPool.getAll().length);
   });
 }

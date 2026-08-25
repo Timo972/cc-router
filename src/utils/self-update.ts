@@ -112,7 +112,7 @@ export async function checkForUpdate(force = false): Promise<UpdateCheckResult> 
 function detectInstallPrefix(): string {
   try {
     const scriptPath = realpathSync(process.argv[1]);
-    // scriptPath is like: /prefix/lib/node_modules/@timo972/cc-router/dist/cli/index.js
+    // scriptPath is like: /prefix/lib/node_modules/@timo972/cc-router/dist/cli/bootstrap.js
     // We need to walk up to the prefix root. join() normalizes the scope
     // separator, so the marker matches on Windows backslash paths too.
     const marker = join("node_modules", PKG_NAME);

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   fetchAnthropicModels,
   fetchOpenAICodexModels,
+  isModelDiscoveryPayload,
   normalizeModelIds,
 } from "../providers/model-discovery.js";
 import type { Account } from "../proxy/types.js";
@@ -86,6 +87,25 @@ describe("fetchAnthropicModels", () => {
       }),
       signal: expect.any(AbortSignal),
     });
+  });
+
+  it("accepts an explicitly empty model list", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+
+    await expect(fetchAnthropicModels(makeAnthropicAccount(), fetchMock)).resolves.toEqual([]);
+  });
+
+  it("classifies missing and null model-list schemas before normalization", () => {
+    expect(isModelDiscoveryPayload({ private: "payload" })).toBe(false);
+    expect(isModelDiscoveryPayload(null)).toBe(false);
+    expect(isModelDiscoveryPayload({ data: null })).toBe(false);
+    expect(isModelDiscoveryPayload({ data: [{}] })).toBe(false);
+    expect(isModelDiscoveryPayload({ data: [] })).toBe(true);
+    expect(isModelDiscoveryPayload({ models: [] })).toBe(true);
+    expect(isModelDiscoveryPayload([])).toBe(true);
   });
 });
 

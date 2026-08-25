@@ -14,7 +14,8 @@ export const CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage"
 
 export type CodexUsageFetchResult =
   | { ok: true; update: CodexRateLimitsUpdate }
-  | { ok: false; reason: "auth" | "http" | "network" | "malformed" };
+  | { ok: false; reason: "auth" | "http"; status: number }
+  | { ok: false; reason: "network" | "malformed" };
 
 export interface FetchCodexUsageOptions {
   fetch?: typeof globalThis.fetch;
@@ -37,8 +38,10 @@ export async function fetchCodexUsage(
   } catch {
     return { ok: false, reason: "network" };
   }
-  if (response.status === 401 || response.status === 403) return { ok: false, reason: "auth" };
-  if (!response.ok) return { ok: false, reason: "http" };
+  if (response.status === 401 || response.status === 403) {
+    return { ok: false, reason: "auth", status: response.status };
+  }
+  if (!response.ok) return { ok: false, reason: "http", status: response.status };
 
   let body: unknown;
   try {
@@ -85,11 +88,36 @@ export class OpenAIUsageRefresher extends UsageRefresher<OpenAIAccount, CodexUsa
           } catch {
             ready = false;
           }
-          if (!ready) return { ok: false, reason: "auth" };
+          if (!ready) return { ok: false, reason: "auth", status: 401 };
         }
         return fetchUsage(account);
       },
       cancelledResult: () => ({ ok: false, reason: "network" }),
+      telemetry: {
+        provider: "openai",
+        classifyResult: result => {
+          if (result.ok) return { outcome: "complete" };
+          if (result.reason === "network") {
+            return { outcome: "upstream_error", reason: "network_failure" };
+          }
+          if (result.reason === "malformed") {
+            return { outcome: "upstream_error", reason: "unexpected_response_shape" };
+          }
+          if (!("status" in result)) {
+            return { outcome: "upstream_error", reason: "other" };
+          }
+          const reason = result.status === 401 ? "unauthorized"
+            : result.status === 403 ? "forbidden"
+            : result.status === 429 ? "rate_limited"
+            : result.status >= 500 ? "upstream_5xx"
+            : "upstream_4xx";
+          return {
+            outcome: result.status === 429 ? "rate_limited" : "upstream_error",
+            reason,
+            httpStatusCode: result.status,
+          };
+        },
+      },
       applyResult: (account, result) => {
         if (result.ok) applyCodexRateLimits(account, result.update, now());
       },

@@ -25,17 +25,22 @@ export interface AnthropicUsageCaptureOptions {
   /** message_delta usage (output tokens), or the sole usage object of a
    *  non-streaming JSON body. */
   onOutputUsage(usage: Record<string, number>): void;
+  /** Decoded bytes for terminal SSE inspection. Never receives compressed
+   *  source bytes. */
+  onDecodedChunk?(chunk: Buffer): void;
 }
 
 export interface AnthropicUsageCapture {
   write(chunk: Buffer): void;
   end(): void;
+  readonly finished: Promise<void>;
 }
 
 /** Non-streaming bodies are buffered for one parse at end-of-stream; a body
  *  past this size stops being buffered (usage is best-effort diagnostics —
  *  unbounded buffering of a pathological body is not worth it). */
 const MAX_JSON_BODY_BYTES = 20 * 1024 * 1024;
+const MAX_SSE_USAGE_LINE_BYTES = 64 * 1024;
 
 function createDecoder(contentEncoding: string): Transform | null | undefined {
   const encoding = contentEncoding.trim().toLowerCase();
@@ -59,40 +64,76 @@ export function createAnthropicUsageCapture(
   if (decoder === undefined) return null;
 
   let dead = false;
+  let resolveFinished!: () => void;
+  let finishedSettled = false;
+  const finished = new Promise<void>(resolve => { resolveFinished = resolve; });
+  const settleFinished = (): void => {
+    if (finishedSettled) return;
+    finishedSettled = true;
+    resolveFinished();
+  };
   const die = () => {
     if (dead) return;
     dead = true;
     decoder?.destroy();
+    settleFinished();
   };
 
   // ── SSE: incremental line parsing, stop once both events were seen ────────
   let lineBuf = "";
   let gotInput = false;
   let gotOutput = false;
+  let usageComplete = false;
+  let usageParsingStopped = false;
+  let lineBufBytes = 0;
+  const stopUsageParsing = (): void => {
+    usageParsingStopped = true;
+    lineBuf = "";
+    lineBufBytes = 0;
+    if (!options.onDecodedChunk) die();
+  };
+  const parseSSELine = (line: string): void => {
+    if (!line.startsWith("data: ")) return;
+    try {
+      const evt = JSON.parse(line.slice(6)) as {
+        type?: string;
+        message?: { usage?: Record<string, number> };
+        usage?: Record<string, number>;
+      };
+      if (!gotInput && evt.type === "message_start" && evt.message?.usage) {
+        options.onInputUsage(evt.message.usage);
+        gotInput = true;
+      }
+      if (!gotOutput && evt.type === "message_delta" && evt.usage) {
+        options.onOutputUsage(evt.usage);
+        gotOutput = true;
+      }
+      if (gotInput && gotOutput) {
+        usageComplete = true;
+        stopUsageParsing();
+      }
+    } catch { /* malformed complete data lines are irrelevant to usage capture */ }
+  };
   const parseSSEChunk = (text: string): void => {
-    lineBuf += text;
-    const lines = lineBuf.split("\n");
-    lineBuf = lines.pop() ?? ""; // keep incomplete last line
-    for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
-      try {
-        const evt = JSON.parse(line.slice(6)) as {
-          type?: string;
-          message?: { usage?: Record<string, number> };
-          usage?: Record<string, number>;
-        };
-        if (!gotInput && evt.type === "message_start" && evt.message?.usage) {
-          options.onInputUsage(evt.message.usage);
-          gotInput = true;
-        }
-        if (!gotOutput && evt.type === "message_delta" && evt.usage) {
-          options.onOutputUsage(evt.usage);
-          gotOutput = true;
-        }
-        // Everything of interest has been seen — stop paying for the rest of
-        // the stream (and free the decompressor's zlib state).
-        if (gotInput && gotOutput) die();
-      } catch { /* partial JSON across chunk boundary — next chunk completes it */ }
+    if (usageComplete || usageParsingStopped) return;
+    let offset = 0;
+    while (offset < text.length) {
+      const newlineAt = text.indexOf("\n", offset);
+      const fragmentEnd = newlineAt === -1 ? text.length : newlineAt;
+      const fragment = text.slice(offset, fragmentEnd);
+      const fragmentBytes = Buffer.byteLength(fragment, "utf8");
+      if (lineBufBytes + fragmentBytes > MAX_SSE_USAGE_LINE_BYTES) {
+        stopUsageParsing();
+        return;
+      }
+      lineBuf += fragment;
+      lineBufBytes += fragmentBytes;
+      if (newlineAt === -1) return;
+      parseSSELine(lineBuf);
+      lineBuf = "";
+      lineBufBytes = 0;
+      if (usageComplete || usageParsingStopped) return;
+      offset = newlineAt + 1;
     }
   };
 
@@ -110,8 +151,9 @@ export function createAnthropicUsageCapture(
 
   const consume = (chunk: Buffer): void => {
     if (dead) return;
+    try { options.onDecodedChunk?.(chunk); } catch { /* passive observer */ }
     if (isSSE) {
-      parseSSEChunk(chunk.toString("utf8"));
+      if (!usageComplete && !usageParsingStopped) parseSSEChunk(chunk.toString("utf8"));
       return;
     }
     if (jsonBuf.length + chunk.length > MAX_JSON_BODY_BYTES) {
@@ -124,12 +166,14 @@ export function createAnthropicUsageCapture(
     if (dead) return;
     if (isJSON) parseJSONBody();
     dead = true;
+    settleFinished();
   };
 
   if (!decoder) {
     return {
       write: (chunk) => consume(chunk),
       end: () => finish(),
+      finished,
     };
   }
 
@@ -141,11 +185,12 @@ export function createAnthropicUsageCapture(
   return {
     write: (chunk) => {
       if (dead) return;
-      decoder.write(chunk);
+      try { decoder.write(chunk); } catch { die(); }
     },
     end: () => {
       if (dead) return;
-      decoder.end();
+      try { decoder.end(); } catch { die(); }
     },
+    finished,
   };
 }

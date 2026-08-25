@@ -7,6 +7,7 @@ import {
   createHealthAccountViews,
   createOpenAIPersister,
   createOperationalStatus,
+  shouldRecordAnthropicRuntimeFailure,
 } from "../proxy/server.js";
 import { applyOpenAIAccountPatch } from "../proxy/account-patch.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
@@ -50,6 +51,14 @@ function makeAnthropicAccount(): Account {
     weeklyLimitPercent: 90,
   };
 }
+
+describe("shouldRecordAnthropicRuntimeFailure", () => {
+  it("includes every upstream 5xx plus explicitly classified client failures", () => {
+    expect([401, 403, 429, 500, 502, 503, 504, 529].filter(shouldRecordAnthropicRuntimeFailure))
+      .toEqual([401, 403, 429, 500, 502, 503, 504, 529]);
+    expect([200, 400, 404].filter(shouldRecordAnthropicRuntimeFailure)).toEqual([]);
+  });
+});
 
 describe("createHealthAccountViews", () => {
   it("combines Anthropic pool stats with OpenAI subscription account status", () => {

@@ -6,7 +6,13 @@ vi.mock("fs", () => ({
   readFileSync: vi.fn(),
 }));
 
-import { extractFromCredentialsFile, formatExpiry, redactToken } from "../utils/token-extractor.js";
+import {
+  extractFromCredentialsFile,
+  extractFromCredentialsFileDetailed,
+  extractFromKeychainDetailed,
+  formatExpiry,
+  redactToken,
+} from "../utils/token-extractor.js";
 import * as fs from "fs";
 
 afterEach(() => {
@@ -110,6 +116,121 @@ describe("extractFromCredentialsFile", () => {
     vi.mocked(fs.readFileSync).mockReturnValue("not json {{{{");
 
     expect(extractFromCredentialsFile()).toBeNull();
+  });
+});
+
+describe("typed credential extraction", () => {
+  it("distinguishes missing, unreadable, and malformed credential files without exporting local detail", () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    expect(extractFromCredentialsFileDetailed()).toEqual({
+      ok: false,
+      error: expect.objectContaining({
+        classification: {
+          stage: "credential_read",
+          reason: "not_found",
+          expected: true,
+        },
+      }),
+    });
+
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockImplementation(() => {
+      throw Object.assign(new Error("/Users/private/.claude/.credentials.json PRIVATE"), { code: "EACCES" });
+    });
+    const denied = extractFromCredentialsFileDetailed();
+    expect(denied.ok).toBe(false);
+    if (!denied.ok) {
+      expect(denied.error.message).toContain("PRIVATE");
+      expect(denied.error.classification).toEqual({
+        stage: "credential_read",
+        reason: "permission_denied",
+        expected: true,
+      });
+      expect(JSON.stringify(denied.error.classification)).not.toContain("PRIVATE");
+    }
+
+    vi.mocked(fs.readFileSync).mockReturnValue("PRIVATE malformed {{{");
+    const malformed = extractFromCredentialsFileDetailed();
+    expect(malformed).toEqual({
+      ok: false,
+      error: expect.objectContaining({
+        classification: {
+          stage: "credential_parse",
+          reason: "malformed_credentials",
+          expected: true,
+        },
+      }),
+    });
+  });
+
+  it("classifies Keychain read and parse failures at their origin", async () => {
+    const denied = await extractFromKeychainDetailed({
+      readCredential: async () => {
+        throw Object.assign(new Error("PRIVATE keychain path"), { code: "EPERM" });
+      },
+    });
+    expect(denied).toEqual({
+      ok: false,
+      error: expect.objectContaining({
+        classification: {
+          stage: "credential_read",
+          reason: "permission_denied",
+          expected: true,
+        },
+      }),
+    });
+
+    const malformed = await extractFromKeychainDetailed({
+      readCredential: async () => "PRIVATE not-json",
+    });
+    expect(malformed).toEqual({
+      ok: false,
+      error: expect.objectContaining({
+        classification: {
+          stage: "credential_parse",
+          reason: "malformed_credentials",
+          expected: true,
+        },
+      }),
+    });
+  });
+
+  it("returns completed read/parse stages only with valid credentials", () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({
+      accessToken: "sk-ant-oat01-valid",
+      refreshToken: "sk-ant-ort01-valid",
+      expiresAt: 1999999999000,
+    }));
+
+    expect(extractFromCredentialsFileDetailed()).toEqual({
+      ok: true,
+      tokens: expect.objectContaining({ accessToken: "sk-ant-oat01-valid" }),
+      completedStages: ["credential_read", "credential_parse"],
+    });
+  });
+
+  it("rejects invalid expiry and scope shapes as malformed credentials", () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({
+      accessToken: "sk-ant-oat01-valid",
+      refreshToken: "sk-ant-ort01-valid",
+      expiresAt: "not-a-date",
+      scopes: ["user:inference", { private: "PRIVATE" }],
+    }));
+
+    const result = extractFromCredentialsFileDetailed();
+
+    expect(result).toEqual({
+      ok: false,
+      error: expect.objectContaining({
+        classification: {
+          stage: "credential_parse",
+          reason: "malformed_credentials",
+          expected: true,
+        },
+      }),
+    });
   });
 });
 

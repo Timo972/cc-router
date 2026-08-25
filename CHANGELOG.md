@@ -10,6 +10,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Privacy-safe OpenTelemetry and PostHog EU telemetry: sampled proxy
+  waterfalls, closed-schema setup/runtime diagnostics, lifecycle analytics,
+  and sanitized Error Tracking with diagnostic IDs. Fresh installs default
+  on; persisted and environment opt-outs gate every signal. Usage polling and
+  retrying provider requests retain provider and attempt-level visibility
+  without exporting prompts, bodies, headers, URLs, account IDs, or raw errors.
+  See [docs/telemetry.md](docs/telemetry.md) for the exhaustive inventory.
+
 - Automatic upstream failover and retry on both providers. A 429 or 5xx
   received before any response byte is relayed no longer passes straight
   through to the client: the router applies the existing cooldown/affinity
@@ -32,6 +40,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Aptabase telemetry has been replaced by a reconstructive, closed-schema
+  PostHog EU boundary with no Person profiles, disabled GeoIP enrichment, and
+  immediate late opt-out checks. Existing persisted opt-outs remain disabled.
+
 - Claude-bound POST `/v1/messages` moved from the generic proxy middleware
   to a dedicated transport (same byte-transparent relay contract: verbatim
   status/headers, raw body bytes, no synthesized events) so the router can
@@ -40,6 +52,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   model and the full `/v1/messages` path.
 
 ### Fixed
+
+- Shared Anthropic and OpenAI usage polling now exports its allowlisted
+  `provider.usage_refresh` spans with terminal status and duration, while
+  telemetry classification failures remain isolated from refresh behavior.
 
 - An account whose quota refills early — upgrading a Claude plan being the
   common case — is returned to rotation as soon as the usage endpoint says

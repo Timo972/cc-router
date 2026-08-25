@@ -1,4 +1,9 @@
 import type { OpenAIResponsesRequest } from "../../protocol/openai-responses-types.js";
+import {
+  classifyExpectedRuntimeFailure,
+  recordSafeLog,
+  recordUnexpectedException,
+} from "../../telemetry/facade.js";
 import type { OpenAISubscriptionAccount } from "./token-refresher.js";
 
 const CODEX_RESPONSES_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
@@ -11,23 +16,76 @@ export interface ForwardOpenAICodexResponseOptions {
   /** Aborted when the client disconnects, so a request nobody is waiting for
    *  stops occupying an upstream slot on the account. */
   signal?: AbortSignal;
+  /** One-based router attempt for failover/retry correlation. */
+  attempt?: number;
 }
 
 export async function forwardOpenAICodexResponse(
   opts: ForwardOpenAICodexResponseOptions,
 ): Promise<Response> {
-  const body = toCodexBackendRequest(opts.body);
-  const upstream = await fetch(CODEX_RESPONSES_ENDPOINT, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${opts.account.accessToken}`,
-      "content-type": "application/json",
-      accept: "text/event-stream",
-    },
-    body: JSON.stringify(body),
-    ...(opts.signal ? { signal: opts.signal } : {}),
-  });
-  return ensureEventStreamContentType(upstream);
+  const startedAt = Date.now();
+  try {
+    const body = toCodexBackendRequest(opts.body);
+    const upstream = await fetch(CODEX_RESPONSES_ENDPOINT, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${opts.account.accessToken}`,
+        "content-type": "application/json",
+        accept: "text/event-stream",
+      },
+      body: JSON.stringify(body),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
+    const outcome = responseOutcome(upstream.status);
+    if (upstream.status === 401 || upstream.status === 403
+      || upstream.status === 429 || upstream.status >= 500) {
+      recordSafeLog({
+        operation: "provider.inference",
+        provider: "openai",
+        reason: responseReason(upstream.status),
+        outcome,
+        httpStatusCode: upstream.status,
+        attempt: opts.attempt,
+        operationDurationMs: Date.now() - startedAt,
+        severity: "warn",
+      });
+    }
+    return ensureEventStreamContentType(upstream);
+  } catch (error) {
+    const reason = classifyExpectedRuntimeFailure(error);
+    const outcome = reason === "timeout" ? "timeout" : "upstream_error";
+    if (reason) {
+      recordSafeLog({
+        operation: "provider.inference",
+        provider: "openai",
+        reason,
+        outcome,
+        attempt: opts.attempt,
+        operationDurationMs: Date.now() - startedAt,
+        severity: "error",
+      });
+    } else {
+      recordUnexpectedException(error, {
+        category: "runtime",
+        reason: "other",
+        operation: "provider.inference",
+        provider: "openai",
+      });
+    }
+    throw error;
+  }
+}
+
+function responseOutcome(status: number): "complete" | "rate_limited" | "upstream_error" {
+  if (status >= 200 && status < 400) return "complete";
+  return status === 429 ? "rate_limited" : "upstream_error";
+}
+
+function responseReason(status: number): "unauthorized" | "forbidden" | "rate_limited" | "upstream_5xx" {
+  if (status === 401) return "unauthorized";
+  if (status === 403) return "forbidden";
+  if (status === 429) return "rate_limited";
+  return "upstream_5xx";
 }
 
 export function toCodexBackendRequest(body: OpenAIResponsesRequest): OpenAIResponsesRequest & {

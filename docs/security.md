@@ -73,28 +73,40 @@ cc-router only makes outbound connections to:
 | Host | Purpose |
 |------|---------|
 | `api.anthropic.com` | Forwarding Claude Code requests (standalone mode) |
-| `console.anthropic.com` | OAuth token refresh |
+| `claude.ai` | Anthropic OAuth token refresh |
 | `chatgpt.com` | OpenAI Codex subscription Responses route |
 | `auth.openai.com` | OpenAI subscription OAuth token refresh |
 | `localhost:4000` | LiteLLM (full mode only) |
 | `registry.npmjs.org` | Update **check** (version lookup only; installs are manual by default) |
-| `eu.aptabase.com` | Anonymous telemetry — **only if you opt in** (see below) |
+| `eu.i.posthog.com` | PostHog EU analytics and sanitized exceptions (`/batch/`) plus OTLP traces and logs (`/i/v1/traces`, `/i/v1/logs`) when telemetry is enabled |
 
 ## Telemetry
 
-Telemetry is **opt-in and off by default.** Nothing is sent unless you run
-`cc-router telemetry on`. When enabled, anonymous usage events are sent to
-Aptabase (`https://eu.aptabase.com`).
+Telemetry is **on by default for fresh installations**. Existing persisted
+opt-outs remain off. Persistently disable it with `cc-router telemetry off`, or
+disable a process with `DO_NOT_TRACK=1` or `CC_ROUTER_TELEMETRY=0`. Environment
+variables cannot force a persisted opt-out on. Turning telemetry off stops new
+capture immediately and discards queued records; a request already in flight
+cannot be recalled. After `cc-router telemetry on`, restart a daemon that
+started disabled so it can initialize its runtime telemetry stack.
 
-**What is sent:** a random install UUID (not linked to any identity), OS name/
-version, app and Node versions, and coarse counters (event name, account count,
-uptime). **What is never sent:** OAuth tokens, prompts, request/response bodies,
-account names, or email addresses. Your IP is visible to the endpoint at the
-network layer, as with any HTTPS request.
+Enabled telemetry sends only reconstructed closed-schema records to the
+hardcoded PostHog EU ingestion host shown above. A random installation UUID is
+the stable pseudonym used as PostHog `distinctId` and OpenTelemetry
+`service.instance.id`; it is not derived from user, account, host, network, or
+machine identity. Analytics and sanitized exceptions disable GeoIP processing
+and Person profiles are never created. The receiving HTTPS service necessarily
+sees the connection's source IP at the transport layer, but CC-Router does not
+include it in the application payload.
 
-**Opt out / stay off:** it is already off by default. You can also set
-`DO_NOT_TRACK=1` or `CC_ROUTER_TELEMETRY=0`, or run `cc-router telemetry off`.
-The endpoint is hardcoded and cannot be redirected.
+The final exporters reconstruct new allowlisted objects and reject unknown
+fields and instrumentation scopes. Prompts, content, bodies, credentials,
+account/session/user identifiers, raw errors, URLs, headers, hostnames, and
+absolute paths are forbidden. Existing console output and detailed local logs
+are not bridged to telemetry. PostHog Logs ingestion PII scrubbing should also
+be enabled as defense-in-depth; correctness does not depend on that backend
+filter. See [telemetry.md](telemetry.md) for the exhaustive outbound inventory
+and privacy contract.
 
 ---
 

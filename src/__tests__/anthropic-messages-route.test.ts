@@ -1,10 +1,14 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { gzipSync } from "node:zlib";
 import express from "express";
 import type { Request } from "express";
 import { describe, expect, it, vi } from "vitest";
 import { mountAnthropicMessagesRoute, unbracketedHostname, withOAuthBeta } from "../proxy/anthropic-messages-route.js";
-import type { AnthropicMessagesRouteOptions } from "../proxy/anthropic-messages-route.js";
+import type {
+  AnthropicMessagesRouteOptions,
+  AnthropicMessagesRouteTelemetry,
+} from "../proxy/anthropic-messages-route.js";
 import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.js";
 import { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
@@ -108,6 +112,7 @@ function mountRoute(
     }),
     (req, _res, next) => {
       req._ccRouteContext = { requestedModel: "claude-sonnet-5", modelFamily: "sonnet" };
+      req._ccTelemetryStreaming = req.body?.stream === true;
       next();
     },
   );
@@ -152,7 +157,149 @@ function postMessages(
 }
 
 describe("mountAnthropicMessagesRoute", () => {
+  it("starts the Anthropic attempt span before response headers arrive", async () => {
+    const spanRecords: unknown[] = [];
+    const telemetry: AnthropicMessagesRouteTelemetry = {
+      annotateActiveSpan: vi.fn(),
+      recordSafeLog: vi.fn(),
+      recordUnexpectedException: vi.fn(),
+      startTelemetrySpan: (operation, attributes) => {
+        spanRecords.push(["start", operation, attributes]);
+        return {
+          annotate: (next: unknown) => { spanRecords.push(["annotate", next]); },
+          end: (status: unknown) => { spanRecords.push(["end", status]); },
+        };
+      },
+    };
+    let releaseHeaders: (() => void) | undefined;
+    const { server, calls } = scriptedUpstream((_call, _req, res) => {
+      releaseHeaders = () => {
+        if (res.headersSent) return;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"id":"msg_1","usage":{"input_tokens":12,"output_tokens":42}}');
+      };
+    });
+    const upstreamPort = await listen(server);
+    const { app } = mountRoute([makeAccount("a")], upstreamPort, { telemetry });
+
+    try {
+      await withApp(app, async baseUrl => {
+        const responsePromise = postMessages(baseUrl);
+        let assertionError: unknown;
+        try {
+          await vi.waitFor(() => {
+            expect(calls).toHaveLength(1);
+            expect(releaseHeaders).toBeTypeOf("function");
+          });
+          expect(spanRecords).toContainEqual([
+            "start",
+            "provider.inference",
+            expect.objectContaining({ attempt: 1 }),
+          ]);
+        } catch (error) {
+          assertionError = error;
+        } finally {
+          releaseHeaders?.();
+        }
+        const response = await responsePromise;
+        expect(response.status).toBe(200);
+        await response.arrayBuffer();
+        if (assertionError) throw assertionError;
+      });
+    } finally {
+      releaseHeaders?.();
+      await close(server);
+    }
+  });
+
+  it("keeps the attempt span open until compressed terminal usage is captured", async () => {
+    const spanRecords: unknown[] = [];
+    const telemetry: AnthropicMessagesRouteTelemetry = {
+      annotateActiveSpan: vi.fn(),
+      recordSafeLog: vi.fn(),
+      recordUnexpectedException: vi.fn(),
+      startTelemetrySpan: (operation, attributes) => {
+        spanRecords.push(["start", operation, attributes]);
+        return {
+          annotate: (attributes: unknown) => { spanRecords.push(["annotate", attributes]); },
+          end: (status: unknown) => { spanRecords.push(["end", status]); },
+        };
+      },
+    };
+    const sseBody = Buffer.from([
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":12}}}',
+      "",
+      'data: {"type":"message_delta","usage":{"output_tokens":42}}',
+      "",
+      'data: {"type":"message_stop"}',
+      "",
+      "",
+    ].join("\n"));
+    const { server } = scriptedUpstream((_call, _req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "content-encoding": "gzip",
+      });
+      res.end(gzipSync(sseBody));
+    });
+    const upstreamPort = await listen(server);
+    const { app } = mountRoute([makeAccount("a")], upstreamPort, { telemetry });
+
+    try {
+      await withApp(app, async baseUrl => {
+        const response = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "claude-sonnet-5", messages: [], stream: true }),
+        });
+        expect(response.status).toBe(200);
+        await response.arrayBuffer();
+
+        await vi.waitFor(() => expect(spanRecords).toContainEqual([
+          "annotate",
+          expect.objectContaining({
+            streamOutcome: "complete",
+            inputTokens: 12,
+            outputTokens: 42,
+          }),
+        ]));
+        expect(spanRecords).toContainEqual([
+          "start",
+          "provider.inference",
+          expect.objectContaining({
+            provider: "anthropic",
+            route: "messages",
+            streaming: true,
+          }),
+        ]);
+        expect(spanRecords).toContainEqual([
+          "annotate",
+          expect.objectContaining({ httpStatusCode: 200, outcome: "complete" }),
+        ]);
+        expect(spanRecords).toContainEqual(["end", "ok"]);
+        expect(spanRecords.filter(record => Array.isArray(record) && record[0] === "end"))
+          .toEqual([["end", "ok"]]);
+      });
+    } finally {
+      await close(server);
+    }
+  });
+
   it("fails a 429 over to a different account within one request and rebinds the session", async () => {
+    const telemetryRecords: unknown[] = [];
+    const telemetry: AnthropicMessagesRouteTelemetry = {
+      annotateActiveSpan: (...values) => telemetryRecords.push(["span", ...values]),
+      startTelemetrySpan: (_operation, attributes) => {
+        const attempt = attributes.attempt;
+        telemetryRecords.push(["attempt-start", attempt]);
+        return {
+          annotate: next => telemetryRecords.push(["attempt-annotate", attempt, next]),
+          end: status => telemetryRecords.push(["attempt-end", attempt, status]),
+        };
+      },
+      recordSafeLog: value => telemetryRecords.push(["log", value]),
+      recordUnexpectedException: (...values) => telemetryRecords.push(["exception", ...values]),
+    };
     const sseBody = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
       "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     const { server, calls } = scriptedUpstream((call, _req, res) => {
@@ -166,7 +313,7 @@ describe("mountAnthropicMessagesRoute", () => {
     });
     const upstreamPort = await listen(server);
     const accounts = [makeAccount("a"), makeAccount("b")];
-    const { app, pool, activity } = mountRoute(accounts, upstreamPort);
+    const { app, pool, activity } = mountRoute(accounts, upstreamPort, { telemetry });
 
     try {
       await withApp(app, async baseUrl => {
@@ -176,8 +323,30 @@ describe("mountAnthropicMessagesRoute", () => {
 
         expect(calls).toHaveLength(2);
         expect(calls[1]!.authorization).not.toBe(calls[0]!.authorization);
+        await vi.waitFor(() => {
+          expect(telemetryRecords.filter(record => Array.isArray(record) && record[0] === "attempt-start"))
+            .toEqual([["attempt-start", 1], ["attempt-start", 2]]);
+          expect(telemetryRecords.filter(record => Array.isArray(record) && record[0] === "attempt-end"))
+            .toEqual([["attempt-end", 1, "error"], ["attempt-end", 2, "ok"]]);
+        });
         const failedId = calls[0]!.authorization.endsWith("-a") ? "a" : "b";
         expect(pool.isEligible(failedId, { modelFamily: "sonnet" })).toBe(false);
+
+        expect(telemetryRecords).toContainEqual([
+          "log",
+          expect.objectContaining({
+            operation: "provider.inference",
+            provider: "anthropic",
+            httpStatusCode: 429,
+            attempt: 1,
+          }),
+        ]);
+        expect(telemetryRecords).toContainEqual([
+          "span",
+          "proxy.request",
+          expect.objectContaining({ httpStatusCode: 200, outcome: "complete", attempt: 2 }),
+        ]);
+        expect(JSON.stringify(telemetryRecords)).not.toContain("access-");
 
         // The session sticks to the account that actually served it.
         const followUp = await postMessages(baseUrl, { "x-claude-code-session-id": "session-1" });
@@ -608,9 +777,21 @@ describe("mountAnthropicMessagesRoute", () => {
       res.writeHead(429, { "content-type": "application/json", "retry-after": "60" });
       res.end("{\"type\":\"error\"}");
     });
+    const attemptAnnotations: Array<Record<string, unknown>> = [];
+    const attemptEnd = vi.fn();
+    const telemetry: AnthropicMessagesRouteTelemetry = {
+      annotateActiveSpan: vi.fn(),
+      recordSafeLog: vi.fn(),
+      recordUnexpectedException: vi.fn(),
+      startTelemetrySpan: () => ({
+        annotate: attributes => { attemptAnnotations.push(attributes); },
+        end: attemptEnd,
+      }),
+    };
     const upstreamPort = await listen(server);
     const { app, activity } = mountRoute([makeAccount("a"), makeAccount("b")], upstreamPort, {
       maxAttempts: 1,
+      telemetry,
     });
 
     try {
@@ -627,6 +808,11 @@ describe("mountAnthropicMessagesRoute", () => {
     expect(calls).toHaveLength(1);
     expect(activity).toHaveLength(1);
     expect(activity[0]!.details).not.toContain(":will-retry");
+    expect(attemptEnd).toHaveBeenCalledWith("error");
+    expect(attemptAnnotations.at(-1)).toEqual(expect.objectContaining({
+      httpStatusCode: 429,
+      outcome: "rate_limited",
+    }));
   });
 
   it("retries an unscoped plain 5xx wherever a fresh request would route", async () => {

@@ -78,8 +78,6 @@ vi.mock("../interceptor/mitmproxy-manager.js", () => ({
   isInterceptorServiceInstalled: vi.fn(() => false),
 }));
 
-vi.mock("../utils/telemetry.js", () => ({ trackEvent: vi.fn() }));
-
 import * as fs from "node:fs";
 import { Command } from "commander";
 import { registerClient } from "../cli/cmd-client.js";

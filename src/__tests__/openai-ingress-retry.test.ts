@@ -8,6 +8,7 @@ import { SessionRouter } from "../proxy/session-router.js";
 import { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
 import type { LogEntry } from "../proxy/stats.js";
+import type { OpenAIIngressTelemetry } from "../proxy/openai-ingress.js";
 
 type ForwardOpenAI = (opts: {
   account: OpenAIAccount;
@@ -81,6 +82,21 @@ async function postResponses(baseUrl: string, body: Record<string, unknown>): Pr
 
 describe("runOpenAIIngress upstream retry", () => {
   it("fails a 429 over to a different account and relays only the successful response", async () => {
+    const telemetryRecords: unknown[] = [];
+    const attemptSpans: Array<{ annotations: unknown[]; endings: unknown[] }> = [];
+    const telemetry: OpenAIIngressTelemetry = {
+      annotateActiveSpan: (...values) => telemetryRecords.push(["span", ...values]),
+      startTelemetrySpan: (_operation, attributes) => {
+        const span = { annotations: [attributes] as unknown[], endings: [] as unknown[] };
+        attemptSpans.push(span);
+        return {
+          annotate: value => span.annotations.push(value),
+          end: status => span.endings.push(status),
+        };
+      },
+      recordSafeLog: value => telemetryRecords.push(["log", value]),
+      recordUnexpectedException: (...values) => telemetryRecords.push(["exception", ...values]),
+    };
     const attempts: string[] = [];
     const forward: ForwardOpenAI = async ({ account }) => {
       attempts.push(account.id);
@@ -90,7 +106,7 @@ describe("runOpenAIIngress upstream retry", () => {
       return jsonResponse(200, { id: "resp_ok", output: [], usage: {} });
     };
     const accounts = [makeRuntimeAccount("openai-a"), makeRuntimeAccount("openai-b")];
-    const { app, openAIPool, activity } = mountWithPool(accounts, forward);
+    const { app, openAIPool, activity } = mountWithPool(accounts, forward, { telemetry });
 
     await withServer(app, async baseUrl => {
       const res = await postResponses(baseUrl, {});
@@ -116,6 +132,37 @@ describe("runOpenAIIngress upstream retry", () => {
       statusCode: 200,
       accountId: attempts[1],
     }));
+    expect(telemetryRecords).toContainEqual([
+      "log",
+      expect.objectContaining({
+        operation: "provider.inference",
+        provider: "openai",
+        httpStatusCode: 429,
+        attempt: 1,
+      }),
+    ]);
+    expect(telemetryRecords).toContainEqual([
+      "span",
+      "proxy.request",
+      expect.objectContaining({ httpStatusCode: 200, outcome: "complete", attempt: 2 }),
+    ]);
+    expect(attemptSpans).toHaveLength(2);
+    expect(attemptSpans[0]).toMatchObject({
+      annotations: [
+        expect.objectContaining({ attempt: 1 }),
+        expect.objectContaining({ httpStatusCode: 429, outcome: "rate_limited" }),
+      ],
+      endings: ["error"],
+    });
+    expect(attemptSpans[1]).toMatchObject({
+      annotations: [
+        expect.objectContaining({ attempt: 2 }),
+        expect.objectContaining({ httpStatusCode: 200, outcome: "complete" }),
+      ],
+      endings: ["ok"],
+    });
+    expect(JSON.stringify(telemetryRecords)).not.toContain("openai-a");
+    expect(JSON.stringify(telemetryRecords)).not.toContain("openai-b");
   });
 
   it("retries a 500 on the same account and succeeds", async () => {

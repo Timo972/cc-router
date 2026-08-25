@@ -1,5 +1,4 @@
-#!/usr/bin/env node
-import { Command } from "commander";
+import { Command, CommanderError } from "commander";
 import { registerSetup } from "./cmd-setup.js";
 import { registerStart } from "./cmd-start.js";
 import { registerStop, registerRevert } from "./cmd-stop.js";
@@ -13,8 +12,11 @@ import { registerTelemetry } from "./cmd-telemetry.js";
 import { registerLogs } from "./cmd-logs.js";
 import { registerModels } from "./cmd-models.js";
 import { getCurrentVersion, checkForUpdate, printUpdateBanner } from "../utils/self-update.js";
+import { recordApplicationStart } from "../telemetry/facade.js";
+import { CliExitError } from "./errors.js";
 
 const program = new Command();
+program.exitOverride();
 
 program
   .name("cc-router")
@@ -63,4 +65,15 @@ if (!process.env["NO_UPDATE_NOTIFIER"] && !process.env["CI"]) {
   }).catch(() => { /* silent */ });
 }
 
-program.parse();
+export async function runCli(): Promise<void> {
+  recordApplicationStart();
+  try {
+    await program.parseAsync();
+  } catch (error) {
+    if (error instanceof CommanderError || error instanceof CliExitError) {
+      process.exitCode = error.exitCode;
+      return;
+    }
+    throw error;
+  }
+}

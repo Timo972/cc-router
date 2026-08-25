@@ -6,13 +6,14 @@ import { fileURLToPath } from "url";
 import { join, dirname } from "path";
 import chalk from "chalk";
 import { detectPlatform } from "../utils/platform.js";
+import { exitCli } from "./errors.js";
 
 const execFileAsync = promisify(execFile);
 
 // Resolve the path to the compiled CLI entry point
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const CLI_ENTRY = join(__dirname, "index.js");
+const CLI_ENTRY = join(__dirname, "bootstrap.js");
 
 export function registerService(program: Command): void {
   const service = program
@@ -35,7 +36,7 @@ export function registerService(program: Command): void {
         } catch (err) {
           console.error(chalk.red("✗ Failed to install PM2:"), (err as Error).message);
           console.error(chalk.gray("  Try manually: npm install -g pm2"));
-          process.exit(1);
+          exitCli(1);
         }
       } else {
         console.log(chalk.green(`✓ PM2 ${pm2Version} found`));
@@ -61,7 +62,7 @@ export function registerService(program: Command): void {
           console.log(chalk.green("✓ cc-router restarted in PM2"));
         } else {
           console.error(chalk.red("✗ Failed to start in PM2:"), msg);
-          process.exit(1);
+          exitCli(1);
         }
       }
 

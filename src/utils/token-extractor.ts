@@ -4,6 +4,7 @@ import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import os from "os";
 import type { OAuthTokens } from "../proxy/types.js";
+import { SetupDiagnosticError } from "../telemetry/setup-diagnostics.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -13,20 +14,80 @@ const execFileAsync = promisify(execFile);
  * preventing any shell injection.
  */
 export async function extractFromKeychain(): Promise<OAuthTokens | null> {
-  try {
-    const { stdout } = await execFileAsync("security", [
+  const result = await extractFromKeychainDetailed();
+  return result.ok ? result.tokens : null;
+}
+
+export type CredentialExtractionResult =
+  | { ok: true; tokens: OAuthTokens; completedStages: readonly ["credential_read", "credential_parse"] }
+  | { ok: false; error: SetupDiagnosticError };
+
+export interface KeychainExtractionOptions {
+  readCredential?: () => Promise<string>;
+}
+
+async function readKeychainCredential(): Promise<string> {
+  const { stdout } = await execFileAsync("security", [
       "find-generic-password",
       "-s", "Claude Code-credentials",
       "-w",
-    ]);
-    const raw = JSON.parse(stdout.trim());
+  ]);
+  return stdout;
+}
+
+function ownErrorCode(error: unknown): string | number | undefined {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+  return descriptor && "value" in descriptor
+    && (typeof descriptor.value === "string" || typeof descriptor.value === "number")
+    ? descriptor.value
+    : undefined;
+}
+
+function credentialReadError(error: unknown, source: "Keychain" | "credentials file"): SetupDiagnosticError {
+  const code = ownErrorCode(error);
+  const reason = code === "EACCES" || code === "EPERM"
+    ? "permission_denied" as const
+    : code === "ENOENT" || code === 44
+      ? "not_found" as const
+      : "other" as const;
+  const detail = error instanceof Error ? error.message : String(error);
+  return new SetupDiagnosticError(`${source} read failed: ${detail}`, {
+    stage: "credential_read",
+    reason,
+    expected: reason !== "other",
+  }, { cause: error });
+}
+
+function credentialParseError(error: unknown): SetupDiagnosticError {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new SetupDiagnosticError(`Credential parse failed: ${detail}`, {
+    stage: "credential_parse",
+    reason: "malformed_credentials",
+    expected: true,
+  }, { cause: error });
+}
+
+export async function extractFromKeychainDetailed(
+  options: KeychainExtractionOptions = {},
+): Promise<CredentialExtractionResult> {
+  let stdout: string;
+  try {
+    stdout = await (options.readCredential ?? readKeychainCredential)();
+  } catch (error) {
+    return { ok: false, error: credentialReadError(error, "Keychain") };
+  }
+  try {
+    const raw = JSON.parse(stdout.trim()) as unknown;
     // Keychain JSON can be either:
     //   { claudeAiOauth: { accessToken, refreshToken, ... }, mcpOAuth: {...} }
     //   { accessToken, refreshToken, ... }  (direct, older versions)
-    const oauth = raw.claudeAiOauth ?? raw;
-    return parseCredentialJson(oauth);
-  } catch {
-    return null;
+    const oauth = oauthPayload(raw);
+    const tokens = parseCredentialJson(oauth);
+    if (!tokens) throw new TypeError("Credential object is missing required OAuth token fields");
+    return { ok: true, tokens, completedStages: ["credential_read", "credential_parse"] };
+  } catch (error) {
+    return { ok: false, error: credentialParseError(error) };
   }
 }
 
@@ -36,18 +97,46 @@ export async function extractFromKeychain(): Promise<OAuthTokens | null> {
  * No shell — pure Node.js file read.
  */
 export function extractFromCredentialsFile(): OAuthTokens | null {
+  const result = extractFromCredentialsFileDetailed();
+  return result.ok ? result.tokens : null;
+}
+
+export function extractFromCredentialsFileDetailed(): CredentialExtractionResult {
   const credPath = join(os.homedir(), ".claude", ".credentials.json");
-  if (!existsSync(credPath)) return null;
+  if (!existsSync(credPath)) {
+    return {
+      ok: false,
+      error: new SetupDiagnosticError("Claude credentials file was not found", {
+        stage: "credential_read",
+        reason: "not_found",
+        expected: true,
+      }),
+    };
+  }
+  let contents: string;
   try {
-    const raw = JSON.parse(readFileSync(credPath, "utf-8"));
+    contents = readFileSync(credPath, "utf-8");
+  } catch (error) {
+    return { ok: false, error: credentialReadError(error, "credentials file") };
+  }
+  try {
+    const raw = JSON.parse(contents) as unknown;
     // The file can have two shapes:
     //   { claudeAiOauth: { accessToken, refreshToken, expiresAt, scopes } }
     //   { accessToken, refreshToken, expiresAt, scopes }  (direct)
-    const oauth = raw.claudeAiOauth ?? raw;
-    return parseCredentialJson(oauth);
-  } catch {
-    return null;
+    const oauth = oauthPayload(raw);
+    const tokens = parseCredentialJson(oauth);
+    if (!tokens) throw new TypeError("Credential object is missing required OAuth token fields");
+    return { ok: true, tokens, completedStages: ["credential_read", "credential_parse"] };
+  } catch (error) {
+    return { ok: false, error: credentialParseError(error) };
   }
+}
+
+function oauthPayload(raw: unknown): unknown {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return raw;
+  const record = raw as Record<string, unknown>;
+  return record["claudeAiOauth"] ?? raw;
 }
 
 /** Parse and normalise either a raw JSON string or an already-parsed object. */
@@ -68,9 +157,13 @@ function parseCredentialJson(raw: unknown): OAuthTokens | null {
       return null;
     }
 
-    const scopes = Array.isArray(obj["scopes"])
-      ? (obj["scopes"] as string[])
-      : ["user:inference", "user:profile"];
+    const rawScopes = obj["scopes"];
+    if (rawScopes !== undefined
+      && (!Array.isArray(rawScopes) || !rawScopes.every(scope => typeof scope === "string"))) {
+      return null;
+    }
+    const scopes = rawScopes as string[] | undefined
+      ?? ["user:inference", "user:profile"];
 
     let expiresAtMs: number;
     if (typeof expiresAt === "number") {
@@ -81,6 +174,7 @@ function parseCredentialJson(raw: unknown): OAuthTokens | null {
       // No expiry info — assume 8h from now (standard OAuth token lifetime)
       expiresAtMs = Date.now() + 8 * 60 * 60 * 1000;
     }
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= 0) return null;
 
     return { accessToken, refreshToken, expiresAt: expiresAtMs, scopes };
   } catch {

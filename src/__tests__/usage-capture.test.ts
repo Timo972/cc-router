@@ -49,6 +49,57 @@ describe("createAnthropicUsageCapture", () => {
     });
   });
 
+  it("stops parsing SSE lines after usage completes while continuing decoded observation", async () => {
+    const onInputUsage = vi.fn();
+    const onOutputUsage = vi.fn();
+    const tail = Buffer.alloc(128 * 1024, 0x78);
+    let observedTail = false;
+    const capture = createAnthropicUsageCapture({
+      contentType: "text/event-stream",
+      contentEncoding: "",
+      onInputUsage,
+      onOutputUsage,
+      onDecodedChunk: chunk => { observedTail ||= chunk === tail; },
+    });
+    const tailToString = vi.spyOn(tail, "toString");
+
+    capture!.write(sseBody());
+    expect(onInputUsage).toHaveBeenCalledWith(INPUT_USAGE);
+    expect(onOutputUsage).toHaveBeenCalledWith(OUTPUT_USAGE);
+
+    capture!.write(tail);
+    capture!.end();
+
+    expect(observedTail).toBe(true);
+    expect(tailToString).not.toHaveBeenCalled();
+    await expect(capture!.finished).resolves.toBeUndefined();
+  });
+
+  it("stops usage parsing after an oversized SSE line while continuing decoded observation", async () => {
+    const onInputUsage = vi.fn();
+    const onOutputUsage = vi.fn();
+    const observed: Buffer[] = [];
+    const capture = createAnthropicUsageCapture({
+      contentType: "text/event-stream",
+      contentEncoding: "",
+      onInputUsage,
+      onOutputUsage,
+      onDecodedChunk: chunk => { observed.push(chunk); },
+    });
+    const oversizedLine = Buffer.alloc(128 * 1024, 0x78);
+    const validUsage = sseBody();
+
+    capture!.write(oversizedLine);
+    capture!.write(Buffer.from("\n"));
+    capture!.write(validUsage);
+    capture!.end();
+
+    expect(onInputUsage).not.toHaveBeenCalled();
+    expect(onOutputUsage).not.toHaveBeenCalled();
+    expect(observed).toEqual([oversizedLine, expect.any(Buffer), validUsage]);
+    await expect(capture!.finished).resolves.toBeUndefined();
+  });
+
   it("parses usage from a gzip-compressed SSE stream", async () => {
     // The whole point of this module: the proxy is byte-transparent, so the
     // client's accept-encoding makes upstream compress — and before this

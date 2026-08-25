@@ -25,11 +25,18 @@ export function createAnthropicProxy(options: AnthropicProxyOptions): RequestHan
     on: {
       ...options.on,
       proxyReq: (proxyRequest, request, response, proxyOptions) => {
+        const stripPropagationHeaders = (): void => {
+          proxyRequest.removeHeader("traceparent");
+          proxyRequest.removeHeader("tracestate");
+          proxyRequest.removeHeader("baggage");
+        };
+        stripPropagationHeaders();
         proxyRequest.once("response", () => {
           proxyRequest.setTimeout(0);
           request.socket.setTimeout(0);
         });
         configuredProxyRequest?.(proxyRequest, request, response, proxyOptions);
+        if (!proxyRequest.headersSent) stripPropagationHeaders();
       },
     },
   });

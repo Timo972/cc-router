@@ -2,7 +2,7 @@ import { applyAnthropicInputUsage, applyAnthropicOutputUsage } from "./stats.js"
 import type { LogEntry } from "./stats.js";
 import { createAnthropicUsageCapture } from "./usage-capture.js";
 import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
-import type { LifecycleEmitter } from "./stream-lifecycle.js";
+import type { LifecycleEmitter, StreamTerminalTelemetry } from "./stream-lifecycle.js";
 
 export interface CapturableUpstream extends LifecycleEmitter {
   headers: Record<string, string | string[] | undefined>;
@@ -32,24 +32,42 @@ export function attachAnthropicResponseCapture(
   downstream: LifecycleEmitter,
   entry: LogEntry,
   startedAt: number,
+  options: {
+    now?: () => number;
+    onTerminal?: (terminal: StreamTerminalTelemetry) => void;
+  } = {},
 ): void {
   const contentType = String(upstream.headers["content-type"] ?? "");
-  const encoding = String(upstream.headers["content-encoding"] ?? "");
+  const encoding = String(upstream.headers["content-encoding"] ?? "").toLowerCase();
   const isCompressed = /gzip|br|deflate/.test(encoding);
-  const streamTracker = createStreamLifecycleTracker(
-    startedAt,
-    !isCompressed && contentType.includes("text/event-stream"),
-  );
-  entry.streamLifecycle = streamTracker.state;
-  streamTracker.attach(upstream, downstream);
-  upstream.on("data", (chunk: Buffer) => streamTracker.observeChunk(chunk));
-
+  const isEventStream = contentType.includes("text/event-stream");
+  let streamTracker!: ReturnType<typeof createStreamLifecycleTracker>;
   const usageCapture = createAnthropicUsageCapture({
     contentType,
     contentEncoding: encoding,
     onInputUsage: usage => applyAnthropicInputUsage(entry, usage),
     onOutputUsage: usage => applyAnthropicOutputUsage(entry, usage),
+    ...(isEventStream ? { onDecodedChunk: (chunk: Buffer) => streamTracker.observeChunk(chunk) } : {}),
   });
+  streamTracker = createStreamLifecycleTracker(
+    startedAt,
+    isEventStream && usageCapture !== null,
+    options.now,
+    options.onTerminal,
+    {
+      requireSseTerminal: isEventStream,
+      ...(isCompressed && usageCapture
+        ? {
+            beforeTerminal: async () => {
+              usageCapture.end();
+              await usageCapture.finished;
+            },
+          }
+        : {}),
+    },
+  );
+  entry.streamLifecycle = streamTracker.state;
+  streamTracker.attach(upstream, downstream);
   if (usageCapture) {
     upstream.on("data", (chunk: Buffer) => usageCapture.write(chunk));
     upstream.on("end", () => usageCapture.end());

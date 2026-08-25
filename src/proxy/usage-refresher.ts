@@ -1,3 +1,11 @@
+import {
+  annotateActiveSpan,
+  recordSafeLog,
+  recordUnexpectedException,
+  withTelemetrySpan,
+} from "../telemetry/facade.js";
+import type { Outcome, Provider, SetupReason } from "../telemetry/contracts.js";
+
 const SUCCESS_REFRESH_MS = 5 * 60_000;
 const FAILURE_BACKOFF_MS = [60_000, 2 * 60_000, 5 * 60_000, 15 * 60_000];
 const DEFAULT_STARTUP_STAGGER_MS = 250;
@@ -19,6 +27,14 @@ export interface UsageRefresherHooks<TAccount extends { id: string }, TResult ex
   /** The result handed to waiters when a refresh is cancelled without running
    *  (refresher stopped, or the account left the pool). */
   cancelledResult(): TResult;
+  telemetry?: {
+    provider: Exclude<Provider, "other">;
+    classifyResult(result: TResult): {
+      outcome: Outcome;
+      reason?: SetupReason;
+      httpStatusCode?: number;
+    };
+  };
   now?: () => number;
   startupStaggerMs?: number;
   maxConcurrent?: number;
@@ -175,12 +191,75 @@ export class UsageRefresher<TAccount extends { id: string }, TResult extends { o
       return;
     }
     void (async () => {
-      let result: TResult;
-      try {
-        result = await this.hooks.fetchUsage(account);
-      } catch {
-        result = this.hooks.cancelledResult();
-      }
+      const startedAt = this.now();
+      const refreshUsage = async (): Promise<TResult> => {
+        let result: TResult;
+        let fetchThrew = false;
+        try {
+          result = await this.hooks.fetchUsage(account);
+        } catch (error) {
+          fetchThrew = true;
+          const duration = Math.max(0, this.now() - startedAt);
+          const provider = this.hooks.telemetry?.provider;
+          if (provider) {
+            annotateActiveSpan("provider.usage_refresh", {
+              outcome: "upstream_error",
+              operationDurationMs: duration,
+            });
+            recordSafeLog({
+              operation: "provider.usage_refresh",
+              provider,
+              reason: "other",
+              outcome: "upstream_error",
+              accountPoolSize: this.pool.getAll().length,
+              concurrency: this.active,
+              operationDurationMs: duration,
+              severity: "error",
+            });
+            recordUnexpectedException(error, {
+              category: "runtime",
+              reason: "other",
+              operation: "provider.usage_refresh",
+              provider,
+            });
+          }
+          result = this.hooks.cancelledResult();
+        }
+
+        if (this.hooks.telemetry && !fetchThrew) {
+          try {
+            const duration = Math.max(0, this.now() - startedAt);
+            const classification = this.hooks.telemetry.classifyResult(result);
+            annotateActiveSpan("provider.usage_refresh", {
+              outcome: classification.outcome,
+              httpStatusCode: classification.httpStatusCode,
+              operationDurationMs: duration,
+            });
+            if (!result.ok && classification.reason) {
+              recordSafeLog({
+                operation: "provider.usage_refresh",
+                provider: this.hooks.telemetry.provider,
+                reason: classification.reason,
+                outcome: classification.outcome,
+                httpStatusCode: classification.httpStatusCode,
+                accountPoolSize: this.pool.getAll().length,
+                concurrency: this.active,
+                operationDurationMs: duration,
+                severity: "warn",
+              });
+            }
+          } catch {}
+        }
+        return result;
+      };
+      const provider = this.hooks.telemetry?.provider;
+      const result = provider
+        ? await withTelemetrySpan("provider.usage_refresh", {
+            provider,
+            accountPoolSize: this.pool.getAll().length,
+            concurrency: this.active,
+          }, refreshUsage)
+        : await refreshUsage();
 
       if (this.pool.findById(account.id) === account) {
         if (result.ok) this.failures.delete(account);

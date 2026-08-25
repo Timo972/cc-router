@@ -19,12 +19,24 @@ export interface StreamLifecycleTracker {
   attach(upstream: LifecycleEmitter, downstream: LifecycleEmitter): void;
 }
 
+export interface StreamTerminalTelemetry {
+  outcome: "complete" | "upstream_error" | "cancelled" | "other";
+  durationMs: number;
+}
+
+export interface StreamLifecycleOptions {
+  requireSseTerminal?: boolean;
+  beforeTerminal?: () => Promise<void>;
+}
+
 export const MAX_RETAINED_SSE_LINE_BYTES = 64 * 1024;
 
 export function createStreamLifecycleTracker(
   startedAt: number,
   inspectSse: boolean,
   now: () => number = Date.now,
+  onTerminal?: (terminal: StreamTerminalTelemetry) => void,
+  options: StreamLifecycleOptions = {},
 ): StreamLifecycleTracker {
   const state: StreamLifecycleState = {
     sawMessageStop: false,
@@ -36,6 +48,7 @@ export function createStreamLifecycleTracker(
   };
   let lineBuffer = Buffer.alloc(0);
   let discardingOversizedLine = false;
+  let terminalStarted = false;
   const clearParserState = () => {
     lineBuffer = Buffer.alloc(0);
     discardingOversizedLine = false;
@@ -53,9 +66,36 @@ export function createStreamLifecycleTracker(
       // Complete non-JSON data lines are irrelevant to terminal tracking.
     }
   };
-  const terminal = () => {
-    clearParserState();
-    state.bodyDurationMs = Math.max(0, now() - startedAt);
+  const terminal = (
+    outcome?: StreamTerminalTelemetry["outcome"] | (() => StreamTerminalTelemetry["outcome"]),
+  ) => {
+    const durationMs = Math.max(0, now() - startedAt);
+    state.bodyDurationMs = durationMs;
+    if (!outcome) {
+      if (!options.beforeTerminal) clearParserState();
+      return;
+    }
+    if (terminalStarted) return;
+    terminalStarted = true;
+    const report = (): void => {
+      clearParserState();
+      try {
+        onTerminal?.({
+          outcome: typeof outcome === "function" ? outcome() : outcome,
+          durationMs,
+        });
+      } catch {
+        // Observability callbacks cannot change streaming lifecycle behavior.
+      }
+    };
+    if (!options.beforeTerminal) {
+      report();
+      return;
+    }
+    void Promise.resolve()
+      .then(options.beforeTerminal)
+      .catch(() => undefined)
+      .then(report);
   };
   return {
     state,
@@ -98,10 +138,24 @@ export function createStreamLifecycleTracker(
     },
     attach(upstream, downstream) {
       upstream.once("end", () => { state.upstreamEnd = true; terminal(); });
-      upstream.once("aborted", () => { state.upstreamAborted = true; terminal(); });
-      upstream.once("close", () => { state.upstreamClose = true; terminal(); });
-      downstream.once("finish", () => { state.downstreamFinish = true; terminal(); });
-      downstream.once("close", () => { state.downstreamClose = true; terminal(); });
+      upstream.once("aborted", () => {
+        state.upstreamAborted = true;
+        terminal("upstream_error");
+      });
+      upstream.once("close", () => {
+        state.upstreamClose = true;
+        terminal();
+      });
+      downstream.once("finish", () => {
+        state.downstreamFinish = true;
+        terminal(() => (options.requireSseTerminal ?? inspectSse) && !state.sawMessageStop
+          ? "other"
+          : "complete");
+      });
+      downstream.once("close", () => {
+        state.downstreamClose = true;
+        terminal(state.downstreamFinish ? undefined : "cancelled");
+      });
     },
   };
 }

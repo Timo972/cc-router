@@ -6,6 +6,7 @@ import {
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
 import { TokenPool } from "../proxy/token-pool.js";
 import { DEFAULT_RATE_LIMITS, type Account } from "../proxy/types.js";
+import { UsageRefresher } from "../proxy/usage-refresher.js";
 
 function account(id: string): Account {
   return {
@@ -149,7 +150,13 @@ describe("AnthropicUsageRefresher", () => {
     const accounts = [account("a"), account("b"), account("c")];
     const pool = new TokenPool(accounts);
     const requests = deferred<UsageFetchResult>();
-    const fetchUsage = vi.fn(() => requests.promise);
+    const thirdRequestStarted = deferred<void>();
+    let requestCount = 0;
+    const fetchUsage = vi.fn(() => {
+      requestCount++;
+      if (requestCount === 3) thirdRequestStarted.resolve();
+      return requests.promise;
+    });
     const refresher = new AnthropicUsageRefresher(pool, {
       fetchUsage,
       startupStaggerMs: 10,
@@ -160,8 +167,7 @@ describe("AnthropicUsageRefresher", () => {
     await vi.advanceTimersByTimeAsync(30);
     expect(fetchUsage).toHaveBeenCalledTimes(2);
     requests.resolve(usageResult());
-    await Promise.resolve();
-    await Promise.resolve();
+    await thirdRequestStarted.promise;
     expect(fetchUsage).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(5 * 60_000);
     expect(fetchUsage.mock.calls.length).toBeGreaterThanOrEqual(4);
@@ -204,6 +210,26 @@ describe("AnthropicUsageRefresher", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(a.rateLimits.usage).toEqual({ modelLimits: [], fetchedAt: 99, fetchStatus: "unavailable" });
     refresher.stop();
+  });
+
+  it("keeps telemetry classification failures outside refresh behavior", async () => {
+    const current = { id: "a", usage: 0 };
+    const expected = { ok: true as const, usage: 42 };
+    const refresher = new UsageRefresher({
+      getAll: () => [current],
+      findById: () => current,
+    }, {
+      fetchUsage: async () => expected,
+      applyResult: (account, result) => { account.usage = result.usage; },
+      cancelledResult: () => ({ ok: false as const, usage: 0 }),
+      telemetry: {
+        provider: "anthropic",
+        classifyResult: () => { throw new Error("telemetry failure"); },
+      },
+    });
+
+    await expect(refresher.refreshNow(current)).resolves.toBe(expected);
+    expect(current.usage).toBe(42);
   });
 
   it("joins an exact-account in-flight request and discards a stale replacement result", async () => {
