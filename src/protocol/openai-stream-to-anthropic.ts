@@ -1,3 +1,5 @@
+import { OpenAIProtocolError, parseOpenAIFunctionArguments } from "./openai-function-call.js";
+
 interface OpenAIStreamEventItem {
   id?: string;
   type?: string;
@@ -33,22 +35,25 @@ interface OpenBlock {
   index: number;
   kind: "text" | "tool_use";
   sentArguments: boolean;
+  argumentsJson: string;
 }
 
 export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthropicNormalizer {
   let blocks = new Map<number, OpenBlock>();
   let nextIndex = 0;
   let sawToolUse = false;
+  let sawRefusal = false;
 
   const reset = () => {
     blocks = new Map();
     nextIndex = 0;
     sawToolUse = false;
+    sawRefusal = false;
   };
 
   const openTextBlock = (outputIndex: number): AnthropicStreamEvent[] => {
     if (blocks.has(outputIndex)) return [];
-    const block: OpenBlock = { index: nextIndex++, kind: "text", sentArguments: false };
+    const block: OpenBlock = { index: nextIndex++, kind: "text", sentArguments: false, argumentsJson: "" };
     blocks.set(outputIndex, block);
     return [{
       type: "content_block_start",
@@ -88,7 +93,15 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
 
       if (event.type === "response.output_item.added") {
         if (event.item?.type !== "function_call" || blocks.has(outputIndex)) return [];
-        const block: OpenBlock = { index: nextIndex++, kind: "tool_use", sentArguments: false };
+        if (!event.item.call_id?.trim() || !event.item.name?.trim()) {
+          throw new OpenAIProtocolError("Invalid OpenAI function call metadata");
+        }
+        const block: OpenBlock = {
+          index: nextIndex++,
+          kind: "tool_use",
+          sentArguments: false,
+          argumentsJson: "",
+        };
         blocks.set(outputIndex, block);
         sawToolUse = true;
         return [{
@@ -96,8 +109,8 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
           index: block.index,
           content_block: {
             type: "tool_use",
-            id: event.item.call_id ?? event.item.id ?? "",
-            name: event.item.name ?? "",
+            id: event.item.call_id,
+            name: event.item.name,
             input: {},
           },
         }];
@@ -113,10 +126,22 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
         }];
       }
 
+      if (event.type === "response.refusal.delta") {
+        sawRefusal = true;
+        const prefix = openTextBlock(outputIndex);
+        const block = blocks.get(outputIndex);
+        return [...prefix, {
+          type: "content_block_delta",
+          index: block?.index ?? 0,
+          delta: { type: "text_delta", text: event.delta ?? "" },
+        }];
+      }
+
       if (event.type === "response.function_call_arguments.delta") {
         const block = blocks.get(outputIndex);
         if (!block || block.kind !== "tool_use") return [];
         block.sentArguments = true;
+        block.argumentsJson += event.delta ?? "";
         return [{
           type: "content_block_delta",
           index: block.index,
@@ -128,6 +153,7 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
         const block = blocks.get(outputIndex);
         if (!block || block.kind !== "tool_use" || block.sentArguments || !event.arguments) return [];
         block.sentArguments = true;
+        block.argumentsJson = event.arguments;
         return [{
           type: "content_block_delta",
           index: block.index,
@@ -137,19 +163,29 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
 
       if (event.type === "response.output_item.done") {
         const block = blocks.get(outputIndex);
-        const argumentEvent = block?.kind === "tool_use" && !block.sentArguments && event.item?.arguments
+        const atomicArguments = block?.kind === "tool_use" && !block.sentArguments
+          ? event.item?.arguments ?? ""
+          : "";
+        if (block?.kind === "tool_use") {
+          if (atomicArguments) block.argumentsJson = atomicArguments;
+          parseOpenAIFunctionArguments(block.argumentsJson);
+        }
+        const argumentEvent = block?.kind === "tool_use" && atomicArguments
           ? [{
               type: "content_block_delta",
               index: block.index,
-              delta: { type: "input_json_delta", partial_json: event.item.arguments },
+              delta: { type: "input_json_delta", partial_json: atomicArguments },
             }]
           : [];
         return [...argumentEvent, ...closeBlock(outputIndex)];
       }
 
       if (event.type === "response.completed") {
+        if ([...blocks.values()].some(block => block.kind === "tool_use")) {
+          throw new OpenAIProtocolError("OpenAI function call ended before completion");
+        }
         const prefix = [...blocks.keys()].flatMap(closeBlock);
-        const stopReason = sawToolUse ? "tool_use" : "end_turn";
+        const stopReason = sawToolUse ? "tool_use" : sawRefusal ? "refusal" : "end_turn";
         const outputTokens = event.response?.usage?.output_tokens ?? 0;
         reset();
         return [

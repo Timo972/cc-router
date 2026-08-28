@@ -189,4 +189,97 @@ describe("openAIStreamEventToAnthropicEvents", () => {
     ]);
   });
 
+  it("streams refusal text and preserves the refusal stop reason", () => {
+    const normalizer = createOpenAIStreamToAnthropicNormalizer();
+    const events = [
+      ...normalizer.convert({ type: "response.created", response: { id: "resp_refusal", model: "gpt-5.5" } }),
+      ...normalizer.convert({ type: "response.refusal.delta", output_index: 0, delta: "I cannot help with that." }),
+      ...normalizer.convert({ type: "response.output_item.done", output_index: 0 }),
+      ...normalizer.convert({
+        type: "response.completed",
+        response: { id: "resp_refusal", usage: { input_tokens: 5, output_tokens: 6 } },
+      }),
+    ];
+
+    expect(events).toEqual([
+      {
+        type: "message_start",
+        message: {
+          id: "resp_refusal",
+          type: "message",
+          role: "assistant",
+          model: "gpt-5.5",
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "I cannot help with that." },
+      },
+      { type: "content_block_stop", index: 0 },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "refusal", stop_sequence: null },
+        usage: { output_tokens: 6 },
+      },
+      { type: "message_stop" },
+    ]);
+  });
+
+  it("rejects streamed function calls without a call_id", () => {
+    const normalizer = createOpenAIStreamToAnthropicNormalizer();
+    normalizer.convert({ type: "response.created", response: { id: "resp_invalid" } });
+
+    expect(() => normalizer.convert({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", name: "read_file" },
+    })).toThrow("Invalid OpenAI function call metadata");
+  });
+
+  it("rejects a streamed function call whose final arguments are invalid JSON", () => {
+    const normalizer = createOpenAIStreamToAnthropicNormalizer();
+    normalizer.convert({ type: "response.created", response: { id: "resp_invalid" } });
+    normalizer.convert({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "function_call", call_id: "call_1", name: "read_file" },
+    });
+    normalizer.convert({
+      type: "response.function_call_arguments.delta",
+      output_index: 0,
+      delta: "{",
+    });
+
+    expect(() => normalizer.convert({
+      type: "response.output_item.done",
+      output_index: 0,
+    })).toThrow("Invalid OpenAI function call arguments");
+  });
+
+  it("rejects response.completed while a streamed function call is still open", () => {
+    const normalizer = createOpenAIStreamToAnthropicNormalizer();
+    normalizer.convert({ type: "response.created", response: { id: "resp_incomplete" } });
+    normalizer.convert({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "function_call", call_id: "call_1", name: "read_file" },
+    });
+    normalizer.convert({
+      type: "response.function_call_arguments.delta",
+      output_index: 0,
+      delta: "{}",
+    });
+
+    expect(() => normalizer.convert({
+      type: "response.completed",
+      response: { id: "resp_incomplete" },
+    })).toThrow("OpenAI function call ended before completion");
+  });
+
 });

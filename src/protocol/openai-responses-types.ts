@@ -10,6 +10,11 @@ export interface OpenAIOutputText {
   text: string;
 }
 
+export interface OpenAIRefusal {
+  type: "refusal";
+  refusal: string;
+}
+
 export interface OpenAIFunctionCall {
   type: "function_call";
   id?: string;
@@ -54,7 +59,7 @@ export interface OpenAIResponsesRequest {
 export interface OpenAIResponseOutputMessage {
   type: "message";
   role?: "assistant";
-  content: OpenAIOutputText[];
+  content: Array<OpenAIOutputText | OpenAIRefusal>;
 }
 
 export type OpenAIResponseOutputItem = OpenAIResponseOutputMessage | OpenAIFunctionCall;
