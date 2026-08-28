@@ -422,7 +422,7 @@ Examples after the configuration above:
 
 Claude Code can also send a `/v1/messages` request with an `openai/*` model. CC-Router translates that Anthropic Messages request into an OpenAI Responses request and converts JSON or basic text SSE responses back into Anthropic-shaped message responses.
 
-Current limitation: OpenAI-to-Anthropic streaming currently covers text deltas and final usage. Streaming tool-call normalization is still experimental.
+OpenAI-to-Anthropic conversion supports text and function tool calls in both streaming and non-streaming responses.
 
 OpenAI subscription account records are separated from Claude accounts with `provider: "openai_subscription"` so they do not enter the Anthropic token pool:
 

@@ -3,11 +3,12 @@ import type { Express, NextFunction, Request, Response } from "express";
 import { selectRoute } from "../providers/route-selector.js";
 import { anthropicToOpenAIResponses } from "../protocol/anthropic-to-openai.js";
 import { openAIResponseToAnthropicMessage } from "../protocol/openai-response-to-anthropic.js";
+import { OpenAIProtocolError } from "../protocol/openai-function-call.js";
 import { createOpenAIStreamToAnthropicNormalizer } from "../protocol/openai-stream-to-anthropic.js";
 import { encodeSseEvent, parseSseLines } from "../protocol/sse.js";
 import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.js";
 import type { AnthropicMessagesRequest } from "../protocol/anthropic-types.js";
-import type { OpenAIResponseCompleted } from "../protocol/openai-responses-types.js";
+import type { OpenAIFunctionCall, OpenAIResponseCompleted, OpenAIResponseOutputItem } from "../protocol/openai-responses-types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 
@@ -39,26 +40,37 @@ async function sendOpenAIAsAnthropic(
   res: Response,
   requestedStream: boolean,
 ): Promise<void> {
-  const contentType = upstream.headers.get("content-type") ?? "";
-  if (contentType.includes("text/event-stream")) {
-    if (requestedStream) {
-      await sendOpenAIStreamAsAnthropic(upstream, res);
+  try {
+    const contentType = upstream.headers.get("content-type") ?? "";
+    if (contentType.includes("text/event-stream")) {
+      if (requestedStream) {
+        await sendOpenAIStreamAsAnthropic(upstream, res);
+        return;
+      }
+
+      res.status(upstream.status).json(await collectOpenAIStreamAsAnthropicMessage(upstream));
       return;
     }
 
-    res.status(upstream.status).json(await collectOpenAIStreamAsAnthropicMessage(upstream));
-    return;
-  }
+    if (!contentType.includes("application/json")) {
+      res.status(upstream.status);
+      res.setHeader("content-type", contentType || "text/plain");
+      res.send(await upstream.text());
+      return;
+    }
 
-  if (!contentType.includes("application/json")) {
-    res.status(upstream.status);
-    res.setHeader("content-type", contentType || "text/plain");
-    res.send(await upstream.text());
-    return;
+    const json = await upstream.json() as OpenAIResponseCompleted;
+    res.status(upstream.status).json(openAIResponseToAnthropicMessage(json));
+  } catch (error) {
+    if (!(error instanceof OpenAIProtocolError) || res.headersSent) throw error;
+    res.status(502).json({
+      type: "error",
+      error: {
+        type: "api_error",
+        message: "Invalid or incomplete response from OpenAI",
+      },
+    });
   }
-
-  const json = await upstream.json() as OpenAIResponseCompleted;
-  res.status(upstream.status).json(openAIResponseToAnthropicMessage(json));
 }
 
 async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Response): Promise<ReturnType<typeof openAIResponseToAnthropicMessage>> {
@@ -71,20 +83,29 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
   let remainder = "";
   let id = "";
   let model = "";
-  let text = "";
   let usage: OpenAIResponseCompleted["usage"] = {};
+  let completed = false;
+  const textByIndex = new Map<number, string>();
+  const refusalByIndex = new Map<number, string>();
+  const argumentsByIndex = new Map<number, string>();
+  const pendingCallsByIndex = new Map<number, OpenAIFunctionCall>();
+  const callsByIndex = new Map<number, OpenAIFunctionCall>();
 
   const applyEvent = (event: unknown) => {
     if (typeof event !== "object" || event === null) return;
     const openAIEvent = event as {
       type?: string;
       delta?: string;
+      arguments?: string;
+      output_index?: number;
+      item?: { type?: string; call_id?: string; name?: string; arguments?: string };
       response?: {
         id?: string;
         model?: string;
         usage?: OpenAIResponseCompleted["usage"];
       };
     };
+    const outputIndex = openAIEvent.output_index ?? 0;
 
     if (openAIEvent.type === "response.created") {
       id = openAIEvent.response?.id ?? id;
@@ -93,14 +114,74 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
     }
 
     if (openAIEvent.type === "response.output_text.delta") {
-      text += openAIEvent.delta ?? "";
+      textByIndex.set(outputIndex, (textByIndex.get(outputIndex) ?? "") + (openAIEvent.delta ?? ""));
+      return;
+    }
+
+    if (openAIEvent.type === "response.refusal.delta") {
+      refusalByIndex.set(outputIndex, (refusalByIndex.get(outputIndex) ?? "") + (openAIEvent.delta ?? ""));
+      return;
+    }
+
+    if (openAIEvent.type === "response.output_item.added") {
+      const item = openAIEvent.item;
+      if (item?.type === "function_call") {
+        if (!item.call_id?.trim() || !item.name?.trim()) {
+          throw new OpenAIProtocolError("Invalid OpenAI function call metadata");
+        }
+        pendingCallsByIndex.set(outputIndex, {
+          type: "function_call",
+          call_id: item.call_id,
+          name: item.name,
+          arguments: item.arguments ?? "",
+        });
+      }
+      return;
+    }
+
+    if (openAIEvent.type === "response.function_call_arguments.delta") {
+      if (!pendingCallsByIndex.has(outputIndex)) return;
+      argumentsByIndex.set(outputIndex, (argumentsByIndex.get(outputIndex) ?? "") + (openAIEvent.delta ?? ""));
+      return;
+    }
+
+    if (openAIEvent.type === "response.function_call_arguments.done") {
+      if (pendingCallsByIndex.has(outputIndex) && !argumentsByIndex.has(outputIndex) && openAIEvent.arguments) {
+        argumentsByIndex.set(outputIndex, openAIEvent.arguments);
+      }
+      return;
+    }
+
+    if (openAIEvent.type === "response.output_item.done") {
+      const item = openAIEvent.item;
+      const pending = pendingCallsByIndex.get(outputIndex);
+      if (item?.type === "function_call" || pending) {
+        const callId = item?.call_id || pending?.call_id;
+        const name = item?.name || pending?.name;
+        if (!callId?.trim() || !name?.trim()) {
+          throw new OpenAIProtocolError("Invalid OpenAI function call metadata");
+        }
+        callsByIndex.set(outputIndex, {
+          type: "function_call",
+          call_id: callId,
+          name,
+          arguments: item?.arguments || argumentsByIndex.get(outputIndex) || pending?.arguments || "",
+        });
+        pendingCallsByIndex.delete(outputIndex);
+      }
       return;
     }
 
     if (openAIEvent.type === "response.completed") {
+      completed = true;
       id = openAIEvent.response?.id ?? id;
       model = openAIEvent.response?.model ?? model;
       usage = openAIEvent.response?.usage ?? usage;
+      return;
+    }
+
+    if (openAIEvent.type === "response.failed" || openAIEvent.type === "response.incomplete") {
+      throw new OpenAIProtocolError("OpenAI response stream did not complete successfully");
     }
   };
 
@@ -118,16 +199,33 @@ async function collectOpenAIStreamAsAnthropicMessage(upstream: globalThis.Respon
     parseSseLines(remainder + tail + "\n").events.forEach(applyEvent);
   }
 
-  return openAIResponseToAnthropicMessage({
-    id,
-    model,
-    output: text ? [{
-      type: "message",
-      role: "assistant",
-      content: [{ type: "output_text", text }],
-    }] : [],
-    usage,
-  });
+  if (!completed || pendingCallsByIndex.size > 0) {
+    throw new OpenAIProtocolError("OpenAI response stream ended before completion");
+  }
+
+  const output: OpenAIResponseOutputItem[] = [...new Set([
+    ...textByIndex.keys(),
+    ...refusalByIndex.keys(),
+    ...callsByIndex.keys(),
+  ])]
+    .sort((a, b) => a - b)
+    .flatMap((index): OpenAIResponseOutputItem[] => {
+      const call = callsByIndex.get(index);
+      if (call) return [{ ...call, arguments: call.arguments || argumentsByIndex.get(index) || "" }];
+      const text = textByIndex.get(index);
+      const refusal = refusalByIndex.get(index);
+      const content = [
+        ...(text ? [{ type: "output_text" as const, text }] : []),
+        ...(refusal ? [{ type: "refusal" as const, refusal }] : []),
+      ];
+      return content.length > 0 ? [{
+        type: "message",
+        role: "assistant",
+        content,
+      }] : [];
+    });
+
+  return openAIResponseToAnthropicMessage({ id, model, output, usage });
 }
 
 async function sendOpenAIStreamAsAnthropic(upstream: globalThis.Response, res: Response): Promise<void> {
@@ -145,6 +243,27 @@ async function sendOpenAIStreamAsAnthropic(upstream: globalThis.Response, res: R
 
   const decoder = new TextDecoder();
   let remainder = "";
+  let completed = false;
+
+  const writeProtocolError = () => {
+    res.write(encodeSseEvent({
+      type: "error",
+      error: {
+        type: "api_error",
+        message: "Invalid or incomplete response from OpenAI",
+      },
+    }));
+  };
+
+  const forwardEvent = (event: unknown) => {
+    const eventType = typeof event === "object" && event !== null
+      ? (event as { type?: unknown }).type
+      : undefined;
+    if (eventType === "response.completed") completed = true;
+    for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
+      res.write(encodeSseEvent(mapped));
+    }
+  };
 
   try {
     while (true) {
@@ -154,9 +273,7 @@ async function sendOpenAIStreamAsAnthropic(upstream: globalThis.Response, res: R
       const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }));
       remainder = parsed.remainder;
       for (const event of parsed.events) {
-        for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
-          res.write(encodeSseEvent(mapped));
-        }
+        forwardEvent(event);
       }
     }
 
@@ -164,11 +281,16 @@ async function sendOpenAIStreamAsAnthropic(upstream: globalThis.Response, res: R
     if (tail || remainder) {
       const parsed = parseSseLines(remainder + tail + "\n");
       for (const event of parsed.events) {
-        for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
-          res.write(encodeSseEvent(mapped));
-        }
+        forwardEvent(event);
       }
     }
+
+    if (!completed) {
+      writeProtocolError();
+    }
+  } catch (error) {
+    if (!(error instanceof OpenAIProtocolError)) throw error;
+    writeProtocolError();
   } finally {
     res.end();
   }

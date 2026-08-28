@@ -253,6 +253,65 @@ describe("mountMessagesCrossProviderRoute", () => {
     }
   });
 
+  it("preserves refusal text when collapsing SSE into a non-stream response", async () => {
+    const app = express();
+
+    mountMessagesCrossProviderRoute(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            push({ type: "response.created", response: { id: "resp_refusal", model: "gpt-5.5" } });
+            push({ type: "response.refusal.delta", output_index: 0, delta: "I cannot help with that." });
+            push({ type: "response.output_item.done", output_index: 0 });
+            push({
+              type: "response.completed",
+              response: { id: "resp_refusal", model: "gpt-5.5", usage: { input_tokens: 5, output_tokens: 6 } },
+            });
+            controller.close();
+          },
+        }) as BodyInit,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          messages: [{ role: "user", content: "Unsafe request" }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        content: [{ type: "text", text: "I cannot help with that." }],
+        stop_reason: "refusal",
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
   it("streams OpenAI Responses SSE back as Anthropic Messages SSE", async () => {
     const app = express();
 
@@ -305,6 +364,310 @@ describe("mountMessagesCrossProviderRoute", () => {
       expect(text).toContain("data: {\"type\":\"message_start\"");
       expect(text).toContain("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}");
       expect(text).toContain("data: {\"type\":\"message_stop\"}");
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it("streams function calls back as Anthropic tool_use events", async () => {
+    const app = express();
+
+    mountMessagesCrossProviderRoute(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            push({ type: "response.created", response: { id: "resp_tool", model: "gpt-5.5" } });
+            push({
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { type: "function_call", call_id: "call_1", name: "read_file" },
+            });
+            push({ type: "response.function_call_arguments.delta", output_index: 0, delta: "{\"path\":\"README.md\"}" });
+            push({ type: "response.output_item.done", output_index: 0 });
+            push({ type: "response.completed", response: { id: "resp_tool", usage: { input_tokens: 8, output_tokens: 4 } } });
+            controller.close();
+          },
+        }) as BodyInit,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          messages: [{ role: "user", content: "Read README.md" }],
+          stream: true,
+        }),
+      });
+      const body = await res.text();
+
+      expect(body).toContain('"content_block":{"type":"tool_use","id":"call_1","name":"read_file","input":{}}');
+      expect(body).toContain('"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"README.md\\"}"}');
+      expect(body).toContain('"stop_reason":"tool_use"');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it("emits an Anthropic error when a streaming tool call ends prematurely", async () => {
+    const app = express();
+
+    mountMessagesCrossProviderRoute(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            push({ type: "response.created", response: { id: "resp_partial", model: "gpt-5.5" } });
+            push({
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { type: "function_call", call_id: "call_1", name: "dangerous_default_tool" },
+            });
+            push({ type: "response.function_call_arguments.delta", output_index: 0, delta: "{" });
+            controller.close();
+          },
+        }) as BodyInit,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          messages: [{ role: "user", content: "Run the tool" }],
+          stream: true,
+        }),
+      });
+      const body = await res.text();
+
+      expect(body).toContain('"type":"error"');
+      expect(body).toContain('"message":"Invalid or incomplete response from OpenAI"');
+      expect(body).not.toContain('"type":"message_stop"');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it("emits an Anthropic error for streamed function calls without a call_id", async () => {
+    const app = express();
+
+    mountMessagesCrossProviderRoute(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            push({ type: "response.created", response: { id: "resp_invalid", model: "gpt-5.5" } });
+            push({
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { type: "function_call", id: "fc_1", name: "read_file" },
+            });
+            controller.close();
+          },
+        }) as BodyInit,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          messages: [{ role: "user", content: "Read a file" }],
+          stream: true,
+        }),
+      });
+      const body = await res.text();
+
+      expect(body).toContain('"type":"error"');
+      expect(body).toContain('"message":"Invalid or incomplete response from OpenAI"');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+
+  it("collapses a function-call stream into an Anthropic tool_use response", async () => {
+    const app = express();
+
+    mountMessagesCrossProviderRoute(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            push({ type: "response.created", response: { id: "resp_tool", model: "gpt-5.5" } });
+            push({
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { type: "function_call", call_id: "call_1", name: "read_file", arguments: "" },
+            });
+            push({
+              type: "response.function_call_arguments.done",
+              output_index: 0,
+              arguments: "{\"path\":\"README.md\"}",
+            });
+            push({ type: "response.output_item.done", output_index: 0 });
+            push({ type: "response.completed", response: { id: "resp_tool", model: "gpt-5.5", usage: { input_tokens: 8, output_tokens: 4 } } });
+            controller.close();
+          },
+        }) as BodyInit,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          messages: [{ role: "user", content: "Read README.md" }],
+          stream: false,
+        }),
+      });
+
+      expect(await res.json()).toEqual({
+        id: "resp_tool",
+        type: "message",
+        role: "assistant",
+        model: "gpt-5.5",
+        content: [{ type: "tool_use", id: "call_1", name: "read_file", input: { path: "README.md" } }],
+        stop_reason: "tool_use",
+        stop_sequence: null,
+        usage: { input_tokens: 8, output_tokens: 4 },
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it("rejects a non-stream tool call when the upstream SSE ends before completion", async () => {
+    const app = express();
+
+    mountMessagesCrossProviderRoute(app, {
+      getOpenAIAccount: () => ({
+        id: "openai-victor",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        enabled: true,
+      }),
+      forwardOpenAI: async () => new Response(
+        new ReadableStream({
+          start(controller) {
+            const event = {
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { type: "function_call", call_id: "call_1", name: "dangerous_default_tool" },
+            };
+            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+            controller.close();
+          },
+        }) as BodyInit,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          messages: [{ role: "user", content: "Run the tool" }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: {
+          type: "api_error",
+          message: "Invalid or incomplete response from OpenAI",
+        },
+      });
     } finally {
       await new Promise<void>((resolve, reject) => {
         server.close(err => err ? reject(err) : resolve());
