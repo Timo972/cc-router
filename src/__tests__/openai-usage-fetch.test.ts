@@ -57,6 +57,7 @@ function samplePayload(): unknown {
       approx_local_messages: null,
       approx_cloud_messages: null,
     },
+    rate_limit_reset_credits: { available_count: 2 },
   };
 }
 
@@ -75,6 +76,29 @@ describe("parseCodexUsagePayload", () => {
     });
     expect(bucket.secondary).toBeUndefined();
     expect(update!.credits).toEqual({ hasCredits: false, unlimited: false });
+    expect(update!.resetCredits).toEqual({ available: 2 });
+  });
+
+  it("parses rate_limit_reset_credits.available_count including zero", () => {
+    const payload = samplePayload() as Record<string, unknown>;
+    payload["rate_limit_reset_credits"] = { available_count: 0 };
+    expect(parseCodexUsagePayload(payload, NOW_MS)!.resetCredits).toEqual({ available: 0 });
+  });
+
+  it("omits resetCredits when the usage field is absent", () => {
+    const payload = samplePayload() as Record<string, unknown>;
+    delete payload["rate_limit_reset_credits"];
+    expect(parseCodexUsagePayload(payload, NOW_MS)!.resetCredits).toBeUndefined();
+  });
+
+  it("clamps reset credit counts to 0..99", () => {
+    const high = samplePayload() as Record<string, unknown>;
+    high["rate_limit_reset_credits"] = { available_count: 150 };
+    expect(parseCodexUsagePayload(high, NOW_MS)!.resetCredits).toEqual({ available: 99 });
+
+    const low = samplePayload() as Record<string, unknown>;
+    low["rate_limit_reset_credits"] = { available_count: -3 };
+    expect(parseCodexUsagePayload(low, NOW_MS)!.resetCredits).toEqual({ available: 0 });
   });
 
   it("maps named additional rate limits into their own buckets", () => {

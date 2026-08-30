@@ -7,7 +7,7 @@ import type { Socket } from "net";
 import type { Request, Response } from "express";
 import { EmptyPoolError, NoEligibleAccountError, TokenPool } from "./token-pool.js";
 import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
-import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
 import { loadTelemetryState } from "../config/telemetry.js";
@@ -17,6 +17,7 @@ import type { LogEntry } from "./stats.js";
 import { applyRateLimitHeaders } from "../providers/anthropic/rate-limit-headers.js";
 import { mountAnthropicMessagesRoute, withOAuthBeta } from "./anthropic-messages-route.js";
 import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
+import { loadGrokHealthSnapshots, type GrokAccountSnapshot } from "../providers/xai/overview.js";
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
@@ -64,6 +65,7 @@ import {
   createAnthropicRefreshMiddleware,
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
+import { createAllowanceView } from "./allowance.js";
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
@@ -85,7 +87,7 @@ export interface ServerOptions {
 
 export interface HealthAccountView {
   id: string;
-  provider: "anthropic_subscription" | "openai_subscription";
+  provider: "anthropic_subscription" | "openai_subscription" | "xai_subscription";
   enabled: boolean;
   healthy: boolean;
   busy: boolean;
@@ -109,6 +111,8 @@ export interface HealthAccountView {
    *  the write lands would fall back to the old refresh token, which the
    *  provider already invalidated, and require re-authentication. */
   credentialsPendingWrite?: boolean;
+  /** Spend-tier from the Grok CLI access-token claims. Dashboard-only. */
+  xai?: { tier: number };
 }
 
 export interface PublicCodexWindow {
@@ -130,6 +134,7 @@ export interface PublicCodexRateLimits {
   plan: string; // sanitized, "" when unknown
   buckets: PublicCodexBucket[]; // default bucket first, max 8
   credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  resetCredits?: { available: number };
   lastUpdated: number;
 }
 
@@ -199,10 +204,12 @@ export interface OperationalStatus {
   providers: {
     anthropic: ProviderOperationalStatus;
     openai: ProviderOperationalStatus;
+    xai: ProviderOperationalStatus;
   };
   endpoints: {
     health: string;
     accounts: string;
+    allowance: string;
     messages: string;
     responses: string;
     models: string;
@@ -238,6 +245,7 @@ export function createOperationalStatus(opts: {
 }): OperationalStatus {
   const anthropicAccounts = opts.accounts.filter(a => a.provider === "anthropic_subscription");
   const openAIAccounts = opts.accounts.filter(a => a.provider === "openai_subscription");
+  const xaiAccounts = opts.accounts.filter(a => a.provider === "xai_subscription");
   const modelRouting = opts.modelRouting ?? {};
 
   return {
@@ -247,10 +255,12 @@ export function createOperationalStatus(opts: {
     providers: {
       anthropic: providerStatus(anthropicAccounts),
       openai: providerStatus(openAIAccounts),
+      xai: providerStatus(xaiAccounts),
     },
     endpoints: {
       health: "/cc-router/health",
       accounts: "/cc-router/accounts",
+      allowance: "/cc-router/allowance",
       messages: "/v1/messages",
       responses: "/v1/responses",
       models: "/v1/models",
@@ -276,6 +286,7 @@ export function createHealthAccountViews(
   openAIAccounts: OpenAIAccount[],
   resolveRoutingMetrics: RoutingMetricsResolver = zeroRoutingMetrics,
   resolveOpenAIRouting?: (accountId: string) => { metrics: AccountRoutingMetrics; cooldowns: OpenAICooldownView },
+  xaiAccounts: GrokAccountSnapshot[] = [],
 ): HealthAccountView[] {
   return [
     ...anthropicAccounts.map(account => (
@@ -285,7 +296,26 @@ export function createHealthAccountViews(
       account,
       resolveOpenAIRouting?.(account.id) ?? { metrics: zeroRoutingMetrics(account.id), cooldowns: { globalUntilMs: 0, bucketCooldowns: [] } },
     )),
+    ...xaiAccounts.map(publicXaiAccountView),
   ];
+}
+
+function publicXaiAccountView(account: GrokAccountSnapshot): HealthAccountView {
+  return {
+    id: account.id,
+    provider: "xai_subscription",
+    enabled: true,
+    healthy: account.healthy,
+    busy: account.busy,
+    inFlightRequests: 0,
+    activeSessions: account.activeSessions,
+    requestCount: account.requestCount,
+    errorCount: 0,
+    expiresInMs: account.expiresInMs,
+    lastUsedMs: 0,
+    lastRefreshMs: 0,
+    ...(account.tier !== undefined ? { xai: { tier: account.tier } } : {}),
+  };
 }
 
 function publicAnthropicAccountView(
@@ -467,6 +497,7 @@ function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView):
   const balance = typeof credits?.balance === "string"
     ? credits.balance.replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 32)
     : "";
+  const resetAvailable = rl.resetCredits?.available;
   return {
     status: rl.status === "rate_limited" ? "rate_limited" : "ok",
     plan: publicCodexPlan(rl.plan),
@@ -477,6 +508,9 @@ function publicCodexRateLimits(a: OpenAIAccount, cooldowns: OpenAICooldownView):
         unlimited: credits.unlimited === true,
         ...(balance ? { balance } : {}),
       },
+    } : {}),
+    ...(typeof resetAvailable === "number" && Number.isFinite(resetAvailable) ? {
+      resetCredits: { available: Math.max(0, Math.min(99, Math.floor(resetAvailable))) },
     } : {}),
     lastUpdated: publicTimestamp(rl.lastUpdated),
   };
@@ -706,6 +740,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       openAIAccounts,
       resolveRoutingMetrics,
       createOpenAIRoutingResolver(),
+      loadGrokHealthSnapshots(),
     );
     const status = accountViews.some(a => a.healthy) ? "ok" : "degraded";
 
@@ -743,6 +778,31 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     });
   });
 
+  // ─── Allowance endpoint (cc-router internal, NOT proxied) ─────────────────
+  // Operational-status sibling of /cc-router/health, not an account
+  // operation — hence a top-level route rather than living under
+  // accountsRouter. Read-only allowance signal (anthropic + openai only) —
+  // createAllowanceView is a PURE function over the already-in-memory account
+  // views, so polling it can never itself rate-limit an account. See
+  // ./allowance.ts for the 7d-primary logic. Behind the same secret gate as
+  // every other path except /cc-router/health (see ~line 757).
+  app.get("/cc-router/allowance", (_req, res) => {
+    // Sweep expired cooldowns on each poll, mirroring the health route, so an
+    // account that cooled down during idle time reads as available rather
+    // than stale.
+    pool.sweepExpiredCooldowns();
+    openAIPool.sweepExpiredCooldowns();
+    const resolveRoutingMetrics = createRoutingMetricsResolver();
+    const views = createHealthAccountViews(
+      pool.getAll(),
+      openAIAccounts,
+      resolveRoutingMetrics,
+      createOpenAIRoutingResolver(),
+      loadGrokHealthSnapshots(),
+    );
+    res.json(createAllowanceView(views, Date.now()));
+  });
+
   // ─── Account management endpoints (authenticated) ─────────────────────────
   // These are mounted BEFORE the /v1/* proxy middleware so they don't get
   // forwarded to Anthropic. express.json() is scoped to this sub-router so
@@ -759,14 +819,35 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         openAIAccounts,
         resolveRoutingMetrics,
         createOpenAIRoutingResolver(),
+        loadGrokHealthSnapshots(),
       ),
     });
   });
 
   accountsRouter.patch("/providers/:provider", (req, res) => {
     const providerParam = req.params.provider;
-    if (providerParam !== "anthropic_subscription" && providerParam !== "openai_subscription") {
-      res.status(400).json({ error: "provider must be anthropic_subscription or openai_subscription" });
+    if (
+      providerParam !== "anthropic_subscription"
+      && providerParam !== "openai_subscription"
+      && providerParam !== "xai_subscription"
+    ) {
+      res.status(400).json({ error: "provider must be anthropic_subscription, openai_subscription, or xai_subscription" });
+      return;
+    }
+
+    if (providerParam === "xai_subscription") {
+      const body = (req.body ?? {}) as { enabled?: unknown };
+      if (typeof body.enabled !== "boolean") {
+        res.status(400).json({ error: "enabled must be boolean" });
+        return;
+      }
+      try {
+        const changed = setProviderAccountsEnabled("xai_subscription", body.enabled, accountsPath);
+        res.json({ provider: providerParam, enabled: body.enabled, changed });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
+      }
       return;
     }
 
@@ -1012,6 +1093,42 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       return;
     }
 
+    if (body.provider === "xai_subscription") {
+      try {
+        upsertAccountRecord({
+          id: body.id,
+          provider: "xai_subscription",
+          accessToken: body.accessToken,
+          refreshToken: body.refreshToken,
+          expiresAt: body.expiresAt,
+          scopes: Array.isArray(body.scopes) ? body.scopes : [],
+          enabled: body.enabled !== false,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
+        return;
+      }
+      const now = Date.now();
+      res.status(201).json({
+        account: publicXaiAccountView({
+          id: body.id,
+          provider: "xai_subscription",
+          enabled: true,
+          healthy: body.expiresAt > now,
+          busy: false,
+          inFlightRequests: 0,
+          activeSessions: 0,
+          requestCount: 0,
+          errorCount: 0,
+          expiresInMs: body.expiresAt - now,
+          lastUsedMs: 0,
+          lastRefreshMs: 0,
+        }),
+      });
+      return;
+    }
+
     if (body.provider === "openai_subscription") {
       let addedOpenAI;
       try {
@@ -1074,6 +1191,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     const existing = pool.findById(id);
     const openAIExisting = openAIAccounts.find(account => account.id === id);
     if (!existing && !openAIExisting) {
+      const removedXai = removeAccountRecordById(id);
+      if (removedXai?.provider === "xai_subscription") {
+        res.json({ deleted: id, remaining: pool.getAll().length + openAIAccounts.length });
+        return;
+      }
       res.status(404).json({ error: `Account "${id}" not found` });
       return;
     }

@@ -38,10 +38,16 @@ export interface CodexCredits {
   balance?: string;
 }
 
+/** Banked "Redeem usage limit reset" coupons from the usage endpoint. */
+export interface CodexResetCredits {
+  available: number;
+}
+
 export interface CodexRateLimits {
   status: "ok" | "rate_limited";
   buckets: Map<string, CodexLimitBucket>;
   credits?: CodexCredits;
+  resetCredits?: CodexResetCredits;
   plan?: string;
   lastUpdated: number;
 }
@@ -49,6 +55,7 @@ export interface CodexRateLimits {
 export interface CodexRateLimitsUpdate {
   buckets: CodexLimitBucket[];
   credits?: CodexCredits;
+  resetCredits?: CodexResetCredits;
 }
 
 export const DEFAULT_CODEX_LIMIT_ID = "codex";
@@ -312,7 +319,21 @@ export function parseCodexUsagePayload(value: unknown, nowMs: number): CodexRate
     }
   }
 
-  return { buckets, ...(credits ? { credits } : {}) };
+  let resetCredits: CodexResetCredits | undefined;
+  const rawResetCredits = payload["rate_limit_reset_credits"];
+  if (typeof rawResetCredits === "object" && rawResetCredits !== null) {
+    const record = rawResetCredits as Record<string, unknown>;
+    const count = usageNumber(record["available_count"]) ?? usageNumber(record["available"]);
+    if (count !== undefined) {
+      resetCredits = { available: Math.max(0, Math.min(99, Math.floor(count))) };
+    }
+  }
+
+  return {
+    buckets,
+    ...(credits ? { credits } : {}),
+    ...(resetCredits ? { resetCredits } : {}),
+  };
 }
 
 export function resolveActiveLimit(headers: Record<string, unknown>): string | undefined {

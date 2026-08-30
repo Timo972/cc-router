@@ -4,7 +4,7 @@ import { existsSync } from "fs";
 import { input, confirm } from "@inquirer/prompts";
 import { readConfig, writeConfig, type ClientConfig } from "../config/manager.js";
 import { writeClaudeSettings, removeClaudeSettings, readClaudeProxySettings } from "../utils/claude-config.js";
-import { codexBaseUrlFromRouterUrl, writeCodexRouterConfigFromClient } from "../utils/codex-config.js";
+import { codexBaseUrlFromRouterUrl, writeCodexRouterConfigFromClient, removeCodexRouterConfig } from "../utils/codex-config.js";
 import { isMacos, isWindows } from "../utils/platform.js";
 import {
   checkMitmproxyInstalled,
@@ -284,13 +284,14 @@ export function registerClient(program: Command): void {
       }
 
       removeClaudeSettings();
+      removeCodexRouterConfig();
 
       const current = readConfig();
       delete current.client;
       writeConfig(current);
 
       console.log(chalk.green("\n✓ Disconnected from CC-Router"));
-      console.log(chalk.gray("  Claude Code will use direct Anthropic connection on next restart.\n"));
+      console.log(chalk.gray("  Claude Code and Codex CLI will use their native auth on next restart.\n"));
     });
 
   // ── cc-router client status ─────────────────────────────────────────────────

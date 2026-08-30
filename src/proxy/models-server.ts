@@ -4,7 +4,7 @@ import {
   fetchOpenAICodexModels,
 } from "../providers/model-discovery.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
-import type { ModelRoutingConfig } from "../protocol/model-ref.js";
+import { isBareOpenAIModel, type ModelRoutingConfig } from "../protocol/model-ref.js";
 import { buildModelRoutingUpdate } from "../protocol/model-routing-config.js";
 import type { Account } from "./types.js";
 
@@ -108,6 +108,7 @@ async function discoverModelList(
     models.set(model.id, model);
   }
   addConfiguredAliases(models, currentModelRouting(opts));
+  addBareOpenAIEntries(models);
 
   return [...models.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
@@ -167,11 +168,39 @@ function addConfiguredAliases(models: Map<string, OpenAIModel>, config: ModelRou
   }
 }
 
+/**
+ * Routing already claims bare `gpt-*` slugs for OpenAI (isBareOpenAIModel in
+ * model-ref.ts), because the Codex CLI writes those bare slugs into its own
+ * config. Without a matching metadata entry here, Codex warns "Model
+ * metadata not found" and falls back to generic defaults for a model the
+ * router routes correctly.
+ */
+function addBareOpenAIEntries(models: Map<string, OpenAIModel>): void {
+  for (const model of [...models.values()]) {
+    if (model.owned_by !== "openai_subscription") continue;
+    const bare = model.id.startsWith("openai/") ? model.id.slice("openai/".length) : model.id;
+    if (isBareOpenAIModel(bare) && !models.has(bare)) {
+      models.set(bare, modelEntry(bare, "openai_subscription"));
+    }
+  }
+}
+
 function modelEntry(
   id: string,
   ownedBy: OpenAIModel["owned_by"],
 ): OpenAIModel {
   return { id, object: "model", owned_by: ownedBy };
+}
+
+/**
+ * Codex's hardcoded skills-context budget (2%) is carved out of
+ * context_window, so an undersized value here starves it. Use the
+ * official per-family windows instead of one shared guess.
+ */
+function contextWindowFor(ownedBy: OpenAIModel["owned_by"]): { context_window: number; max_context_window: number } {
+  return ownedBy === "openai_subscription"
+    ? { context_window: 272_000, max_context_window: 1_050_000 }
+    : { context_window: 200_000, max_context_window: 200_000 };
 }
 
 function toCodexCliModel(model: OpenAIModel): CodexCliModel {
@@ -189,8 +218,7 @@ function toCodexCliModel(model: OpenAIModel): CodexCliModel {
     multi_agent_version: null,
     use_responses_lite: false,
     auto_review_model_override: null,
-    context_window: 128_000,
-    max_context_window: 128_000,
+    ...contextWindowFor(model.owned_by),
     auto_compact_token_limit: null,
     reasoning_summary_format: "experimental",
     default_reasoning_summary: "none",

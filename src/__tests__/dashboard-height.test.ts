@@ -8,7 +8,8 @@ afterEach(() => {
 function makeAccount(id: string) {
   return {
     id,
-    provider: "anthropic_subscription",
+    provider: "anthropic_subscription" as string,
+    xai: undefined as { tier: number } | undefined,
     healthy: true,
     busy: false,
     inFlightRequests: 0,
@@ -72,6 +73,7 @@ function tallHealth() {
       providers: {
         anthropic: { configured: true, accounts: 9, healthy: 9, enabled: 9 },
         openai: { configured: false, accounts: 0, healthy: 0, enabled: 0 },
+        xai: { configured: false, accounts: 0, healthy: 0, enabled: 0 },
       },
       endpoints: {
         health: "/cc-router/health",
@@ -112,10 +114,10 @@ function tallAccount(id: string) {
   account.rateLimits.usage.modelLimits = Array.from({ length: 8 }, (_, i) => ({
     modelFamily: `family-${i}`,
     displayName: `Model Family ${i}`,
-    utilization: 0.1 * i,
+    utilization: 0.85,
     resetAt: 0,
     active: true,
-    severity: "",
+    severity: "warning",
   }));
   return account;
 }
@@ -435,32 +437,28 @@ describe("dashboard viewport fitting", () => {
     }
   }, 15_000);
 
-  it("re-expands a denied list once the rows it was denied against change shape", async () => {
-    // A denial is measured against concrete row heights. When a health poll
-    // later shrinks the tall hidden account — same fleet size, same newest
-    // log entry — the stale denial must not keep the list collapsed forever.
+  it("re-expands a denied list once the fleet shrinks", async () => {
+    // Account rows are one line, so height variance comes from fleet size.
+    // A large fleet is windowed; after a poll drops to three accounts the
+    // previously hidden last id must become visible.
     const grown = tallHealth();
-    grown.accounts = [makeAccount("short-01"), makeAccount("short-02"), tallAccount("tall-03")];
+    grown.accounts = Array.from({ length: 12 }, (_, i) => makeAccount(`acc-${String(i + 1).padStart(2, "0")}`));
     const shrunk = tallHealth();
-    shrunk.accounts = [makeAccount("short-01"), makeAccount("short-02"), makeAccount("tall-03")];
+    shrunk.accounts = grown.accounts.slice(0, 3);
     let payload: unknown = grown;
-    // 38 rows is the discriminating viewport: the tall fleet collapses to
-    // two visible accounts while three short accounts fit entirely.
-    const dash = renderDashboard(grown, {}, { rows: 38, columns: 220 });
+    const dash = renderDashboard(grown, {}, { rows: 32, columns: 220 });
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => Response.json(payload)));
     try {
       await dash.waitUntil(() => {
         expect(dash.lastFrame()).toContain("ACCOUNTS");
       });
-      // Let the controller settle (the tall account's growth gets denied).
       await new Promise(resolve => setTimeout(resolve, 400));
-      expect(dash.lastFrame()).not.toContain("tall-03");
+      expect(dash.lastFrame()).not.toContain("acc-12");
 
-      // The tall account becomes short via an ordinary poll.
       payload = shrunk;
       await vi.waitFor(() => {
-        expect(dash.lastFrame()).toContain("tall-03");
-        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(38);
+        expect(dash.lastFrame()).toContain("acc-03");
+        expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(32);
       }, { timeout: 12_000, interval: 100 });
     } finally {
       await dash.cleanup();
@@ -504,6 +502,48 @@ describe("dashboard viewport fitting", () => {
       });
       expect(dash.lastFrame()).not.toContain("row21");
       expect(frameHeight(dash.lastFrame())).toBeLessThanOrEqual(120);
+    } finally {
+      await dash.cleanup();
+    }
+  });
+
+  it("shows the DETAILS box for the selected activity row", async () => {
+    const health = tallHealth();
+    health.operational.providers.openai = { configured: true, accounts: 1, healthy: 1, enabled: 1 };
+    health.operational.providers.xai = { configured: true, accounts: 1, healthy: 1, enabled: 1 };
+    health.accounts = [
+      ...health.accounts.slice(0, 2),
+      {
+        ...makeAccount("chatgpt-ok"),
+        id: "chatgpt-ok",
+        provider: "openai_subscription",
+      },
+      {
+        ...makeAccount("grok"),
+        id: "grok",
+        provider: "xai_subscription",
+        xai: { tier: 1 },
+        activeSessions: 2,
+      },
+    ];
+    const dash = renderDashboard(health, {}, { rows: 120, columns: 220 });
+    try {
+      await dash.waitUntil(() => {
+        const frame = dash.lastFrame();
+        expect(frame).toContain("DETAILS");
+        expect(frame).toContain("row01");
+        const claudeAt = frame.indexOf("CLAUDE");
+        const chatgptAt = frame.indexOf("CHATGPT");
+        const grokAt = frame.indexOf("GROK");
+        expect(claudeAt).toBeGreaterThan(-1);
+        expect(chatgptAt).toBeGreaterThan(claudeAt);
+        expect(grokAt).toBeGreaterThan(chatgptAt);
+        expect(frame).toContain("account-01");
+        expect(frame).toContain("chatgpt-ok");
+        expect(frame).toContain("grok");
+        expect(frame).toContain("tier 1");
+        expect(frame).toContain("Grok 1/1");
+      });
     } finally {
       await dash.cleanup();
     }

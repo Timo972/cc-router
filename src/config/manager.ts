@@ -118,12 +118,12 @@ export function renameAccountRecordById(oldId: string, newId: string): AccountRe
   return target;
 }
 
-export type AccountProvider = "anthropic_subscription" | "openai_subscription";
+export type AccountProvider = "anthropic_subscription" | "openai_subscription" | "xai_subscription";
 
 function normalizeAccountProvider(record: AccountRecord): AccountProvider {
-  return record.provider === "openai_subscription"
-    ? "openai_subscription"
-    : "anthropic_subscription";
+  if (record.provider === "openai_subscription") return "openai_subscription";
+  if (record.provider === "xai_subscription") return "xai_subscription";
+  return "anthropic_subscription";
 }
 
 export function migrateLegacyAccountProviders(path = ACCOUNTS_PATH): boolean {
@@ -200,6 +200,31 @@ export function saveOpenAIAccountsToPath(accounts: OpenAISubscriptionAccount[], 
 
 export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void {
   saveOpenAIAccountsToPath(accounts, ACCOUNTS_PATH);
+}
+
+export interface XaiSubscriptionAccount {
+  id: string;
+  provider: "xai_subscription";
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  enabled: boolean;
+  scopes?: string[];
+}
+
+export function loadXaiAccounts(path?: string): XaiSubscriptionAccount[] {
+  const records = readRawFromPath(path ?? ACCOUNTS_PATH) as AccountRecord[];
+  return records
+    .filter(a => a.provider === "xai_subscription")
+    .map(a => ({
+      id: a.id,
+      provider: "xai_subscription" as const,
+      accessToken: a.accessToken,
+      refreshToken: a.refreshToken,
+      expiresAt: a.expiresAt,
+      enabled: a.enabled !== false,
+      ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
+    }));
 }
 
 // ─── Proxy config (password, future settings) ─────────────────────────────────
