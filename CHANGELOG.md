@@ -8,6 +8,23 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.12.0-rc.1] — 2026-08-30
+
+### Fixed
+
+- OpenAI Responses function calls and their outputs remain top-level input
+  items across the Anthropic Messages bridge. JSON and SSE responses now
+  preserve call IDs, streamed or atomic arguments, refusal text, and
+  `tool_use` stop reasons. Invalid metadata, malformed arguments, and tool
+  streams that end before completion fail closed instead of fabricating a
+  successful assistant turn.
+
+---
+
+## [0.12.0-rc.0] — 2026-08-30
+
 ### Added
 
 - `cc-router cli claude` and `cc-router cli codex` toggle Claude Code / Codex
@@ -22,6 +39,33 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is focused).
 - Status dashboard `rst` column shows Codex banked usage-limit reset count
   (`0` = none available); Claude cells are `—`.
+- Grok subscriptions are first-class accounts: device login and token import,
+  persisted account records, live plan/usage refresh, CLI account management,
+  allowance reporting, and grouped dashboard rows with credits and reset data.
+
+### Changed
+
+- Codex configuration rewrites now use TOML-aware parsing and validation rather
+  than line-oriented edits, including safe CLI start/stop toggles for the
+  managed block.
+- The status dashboard uses compact provider groups, keeps account headers
+  visible in short terminals, and exposes the fleet-wide weekly-full count.
+
+### Fixed
+
+- `/v1/models` reports real context windows and includes bare `gpt-*` slugs used
+  by the Codex CLI.
+- Codex routing accepts both dashed session-header spellings, logs route
+  reasons, and includes calendar dates in proxy log timestamps.
+- Grok overview fixtures resolve portably across local and CI working
+  directories.
+
+---
+
+## [0.11.0] — 2026-08-30
+
+### Added
+
 - Automatic upstream failover and retry on both providers. A 429 or 5xx
   received before any response byte is relayed no longer passes straight
   through to the client: the router applies the existing cooldown/affinity
@@ -125,6 +169,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   during an idle stretch with nothing routing or polling in the meantime. A
   model-scoped limit never emits one, since the account kept serving every
   other family and so never left the rotation to rejoin.
+- Codex cache accounting separates cached and uncached input before updating
+  shared activity and aggregate totals, preventing cached tokens from being
+  counted twice in cache-hit percentages and token totals.
+- `/v1/responses` accepts JSON request bodies up to 32 MiB, so long-running
+  Codex sessions with large retained tool outputs are not rejected locally by
+  Express's former 10 MiB parser limit.
 
 ---
 
@@ -620,6 +670,9 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
+[0.12.0-rc.1]: https://github.com/Timo972/cc-router/releases/tag/v0.12.0-rc.1
+[0.12.0-rc.0]: https://github.com/Timo972/cc-router/releases/tag/v0.12.0-rc.0
+[0.11.0]: https://github.com/Timo972/cc-router/releases/tag/v0.11.0
 [0.9.0]: https://github.com/Timo972/cc-router/releases/tag/v0.9.0
 [0.8.3]: https://github.com/Timo972/cc-router/releases/tag/v0.8.3
 [0.8.2]: https://github.com/Timo972/cc-router/releases/tag/v0.8.2
