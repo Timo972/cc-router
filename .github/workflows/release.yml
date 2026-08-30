@@ -1,10 +1,23 @@
 name: Release
 
-# Triggered only on version tags — no untrusted input used in run steps
+# Version tags publish automatically. workflow_dispatch is the recovery path
+# for an existing tag whose original publish run failed before reaching npm.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish, for example v0.12.0-rc.1
+        required: true
+        type: string
+
+concurrency:
+  # npm dist-tags are mutable shared state. Serialize every publish so rc.0
+  # cannot finish after rc.1 and move the `rc` tag backwards.
+  group: npm-release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -19,6 +32,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # A manual recovery must build the exact historical tag, not the
+          # default branch that contains this workflow definition.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - uses: pnpm/action-setup@v6
 
@@ -34,15 +52,40 @@ jobs:
           node-version: '24'
           registry-url: https://registry.npmjs.org
 
-      # Fail before doing any work if the tag and manifest disagree. An npm
-      # version can never be reused, so a mismatched publish is unrecoverable.
-      # GITHUB_REF_NAME is read at runtime, not interpolated into the script.
-      - name: Resolve version and dist-tag
+      # The tag is the release authority. Normalize the checked-out manifest at
+      # build time so forgetting a package.json bump cannot strand a valid tag.
+      # This also lets workflow_dispatch recover an older failed tag while still
+      # building that tag's exact source tree. RELEASE_REF is passed through the
+      # environment rather than interpolated into the shell script.
+      - name: Prepare version and dist-tag
+        env:
+          RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          case "$RELEASE_REF" in
+            v*) TAG="${RELEASE_REF#v}" ;;
+            *)
+              echo "Release ref must be a v-prefixed version tag, got: $RELEASE_REF" >&2
+              exit 1
+              ;;
+          esac
+
+          TAG_COMMIT="$(git rev-list -n 1 "$RELEASE_REF")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [ -z "$TAG_COMMIT" ] || [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+            echo "Checked-out commit $HEAD_COMMIT does not match tag $RELEASE_REF ($TAG_COMMIT)" >&2
+            exit 1
+          fi
+
+          # npm validates the semver and rewrites package.json without creating
+          # a commit or tag. --ignore-scripts keeps this metadata-only.
+          npm version "$TAG" \
+            --no-git-tag-version \
+            --allow-same-version \
+            --ignore-scripts
+
           PKG="$(node -p "require('./package.json').version")"
           if [ "$TAG" != "$PKG" ]; then
-            echo "Tag v${TAG} does not match package.json version ${PKG}" >&2
+            echo "Failed to normalize package.json to tag version ${TAG}; got ${PKG}" >&2
             exit 1
           fi
           # npm applies the "latest" dist-tag unless told otherwise — it does not
@@ -53,6 +96,7 @@ jobs:
             *-*) DIST_TAG="${TAG#*-}"; DIST_TAG="${DIST_TAG%%.*}" ;;
             *)   DIST_TAG=latest ;;
           esac
+          echo "RELEASE_VERSION=${PKG}" >> "$GITHUB_ENV"
           echo "DIST_TAG=${DIST_TAG}" >> "$GITHUB_ENV"
           echo "Publishing ${PKG} to dist-tag ${DIST_TAG}"
 
