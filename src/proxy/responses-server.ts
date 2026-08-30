@@ -48,6 +48,8 @@ const RESPONSES_ENVELOPE: OpenAIIngressEnvelope = {
   sendNoEligible: (error, res, nowMs) => sendOpenAINoEligibleResponse(error, res, nowMs),
 };
 
+const RESPONSES_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
+
 function isResponsesRequest(value: unknown): value is OpenAIResponsesRequest {
   return (
     typeof value === "object" &&
@@ -114,7 +116,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
   const recordActivity = opts.recordActivity ?? ((entry: LogEntry) => stats.addLog(entry));
   const now = opts.now ?? Date.now;
 
-  app.post("/v1/responses", express.json({ limit: "10mb" }), async (req: Request, res: Response) => {
+  app.post("/v1/responses", express.json({ limit: RESPONSES_BODY_LIMIT_BYTES }), async (req: Request, res: Response) => {
     if (!isResponsesRequest(req.body)) {
       res.status(400).json({
         error: {
