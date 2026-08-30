@@ -549,6 +549,166 @@ describe("mountMessagesCrossProviderRoute", () => {
     expect(routeEntry).toEqual(expect.objectContaining({ statusCode: 200 }));
   });
 
+  it("preserves refusal text when collapsing SSE into a non-stream response", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          push({ type: "response.created", response: { id: "resp_refusal", model: "gpt-5.5" } });
+          push({ type: "response.refusal.delta", output_index: 0, delta: "I cannot help with that." });
+          push({ type: "response.output_item.done", output_index: 0 });
+          push({
+            type: "response.completed",
+            response: { id: "resp_refusal", model: "gpt-5.5", usage: { input_tokens: 5, output_tokens: 6 } },
+          });
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: false });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        content: [{ type: "text", text: "I cannot help with that." }],
+        stop_reason: "refusal",
+      });
+    });
+  });
+
+  it("collapses a function-call stream into an Anthropic tool_use response", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          push({ type: "response.created", response: { id: "resp_tool", model: "gpt-5.5" } });
+          push({
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "function_call", call_id: "call_1", name: "read_file", arguments: "" },
+          });
+          push({
+            type: "response.function_call_arguments.done",
+            output_index: 0,
+            arguments: "{\"path\":\"README.md\"}",
+          });
+          push({ type: "response.output_item.done", output_index: 0 });
+          push({
+            type: "response.completed",
+            response: { id: "resp_tool", model: "gpt-5.5", usage: { input_tokens: 8, output_tokens: 4 } },
+          });
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: false });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        id: "resp_tool",
+        type: "message",
+        role: "assistant",
+        model: "gpt-5.5",
+        content: [{ type: "tool_use", id: "call_1", name: "read_file", input: { path: "README.md" } }],
+        stop_reason: "tool_use",
+        stop_sequence: null,
+        usage: { input_tokens: 8, output_tokens: 4 },
+      });
+    });
+  });
+
+  it("streams function calls back as Anthropic tool_use events", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          push({ type: "response.created", response: { id: "resp_tool", model: "gpt-5.5" } });
+          push({
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "function_call", call_id: "call_1", name: "read_file" },
+          });
+          push({ type: "response.function_call_arguments.delta", output_index: 0, delta: "{\"path\":" });
+          push({ type: "response.function_call_arguments.delta", output_index: 0, delta: "\"README.md\"}" });
+          push({ type: "response.output_item.done", output_index: 0 });
+          push({ type: "response.completed", response: { id: "resp_tool", model: "gpt-5.5", usage: { output_tokens: 4 } } });
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain('"content_block":{"type":"tool_use","id":"call_1","name":"read_file","input":{}}');
+      expect(text).toContain('"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":"}');
+      expect(text).toContain('"stop_reason":"tool_use"');
+    });
+  });
+
+  it("emits an Anthropic error when a streaming tool call ends prematurely", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const event = {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "function_call", call_id: "call_1", name: "dangerous_default_tool" },
+          };
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      const text = await res.text();
+      expect(text).toContain('"type":"error"');
+      expect(text).toContain("Invalid or incomplete response from OpenAI");
+    });
+
+    expect(activity).toContainEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+  });
+
+  it("emits an Anthropic error for streamed function calls without a call_id", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const event = {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "function_call", name: "read_file" },
+          };
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      const text = await res.text();
+      expect(text).toContain('"type":"error"');
+      expect(text).toContain("Invalid or incomplete response from OpenAI");
+    });
+  });
+
   it("passes non-openai models to later Anthropic proxy middleware with route context and replayable raw body", async () => {
     const app = express();
     const nextSpy = vi.fn();
