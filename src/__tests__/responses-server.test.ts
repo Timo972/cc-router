@@ -217,7 +217,7 @@ describe("mountResponsesRoutes", () => {
   });
 
   it("bounds an oversized client model name in every retained activity entry", async () => {
-    // A 10mb body limit means the model string is a client-controlled lever on
+    // The request body limit means the model string is a client-controlled lever on
     // how much the 100-entry activity buffer retains, and on how much the
     // health response re-serializes each time it is read.
     const oversized = `openai/${"g".repeat(50_000)}`;
@@ -308,6 +308,40 @@ describe("mountResponsesRoutes", () => {
         },
       ]);
     });
+  });
+
+  it("accepts valid Codex Responses payloads larger than 10 MiB", async () => {
+    const toolOutput = "x".repeat(11 * 1024 * 1024);
+    let forwardedOutputLength = 0;
+    const forward: ForwardOpenAI = async ({ body }) => {
+      const output = body.input[0]?.content[0];
+      if (output?.type === "function_call_output") forwardedOutputLength = output.output.length;
+      return new Response(JSON.stringify({ id: "resp_large" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          input: [{
+            role: "tool",
+            content: [{ type: "function_call_output", call_id: "call_large", output: toolOutput }],
+          }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ id: "resp_large" });
+    });
+
+    expect(forwardedOutputLength).toBe(toolOutput.length);
   });
 
   it("applies configured OpenAI model aliases before forwarding Responses requests", async () => {
