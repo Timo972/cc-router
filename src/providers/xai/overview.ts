@@ -49,6 +49,15 @@ export interface GrokOverviewOptions {
   fileExists?: (filePath: string) => boolean;
 }
 
+function loadConfiguredXaiAccounts() {
+  // Read the override at call time. This keeps the overview aligned with the
+  // manager's documented ACCOUNTS_PATH override even when the environment is
+  // installed after this module has been imported (as in embedded callers and
+  // tests); without it the paths module's import-time snapshot can hide stored
+  // xAI accounts from the dashboard.
+  return loadXaiAccounts(process.env["ACCOUNTS_PATH"] || undefined);
+}
+
 interface GrokAuthEntry {
   key?: unknown;
   auth_mode?: unknown;
@@ -106,7 +115,7 @@ export function loadGrokAccountSnapshots(opts: GrokOverviewOptions = {}): GrokAc
 export function loadGrokHealthSnapshots(opts: GrokOverviewOptions = {}): GrokAccountSnapshot[] {
   const overlay = loadGrokAccountSnapshots(opts);
   const liveSessions = overlay.reduce((sum, account) => Math.max(sum, account.activeSessions), 0);
-  const stored = loadXaiAccounts();
+  const stored = loadConfiguredXaiAccounts();
   if (stored.length === 0) return overlay;
   const now = (opts.now ?? Date.now)();
   return stored.map(account => {
@@ -147,7 +156,7 @@ export async function loadGrokHealthSnapshotsWithSubscription(
 ): Promise<GrokAccountSnapshot[]> {
   const base = loadGrokHealthSnapshots(opts);
   if (base.length === 0) return base;
-  const accounts = opts.accounts ?? loadXaiAccounts();
+  const accounts = opts.accounts ?? loadConfiguredXaiAccounts();
   const fetchSubscription = opts.fetchSubscription
     ?? ((accessToken: string) => fetchGrokSubscription({ accessToken }));
 
