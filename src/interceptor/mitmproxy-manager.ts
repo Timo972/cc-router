@@ -203,6 +203,34 @@ export async function installCaCert(): Promise<boolean> {
   }
 }
 
+/**
+ * Remove the mitmproxy CA certificate from the OS trust store — the reverse of
+ * installCaCert. Requires elevated privileges. Best-effort: returns false if the
+ * platform tool fails (e.g. the cert was already removed). Call this on full
+ * teardown/uninstall so a system-wide trusted root (whose private key sits in
+ * ~/.mitmproxy) is not left behind.
+ */
+export async function removeCaCert(): Promise<boolean> {
+  try {
+    if (isMacos()) {
+      // remove-trusted-cert needs the cert file to reference.
+      if (!existsSync(CA_PATH)) return false;
+      await execFileP("sudo", ["security", "remove-trusted-cert", "-d", CA_PATH]);
+    } else if (isWindows()) {
+      // Delete by subject CN ("mitmproxy") from the root store.
+      await execFileP("certutil", ["-delstore", "root", "mitmproxy"]);
+    } else {
+      const destFile = join("/usr/local/share/ca-certificates", "mitmproxy.crt");
+      await execFileP("sudo", ["rm", "-f", destFile]);
+      await execFileP("sudo", ["update-ca-certificates", "--fresh"]);
+    }
+    return true;
+  } catch (e) {
+    console.error(`CA removal error: ${(e as Error).message}`);
+    return false;
+  }
+}
+
 // ─── Addon script ─────────────────────────────────────────────────────────────
 
 /**

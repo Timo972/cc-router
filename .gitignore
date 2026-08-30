@@ -44,3 +44,9 @@ coverage/
 
 # Temp files
 *.tmp
+
+# Isolated implementation worktrees
+.worktrees/
+
+# Agent scratch space (task briefs, reports, ledgers)
+.superpowers/

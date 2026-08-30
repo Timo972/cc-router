@@ -105,6 +105,77 @@ ${envVars}
 `;
 }
 
+/** Runs `launchctl <args>`; resolves on success, throws on a non-zero exit. */
+export type LaunchctlRunner = (args: string[]) => Promise<void>;
+
+export interface BootstrapAfterTeardownOptions {
+  uid: string;
+  label: string;
+  plistPath: string;
+  run: LaunchctlRunner;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  /** Total budget for teardown + bootstrap. Default 10s. */
+  timeoutMs?: number;
+}
+
+const TEARDOWN_POLL_MS = 200;
+const TEARDOWN_TIMEOUT_MS = 10_000;
+
+/**
+ * Load a LaunchAgent that may have just been booted out.
+ *
+ * `launchctl bootout` returns as soon as launchd accepts the request, not once
+ * the job is gone. Bootstrapping the same label during that window fails with
+ * "Bootstrap failed: 5: Input/output error" — and the legacy `load` fallback
+ * fails the same way, so retrying through it does not help. That is what made
+ * `cc-router start` need a second invocation after a restart: the first one
+ * raced launchd's teardown, warned, and left nothing running.
+ *
+ * So: poll until launchd no longer knows the label, then bootstrap, retrying
+ * until a shared deadline because launchd can still reject briefly after the
+ * job disappears from `print`.
+ */
+export async function bootstrapAfterTeardown(
+  opts: BootstrapAfterTeardownOptions,
+): Promise<boolean> {
+  const { uid, label, plistPath, run, sleep, now } = opts;
+  const deadline = now() + (opts.timeoutMs ?? TEARDOWN_TIMEOUT_MS);
+
+  // Phase 1 — wait for launchd to forget the old job.
+  for (;;) {
+    let stillLoaded: boolean;
+    try {
+      await run(["print", `gui/${uid}/${label}`]);
+      stillLoaded = true;
+    } catch {
+      stillLoaded = false; // `print` fails once the label is gone
+    }
+    if (!stillLoaded) break;
+    if (now() >= deadline) return false;
+    await sleep(TEARDOWN_POLL_MS);
+  }
+
+  // Phase 2 — bootstrap, retrying while launchd finishes releasing the label.
+  for (;;) {
+    try {
+      await run(["bootstrap", `gui/${uid}`, plistPath]);
+      return true;
+    } catch {
+      if (now() >= deadline) return false;
+      await sleep(TEARDOWN_POLL_MS);
+    }
+  }
+}
+
+const launchctlRun: LaunchctlRunner = async (args) => {
+  await execFileAsync("launchctl", args);
+};
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
 async function installMacOS(serverMode: boolean): Promise<void> {
   // Ensure LaunchAgents dir exists
   const launchAgentsDir = dirname(LAUNCHD_PLIST);
@@ -117,11 +188,18 @@ async function installMacOS(serverMode: boolean): Promise<void> {
 
   writeFileSync(LAUNCHD_PLIST, buildPlist(serverMode), "utf-8");
 
-  // Load — try modern `bootstrap` first, fallback to legacy `load`
   const uid = String(process.getuid?.() ?? 501);
-  try {
-    await execFileAsync("launchctl", ["bootstrap", `gui/${uid}`, LAUNCHD_PLIST]);
-  } catch {
+  const loaded = await bootstrapAfterTeardown({
+    uid,
+    label: LAUNCHD_LABEL,
+    plistPath: LAUNCHD_PLIST,
+    run: launchctlRun,
+    sleep: sleepMs,
+    now: Date.now,
+  });
+
+  if (!loaded) {
+    // Last resort for hosts where `bootstrap` is unavailable rather than busy.
     try {
       await execFileAsync("launchctl", ["load", LAUNCHD_PLIST]);
     } catch (err) {

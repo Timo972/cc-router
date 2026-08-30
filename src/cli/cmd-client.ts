@@ -4,7 +4,7 @@ import { existsSync } from "fs";
 import { input, confirm } from "@inquirer/prompts";
 import { readConfig, writeConfig, type ClientConfig } from "../config/manager.js";
 import { writeClaudeSettings, removeClaudeSettings, readClaudeProxySettings } from "../utils/claude-config.js";
-import { codexBaseUrlFromRouterUrl, writeCodexRouterConfigFromClient } from "../utils/codex-config.js";
+import { codexBaseUrlFromRouterUrl, writeCodexRouterConfigFromClient, removeCodexRouterConfig } from "../utils/codex-config.js";
 import { isMacos, isWindows } from "../utils/platform.js";
 import {
   checkMitmproxyInstalled,
@@ -21,6 +21,7 @@ import {
   installInterceptorService,
   uninstallInterceptorService,
   isInterceptorServiceInstalled,
+  removeCaCert,
 } from "../interceptor/mitmproxy-manager.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -108,6 +109,14 @@ function formatUrl(raw: string): string {
   return url;
 }
 
+function mergeStoredClient(patch: Partial<ClientConfig>): ClientConfig | undefined {
+  const config = readConfig();
+  if (!config.client) return undefined;
+  const client = { ...config.client, ...patch };
+  writeConfig({ ...config, client });
+  return client;
+}
+
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 export function registerClient(program: Command): void {
@@ -153,11 +162,9 @@ export function registerClient(program: Command): void {
       console.log(chalk.green(`✓ Connected — ${test.data?.accounts?.length ?? "?"} accounts on server\n`));
 
       // 4. Save client config
-      const cfg = readConfig();
       const clientCfg: ClientConfig = { remoteUrl: url };
       if (secret) clientCfg.remoteSecret = secret;
-      cfg.client = clientCfg;
-      writeConfig(cfg);
+      writeConfig({ ...readConfig(), client: clientCfg });
 
       // 5. Configure Claude Code
       writeClaudeSettings(0, url, secret ?? "proxy-managed", opts?.model);
@@ -166,7 +173,7 @@ export function registerClient(program: Command): void {
       if (opts?.model) console.log(chalk.gray(`  model              → ${opts.model}`));
 
       if (opts?.codex) {
-        const result = writeCodexRouterConfigFromClient(cfg, {
+        const result = writeCodexRouterConfigFromClient(readConfig(), {
           defaultModel: opts.codexModel,
         });
         console.log(chalk.green("✓ Codex CLI configured to route through CC-Router"));
@@ -186,8 +193,11 @@ export function registerClient(program: Command): void {
 
       if (wantsDesktop) {
         await setupDesktopInterception(url, secret);
-        cfg.client!.desktopEnabled = true;
-        writeConfig(cfg);
+        const current = readConfig();
+        if (current.client) {
+          current.client = { ...current.client, desktopEnabled: true };
+          writeConfig(current);
+        }
       }
 
       console.log(chalk.bold.green("\n✓ Client mode active\n"));
@@ -254,15 +264,34 @@ export function registerClient(program: Command): void {
         }
         console.log(chalk.yellow("Stopping Claude Desktop interceptor..."));
         await stopInterceptor();
+
+        // Full teardown is the right moment to offer removing the system-wide
+        // root CA. It's left in place by default because reconnecting reuses it
+        // and reinstalling needs sudo again — but a permanently trusted CA whose
+        // private key lives in ~/.mitmproxy is a real leftover if you're done.
+        const removeCa = await confirm({
+          message: "Also remove the mitmproxy root CA from your system trust store? (needs sudo/admin — recommended if you won't reconnect)",
+          default: false,
+        });
+        if (removeCa) {
+          const ok = await removeCaCert();
+          console.log(ok
+            ? chalk.green("✓ mitmproxy root CA removed from the trust store")
+            : chalk.yellow("⚠ Could not remove the CA automatically — remove 'mitmproxy' from your OS trust store manually"));
+        } else {
+          console.log(chalk.gray("  Left the mitmproxy CA in your trust store (reused on reconnect)."));
+        }
       }
 
       removeClaudeSettings();
+      removeCodexRouterConfig();
 
-      delete cfg.client;
-      writeConfig(cfg);
+      const current = readConfig();
+      delete current.client;
+      writeConfig(current);
 
       console.log(chalk.green("\n✓ Disconnected from CC-Router"));
-      console.log(chalk.gray("  Claude Code will use direct Anthropic connection on next restart.\n"));
+      console.log(chalk.gray("  Claude Code and Codex CLI will use their native auth on next restart.\n"));
     });
 
   // ── cc-router client status ─────────────────────────────────────────────────
@@ -405,8 +434,7 @@ export function registerClient(program: Command): void {
 
       if (!cfg.client.desktopEnabled) {
         await setupDesktopInterception(cfg.client.remoteUrl, cfg.client.remoteSecret);
-        cfg.client.desktopEnabled = true;
-        writeConfig(cfg);
+        mergeStoredClient({ desktopEnabled: true });
       }
 
       // Pre-flight check: verify Network Extension is ready on macOS.
@@ -450,7 +478,8 @@ export function registerClient(program: Command): void {
       console.log(chalk.green("\n✓ Claude Desktop interceptor running"));
 
       // ── Auto-start on boot ─────────────────────────────────────────────
-      if (!cfg.client.desktopAutoStart && !isInterceptorServiceInstalled()) {
+      const currentClient = readConfig().client;
+      if (!currentClient?.desktopAutoStart && !isInterceptorServiceInstalled()) {
         const autoStart = await confirm({
           message: "Start interceptor automatically when your computer boots? (recommended)",
           default: true,
@@ -458,14 +487,13 @@ export function registerClient(program: Command): void {
         if (autoStart) {
           const ok = await installInterceptorService(target, secret);
           if (ok) {
-            cfg.client.desktopAutoStart = true;
-            writeConfig(cfg);
+            mergeStoredClient({ desktopAutoStart: true });
             console.log(chalk.green("✓ Auto-start on boot configured"));
           } else {
             console.log(chalk.yellow("⚠ Could not configure auto-start. You can retry later."));
           }
         }
-      } else if (cfg.client.desktopAutoStart) {
+      } else if (currentClient?.desktopAutoStart) {
         console.log(chalk.gray("  Auto-start on boot: enabled"));
       }
 

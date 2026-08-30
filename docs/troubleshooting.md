@@ -58,12 +58,46 @@ cc-router setup --add
 
 ## 429 Rate limit errors
 
-The account is hitting Anthropic's rate limits. cc-router puts the account on cooldown for the `Retry-After` period automatically.
+Do not assume every 429 is a short requests-per-minute throttle. Anthropic can
+exhaust a model-scoped weekly allowance while the account's overall weekly
+utilisation is still below 100%. For example, an account can show 67% overall
+weekly use while the requested model family is already at 100%.
+
+Inspect the authenticated dashboard or `cc-router status --json`. Find the
+requested model's capacity row, its snapshot freshness, and the earliest reset
+or cooldown. The row distinguishes included allowance, paid-extra use, an
+applicable requested-model cooldown, and stale or unavailable usage data.
+
+When Anthropic returns a 429, cc-router passes it through unchanged, records a
+global or unambiguous requested-model cooldown, invalidates that session's
+binding, and lets the client's next retry choose another usable account. It
+does not retry a started request itself.
+
+When all configured accounts are already hard-blocked, cc-router does not call
+Anthropic. It returns a local Anthropic-shaped 429 whenever any account has a
+rate-limit or quota blocker. The response includes `Retry-After` only when the
+router knows a trustworthy unblock time; without one, it remains a 429 without
+that header. A local 503 means the accounts were unavailable entirely for
+non-rate-limit reasons, such as all being disabled or unhealthy. Wait for the
+reported time when present or make another account with allowance available.
+If recent activity shows `no-eligible:rate-limited`, the 429 was generated
+locally; an original upstream 429 remains byte-transparent.
+
+If usage is marked stale or unavailable, the internal Anthropic OAuth usage
+endpoint could not be refreshed. The router keeps conservative stale exhaustion
+evidence until reset and otherwise falls back to global response-header state;
+it does not treat stale paid-extra state as spend authorization. Repeated
+refresh failures back off automatically.
 
 If it happens frequently with a single account, add more accounts:
 ```bash
 cc-router setup --add
 ```
+
+Configured per-account caps are soft and may be bypassed only when every
+otherwise usable account is capped. They do not bypass upstream cooldowns or
+effective quota exhaustion. See [session routing](session-routing.md#upstream-allowance-and-cooldowns)
+for the complete distinction.
 
 ---
 
@@ -76,6 +110,19 @@ If you're running cc-router behind another proxy (e.g. nginx), make sure:
 - `X-Accel-Buffering: no` header is forwarded
 
 cc-router itself does not buffer SSE — `selfHandleResponse` is always `false`.
+
+---
+
+## Response stalled mid-stream
+
+CC-Router keeps passive lifecycle details on recent route entries returned by `cc-router status --json` and the `/cc-router/health` endpoint. Inspect the entry's `streamLifecycle` object:
+
+- `sawMessageStop: true`, `upstreamEnd: true`, and `downstreamFinish: true` indicate a normally completed SSE response.
+- `upstreamAborted: true` identifies termination by the upstream response.
+- `downstreamClose: true` with `downstreamFinish: false` identifies downstream cancellation, such as a client disconnect.
+- A missing `message_stop` is diagnostic evidence only. CC-Router never synthesizes a terminal event or changes the response body based on this flag.
+
+Streaming remains byte-transparent, and these diagnostics never retain response payload content or session IDs. If you changed Claude Code's stream idle watchdog configuration, restart existing Claude Code processes so they inherit the new values. When an outer reverse proxy is present, also check its response-body idle timeout separately from CC-Router's pre-header `proxyRequestTimeoutMs`.
 
 ---
 

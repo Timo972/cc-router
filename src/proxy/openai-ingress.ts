@@ -1,0 +1,624 @@
+import type { Response } from "express";
+import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.js";
+import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
+import { applyCodexRateLimits, type OpenAIAccount } from "../providers/openai/account-state.js";
+import { headersToRecord, parseCodexRateLimits } from "../providers/openai/usage.js";
+import { applyCodexFailureRouting } from "../providers/openai/failure-routing.js";
+import { needsOpenAIRefresh } from "../providers/openai/token-refresher.js";
+import type { OpenAITokenPool } from "../providers/openai/token-pool.js";
+import { stats, boundModelId, createLocalRoutingErrorLog } from "./stats.js";
+import type { LogEntry } from "./stats.js";
+import { logError, logRoute } from "./logger.js";
+import { EmptyPoolError, NoEligibleAccountError } from "./account-pool.js";
+import type { SessionRouter, RoutedAccountLease } from "./session-router.js";
+import { acquireRequestRoute, routeReasonDetails, routeFailureDetails } from "./lease-lifecycle.js";
+import {
+  MAX_UPSTREAM_ATTEMPTS,
+  RETRY_REFRESH_TIMEOUT_MS,
+  SAME_ACCOUNT_RETRY_DELAY_MS,
+  boundedWait,
+  isRetryableUpstreamStatus,
+  retryDelay,
+} from "./upstream-retry.js";
+
+/**
+ * Mirrors `anthropic-routing.ts`'s `requestTerminated` check. This ingress
+ * path never threads the raw `Request` through (only `Response`), so it
+ * checks just the response side: `res.destroyed`/`res.writableEnded` are
+ * enough to detect a client that disconnected while we were off awaiting a
+ * token refresh.
+ */
+function responseTerminated(res: Response): boolean {
+  return res.destroyed || res.writableEnded;
+}
+
+export type ForwardOpenAI = typeof forwardOpenAICodexResponse;
+
+/**
+ * Cooldown applied when a *local* token refresh fails. Matches the upstream-401
+ * cooldown in `failure-routing.ts`: a refresh that cannot produce a usable token
+ * is an auth failure, and without a cooldown the pool would immediately hand the
+ * same account back to the next request.
+ */
+const REFRESH_FAILURE_COOLDOWN_MS = 30_000;
+
+/**
+ * Response headers that must never be mirrored to the local client when
+ * relaying an upstream response verbatim:
+ *  - hop-by-hop headers per RFC 7230 §6.1 (content-length, transfer-encoding,
+ *    connection, keep-alive, te, trailer, upgrade, proxy-authenticate,
+ *    proxy-authorization) are meaningless (or actively wrong/dangerous) once
+ *    re-framed by our own HTTP server — e.g. `upgrade` would claim a protocol
+ *    switch never negotiated with this client, and the two `proxy-*` headers
+ *    are scoped to the upstream hop's own (unrelated) proxy auth.
+ *  - content-encoding is dropped because undici's fetch() already
+ *    transparently decompresses the body while leaving this header intact —
+ *    forwarding it would tell the client to gunzip bytes that are no longer
+ *    compressed. Deliberate drop, not RFC hop-by-hop.
+ *  - set-cookie must never leak the upstream service's session cookies to a
+ *    local client. Deliberate drop, not RFC hop-by-hop.
+ */
+export const EXCLUDED_UPSTREAM_RELAY_HEADERS = new Set([
+  "content-length",
+  "transfer-encoding",
+  "connection",
+  "keep-alive",
+  "te",
+  "trailer",
+  "upgrade",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "content-encoding",
+  "set-cookie",
+]);
+
+/**
+ * The `Connection` header can nominate additional header names as hop-by-hop
+ * for this specific response (RFC 7230 §6.1), beyond the fixed set above —
+ * e.g. `Connection: close, X-Internal-Token` means `X-Internal-Token` is also
+ * hop-by-hop here and must not reach the client.
+ */
+function connectionNominatedHeaders(source: Headers): Set<string> {
+  const nominated = new Set<string>();
+  const connection = source.get("connection");
+  if (!connection) return nominated;
+  for (const token of connection.split(",")) {
+    const name = token.trim().toLowerCase();
+    if (name) nominated.add(name);
+  }
+  return nominated;
+}
+
+/**
+ * Single place that decides which upstream response headers are safe to
+ * mirror to the local client, so every relay site shares the same policy
+ * instead of re-implementing the exclusion set (and the dynamic `Connection`
+ * nomination) inline. `apply` is called once per header that passes the
+ * filter, in `source`'s own iteration order — callers still own their own
+ * per-header special cases (e.g. content-type) by skipping in `apply`.
+ */
+export function mirrorUpstreamHeaders(source: Headers, apply: (name: string, value: string) => void): void {
+  const nominated = connectionNominatedHeaders(source);
+  source.forEach((value, key) => {
+    const lower = key.toLowerCase();
+    if (EXCLUDED_UPSTREAM_RELAY_HEADERS.has(lower)) return;
+    if (nominated.has(lower)) return;
+    apply(key, value);
+  });
+}
+
+/** Route-specific error envelope shape (OpenAI Responses vs. Anthropic Messages). */
+export interface OpenAIIngressEnvelope {
+  /** Wrap an `{type, message}` pair in this route's top-level error shape. */
+  wrap(type: string, message: string): unknown;
+  /** Send the route-shaped local rejection for a routing-level failure. */
+  sendNoEligible(error: NoEligibleAccountError, res: Response, nowMs: number): void;
+}
+
+/** Result of relaying the upstream response to the client. */
+export interface OpenAIIngressRelayResult {
+  /** The status code actually sent to the client — may differ from the raw
+   * upstream HTTP status when the relay synthesizes a failure (e.g. a
+   * non-streaming collector that turns an upstream `response.failed` SSE
+   * event, arriving on a 200, into a local 502). */
+  statusCode: number;
+}
+
+/**
+ * Scratch the relay writes to the moment it observes something the ingress
+ * must know even if the relay never returns.
+ *
+ * A relay can throw after learning the answer: aborting the upstream fetch on
+ * disconnect rejects a pending read, and that read may well be the one after
+ * the `response.failed` event was already parsed. Carrying the verdict on the
+ * return value loses it exactly then — precisely the case where getting it
+ * wrong records a real backend failure as a benign cancellation.
+ */
+export interface OpenAIRelayReport {
+  /** Upstream's own doing: it announced a failure (`response.failed`/`error`),
+   * answered non-2xx, or sent no body at all. None of these is something a
+   * client hanging up can manufacture, unlike a truncated stream. */
+  upstreamReportedFailure: boolean;
+}
+
+export interface OpenAIIngressOptions {
+  res: Response;
+  sessionKey: unknown;
+  requestedModel: string;
+  path: string;
+  /** HTTP method and client, recorded so an OpenAI activity row carries the same
+   *  columns as a Claude one — the dashboard needs both `method` and `path` to
+   *  render the request, and blanks the client column without `source`. */
+  method?: string;
+  source?: LogEntry["source"];
+  openAIRouter: SessionRouter<OpenAIAccount>;
+  openAIPool: OpenAITokenPool;
+  prepareOpenAIAccount: (account: OpenAIAccount) => Promise<boolean>;
+  forwardOpenAI: ForwardOpenAI;
+  forwardBody: OpenAIResponsesRequest;
+  recordActivity: (entry: LogEntry) => void;
+  now: () => number;
+  envelope: OpenAIIngressEnvelope;
+  /** Route-specific relay: byte-transparent SSE mirror for /v1/responses,
+   * Anthropic-shape translation for /v1/messages. Must report the
+   * client-facing status, even when it differs from `upstream.status`. */
+  relay: (
+    upstream: globalThis.Response,
+    res: Response,
+    entry: LogEntry,
+    report: OpenAIRelayReport,
+  ) => Promise<OpenAIIngressRelayResult>;
+  /** Invoked (best-effort, fire-and-forget from the caller's perspective)
+   * when a relayed upstream response carries a 401 — lets the caller kick
+   * off a background subscription-token refresh outside the request path. */
+  onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
+  /** Upstream attempts per client request (default 3). `1` disables
+   *  router-side failover/retry entirely — the `autoFailover: false`
+   *  config opt-out is wired through here. */
+  maxAttempts?: number;
+  /** Delay before re-sending to the SAME account (test override). */
+  sameAccountRetryDelayMs?: number;
+  /** Longest a failover account's token refresh may hold the ready-to-relay
+   *  upstream failure (test override; default 15s). */
+  retryRefreshTimeoutMs?: number;
+}
+
+/**
+ * Shared OpenAI/Codex ingress lifecycle: acquire a sticky account lease,
+ * refresh its token if needed, forward the request, classify the upstream
+ * failure for cooldown/eligibility purposes, relay the response to the
+ * client, then record activity/stats keyed on what the client actually
+ * received. Every awaited step is guarded so a rejection here can only ever
+ * produce a local error response — it must never crash the daemon or leave
+ * an unhandled rejection behind.
+ */
+export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void> {
+  const {
+    res, sessionKey, path, openAIRouter, openAIPool,
+    prepareOpenAIAccount, forwardOpenAI, forwardBody, recordActivity, now,
+    envelope, relay, onUpstreamAuthFailure,
+  } = opts;
+  // The model comes from a client-controlled body and is retained in the
+  // activity ring buffer below. Bound it once, here, so every activity entry,
+  // routing context and bucket lookup on this path carries an identifier that
+  // cannot grow with the request. The body forwarded upstream is untouched —
+  // it still carries whatever model the caller asked for.
+  const requestedModel = boundModelId(opts.requestedModel);
+
+  // A client that hangs up must take the upstream request with it. Releasing
+  // the lease (which the response's own close listener does) only returns the
+  // account's *local* capacity — without this the Codex request keeps
+  // streaming to a socket nobody is reading, so the pool counts the account
+  // idle and routes more work onto an upstream slot that is still occupied.
+  //
+  // Registered before the lease is acquired so this listener runs before the
+  // lifecycle's release, and `once` so it cleans itself up. A normal end also
+  // emits `close`, hence the `writableEnded` guard: only a premature close is
+  // a disconnect.
+  const clientGone = new AbortController();
+  res.once("close", () => {
+    if (!res.writableEnded) clientGone.abort();
+  });
+
+  let selected: { route: RoutedAccountLease<OpenAIAccount>; release: () => void; details: string };
+  try {
+    selected = acquireRequestRoute(sessionKey, res, openAIRouter, { requestedModel });
+  } catch (error) {
+    if (error instanceof EmptyPoolError) {
+      stats.totalErrors++;
+      res.status(503).json(envelope.wrap("no_accounts", "No OpenAI subscription accounts are configured"));
+      return;
+    }
+    if (error instanceof NoEligibleAccountError) {
+      // Local rejections are client-facing failures and must show up in the
+      // shared error total, exactly as the Anthropic routing middleware counts
+      // its own no-eligible-account rejections.
+      stats.totalErrors++;
+      recordActivity(createLocalRoutingErrorLog(error.reason, requestedModel));
+      envelope.sendNoEligible(error, res, now());
+      return;
+    }
+    // Never let an unexpected routing failure crash the daemon or reject
+    // this handler's promise — no account lease was taken, so there is
+    // nothing to release.
+    stats.totalErrors++;
+    const message = error instanceof Error ? error.message : String(error);
+    logError("proxy", 500, `unexpected routing failure: ${message}`);
+    recordActivity({
+      ts: now(),
+      accountId: "proxy",
+      model: requestedModel,
+      type: "error",
+      statusCode: 500,
+      path,
+      details: "proxy_error:acquire",
+    });
+    res.status(500).json(envelope.wrap("proxy_error", "Unexpected routing error"));
+    return;
+  }
+
+  // Mirrors the Anthropic path's route log (server.ts) — without this the
+  // OpenAI/Responses ingress made every routing decision (sticky/new-session/
+  // failover) invisible, unlike the Anthropic path which logs every routed
+  // request. `selected.details` is the pool's preformatted, session-id-free
+  // reason string — keep it that way.
+  logRoute(
+    selected.route.account.id,
+    selected.route.account.requestCount,
+    Math.round((selected.route.account.expiresAt - now()) / 60_000),
+    selected.details,
+  );
+  const startedAt = now();
+  const maxAttempts = Math.max(1, opts.maxAttempts ?? MAX_UPSTREAM_ATTEMPTS);
+  const sameAccountDelayMs = opts.sameAccountRetryDelayMs ?? SAME_ACCOUNT_RETRY_DELAY_MS;
+  const retryRefreshTimeoutMs = opts.retryRefreshTimeoutMs ?? RETRY_REFRESH_TIMEOUT_MS;
+
+  /**
+   * Refresh a routed account's token if needed. On failure this applies the
+   * shared refresh-failure bookkeeping and returns false; what the caller
+   * sends instead is its own decision — the first attempt answers a local
+   * 401, a retry attempt relays the upstream failure it already holds.
+   */
+  const prepareRoute = async (
+    routed: { route: RoutedAccountLease<OpenAIAccount>; release: () => void },
+  ): Promise<boolean> => {
+    const account = routed.route.account;
+    const needed = needsOpenAIRefresh(account);
+    let ready: boolean;
+    try {
+      ready = await prepareOpenAIAccount(account);
+    } catch (error) {
+      // A throwing refresh must behave exactly like a `false` return, never
+      // crash the request (or the daemon).
+      const message = error instanceof Error ? error.message : String(error);
+      logError(account.id, 401, `openai token refresh threw: ${message}`);
+      ready = false;
+    }
+    if (!ready) {
+      routed.release();
+      account.errorCount++;
+      stats.totalErrors++;
+      // Intentionally does not touch `account.healthy`: a single failed
+      // refresh fails only this request. Disabling the account here would
+      // hard-block it from every future request until a manual recovery, even
+      // though the very next request naturally retries the refresh.
+      //
+      // It must, however, break session affinity and cool the account down.
+      // A sticky binding survives this failure, so without both the session
+      // would re-acquire the same broken account on every retry and never fail
+      // over — 401ing forever while healthy accounts sit idle.
+      if (routed.route.sessionId !== undefined && routed.route.bindingGeneration !== undefined) {
+        openAIRouter.invalidate(routed.route.sessionId, account.id, routed.route.bindingGeneration);
+      }
+      openAIPool.setGlobalCooldownForAccount(account, REFRESH_FAILURE_COOLDOWN_MS, "unavailable");
+      recordActivity({
+        ts: now(),
+        accountId: account.id,
+        model: requestedModel,
+        type: "error",
+        statusCode: 401,
+        path,
+        details: "openai token refresh failed",
+      });
+      return false;
+    }
+    account.healthy = true;
+    if (needed) account.lastRefresh = now();
+    return true;
+  };
+
+  if (!(await prepareRoute(selected))) {
+    res.status(401).json(envelope.wrap("authentication_error", "OpenAI subscription token refresh failed"));
+    return;
+  }
+  if (responseTerminated(res)) {
+    // The client disconnected while the token refresh was in flight. Forwarding
+    // now would burn an upstream request nobody can receive the response to.
+    // Just release the lease and stop — no response to send, and it is safe to
+    // release again even if the response's own close/finish listener already
+    // did so (`attachLeaseLifecycle`'s release() is idempotent).
+    selected.release();
+    return;
+  }
+
+  let upstream: globalThis.Response;
+  let upstreamFailed: boolean;
+  let details: string;
+  let accountFailureCounted: boolean;
+
+  for (let attempt = 1; ; attempt++) {
+    const account = selected.route.account;
+    const attemptStartedAt = now();
+    try {
+      upstream = await forwardOpenAI({
+        account,
+        body: forwardBody,
+        stream: forwardBody.stream === true,
+        signal: clientGone.signal,
+      });
+    } catch (error) {
+      // A client that hung up mid-forward rejects this call through the abort
+      // above. That is a cancellation, not an upstream failure: the account did
+      // nothing wrong, so counting it would push a healthy account toward the
+      // unhealthy threshold and a cooldown for nothing more than a user pressing
+      // Ctrl-C, and there is no client left to receive a 502 or to whom an
+      // "upstream_error:network" entry would mean anything. Mirrors the
+      // pre-forward disconnect branch above, which also just releases and stops.
+      if (clientGone.signal.aborted || responseTerminated(res)) {
+        selected.release();
+        return;
+      }
+      // A rejected forward call (network failure) must produce a local 502,
+      // never an unhandled rejection. The lease releases via the response's
+      // own finish/close lifecycle once this response is sent.
+      account.errorCount++;
+      stats.totalErrors++;
+      const message = error instanceof Error ? error.message : String(error);
+      logError(account.id, 502, `openai request failed: ${message}`);
+      recordActivity({
+        ts: startedAt,
+        accountId: account.id,
+        model: requestedModel,
+        type: "error",
+        statusCode: 502,
+        path,
+        details: "upstream_error:network",
+        durationMs: now() - startedAt,
+      });
+      res.status(502).json(envelope.wrap("upstream_error", `OpenAI request failed: ${message}`));
+      return;
+    }
+
+    // Cooldown/eligibility react to the raw upstream signal — this must not
+    // change based on how the relay later renders the response to the client.
+    upstreamFailed = upstream.status === 401 || upstream.status === 429 || upstream.status >= 500;
+    details = routeReasonDetails(selected.route);
+    // Tracks whether `account.errorCount`/`consecutiveErrors` were already
+    // incremented for this request by the upstream-classification branch below,
+    // so a relay-synthesized failure (e.g. a byte-transparent stream that
+    // observed an upstream `response.failed`/`error` event on an otherwise-200
+    // response) can still increment them once further down without double
+    // counting an upstream 401/429/5xx that already did.
+    accountFailureCounted = false;
+    try {
+      // Header/rate-limit parsing and cooldown bookkeeping run on live upstream
+      // data between the two request-level try/catches above — a throw here
+      // (e.g. an unreadable header) must degrade to "skip this bookkeeping",
+      // never crash the daemon or leave the relay below un-reached.
+      const headerRecord = headersToRecord(upstream.headers);
+      applyCodexRateLimits(account, parseCodexRateLimits(headerRecord, now()), now());
+
+      if (upstreamFailed) {
+        account.errorCount++;
+        account.consecutiveErrors++;
+        accountFailureCounted = true;
+        const applied = applyCodexFailureRouting(
+          upstream.status,
+          headerRecord,
+          selected.route,
+          requestedModel,
+          openAIRouter,
+          openAIPool,
+          now,
+        );
+        details = routeFailureDetails(
+          selected.route,
+          upstream.status === 401 ? "token-invalid"
+            : upstream.status === 429 ? "rate-limited"
+            // Only 503/529 are treated as upstream overload for cooldown
+            // purposes; labelling an isolated 500/502/504 "service-overloaded"
+            // would contradict the routing decision actually taken.
+            : upstream.status === 503 || upstream.status === 529 ? "service-overloaded"
+            : "upstream-error",
+          applied.limitingScope,
+        );
+        if (upstream.status === 401) onUpstreamAuthFailure?.(account);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logError(account.id, upstream.status, `openai response classification failed: ${message}`);
+    }
+
+    // Retryable statuses (429 || >= 500) are a strict subset of
+    // `upstreamFailed`, so this predicate alone decides the loop.
+    if (!isRetryableUpstreamStatus(upstream.status)
+      || attempt >= maxAttempts || clientGone.signal.aborted) {
+      break;
+    }
+
+    // Router-side failover/retry. The failure bookkeeping above already ran
+    // (cooldown, affinity break, error counters), and not a single response
+    // byte has been relayed, so the request can move to whichever account the
+    // pool would hand a brand-new request: a different one after a 429 or
+    // 503/529 cooldown, the same one after a plain 5xx. Everything is decided
+    // BEFORE the held failure response is abandoned — any dead end below
+    // still relays the original upstream failure unchanged.
+    let next: typeof selected;
+    try {
+      next = acquireRequestRoute(sessionKey, res, openAIRouter, { requestedModel });
+    } catch (error) {
+      // Nothing eligible to fail over to — pass the failure through. Only
+      // routing-level rejections are expected here; anything else is a bug
+      // worth a log line, though pass-through stays the safe outcome.
+      if (!(error instanceof NoEligibleAccountError) && !(error instanceof EmptyPoolError)) {
+        const message = error instanceof Error ? error.message : String(error);
+        logError("proxy", 500, `unexpected routing failure during retry: ${message}`);
+      }
+      break;
+    }
+    if (upstream.status === 429 && next.route.account.id === account.id) {
+      // Re-sending a 429 to the account that produced it would only
+      // reproduce the rate limit. The cooldown normally guarantees a
+      // different account here; if it ever does not, pass through instead.
+      next.release();
+      break;
+    }
+    // Same bound as the Anthropic route: the held failure is ready to relay
+    // and the refresh fetch has no deadline of its own, so an unbounded wait
+    // here could withhold it for minutes. The refresh is not cancelled — a
+    // late outcome still runs prepareRoute's own bookkeeping in the
+    // background and readies (or cools down) the account for later requests.
+    const prepared = await boundedWait(
+      prepareRoute(next),
+      retryRefreshTimeoutMs,
+      "still-pending" as const,
+      clientGone.signal,
+    );
+    if (prepared === "still-pending") {
+      if (!clientGone.signal.aborted) {
+        logError(
+          next.route.account.id,
+          0,
+          `failover token refresh still pending after ${retryRefreshTimeoutMs}ms — relaying held upstream failure`,
+        );
+      }
+      next.release();
+      break;
+    }
+    if (!prepared) break;
+
+    // Committed: record the failed attempt and abandon its response.
+    stats.totalErrors++;
+    recordActivity({
+      ts: attemptStartedAt,
+      accountId: account.id,
+      model: requestedModel,
+      type: "error",
+      statusCode: upstream.status,
+      path,
+      ...(opts.method !== undefined ? { method: opts.method } : {}),
+      ...(opts.source !== undefined ? { source: opts.source } : {}),
+      details: `${details}:will-retry`,
+      durationMs: now() - attemptStartedAt,
+    });
+    void upstream.body?.cancel().catch(() => {});
+    selected.release();
+    const sameAccount = next.route.account.id === account.id;
+    selected = next;
+    // An immediate same-account replay would hit whatever transient condition
+    // produced the 5xx still in progress; a failover needs no pause.
+    if (sameAccount) await retryDelay(sameAccountDelayMs, clientGone.signal);
+    if (clientGone.signal.aborted || responseTerminated(res)) {
+      selected.release();
+      return;
+    }
+  }
+
+  const account = selected.route.account;
+  const entry: LogEntry = {
+    ts: startedAt,
+    accountId: account.id,
+    model: requestedModel,
+    type: "route",
+    path,
+    ...(opts.method !== undefined ? { method: opts.method } : {}),
+    ...(opts.source !== undefined ? { source: opts.source } : {}),
+    details,
+  };
+
+  let finalStatus = upstream.status;
+  let relayFailed = false;
+  let relayFailureMessage = "";
+  const relayReport: OpenAIRelayReport = { upstreamReportedFailure: false };
+  try {
+    const result = await relay(upstream, res, entry, relayReport);
+    finalStatus = result.statusCode;
+  } catch (error) {
+    // Never let a relay failure become an unhandled rejection. Only send a
+    // local response if no upstream bytes have reached the client yet —
+    // otherwise the client already has a partial response and the best we
+    // can do is tear the connection down.
+    relayFailed = true;
+    const message = error instanceof Error ? error.message : String(error);
+    relayFailureMessage = message;
+    // The recorded status is what this request *became*, which is a failure
+    // whether or not another HTTP response can still be sent. Leaving it at
+    // the upstream's 200 in the headers-already-sent case produced an
+    // activity entry typed "error" carrying statusCode 200 — a diagnostic
+    // that contradicts itself, and one that reads as a success in any view
+    // that keys off the status.
+    finalStatus = 502;
+    if (!res.headersSent) {
+      res.status(502).json(envelope.wrap("upstream_error", `OpenAI response relay failed: ${message}`));
+    } else {
+      if (!res.writableEnded && !res.destroyed) res.destroy();
+    }
+  }
+
+  // A client that hung up during the relay produces every symptom of a
+  // failure without there being one: the aborted body rejects the reader (so
+  // `relayFailed`), and a stream cut short never reaches its terminal event
+  // (so the observer synthesizes a 502). Neither is the account's doing, and
+  // charging them would let routine Ctrl-C walk a healthy account to the
+  // unhealthy threshold. Only the abort signal can say this — `res` reads as
+  // "terminated" after every normal response too.
+  //
+  // Upstream's own verdict still stands: a 429 is a 429 whether or not the
+  // client stayed to read it, and neither is an explicit `response.failed` on
+  // a 200 stream — the client can truncate a stream, but it cannot make
+  // upstream announce a failure. Only the truncation is the disconnect's to
+  // explain away.
+  const clientCancelled = clientGone.signal.aborted && !relayReport.upstreamReportedFailure;
+
+  // Logged only now, after the cancellation classification: the Codex CLI
+  // aborts streams routinely (a superseded turn, Ctrl-C, a pane closing),
+  // and each abort rejects the relay's body read with "This operation was
+  // aborted". Logging that from the catch block printed an [ERROR] line for
+  // every one — eight hours of them in one unattended overnight session —
+  // while the stats correctly ignored them. The log now matches the stats.
+  if (relayFailed && !clientCancelled) {
+    logError(account.id, 502, `openai response relay failed: ${relayFailureMessage}`);
+  }
+
+  // Activity/stats must reflect what the client actually received, not just
+  // the raw upstream signal: the non-streaming collector can synthesize a
+  // local 502 from an upstream 200 whose SSE stream ended in
+  // `response.failed` (or malformed/incomplete), and a relay failure is
+  // always a client-facing failure regardless of the upstream status.
+  const failedFinal = upstreamFailed || (!clientCancelled && (relayFailed || finalStatus >= 400));
+  if (clientCancelled && !upstreamFailed) {
+    // Record what the client had actually received when it left, not the 502
+    // its own disconnect manufactured.
+    finalStatus = upstream.status;
+    entry.details = details ? `${details} client-cancelled` : "client-cancelled";
+  }
+  if (failedFinal) {
+    stats.totalErrors++;
+    // Upstream classification above only counts 401/429/5xx against the
+    // account. A relay-synthesized failure on an otherwise-successful
+    // upstream status (e.g. a streamed `response.failed` event, or a relay
+    // exception after upstream returned 200) is just as real a failure for
+    // this account and must not be dropped on the floor.
+    if (!accountFailureCounted) {
+      account.errorCount++;
+      account.consecutiveErrors++;
+    }
+  } else {
+    account.consecutiveErrors = 0;
+    stats.totalRequests++;
+  }
+  entry.type = failedFinal ? "error" : "route";
+  entry.statusCode = finalStatus;
+  entry.durationMs = now() - startedAt;
+  recordActivity(entry);
+}

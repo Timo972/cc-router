@@ -14,7 +14,9 @@ export interface TelemetryState {
 
 function defaultState(): TelemetryState {
   return {
-    enabled: true,
+    // Opt-in: telemetry stays off until the user explicitly enables it with
+    // `cc-router telemetry on`. Nothing is sent on first run.
+    enabled: false,
     installId: randomUUID(),
     firstRunAt: new Date().toISOString(),
   };
@@ -30,9 +32,10 @@ export function loadTelemetryState(): TelemetryState {
   }
   try {
     const raw = JSON.parse(readFileSync(TELEMETRY_PATH, "utf-8")) as Partial<TelemetryState>;
-    // Fill any missing fields to keep the file forward-compatible
+    // Fill any missing fields to keep the file forward-compatible. Missing
+    // `enabled` defaults to OFF (opt-in).
     const state: TelemetryState = {
-      enabled: raw.enabled ?? true,
+      enabled: raw.enabled ?? false,
       installId: raw.installId ?? randomUUID(),
       firstRunAt: raw.firstRunAt ?? new Date().toISOString(),
     };

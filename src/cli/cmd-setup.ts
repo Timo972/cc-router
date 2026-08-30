@@ -448,11 +448,9 @@ async function runClientSetupFromWizard(): Promise<void> {
   }
 
   // Save config
-  const cfg = readConfig();
   const clientCfg: ClientConfig = { remoteUrl: url };
   if (secret) clientCfg.remoteSecret = secret;
-  cfg.client = clientCfg;
-  writeConfig(cfg);
+  writeConfig({ ...readConfig(), client: clientCfg });
 
   // Configure Claude Code
   writeClaudeSettings(0, url, secret ?? "proxy-managed");
@@ -469,15 +467,18 @@ async function runClientSetupFromWizard(): Promise<void> {
     });
     if (wantsDesktop) {
       await setupDesktopFromWizard(url, secret);
-      cfg.client!.desktopEnabled = true;
-      writeConfig(cfg);
+      const current = readConfig();
+      if (current.client) {
+        current.client = { ...current.client, desktopEnabled: true };
+        writeConfig(current);
+      }
     }
   }
 
   console.log(chalk.bold.green(`\n${"━".repeat(40)}\n  Client mode active\n${"━".repeat(40)}\n`));
   console.log(`  Check status:       ${chalk.cyan("cc-router client status")}`);
   console.log(`  Disconnect:         ${chalk.cyan("cc-router client disconnect")}`);
-  if (cfg.client?.desktopEnabled) {
+  if (readConfig().client?.desktopEnabled) {
     console.log(`  Start Desktop:      ${chalk.cyan("cc-router client start-desktop")}`);
   }
   console.log();

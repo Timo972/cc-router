@@ -9,6 +9,7 @@ export const ACCOUNTS_PATH =
   path.join(CONFIG_DIR, "accounts.json");
 
 export const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), ".claude", "settings.json");
+export const CODEX_CONFIG_PATH = path.join(os.homedir(), ".codex", "config.toml");
 
 export const PROXY_PORT = parseInt(process.env["PORT"] ?? "3456", 10);
 export const LITELLM_PORT = 4000;

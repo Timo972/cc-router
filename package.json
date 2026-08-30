@@ -1,8 +1,9 @@
 {
-  "name": "ai-cc-router",
-  "version": "0.6.2",
-  "description": "Round-robin proxy for Claude Max OAuth tokens — use multiple Claude Max accounts with Claude Code",
+  "name": "@timo972/cc-router",
+  "version": "0.11.0-rc.0",
+  "description": "Cache-aware session router for Claude Max OAuth tokens — use multiple Claude Max accounts with Claude Code",
   "type": "module",
+  "packageManager": "pnpm@11.18.0",
   "bin": {
     "cc-router": "dist/cli/index.js"
   },
@@ -19,19 +20,22 @@
     "anthropic",
     "proxy",
     "oauth",
-    "round-robin",
+    "session-routing",
     "claude-code",
     "claude-max"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/VictorMinemu/CC-Router.git"
+    "url": "git+https://github.com/Timo972/cc-router.git"
   },
   "bugs": {
-    "url": "https://github.com/VictorMinemu/CC-Router/issues"
+    "url": "https://github.com/Timo972/cc-router/issues"
   },
-  "homepage": "https://github.com/VictorMinemu/CC-Router#readme",
+  "homepage": "https://github.com/Timo972/cc-router#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "dist/",
     "src/interceptor/addon.py",
@@ -40,6 +44,7 @@
     "Dockerfile",
     "accounts.example.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "dependencies": {
@@ -49,10 +54,12 @@
     "express": "^4.21.0",
     "http-proxy-middleware": "^3.0.5",
     "ink": "^5.0.0",
-    "react": "^18.3.0"
+    "react": "^18.3.0",
+    "smol-toml": "^1.8.0"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
+    "@types/express-serve-static-core": "^4.17.33",
     "@types/node": "^20.0.0",
     "@types/react": "^18.3.0",
     "tsx": "^4.19.0",
@@ -60,6 +67,6 @@
     "vitest": "^4.1.2"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   }
 }

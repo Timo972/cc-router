@@ -15,6 +15,12 @@ export interface AccountRateLimits {
   plan: string;              // "Pro" | "Max 5x" | "Max 20x" | ""
   requestsLimit: number;     // per-minute RPM from anthropic-ratelimit-requests-limit
   lastUpdated: number;       // Unix timestamp in ms
+  /** Event-sequence token for the response these headers came from (see
+   *  event-sequence.ts). Orders them against a usage refresh that may have
+   *  been initiated in the same millisecond. Absent means unorderable. */
+  lastUpdatedSeq?: number;
+  /** Detailed usage from the OAuth usage endpoint, when available. */
+  usage?: AccountUsageSnapshot;
 }
 
 export const DEFAULT_RATE_LIMITS: AccountRateLimits = {
@@ -29,6 +35,64 @@ export const DEFAULT_RATE_LIMITS: AccountRateLimits = {
   lastUpdated: 0,
 };
 
+export interface RateLimitWindow {
+  /** Absent when the provider reported no usable figure. Consumers deciding
+   *  whether to *block* treat that as 0 (see TokenPool.safeUtilization);
+   *  consumers deciding whether to *release* a block must not — missing data
+   *  is not evidence of capacity. */
+  utilization?: number;
+  resetAt: number;
+}
+
+export interface ModelRateLimit {
+  kind: string;
+  group: string;
+  modelId?: string;
+  modelFamily: string;
+  displayName: string;
+  /** Absent when the provider reported no usable figure — see
+   *  RateLimitWindow.utilization. */
+  utilization?: number;
+  resetAt: number;
+  active: boolean;
+  severity: string;
+}
+
+export interface ExtraUsageState {
+  enabled: boolean;
+  spendLimitReached: boolean;
+  disabledReason?: string;
+  utilization?: number;
+  currency?: string;
+  usedMinor?: number;
+  limitMinor?: number;
+}
+
+/** The account-wide usage windows the OAuth usage endpoint reports. Quotas it
+ *  does not report (OAuth-apps limits, upstream overload) deliberately have no
+ *  member here: nothing in a snapshot can speak for them. */
+export type UsageWindowScope = "five_hour" | "seven_day";
+
+export interface AccountUsageSnapshot {
+  fiveHour?: RateLimitWindow;
+  sevenDay?: RateLimitWindow;
+  modelLimits: ModelRateLimit[];
+  extraUsage?: ExtraUsageState;
+  /** Event-sequence token claimed when the refresh was *initiated* (see
+   *  event-sequence.ts). `fetchedAt` is stamped after the response body is
+   *  parsed, so it can post-date a limit the request never saw; and wall-clock
+   *  ms ties for events in one event-loop turn. Only this token orders the
+   *  snapshot's data against other events. Absent means unorderable. */
+  requestedSeq?: number;
+  fetchedAt: number;
+  fetchStatus: "fresh" | "stale" | "unavailable";
+}
+
+export interface RouteContext {
+  requestedModel?: string;
+  modelFamily?: string;
+}
+
 export interface Account {
   id: string;
   tokens: OAuthTokens;
@@ -39,6 +103,11 @@ export interface Account {
   lastUsed: number;      // Unix timestamp in ms
   lastRefresh: number;   // Unix timestamp in ms
   consecutiveErrors: number;
+  /** Set when a refresh is rejected with a terminal `invalid_grant`
+   *  ("refresh token expired"). Such a token can never be refreshed again, so
+   *  the refresh loop stops retrying it and the account needs re-authentication.
+   *  Persisted so the dead state survives a restart. Default: unset (false). */
+  authExpired?: boolean;
   rateLimits: AccountRateLimits;
   /** When false, the pool skips this account entirely. Default: true. */
   enabled: boolean;
@@ -61,7 +130,7 @@ export interface RefreshResponse {
 // Shape of each entry in accounts.json
 export interface AccountRecord {
   id: string;
-  provider?: "anthropic_subscription" | "openai_subscription" | "openai_api_key";
+  provider?: "anthropic_subscription" | "openai_subscription" | "openai_api_key" | "xai_subscription";
   accessToken: string;
   refreshToken: string;
   expiresAt: number;
@@ -72,6 +141,9 @@ export interface AccountRecord {
   enabled?: boolean;
   sessionLimitPercent?: number;
   weeklyLimitPercent?: number;
+  /** Set once a refresh is rejected as terminal `invalid_grant`; persisted so a
+   *  dead account is not hammered again after a restart. */
+  authExpired?: boolean;
 }
 
 /**

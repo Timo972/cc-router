@@ -12,6 +12,7 @@ vi.mock("../config/paths.js", () => ({
   ACCOUNTS_PATH: `${MOCK_DIR}/accounts.json`,
   CONFIG_PATH: `${MOCK_DIR}/config.json`,
   CLAUDE_SETTINGS_PATH: `${MOCK_DIR}/settings.json`,
+  CODEX_CONFIG_PATH: `${MOCK_DIR}/codex-config.toml`,
   PROXY_PORT: 3456,
   LITELLM_PORT: 4000,
   LITELLM_URL: undefined,
@@ -24,7 +25,9 @@ import {
   writeAnthropicAccountsPreservingOtherProviders,
   upsertAccountRecord,
   removeAccountRecordById,
+  renameAccountRecordById,
   saveOpenAIAccounts,
+  saveOpenAIAccountsToPath,
   migrateLegacyAccountProviders,
   setProviderAccountsEnabled,
   serialize,
@@ -32,6 +35,7 @@ import {
   loadOpenAIAccounts,
   readAccountsFromPath,
   writeConfig,
+  getAutoFailoverEnabled,
   getProxyRequestTimeoutMs,
 } from "../config/manager.js";
 
@@ -355,6 +359,81 @@ describe("saveOpenAIAccounts", () => {
   });
 });
 
+describe("saveOpenAIAccountsToPath", () => {
+  it("writes only the given custom path and leaves the default accounts file untouched", () => {
+    // Baseline: something already exists at the default ACCOUNTS_PATH.
+    writeAccountsAtomic([sampleRecord]);
+    const before = fs.readFileSync(accountsPath(), "utf-8");
+
+    const customPath = `${MOCK_DIR}/custom-accounts.json`;
+    saveOpenAIAccountsToPath(
+      [
+        {
+          id: "openai-custom",
+          provider: "openai_subscription",
+          accessToken: "custom-access",
+          refreshToken: "custom-refresh",
+          expiresAt: 1999999999000,
+          enabled: true,
+        },
+      ],
+      customPath,
+    );
+
+    const custom = JSON.parse(fs.readFileSync(customPath, "utf-8"));
+    expect(custom).toEqual([
+      {
+        id: "openai-custom",
+        provider: "openai_subscription",
+        accessToken: "custom-access",
+        refreshToken: "custom-refresh",
+        expiresAt: 1999999999000,
+        scopes: ["openid", "profile", "email", "offline_access"],
+        enabled: true,
+      },
+    ]);
+
+    // The default accounts.json must be byte-identical to before the call —
+    // a custom-path save must never fall through to the default file.
+    expect(fs.readFileSync(accountsPath(), "utf-8")).toBe(before);
+  });
+
+  it("preserves non-OpenAI records already present at the custom path", () => {
+    const customPath = `${MOCK_DIR}/custom-accounts.json`;
+    fs.writeFileSync(customPath, JSON.stringify([sampleRecord]));
+
+    saveOpenAIAccountsToPath(
+      [
+        {
+          id: "openai-custom",
+          provider: "openai_subscription",
+          accessToken: "custom-access",
+          refreshToken: "custom-refresh",
+          expiresAt: 1999999999000,
+          enabled: true,
+        },
+      ],
+      customPath,
+    );
+
+    const parsed = JSON.parse(fs.readFileSync(customPath, "utf-8"));
+    expect(parsed).toEqual([
+      sampleRecord,
+      {
+        id: "openai-custom",
+        provider: "openai_subscription",
+        accessToken: "custom-access",
+        refreshToken: "custom-refresh",
+        expiresAt: 1999999999000,
+        scopes: ["openid", "profile", "email", "offline_access"],
+        enabled: true,
+      },
+    ]);
+    // The default accounts.json was never created by a custom-path save.
+    expect(fs.existsSync(accountsPath())).toBe(false);
+  });
+});
+
 describe("loadAccounts", () => {
   it("returns empty array when file does not exist", () => {
     expect(loadAccounts()).toEqual([]);
@@ -404,6 +483,21 @@ describe("loadAccounts", () => {
 
     expect(loadAccounts().map(a => a.id)).toEqual(["max-account-1"]);
   });
+
+  it("restores an authExpired account as unhealthy so the pool does not route to it", () => {
+    // An account whose refresh token the server rejected as terminally expired,
+    // then persisted and read back by a restarted process. `authExpired` keeps
+    // it out of the refresh loop, so the startup refresh that used to mark it
+    // unhealthy never runs — `healthy` must therefore come from disk state, or
+    // TokenPool.hardBlock() (which gates only on `enabled && healthy`) routes
+    // live traffic to an account whose access token is long dead.
+    writeAccountsAtomic([{ ...sampleRecord, authExpired: true }]);
+
+    const [account] = loadAccounts();
+
+    expect(account.authExpired).toBe(true);
+    expect(account.healthy).toBe(false);
+  });
 });
 
 describe("serialize", () => {
@@ -415,6 +509,31 @@ describe("serialize", () => {
 
     const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
     expect(parsed[0].provider).toBe("anthropic_subscription");
+  });
+
+  it("persists the terminal authExpired flag so a dead account is not retried after a restart", () => {
+    writeAccountsAtomic([sampleRecord]);
+    const [account] = loadAccounts();
+    account.authExpired = true;
+
+    writeAnthropicAccountsPreservingOtherProviders(serialize([account]));
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].authExpired).toBe(true);
+    // And it survives the read back — the restarted process starts with the
+    // account already marked expired.
+    expect(readAccountsFromPath(accountsPath())[0].authExpired).toBe(true);
+  });
+
+  it("leaves authExpired unset for a healthy account and for legacy records", () => {
+    writeAccountsAtomic([sampleRecord]);
+    const [account] = loadAccounts();
+
+    writeAnthropicAccountsPreservingOtherProviders(serialize([account]));
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].authExpired).toBeUndefined();
+    expect(readAccountsFromPath(accountsPath())[0].authExpired).toBe(false);
   });
 });
 
@@ -440,9 +559,32 @@ describe("loadOpenAIAccounts", () => {
         accessToken: "openai-access",
         refreshToken: "openai-refresh",
         expiresAt: 1999999999000,
+        scopes: ["openid", "profile", "email", "offline_access"],
         enabled: true,
       },
     ]);
+  });
+
+  it("round-trips scopes and user caps through load and save", () => {
+    writeAccountsAtomic([
+      {
+        id: "openai-a",
+        provider: "openai_subscription",
+        accessToken: "at",
+        refreshToken: "rt",
+        expiresAt: 1234,
+        scopes: ["openid", "profile"],
+        enabled: true,
+        sessionLimitPercent: 80,
+        weeklyLimitPercent: 90,
+      },
+    ]);
+
+    const loaded = loadOpenAIAccounts(accountsPath());
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]?.scopes).toEqual(["openid", "profile"]);
+    expect(loaded[0]?.sessionLimitPercent).toBe(80);
+    expect(loaded[0]?.weeklyLimitPercent).toBe(90);
   });
 });
 
@@ -458,6 +600,39 @@ describe("readAccountsFromPath", () => {
   it("returns empty array for a non-existent path", () => {
     const missing = `${MOCK_DIR}/does-not-exist.json`;
     expect(readAccountsFromPath(missing)).toEqual([]);
+  });
+});
+
+describe("getAutoFailoverEnabled", () => {
+  it("defaults to enabled when config.json does not exist", () => {
+    expect(getAutoFailoverEnabled()).toBe(true);
+  });
+
+  it("defaults to enabled when config.json does not mention autoFailover", () => {
+    writeConfig({ proxySecret: "secret" });
+
+    expect(getAutoFailoverEnabled()).toBe(true);
+  });
+
+  it("stays enabled on an explicit true", () => {
+    writeConfig({ autoFailover: true });
+
+    expect(getAutoFailoverEnabled()).toBe(true);
+  });
+
+  it("disables only on an explicit false", () => {
+    writeConfig({ autoFailover: false });
+
+    expect(getAutoFailoverEnabled()).toBe(false);
+  });
+
+  it("treats a malformed value as the enabled default", () => {
+    fs.writeFileSync(
+      `${MOCK_DIR}/config.json`,
+      JSON.stringify({ autoFailover: "no" }),
+    );
+
+    expect(getAutoFailoverEnabled()).toBe(true);
   });
 });
 
@@ -512,5 +687,58 @@ describe("getProxyRequestTimeoutMs", () => {
       anthropicAliases: { "claude/sonnet": "claude-sonnet-4-6" },
       openAIAliases: { codex: "gpt-5-codex" },
     });
+  });
+});
+
+describe("renameAccountRecordById", () => {
+  it("renames a record in place, preserving every other field and record", () => {
+    writeAccountsAtomic([
+      sampleRecord,
+      {
+        id: "openai-primary",
+        provider: "openai_subscription",
+        accessToken: "openai-access",
+        refreshToken: "openai-refresh",
+        expiresAt: 1999999999000,
+        scopes: ["openid"],
+        enabled: true,
+      },
+    ]);
+
+    const renamed = renameAccountRecordById("max-account-1", "max-renamed");
+
+    expect(renamed?.id).toBe("max-renamed");
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0].id).toBe("max-renamed");
+    expect(parsed[0].accessToken).toBe(sampleRecord.accessToken);
+    expect(parsed[1].id).toBe("openai-primary");
+  });
+
+  it("returns null for an unknown id without touching the file", () => {
+    writeAccountsAtomic([sampleRecord]);
+    expect(renameAccountRecordById("missing", "whatever")).toBeNull();
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].id).toBe("max-account-1");
+  });
+
+  it("refuses a new id that any record already uses, across providers", () => {
+    writeAccountsAtomic([
+      sampleRecord,
+      {
+        id: "openai-primary",
+        provider: "openai_subscription",
+        accessToken: "openai-access",
+        refreshToken: "openai-refresh",
+        expiresAt: 1999999999000,
+        scopes: ["openid"],
+        enabled: true,
+      },
+    ]);
+
+    expect(() => renameAccountRecordById("max-account-1", "openai-primary"))
+      .toThrow(/already exists/);
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0].id).toBe("max-account-1");
   });
 });

@@ -1,51 +1,165 @@
-import { describe, expect, it, vi } from "vitest";
-import { createServer } from "http";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createServer, request as httpRequest, type ClientRequest } from "http";
+import type { AddressInfo } from "net";
 import express from "express";
 import { ReadableStream } from "stream/web";
 import { mountMessagesCrossProviderRoute } from "../proxy/messages-cross-route.js";
+import type { MessagesCrossProviderRouteOptions } from "../proxy/messages-cross-route.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
+import { SessionRouter } from "../proxy/session-router.js";
+import { OpenAITokenPool } from "../providers/openai/token-pool.js";
+import { applyCodexRateLimits, createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
+import { parseCodexRateLimits } from "../providers/openai/usage.js";
+import type { LogEntry } from "../proxy/stats.js";
 
-describe("mountMessagesCrossProviderRoute", () => {
-  it("translates Claude Code openai/* messages into Responses and returns Anthropic-shaped JSON", async () => {
-    const forwardedBodies: OpenAIResponsesRequest[] = [];
-    const app = express();
+type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean; signal?: AbortSignal }) => Promise<Response>;
 
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async ({ body }) => {
-        forwardedBodies.push(body);
-        return new Response(JSON.stringify({
-          id: "resp_1",
-          model: "gpt-5.5",
-          output: [
-            {
-              type: "message",
-              role: "assistant",
-              content: [{ type: "output_text", text: "Done." }],
-            },
-          ],
-          usage: { input_tokens: 4, output_tokens: 2 },
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      },
-    });
-
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+async function withServer(
+  app: ReturnType<typeof express>,
+  fn: (baseUrl: string) => Promise<void>,
+): Promise<void> {
+  const server = createServer(app);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
+    await fn(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close(err => err ? reject(err) : resolve());
+    });
+  }
+}
 
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+function makeRuntimeAccount(id: string): OpenAIAccount {
+  return createOpenAIAccount({
+    id,
+    provider: "openai_subscription",
+    accessToken: "header.e30.sig",
+    refreshToken: "rt",
+    expiresAt: Date.now() + 3_600_000,
+    enabled: true,
+  });
+}
+
+function mountWithPool(
+  accounts: OpenAIAccount[],
+  forwardOpenAI: ForwardOpenAI,
+  extra: Partial<MessagesCrossProviderRouteOptions> = {},
+) {
+  const app = express();
+  const openAIPool = new OpenAITokenPool(accounts);
+  const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
+  const activity: LogEntry[] = [];
+  mountMessagesCrossProviderRoute(app, {
+    openAIRouter,
+    openAIPool,
+    forwardOpenAI,
+    recordActivity: entry => activity.push(entry),
+    ...extra,
+  });
+  // Terminal handler so next()-passthrough cases (non-OpenAI models) resolve
+  // instead of hanging when the test doesn't register its own downstream
+  // middleware.
+  app.use("/v1/messages", (_req, res) => {
+    res.status(404).json({ notFound: true });
+  });
+  return { app, openAIPool, openAIRouter, activity };
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+function postMessages(baseUrl: string, body: Record<string, unknown>, headers: Record<string, string> = {}) {
+  return fetch(`${baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify({
+      model: "openai/gpt-5.6-luna",
+      max_tokens: 128,
+      messages: [{ role: "user", content: "hi" }],
+      ...body,
+    }),
+  });
+}
+
+const CROSS_SSE_BODY = `event: response.completed\ndata: ${JSON.stringify({
+  type: "response.completed",
+  response: { id: "resp_1", model: "gpt-5.6-luna", usage: { input_tokens: 10, output_tokens: 5 } },
+})}\n\n`;
+
+function crossSseResponse(headers: Record<string, string> = {}): Response {
+  return new Response(CROSS_SSE_BODY, {
+    status: 200,
+    headers: { "content-type": "text/event-stream", ...headers },
+  });
+}
+
+describe("mountMessagesCrossProviderRoute", () => {
+  it("does not continue OpenAI-routed messages into Anthropic account selection", async () => {
+    const anthropicSelection = vi.fn();
+    const app = express();
+    const openAIPool = new OpenAITokenPool([makeRuntimeAccount("openai-victor")]);
+    const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
+    mountMessagesCrossProviderRoute(app, {
+      openAIRouter,
+      openAIPool,
+      forwardOpenAI: async () => new Response(JSON.stringify({
+        id: "resp_1",
+        model: "gpt-5.5",
+        output: [],
+        usage: {},
+      }), {
+        headers: { "content-type": "application/json" },
+      }),
+    });
+    app.use("/v1/messages", (_req, res) => {
+      anthropicSelection();
+      res.status(500).end();
+    });
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(anthropicSelection).not.toHaveBeenCalled();
+    });
+  });
+
+  it("translates Claude Code openai/* messages into Responses and returns Anthropic-shaped JSON", async () => {
+    const forwardedBodies: OpenAIResponsesRequest[] = [];
+    const forward: ForwardOpenAI = async ({ body }) => {
+      forwardedBodies.push(body);
+      return new Response(JSON.stringify({
+        id: "resp_1",
+        model: "gpt-5.5",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Done." }],
+          },
+        ],
+        usage: { input_tokens: 4, output_tokens: 2 },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -77,48 +191,29 @@ describe("mountMessagesCrossProviderRoute", () => {
           stream: false,
         },
       ]);
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
   it("applies configured OpenAI aliases when Claude Code cross-routes to OpenAI", async () => {
     const forwardedBodies: OpenAIResponsesRequest[] = [];
-    const app = express();
-
-    mountMessagesCrossProviderRoute(app, {
+    const forward: ForwardOpenAI = async ({ body }) => {
+      forwardedBodies.push(body);
+      return new Response(JSON.stringify({
+        id: "resp_1",
+        model: "gpt-5-codex",
+        output: [],
+        usage: {},
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward, {
       modelRouting: { openAIAliases: { codex: "gpt-5-codex" } },
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async ({ body }) => {
-        forwardedBodies.push(body);
-        return new Response(JSON.stringify({
-          id: "resp_1",
-          model: "gpt-5-codex",
-          output: [],
-          usage: {},
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      },
     });
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -130,11 +225,7 @@ describe("mountMessagesCrossProviderRoute", () => {
 
       expect(res.status).toBe(200);
       expect(forwardedBodies[0].model).toBe("gpt-5-codex");
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
   it("refreshes the selected OpenAI account before Claude Code cross-routing", async () => {
@@ -148,28 +239,12 @@ describe("mountMessagesCrossProviderRoute", () => {
       status: 200,
       headers: { "content-type": "application/json" },
     }));
-    const app = express();
-
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60_000,
-        enabled: true,
-      }),
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward, {
       prepareOpenAIAccount: prepare,
-      forwardOpenAI: forward,
     });
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -181,49 +256,29 @@ describe("mountMessagesCrossProviderRoute", () => {
       expect(res.status).toBe(200);
       expect(prepare).toHaveBeenCalledOnce();
       expect(forward).toHaveBeenCalledOnce();
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
   it("collapses OpenAI Responses SSE into Anthropic-shaped JSON for non-stream messages", async () => {
-    const app = express();
-
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async () => new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\"}}\n\n"));
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Done.\"}\n\n"));
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n"));
-            controller.close();
-          },
-        }) as BodyInit,
-        {
-          status: 200,
-          headers: { "content-type": "text/event-stream" },
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Done.\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n"));
+          controller.close();
         },
-      ),
-    });
+      }) as BodyInit,
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -246,108 +301,194 @@ describe("mountMessagesCrossProviderRoute", () => {
         stop_sequence: null,
         usage: { input_tokens: 4, output_tokens: 2 },
       });
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
-  it("preserves refusal text when collapsing SSE into a non-stream response", async () => {
-    const app = express();
+  it("collapses OpenAI Responses SSE ending in response.incomplete into Anthropic-shaped JSON with its usage, not a 502", async () => {
+    // response.incomplete fires when generation stops without completing
+    // (e.g. hitting max_output_tokens), but still carries a full response
+    // with usage — a usable partial answer, not a transport failure.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4-mini\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2},\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async () => new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-            push({ type: "response.created", response: { id: "resp_refusal", model: "gpt-5.5" } });
-            push({ type: "response.refusal.delta", output_index: 0, delta: "I cannot help with that." });
-            push({ type: "response.output_item.done", output_index: 0 });
-            push({
-              type: "response.completed",
-              response: { id: "resp_refusal", model: "gpt-5.5", usage: { input_tokens: 5, output_tokens: 6 } },
-            });
-            controller.close();
-          },
-        }) as BodyInit,
-        { status: 200, headers: { "content-type": "text/event-stream" } },
-      ),
-    });
-
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          model: "openai/gpt-5.5",
-          messages: [{ role: "user", content: "Unsafe request" }],
+          model: "openai/gpt-5.4-mini",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
           stream: false,
         }),
       });
 
       expect(res.status).toBe(200);
-      expect(await res.json()).toMatchObject({
-        content: [{ type: "text", text: "I cannot help with that." }],
-        stop_reason: "refusal",
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({
+        id: "resp_1",
+        type: "message",
+        role: "assistant",
+        model: "gpt-5.4-mini",
+        content: [{ type: "text", text: "Par" }],
+        // The turn was cut off by the output-token ceiling, so it must not be
+        // reported as a deliberate end_turn — and this reconstructed-response
+        // path, not the JSON branch, is what a non-streaming client gets since
+        // Codex always streams.
+        stop_reason: "max_tokens",
+        stop_sequence: null,
+        usage: { input_tokens: 4, output_tokens: 2 },
       });
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
+    });
+
+    expect(activity.some(entry => entry.type === "error")).toBe(false);
+    const routeEntry = activity.find(entry => entry.type === "route");
+    expect(routeEntry).toEqual(expect.objectContaining({ statusCode: 200 }));
+  });
+
+  it("reports a 502 when a non-stream collect never sees a completion event", async () => {
+    // The terminal frame is malformed JSON: tolerant parsing drops it rather
+    // than aborting the read, so without a completion check the collector
+    // would hand the client a fabricated empty message on a 200.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
+          stream: false,
+        }),
       });
-    }
+
+      expect(res.status).toBe(502);
+      const body = await res.json() as { type: string; error: { type: string } };
+      expect(body.type).toBe("error");
+      expect(body.error.type).toBe("upstream_error");
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
+  it("reports a 502 when a non-stream collect's terminal event carries no response object", async () => {
+    // Well-formed SSE and a real terminal event type, but nothing to read a
+    // response out of. Treating the type alone as terminal turned this into a
+    // fabricated empty assistant turn on a 200.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.incomplete\",\"response\":null}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(502);
+      const body = await res.json() as { type: string; error: { type: string } };
+      expect(body.type).toBe("error");
+      expect(body.error.type).toBe("upstream_error");
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
+  it("reports a 502 when a non-stream collect gets a truncated stream", async () => {
+    // Every frame parses, but the stream simply stops before completing —
+    // partial text must not be dressed up as a finished answer.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(502);
+    });
   });
 
   it("streams OpenAI Responses SSE back as Anthropic Messages SSE", async () => {
-    const app = express();
-
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async () => new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n"));
-            controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"));
-            controller.close();
-          },
-        }) as BodyInit,
-        {
-          status: 200,
-          headers: { "content-type": "text/event-stream" },
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"));
+          controller.close();
         },
-      ),
-    });
+      }) as BodyInit,
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -364,241 +505,112 @@ describe("mountMessagesCrossProviderRoute", () => {
       expect(text).toContain("data: {\"type\":\"message_start\"");
       expect(text).toContain("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}");
       expect(text).toContain("data: {\"type\":\"message_stop\"}");
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
-  it("streams function calls back as Anthropic tool_use events", async () => {
-    const app = express();
+  it("streams OpenAI Responses SSE ending in response.incomplete as Anthropic Messages SSE, recording the upstream 200 rather than a 502", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1},\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async () => new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-            push({ type: "response.created", response: { id: "resp_tool", model: "gpt-5.5" } });
-            push({
-              type: "response.output_item.added",
-              output_index: 0,
-              item: { type: "function_call", call_id: "call_1", name: "read_file" },
-            });
-            push({ type: "response.function_call_arguments.delta", output_index: 0, delta: "{\"path\":\"README.md\"}" });
-            push({ type: "response.output_item.done", output_index: 0 });
-            push({ type: "response.completed", response: { id: "resp_tool", usage: { input_tokens: 8, output_tokens: 4 } } });
-            controller.close();
-          },
-        }) as BodyInit,
-        { status: 200, headers: { "content-type": "text/event-stream" } },
-      ),
-    });
-
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           model: "openai/gpt-5.5",
-          messages: [{ role: "user", content: "Read README.md" }],
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hi" }],
           stream: true,
         }),
       });
-      const body = await res.text();
 
-      expect(body).toContain('"content_block":{"type":"tool_use","id":"call_1","name":"read_file","input":{}}');
-      expect(body).toContain('"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"README.md\\"}"}');
-      expect(body).toContain('"stop_reason":"tool_use"');
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
-  });
-
-  it("emits an Anthropic error when a streaming tool call ends prematurely", async () => {
-    const app = express();
-
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async () => new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-            push({ type: "response.created", response: { id: "resp_partial", model: "gpt-5.5" } });
-            push({
-              type: "response.output_item.added",
-              output_index: 0,
-              item: { type: "function_call", call_id: "call_1", name: "dangerous_default_tool" },
-            });
-            push({ type: "response.function_call_arguments.delta", output_index: 0, delta: "{" });
-            controller.close();
-          },
-        }) as BodyInit,
-        { status: 200, headers: { "content-type": "text/event-stream" } },
-      ),
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+      const text = await res.text();
+      expect(text).toContain("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Par\"}}");
     });
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "openai/gpt-5.5",
-          messages: [{ role: "user", content: "Run the tool" }],
-          stream: true,
-        }),
-      });
-      const body = await res.text();
-
-      expect(body).toContain('"type":"error"');
-      expect(body).toContain('"message":"Invalid or incomplete response from OpenAI"');
-      expect(body).not.toContain('"type":"message_stop"');
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(false);
+    const routeEntry = activity.find(entry => entry.type === "route");
+    expect(routeEntry).toEqual(expect.objectContaining({ statusCode: 200 }));
   });
 
-  it("emits an Anthropic error for streamed function calls without a call_id", async () => {
-    const app = express();
+  it("preserves refusal text when collapsing SSE into a non-stream response", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          push({ type: "response.created", response: { id: "resp_refusal", model: "gpt-5.5" } });
+          push({ type: "response.refusal.delta", output_index: 0, delta: "I cannot help with that." });
+          push({ type: "response.output_item.done", output_index: 0 });
+          push({
+            type: "response.completed",
+            response: { id: "resp_refusal", model: "gpt-5.5", usage: { input_tokens: 5, output_tokens: 6 } },
+          });
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async () => new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-            push({ type: "response.created", response: { id: "resp_invalid", model: "gpt-5.5" } });
-            push({
-              type: "response.output_item.added",
-              output_index: 0,
-              item: { type: "function_call", id: "fc_1", name: "read_file" },
-            });
-            controller.close();
-          },
-        }) as BodyInit,
-        { status: 200, headers: { "content-type": "text/event-stream" } },
-      ),
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: false });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        content: [{ type: "text", text: "I cannot help with that." }],
+        stop_reason: "refusal",
+      });
     });
-
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "openai/gpt-5.5",
-          messages: [{ role: "user", content: "Read a file" }],
-          stream: true,
-        }),
-      });
-      const body = await res.text();
-
-      expect(body).toContain('"type":"error"');
-      expect(body).toContain('"message":"Invalid or incomplete response from OpenAI"');
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
   });
-
 
   it("collapses a function-call stream into an Anthropic tool_use response", async () => {
-    const app = express();
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          push({ type: "response.created", response: { id: "resp_tool", model: "gpt-5.5" } });
+          push({
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "function_call", call_id: "call_1", name: "read_file", arguments: "" },
+          });
+          push({
+            type: "response.function_call_arguments.done",
+            output_index: 0,
+            arguments: "{\"path\":\"README.md\"}",
+          });
+          push({ type: "response.output_item.done", output_index: 0 });
+          push({
+            type: "response.completed",
+            response: { id: "resp_tool", model: "gpt-5.5", usage: { input_tokens: 8, output_tokens: 4 } },
+          });
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async () => new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-            push({ type: "response.created", response: { id: "resp_tool", model: "gpt-5.5" } });
-            push({
-              type: "response.output_item.added",
-              output_index: 0,
-              item: { type: "function_call", call_id: "call_1", name: "read_file", arguments: "" },
-            });
-            push({
-              type: "response.function_call_arguments.done",
-              output_index: 0,
-              arguments: "{\"path\":\"README.md\"}",
-            });
-            push({ type: "response.output_item.done", output_index: 0 });
-            push({ type: "response.completed", response: { id: "resp_tool", model: "gpt-5.5", usage: { input_tokens: 8, output_tokens: 4 } } });
-            controller.close();
-          },
-        }) as BodyInit,
-        { status: 200, headers: { "content-type": "text/event-stream" } },
-      ),
-    });
-
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "openai/gpt-5.5",
-          messages: [{ role: "user", content: "Read README.md" }],
-          stream: false,
-        }),
-      });
-
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: false });
+      expect(res.status).toBe(200);
       expect(await res.json()).toEqual({
         id: "resp_tool",
         type: "message",
@@ -609,110 +621,661 @@ describe("mountMessagesCrossProviderRoute", () => {
         stop_sequence: null,
         usage: { input_tokens: 8, output_tokens: 4 },
       });
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    });
   });
 
-  it("rejects a non-stream tool call when the upstream SSE ends before completion", async () => {
-    const app = express();
+  it("streams function calls back as Anthropic tool_use events", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          push({ type: "response.created", response: { id: "resp_tool", model: "gpt-5.5" } });
+          push({
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "function_call", call_id: "call_1", name: "read_file" },
+          });
+          push({ type: "response.function_call_arguments.delta", output_index: 0, delta: "{\"path\":" });
+          push({ type: "response.function_call_arguments.delta", output_index: 0, delta: "\"README.md\"}" });
+          push({ type: "response.output_item.done", output_index: 0 });
+          push({ type: "response.completed", response: { id: "resp_tool", model: "gpt-5.5", usage: { output_tokens: 4 } } });
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
 
-    mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => ({
-        id: "openai-victor",
-        provider: "openai_subscription",
-        accessToken: "access",
-        refreshToken: "refresh",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-        enabled: true,
-      }),
-      forwardOpenAI: async () => new Response(
-        new ReadableStream({
-          start(controller) {
-            const event = {
-              type: "response.output_item.added",
-              output_index: 0,
-              item: { type: "function_call", call_id: "call_1", name: "dangerous_default_tool" },
-            };
-            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
-            controller.close();
-          },
-        }) as BodyInit,
-        { status: 200, headers: { "content-type": "text/event-stream" } },
-      ),
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain('"content_block":{"type":"tool_use","id":"call_1","name":"read_file","input":{}}');
+      expect(text).toContain('"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":"}');
+      expect(text).toContain('"stop_reason":"tool_use"');
+    });
+  });
+
+  it("emits an Anthropic error when a streaming tool call ends prematurely", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const event = {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "function_call", call_id: "call_1", name: "dangerous_default_tool" },
+          };
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      const text = await res.text();
+      expect(text).toContain('"type":"error"');
+      expect(text).toContain("Invalid or incomplete response from OpenAI");
     });
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "openai/gpt-5.5",
-          messages: [{ role: "user", content: "Run the tool" }],
-          stream: false,
-        }),
-      });
-
-      expect(res.status).toBe(502);
-      expect(await res.json()).toEqual({
-        type: "error",
-        error: {
-          type: "api_error",
-          message: "Invalid or incomplete response from OpenAI",
-        },
-      });
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
-      });
-    }
+    expect(activity).toContainEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
   });
 
-  it("passes non-openai models to later Anthropic proxy middleware with replayable raw body", async () => {
+  it("emits an Anthropic error for streamed function calls without a call_id", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const event = {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "function_call", name: "read_file" },
+          };
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      const text = await res.text();
+      expect(text).toContain('"type":"error"');
+      expect(text).toContain("Invalid or incomplete response from OpenAI");
+    });
+  });
+
+  it("passes non-openai models to later Anthropic proxy middleware with route context and replayable raw body", async () => {
     const app = express();
     const nextSpy = vi.fn();
+    const openAIPool = new OpenAITokenPool([]);
+    const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
 
     mountMessagesCrossProviderRoute(app, {
-      getOpenAIAccount: () => null,
+      openAIRouter,
+      openAIPool,
       forwardOpenAI: async () => new Response("unused"),
     });
     app.use("/v1/messages", (req, res) => {
       nextSpy();
       res.json({
         rawBody: req._ccRawBody?.toString("utf8"),
+        routeContext: req._ccRouteContext,
       });
     });
 
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-
-    try {
+    await withServer(app, async baseUrl => {
       const body = {
         model: "claude/sonnet",
         messages: [{ role: "user", content: "hi" }],
       };
-      const res = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       });
 
       expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ rawBody: JSON.stringify(body) });
-      expect(nextSpy).toHaveBeenCalledOnce();
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve());
+      expect(await res.json()).toEqual({
+        rawBody: JSON.stringify(body),
+        routeContext: {
+          requestedModel: "claude-sonnet-4-5",
+          modelFamily: "sonnet",
+        },
       });
+      expect(nextSpy).toHaveBeenCalledOnce();
+    });
+  });
+
+  it.each([42, { future: "model" }])(
+    "treats a non-string Messages model as the default Anthropic route: %j",
+    async (model) => {
+      const app = express();
+      const openAIPool = new OpenAITokenPool([]);
+      const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
+      mountMessagesCrossProviderRoute(app, {
+        openAIRouter,
+        openAIPool,
+        forwardOpenAI: async () => new Response("unused"),
+      });
+      app.use("/v1/messages", (req, res) => {
+        res.json({ routeContext: req._ccRouteContext });
+      });
+
+      await withServer(app, async baseUrl => {
+        const res = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        });
+
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({
+          routeContext: {
+            requestedModel: "claude-sonnet-4-5",
+            modelFamily: "sonnet",
+          },
+        });
+      });
+    },
+  );
+});
+
+describe("mountMessagesCrossProviderRoute crash safety (F1)", () => {
+  it("returns a local 502 in the Anthropic error envelope when forwardOpenAI rejects, and does not crash the process", async () => {
+    const forward: ForwardOpenAI = async () => {
+      throw new Error("network down");
+    };
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual(
+        expect.objectContaining({
+          type: "error",
+          error: expect.objectContaining({ type: "upstream_error" }),
+        }),
+      );
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
+  it("turns an upstream response.failed on a 200 SSE stream into a 502, not an empty success", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n"
+      + "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"model overloaded\"}}}\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "model overloaded" },
+      });
+    });
+
+    expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
+  });
+
+  it("relays an upstream JSON failure body as an Anthropic error envelope", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      JSON.stringify({ error: { message: "rate limit reached" } }),
+      { status: 429, headers: { "content-type": "application/json" } },
+    );
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+
+      expect(res.status).toBe(429);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "rate_limit_error", message: "rate limit reached" },
+      });
+    });
+  });
+
+  it("reports a bodyless collected stream as a failure even if the client left first", async () => {
+    const account = makeRuntimeAccount("openai-victor");
+    const forwardStarted = deferred<void>();
+    const forward: ForwardOpenAI = async opts => {
+      forwardStarted.resolve();
+      // Hold the response until the ingress has actually registered the
+      // disconnect — waiting on the client's own close event is not enough,
+      // since the server observes it a tick later. That ordering is the whole
+      // question here: whether a bodyless stream arriving after the hangup
+      // reads as upstream's failure or as ours to ignore.
+      await new Promise<void>(resolve => {
+        if (opts.signal?.aborted) resolve();
+        else opts.signal?.addEventListener("abort", () => resolve());
+      });
+      return new Response(null, { status: 200, headers: { "content-type": "text/event-stream" } });
+    };
+    const { app, activity } = mountWithPool([account], forward);
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({
+        model: "openai/gpt-5.6-luna",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hi" }],
+        stream: false,
+      });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await forwardStarted.promise;
+      client!.destroy();
+      await clientClosed;
+
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+      // An event-stream response with no body is upstream's failure. A client
+      // that happened to leave first does not make it disappear.
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+      expect(account.errorCount).toBe(1);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
     }
+  });
+
+  it("keeps an explicit response.failed when the client disconnects before EOF", async () => {
+    const account = makeRuntimeAccount("openai-victor");
+    const failedSent = deferred<void>();
+    const forward: ForwardOpenAI = async opts => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n"));
+          failedSent.resolve();
+          // Aborting a real fetch errors its body, so the pending read rejects
+          // — which is what loses a verdict carried on the return value.
+          opts.signal?.addEventListener("abort", () => controller.error(new Error("aborted")));
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([account], forward);
+
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    let client: ClientRequest | undefined;
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const body = JSON.stringify({
+        model: "openai/gpt-5.6-luna",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      });
+      const clientClosed = new Promise<void>(resolve => {
+        client = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        });
+        client.on("error", () => resolve());
+        client.on("close", () => resolve());
+        client.end(body);
+      });
+
+      await failedSent.promise;
+      client!.destroy();
+      await clientClosed;
+      await vi.waitFor(() => expect(activity).toHaveLength(1));
+
+      // The relay throws on the aborted read, after upstream had already said
+      // the turn failed. Treating that as a cancellation would clear the
+      // account's consecutive errors on a request that genuinely failed.
+      expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
+      expect(account.errorCount).toBe(1);
+      expect(account.consecutiveErrors).toBe(1);
+    } finally {
+      client?.destroy();
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  it("reports a 502 for a streamed response whose terminal frame is malformed, without altering the relayed bytes", async () => {
+    // The terminal response.completed frame is malformed JSON: tolerant
+    // parsing drops it rather than aborting the relay, so without a
+    // completion check this stream would be reported as an ordinary success
+    // even though the client never received a finished answer.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.completed\",\"response\":{\"id\":\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      // Headers are already flushed by the time the missing completion is
+      // detected, so the client still gets the real HTTP 200 and whatever
+      // normalized events had already streamed — only message_stop, which is
+      // only emitted in response to response.completed, is missing.
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("message_start");
+      expect(text).toContain("\"text\":\"Hi\"");
+      expect(text).not.toContain("message_stop");
+    });
+
+    const errorEntry = activity.find(entry => entry.type === "error");
+    expect(errorEntry).toEqual(expect.objectContaining({ statusCode: 502 }));
+  });
+
+  it("does not close a streamed message when the terminal frame carries no response object", async () => {
+    // Well-formed SSE, real terminal event type, nothing inside it. The
+    // lifecycle already reports this stream as failed; emitting message_stop
+    // with end_turn would tell the client the opposite.
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.incomplete\",\"response\":null}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("message_start");
+      expect(text).toContain("\"text\":\"Hi\"");
+      expect(text).not.toContain("message_stop");
+      expect(text).not.toContain("end_turn");
+    });
+
+    const errorEntry = activity.find(entry => entry.type === "error");
+    expect(errorEntry).toEqual(expect.objectContaining({ statusCode: 502 }));
+  });
+
+  it("reports a 502 for a streamed response that stops before response.completed, without altering the relayed bytes", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"));
+          controller.enqueue(encoder.encode("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Par\"}\n\n"));
+          controller.close();
+        },
+      }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain("message_start");
+      expect(text).not.toContain("message_stop");
+    });
+
+    const errorEntry = activity.find(entry => entry.type === "error");
+    expect(errorEntry).toEqual(expect.objectContaining({ statusCode: 502 }));
+  });
+
+  it("keeps relaying valid events when a malformed SSE frame shares the chunk", async () => {
+    const forward: ForwardOpenAI = async () => new Response(
+      "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n"
+      + "data: not-json\n\n"
+      + "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
+      + "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    const { app, activity } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, { stream: true });
+      const body = await res.text();
+
+      expect(res.status).toBe(200);
+      // The malformed frame is skipped; the surrounding valid events survive.
+      expect(body).toContain("message_start");
+      expect(body).toContain("hello");
+      expect(body).toContain("message_stop");
+    });
+
+    const routed = activity.find(entry => entry.path === "/v1/messages");
+    expect(routed?.inputTokens).toBe(7);
+    expect(routed?.outputTokens).toBe(3);
+  });
+});
+
+describe("mountMessagesCrossProviderRoute P1: real transport error relay", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function mountWithRealTransport(account: OpenAIAccount) {
+    const app = express();
+    const openAIPool = new OpenAITokenPool([account]);
+    const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
+    // forwardOpenAI is deliberately omitted: mountMessagesCrossProviderRoute
+    // falls back to the real forwardOpenAICodexResponse transport, so these
+    // tests exercise its actual content-type handling end to end rather than
+    // a hand-rolled ForwardOpenAI stub.
+    mountMessagesCrossProviderRoute(app, { openAIRouter, openAIPool });
+    return { app };
+  }
+
+  /**
+   * Stubs only the Codex backend call, not `fetch` itself: `postMessages`
+   * below also calls the global `fetch` to reach this test's own local
+   * server, so a blanket `mockResolvedValue` would swallow that request too
+   * and never actually exercise the route under test.
+   */
+  function mockCodexUpstream(response: Response): void {
+    const realFetch = globalThis.fetch;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("chatgpt.com/backend-api/codex/responses")) return response;
+      return realFetch(input, init);
+    });
+  }
+
+  it("relays a real upstream 429 JSON failure through the actual Codex transport, not a synthesized 502", async () => {
+    mockCodexUpstream(new Response(
+      JSON.stringify({ error: { message: "rate limit reached" } }),
+      {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "120",
+          "x-codex-primary-used-percent": "100",
+          // Must not survive the relay: hop-by-hop, and an upstream cookie.
+          "connection": "keep-alive",
+          "set-cookie": "session=leak",
+        },
+      },
+    ));
+    const { app } = mountWithRealTransport(makeRuntimeAccount("openai-victor"));
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(429);
+      // Without Retry-After a 429 tells the caller to back off but not for how long.
+      expect(res.headers.get("retry-after")).toBe("120");
+      expect(res.headers.get("x-codex-primary-used-percent")).toBe("100");
+      expect(res.headers.get("set-cookie")).toBeNull();
+      // The JSON envelope still owns the content type.
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "rate_limit_error", message: "rate limit reached" },
+      });
+    });
+  });
+
+  it("relays a real upstream 401 JSON failure through the actual Codex transport", async () => {
+    mockCodexUpstream(new Response(
+      JSON.stringify({ error: { message: "invalid bearer token" } }),
+      { status: 401, headers: { "content-type": "application/json" } },
+    ));
+    const { app } = mountWithRealTransport(makeRuntimeAccount("openai-victor"));
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "authentication_error", message: "invalid bearer token" },
+      });
+    });
+  });
+
+  it("relays a real upstream non-JSON error body through the actual Codex transport, keeping its own content-type", async () => {
+    mockCodexUpstream(new Response(
+      "Service Unavailable",
+      { status: 503, headers: { "content-type": "text/plain" } },
+    ));
+    const { app } = mountWithRealTransport(makeRuntimeAccount("openai-victor"));
+
+    await withServer(app, async baseUrl => {
+      const res = await postMessages(baseUrl, {});
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({
+        type: "error",
+        error: { type: "upstream_error", message: "Service Unavailable" },
+      });
+    });
+  });
+});
+
+describe("messages cross-route sticky routing", () => {
+  it("routes repeated x-claude-code-session-id requests to the same account", async () => {
+    const accounts = [makeRuntimeAccount("openai-a"), makeRuntimeAccount("openai-b")];
+    const seen: string[] = [];
+    const forwardOpenAI = vi.fn(async (opts: { account: OpenAIAccount }) => {
+      seen.push(opts.account.id);
+      return crossSseResponse();
+    });
+    const { app } = mountWithPool(accounts, forwardOpenAI);
+
+    await withServer(app, async baseUrl => {
+      await (await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s1" })).text();
+      await (await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s1" })).text();
+      await (await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s2" })).text();
+    });
+
+    expect(seen).toHaveLength(3);
+    expect(seen[0]).toBe(seen[1]);
+    expect(seen[2]).not.toBe(seen[0]);
+  });
+
+  it("applies x-codex-* headers from cross-route responses to the account snapshot", async () => {
+    const account = makeRuntimeAccount("openai-a");
+    const { app } = mountWithPool([account], vi.fn(async () => crossSseResponse({
+      "x-codex-primary-used-percent": "33",
+    })));
+
+    await withServer(app, async baseUrl => {
+      await (await postMessages(baseUrl, {})).text();
+    });
+
+    expect(account.rateLimits.buckets.get("codex")?.primary?.utilization).toBeCloseTo(0.33);
+  });
+
+  it("absorbs an upstream 429 by failing over within the request and cools the account", async () => {
+    const accounts = [makeRuntimeAccount("openai-a"), makeRuntimeAccount("openai-b")];
+    const seen: string[] = [];
+    const forwardOpenAI = vi.fn(async (opts: { account: OpenAIAccount }) => {
+      seen.push(opts.account.id);
+      if (seen.length === 1) {
+        return new Response("{\"error\":\"limit\"}", {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": "60" },
+        });
+      }
+      return crossSseResponse();
+    });
+    const { app, openAIPool } = mountWithPool(accounts, forwardOpenAI);
+
+    await withServer(app, async baseUrl => {
+      // The router retries the 429 on the idle account itself; the client only
+      // ever sees the successful response.
+      const first = await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s1" });
+      expect(first.status).toBe(200);
+      await first.text();
+      expect(seen).toHaveLength(2);
+      expect(seen[1]).not.toBe(seen[0]);
+      expect(openAIPool.isCoolingDown(seen[0]!)).toBe(true);
+
+      // The session's next request sticks to the account that served it.
+      const second = await postMessages(baseUrl, {}, { "x-claude-code-session-id": "s1" });
+      expect(second.status).toBe(200);
+      await second.text();
+    });
+
+    expect(seen).toHaveLength(3);
+    expect(seen[2]).toBe(seen[1]);
+  });
+
+  it("returns a local Anthropic-envelope 429 with Retry-After when everything is blocked", async () => {
+    const account = makeRuntimeAccount("openai-a");
+    applyCodexRateLimits(account, parseCodexRateLimits({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1000) + 600),
+    }, Date.now()), Date.now());
+    const forwardOpenAI = vi.fn();
+    const { app } = mountWithPool([account], forwardOpenAI as never);
+
+    await withServer(app, async baseUrl => {
+      const response = await postMessages(baseUrl, {});
+      expect(response.status).toBe(429);
+      expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
+      const body = await response.json() as { type: string; error: { type: string } };
+      expect(body.type).toBe("error");
+      expect(body.error.type).toBe("rate_limit_error");
+    });
+
+    expect(forwardOpenAI).not.toHaveBeenCalled();
   });
 });

@@ -1,14 +1,42 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Box, Text, useInput, useApp } from "ink";
+import { Box, Text, useInput, useApp, useStdout, measureElement } from "ink";
+import type { DOMElement } from "ink";
 import type { LogEntry } from "../proxy/stats.js";
 import { createAccountsApi } from "./accountsApi.js";
 import type { AccountsApi } from "./accountsApi.js";
 import { createModelsApi } from "./modelsApi.js";
 import type { ModelEntry, ModelsApi, ModelsStatus } from "./modelsApi.js";
+import { getCurrentVersion } from "../utils/self-update.js";
+import {
+  readClaudeRouting,
+  readCodexRouting,
+  setClaudeRouting,
+  setCodexRouting,
+  type ClaudeRoutingStatus,
+  type CodexRoutingStatus,
+} from "../utils/cli-routing.js";
+import { mergeGrokIntoHealth, loadGrokHealthSnapshotsWithSubscription } from "../providers/xai/overview.js";
+import type { GrokAccountSnapshot } from "../providers/xai/overview.js";
 
 const POLL_INTERVAL_MS = 2_000;
+/** Grok's plan/code-access rarely change; refresh far slower than the 2s poll. */
+const GROK_SUBSCRIPTION_INTERVAL_MS = 60_000;
+/** Most activity rows the dashboard will show — the list shrinks below this
+ *  (down to MIN_LOG_VISIBLE) when the terminal is too short for the full
+ *  frame. Ink can only erase as many lines as the viewport holds, so a frame
+ *  taller than the terminal makes every poll re-append it — scrolling the
+ *  header and OPERATIONS panel permanently out of view. */
 const LOG_VISIBLE = 20;
+const MIN_LOG_VISIBLE = 3;
+/** The model window may shrink to a single row: it follows its selection, so
+ *  one visible row IS the selected row — while a larger minimum rendered
+ *  rows below the clip that the selection could land on invisibly. */
+const MIN_MODELS_VISIBLE = 1;
 const MODEL_VISIBLE_ROWS = 16;
+const DASHBOARD_VERSION = getCurrentVersion();
+// Distinguishes "this machine's daemon" (restartable from this shell) from a
+// remote router the dashboard is merely pointed at.
+const LOCAL_TARGET_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -22,13 +50,49 @@ interface AccountRateLimitsView {
   plan: string;
   requestsLimit: number;
   lastUpdated: number;
+  usage?: AccountUsageView;
+}
+
+interface AccountUsageView {
+  fiveHour?: { utilization: number; resetAt: number };
+  sevenDay?: { utilization: number; resetAt: number };
+  modelLimits: AccountModelLimitView[];
+  extraUsage?: { enabled: boolean; spendLimitReached: boolean; usable: boolean };
+  fetchedAt: number;
+  fetchStatus: "fresh" | "stale" | "unavailable";
+}
+
+interface AccountModelLimitView {
+  modelFamily: string;
+  displayName: string;
+  utilization: number;
+  resetAt: number;
+  active: boolean;
+  severity: "" | "warning" | "critical" | "unknown";
+}
+
+export interface CodexRateLimitsView {
+  status: "ok" | "rate_limited";
+  plan: string;
+  buckets: Array<{
+    limitId: string;
+    label: string;
+    primary?: { utilization: number; resetAt: number; windowMinutes: number };
+    secondary?: { utilization: number; resetAt: number; windowMinutes: number };
+    cooldownUntilMs: number;
+  }>;
+  credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  resetCredits?: { available: number };
+  lastUpdated: number;
 }
 
 interface AccountStat {
   id: string;
-  provider?: "anthropic_subscription" | "openai_subscription";
+  provider?: "anthropic_subscription" | "openai_subscription" | "xai_subscription";
   healthy: boolean;
   busy: boolean;
+  inFlightRequests?: number;
+  activeSessions?: number;
   requestCount: number;
   errorCount: number;
   expiresInMs: number;
@@ -38,6 +102,11 @@ interface AccountStat {
   enabled?: boolean;
   sessionLimitPercent?: number;
   weeklyLimitPercent?: number;
+  globalCooldownUntilMs?: number;
+  modelCooldowns?: Array<{ modelFamily: string; untilMs: number }>;
+  codexRateLimits?: CodexRateLimitsView;
+  credentialsPendingWrite?: boolean;
+  xai?: { tier?: number; subscriptionTier?: string; hasCodeAccess?: boolean };
 }
 
 const EMPTY_RL: AccountRateLimitsView = {
@@ -46,8 +115,578 @@ const EMPTY_RL: AccountRateLimitsView = {
   requestsLimit: 0, lastUpdated: 0,
 };
 
+interface GlobalCapacityView {
+  fiveHour: { utilization: number; resetAt: number };
+  sevenDay: { utilization: number; resetAt: number };
+  usageFetchStatus?: AccountUsageView["fetchStatus"];
+}
+
+/** Match TokenPool's source precedence for the dashboard's global windows. */
+export function getGlobalCapacityView(rateLimits: AccountRateLimitsView): GlobalCapacityView {
+  const usage = rateLimits.usage;
+  const snapshotIsCurrent = usage !== undefined &&
+    usage.fetchStatus !== "unavailable" &&
+    usage.fetchedAt >= rateLimits.lastUpdated;
+  const usageFetchStatus = usage?.fetchStatus === "fresh" && !snapshotIsCurrent
+    ? "stale"
+    : usage?.fetchStatus;
+
+  return {
+    fiveHour: snapshotIsCurrent && usage.fiveHour
+      ? usage.fiveHour
+      : { utilization: rateLimits.fiveHourUtil, resetAt: rateLimits.fiveHourReset },
+    sevenDay: snapshotIsCurrent && usage.sevenDay
+      ? usage.sevenDay
+      : { utilization: rateLimits.sevenDayUtil, resetAt: rateLimits.sevenDayReset },
+    usageFetchStatus,
+  };
+}
+
+export interface AccountCapacityRow {
+  label: string;
+  state: string;
+  color: "green" | "yellow" | "red" | "gray";
+  utilization?: number;
+  resetAt?: number;
+}
+
+/** Turn the safe account payload into compact dynamic model/cooldown rows. */
+export function getAccountCapacityRows(account: Pick<AccountStat, "rateLimits" | "globalCooldownUntilMs" | "modelCooldowns">): AccountCapacityRow[] {
+  const usage = account.rateLimits?.usage;
+  const modelCooldowns = account.modelCooldowns ?? [];
+  const rows: AccountCapacityRow[] = [];
+  const matchedCooldowns = new Set<string>();
+  const now = Date.now();
+  if (usage?.modelLimits.length) {
+    const usageFetchStatus = usage.fetchStatus === "fresh" &&
+      usage.fetchedAt < (account.rateLimits?.lastUpdated ?? 0)
+      ? "stale"
+      : usage.fetchStatus;
+    const usageState = usageFetchStatus === "fresh" ? undefined : `usage ${usageFetchStatus}`;
+    const paidExtraAvailable = usage.extraUsage?.usable === true;
+    for (const limit of usage.modelLimits) {
+      const requestedCooldown = modelCooldowns.find(cooldown =>
+        cooldown.modelFamily === limit.modelFamily && cooldown.untilMs > now,
+      );
+      const exhausted = limit.utilization >= 1;
+      const capacityState = usageState
+        ? usageState
+        : !limit.active
+        ? "inactive"
+        : exhausted && paidExtraAvailable
+          ? "paid extra active"
+          : exhausted
+            ? "exhausted"
+            : "included available";
+      const state = requestedCooldown
+        ? `${capacityState} · requested-model cooldown`
+        : capacityState;
+      if (requestedCooldown) matchedCooldowns.add(requestedCooldown.modelFamily);
+      const color: AccountCapacityRow["color"] = requestedCooldown ? "yellow"
+        : usageState ? usageFetchStatus === "stale" ? "yellow" : "gray"
+        : !limit.active ? "gray"
+          : exhausted && paidExtraAvailable ? "yellow"
+            : exhausted || limit.severity === "critical" ? "red"
+              : limit.severity === "warning" || limit.utilization >= 0.7 ? "yellow"
+                : "green";
+      rows.push({
+        label: limit.displayName,
+        state,
+        color,
+        utilization: limit.utilization,
+        resetAt: limit.resetAt,
+      });
+    }
+  }
+  for (const cooldown of modelCooldowns) {
+    if (matchedCooldowns.has(cooldown.modelFamily) || cooldown.untilMs <= now) continue;
+    rows.push({
+      label: `cooldown ${cooldown.modelFamily}`,
+      state: "requested-model cooldown",
+      color: "yellow",
+      resetAt: Math.floor(cooldown.untilMs / 1_000),
+    });
+  }
+  if (account.globalCooldownUntilMs && account.globalCooldownUntilMs > now) {
+    rows.push({ label: "cooldown", state: "global", color: "red", resetAt: Math.floor(account.globalCooldownUntilMs / 1_000) });
+  }
+  return rows;
+}
+
+function codexWindowLabel(windowMinutes: number, fallback: "5h" | "weekly"): string {
+  // 10_080 minutes reads better as "weekly" than the generic "168h"; 300 needs
+  // no special case because the generic branch already renders it as "5h".
+  if (windowMinutes === 10_080) return "weekly";
+  if (windowMinutes > 0) {
+    return windowMinutes % 60 === 0 ? `${windowMinutes / 60}h` : `${windowMinutes}m`;
+  }
+  return fallback;
+}
+
+type CodexWindow = { utilization: number; resetAt: number; windowMinutes: number };
+
+/**
+ * Whether a reported window carries real data.
+ *
+ * Codex sends absent windows as all-zero placeholders rather than omitting the
+ * field, so a truthiness check treats "no such window" as a window with no
+ * duration — which then renders under a guessed label.
+ */
+function hasWindow(window: CodexWindow | undefined): window is CodexWindow {
+  return window !== undefined && window.windowMinutes > 0;
+}
+
+export interface CodexDefaultWindow {
+  label: string;
+  utilization: number;
+  resetAt: number;
+  /** Which user-configured cap applies: the 5h cap or the 7d cap. */
+  kind: "session" | "weekly";
+}
+
+/**
+ * The default (`codex`) bucket's windows, each labelled from its own duration.
+ *
+ * These used to be read positionally — `primary` as the 5h window, `secondary`
+ * as the weekly one. Codex reports the weekly window in `primary` and leaves
+ * `secondary` empty, so an account at 100% of its weekly quota displayed as
+ * "5h 100%" beside a "weekly 0%" bar that was really the empty slot. The reset
+ * countdown gave it away: a 5h window cannot reset five days out.
+ */
+export function getCodexDefaultWindows(
+  codex: CodexRateLimitsView | undefined,
+): CodexDefaultWindow[] {
+  const bucket = codex?.buckets.find(b => b.limitId === "codex");
+  if (!bucket) return [];
+
+  const windows: CodexDefaultWindow[] = [];
+  for (const [window, fallback] of [
+    [bucket.primary, "5h"] as const,
+    [bucket.secondary, "weekly"] as const,
+  ]) {
+    if (!hasWindow(window)) continue;
+    windows.push({
+      label: codexWindowLabel(window.windowMinutes, fallback),
+      utilization: window.utilization,
+      resetAt: window.resetAt,
+      kind: window.windowMinutes >= 10_080 ? "weekly" : "session",
+    });
+  }
+  return windows;
+}
+
+/** Named Codex metered buckets as compact capacity rows (default bucket renders as bars). */
+export function getCodexCapacityRows(
+  codex: CodexRateLimitsView | undefined,
+  globalCooldownUntilMs: number | undefined,
+  now = Date.now(),
+): AccountCapacityRow[] {
+  const rows: AccountCapacityRow[] = [];
+  for (const bucket of codex?.buckets ?? []) {
+    if (bucket.limitId === "codex") continue;
+    const cooling = bucket.cooldownUntilMs > now;
+    const windows: Array<{ label: string; utilization: number; resetAt: number }> = [];
+    // A zero-width window is Codex's placeholder for "this bucket has no such
+    // window", not a real one — it arrives as an all-zero object rather than
+    // being omitted. Rendering it duplicated the bucket, and both rows carried
+    // the same label because codexWindowLabel(0) falls through to its fallback.
+    if (hasWindow(bucket.primary)) {
+      windows.push({ label: codexWindowLabel(bucket.primary.windowMinutes, "5h"), ...bucket.primary });
+    }
+    if (hasWindow(bucket.secondary)) {
+      windows.push({ label: codexWindowLabel(bucket.secondary.windowMinutes, "weekly"), ...bucket.secondary });
+    }
+
+    for (const window of windows) {
+      const exhausted = window.utilization >= 1;
+      // While cooling, the countdown that matters is the cooldown's own expiry
+      // — it can come from Retry-After and outlast (or replace) the window
+      // reset, and a row labeled "bucket cooldown" showing the window's reset
+      // instant, or no time at all when that reset is unknown, tells the
+      // operator the wrong thing about when routing resumes.
+      const resetAt = cooling
+        ? Math.floor(bucket.cooldownUntilMs / 1000)
+        : window.resetAt;
+      rows.push({
+        label: `${bucket.label} ${window.label}`,
+        state: cooling ? "bucket cooldown" : exhausted ? "exhausted" : "available",
+        color: cooling ? "yellow" : exhausted ? "red" : window.utilization >= 0.7 ? "yellow" : "green",
+        utilization: window.utilization,
+        ...(resetAt > 0 ? { resetAt } : {}),
+      });
+    }
+    if (windows.length === 0 && cooling) {
+      rows.push({
+        label: bucket.label,
+        state: "bucket cooldown",
+        color: "yellow",
+        resetAt: Math.floor(bucket.cooldownUntilMs / 1000),
+      });
+    }
+  }
+  if (globalCooldownUntilMs && globalCooldownUntilMs > now) {
+    rows.push({ label: "cooldown", state: "global", color: "red", resetAt: Math.floor(globalCooldownUntilMs / 1000) });
+  }
+  return rows;
+}
+
+/**
+ * True when an OpenAI/Codex account is hard-blocked from routing: the
+ * account-wide status reports `rate_limited`, or the default bucket
+ * (`limitId === "codex"`) has a fully exhausted primary or secondary window.
+ * Named model-scoped buckets exhausting on their own does not count — the
+ * account can still serve other models via those buckets' fallback.
+ */
+export function isCodexLimited(codex: CodexRateLimitsView | undefined): boolean {
+  if (!codex) return false;
+  if (codex.status === "rate_limited") return true;
+  const defaultBucket = codex.buckets.find(bucket => bucket.limitId === "codex");
+  if (!defaultBucket) return false;
+  return (defaultBucket.primary?.utilization ?? 0) >= 1 || (defaultBucket.secondary?.utilization ?? 0) >= 1;
+}
+
+export function isOpenAIAccount(account: Pick<AccountStat, "provider">): boolean {
+  return account.provider === "openai_subscription";
+}
+
+export function isXaiAccount(account: Pick<AccountStat, "provider">): boolean {
+  return account.provider === "xai_subscription";
+}
+
+export function isClaudeAccount(account: Pick<AccountStat, "provider">): boolean {
+  return !isOpenAIAccount(account) && !isXaiAccount(account);
+}
+
+/** Compact `rst` column: banked Codex usage-limit resets. Claude is an em dash. */
+export function resetCreditsColumnLabel(
+  account: Pick<AccountStat, "provider" | "codexRateLimits">,
+): string {
+  if (!isOpenAIAccount(account)) return "—";
+  return String(account.codexRateLimits?.resetCredits?.available ?? 0);
+}
+
+export function isLimitedAccount(
+  account: Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">,
+): boolean {
+  if (isXaiAccount(account)) return false;
+  if (isOpenAIAccount(account)) return isCodexLimited(account.codexRateLimits);
+  if (account.rateLimits?.status === "rate_limited") return true;
+  if (!account.rateLimits) return false;
+  const view = getGlobalCapacityView(account.rateLimits);
+  return view.fiveHour.utilization >= 1 || view.sevenDay.utilization >= 1;
+}
+
+/** Claude, then ChatGPT, then Grok; within each group, accounts at limit last. */
+export function orderAccountsForDashboard<T extends Pick<AccountStat, "id" | "provider" | "codexRateLimits" | "rateLimits">>(
+  accounts: T[],
+): T[] {
+  const usableThenLimited = (list: T[]) => [
+    ...list.filter(account => !isLimitedAccount(account)),
+    ...list.filter(account => isLimitedAccount(account)),
+  ];
+  return [
+    ...usableThenLimited(accounts.filter(isClaudeAccount)),
+    ...usableThenLimited(accounts.filter(isOpenAIAccount)),
+    ...usableThenLimited(accounts.filter(isXaiAccount)),
+  ];
+}
+
+/** Compact view hides healthy/inactive model rows; selection shows the full set. */
+export function visibleCapacityRows(rows: AccountCapacityRow[], selected: boolean): AccountCapacityRow[] {
+  if (selected) return rows;
+  return rows.filter(row => row.color === "red" || row.color === "yellow");
+}
+
+export function noteModelLimit(
+  account: Pick<AccountStat, "rateLimits">,
+): { label: string; utilization: number; color: AccountCapacityRow["color"] } | undefined {
+  const limits = account.rateLimits?.usage?.modelLimits ?? [];
+  if (limits.length === 0) return undefined;
+  const fable = limits.find(limit =>
+    limit.modelFamily === "fable" || /fable/i.test(limit.displayName),
+  );
+  const limit = fable ?? limits.find(entry => entry.active) ?? limits[0];
+  if (!limit) return undefined;
+  const utilization = limit.utilization;
+  const color: AccountCapacityRow["color"] = utilization >= 1 || limit.severity === "critical"
+    ? "red"
+    : utilization >= 0.7 || limit.severity === "warning"
+      ? "yellow"
+      : "green";
+  return {
+    label: limit.displayName.replace(/^Claude\s+/i, ""),
+    utilization,
+    color,
+  };
+}
+
+/**
+ * Grok has no usage windows, so the note carries the plan instead. Prefer the
+ * live plan name from `/v1/user` ("GrokPro"); fall back to the coarse
+ * access-token `tier` when the live lookup has not landed (offline / first
+ * render), and to "cli" when neither is known.
+ */
+export function grokQuotaNote(account: Pick<AccountStat, "provider" | "xai" | "healthy">): string | undefined {
+  if (!isXaiAccount(account)) return undefined;
+  if (account.healthy === false) return "expired";
+  const plan = account.xai?.subscriptionTier?.trim();
+  if (plan) return plan;
+  const tier = account.xai?.tier;
+  return typeof tier === "number" && Number.isFinite(tier) ? `tier ${tier}` : "cli";
+}
+
+export function openaiQuotaGapNote(
+  account: Pick<AccountStat, "provider" | "codexRateLimits">,
+): string | undefined {
+  if (!isOpenAIAccount(account)) return undefined;
+  if (getCodexDefaultWindows(account.codexRateLimits).length > 0) return undefined;
+  const plan = account.codexRateLimits?.plan?.trim();
+  return plan ? `${plan} · no quota` : "no quota";
+}
+
+export function isWeeklyLimited(account: Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">): boolean {
+  if (isOpenAIAccount(account)) {
+    return getCodexDefaultWindows(account.codexRateLimits).some(
+      window => window.kind === "weekly" && window.utilization >= 1,
+    );
+  }
+  if (!account.rateLimits) return false;
+  return getGlobalCapacityView(account.rateLimits).sevenDay.utilization >= 1;
+}
+
+export function earliestWeeklyReset(accounts: AccountStat[]): number | undefined {
+  let earliest: number | undefined;
+  for (const account of accounts) {
+    if (isOpenAIAccount(account)) {
+      for (const window of getCodexDefaultWindows(account.codexRateLimits)) {
+        if (window.kind !== "weekly" || window.resetAt <= 0) continue;
+        if (earliest === undefined || window.resetAt < earliest) earliest = window.resetAt;
+      }
+    } else if (account.rateLimits) {
+      const resetAt = getGlobalCapacityView(account.rateLimits).sevenDay.resetAt;
+      if (resetAt > 0 && (earliest === undefined || resetAt < earliest)) earliest = resetAt;
+    }
+  }
+  return earliest;
+}
+
+/**
+ * First visible row of a scrolling list window that follows its selection.
+ *
+ * The window stays where it is while the selection moves inside it, and
+ * shifts just far enough to contain the selection when it crosses an edge —
+ * one row per one-row step, but any distance when the selection jumps (it is
+ * timestamp-anchored, so a burst of new entries can move it many rows at
+ * once). A stale `scrollTop` from a longer list clamps back into range.
+ */
+export function followScrollWindow(
+  scrollTop: number,
+  selectedIndex: number,
+  total: number,
+  visible: number,
+): number {
+  const maxTop = Math.max(0, total - visible);
+  let top = Math.min(Math.max(0, scrollTop), maxTop);
+  if (selectedIndex < top) top = selectedIndex;
+  else if (selectedIndex > top + visible - 1) top = selectedIndex - visible + 1;
+  return Math.min(Math.max(0, top), maxTop);
+}
+
+// ─── Viewport fit planner ─────────────────────────────────────────────────────
+
+/** One windowed list the viewport fitting controller may resize. Order in
+ *  the `lists` array is SHRINK priority (first shrinks first); growth walks
+ *  the array in reverse, so the last list is the most protected. */
+export interface FitList {
+  key: string;
+  /** Currently rendered row count. */
+  current: number;
+  min: number;
+  max: number;
+  /** MEASURED average lines per rendered row (≥ 1). Every amount the planner
+   *  computes is converted through this — treating a row as one line is
+   *  exactly the assumption that made each list oscillate in turn (tall
+   *  accounts, wrapped activity details, wrapped model ids). */
+  avgRow: number;
+  /** Grow one row per step instead of filling the slack — for lists whose
+   *  row heights vary so wildly that even the average misleads. */
+  growOne?: boolean;
+}
+
+export interface FitAttempt { to: number; slack: number; expiresAt?: number; count?: number }
+
+/** Cross-commit memory: the growth attempted last step, and growths that
+ *  overflowed (denied) together with the slack they would actually need. */
+export interface FitMemory {
+  attempts: Record<string, FitAttempt | undefined>;
+  denials: Record<string, FitAttempt | undefined>;
+}
+
+/**
+ * How long a denied growth stays denied. A denial is measured against
+ * concrete rendered row heights, and those can change through ordinary data
+ * updates the reset key cannot enumerate (an account gaining or losing
+ * capacity rows, a scrolled window showing different entries). Expiry is the
+ * general cure: a stale denial costs at most one clipped grow/shrink pair
+ * per TTL — invisible under the frame bound — instead of a list that stays
+ * collapsed until an unrelated resize.
+ */
+export const FIT_DENIAL_TTL_MS = 2_500;
+
+/**
+ * One reallocation step for the height-fitting controller. `excess` is the
+ * measured content height minus the viewport budget: positive shrinks lists
+ * in array order until covered; negative (slack) grows exactly ONE list —
+ * the last eligible in the array — so a single mispredicted growth can be
+ * attributed, denied, and refined rather than compounding.
+ *
+ * Denial rule: a growth whose commit overflows is remembered with the slack
+ * it actually needs (the slack it had plus the overflow it caused) and is
+ * not retried below that; the next attempt steps DOWN from the denied
+ * target. Targets only ever decrease under denial, so refinement
+ * terminates. Callers reset the memory whenever row heights may have
+ * changed (viewport, fleet, or data identity).
+ */
+export function planViewportFit(
+  excess: number,
+  lists: FitList[],
+  memory: FitMemory,
+  now = 0,
+): Record<string, number> {
+  const targets: Record<string, number> = {};
+  // An expired denial stops CLAMPING but is not forgotten: its retry count
+  // must survive the lapse, or the escalating backoff restarts at the base
+  // TTL on every re-denial and a permanently tall hidden row gets probed
+  // every few seconds forever. The record is deleted only when a retried
+  // growth finally fits (geometry improved) or the caller resets the memory.
+  const activeDenial = (key: string): FitAttempt | undefined => {
+    const denied = memory.denials[key];
+    return denied && (denied.expiresAt === undefined || denied.expiresAt > now) ? denied : undefined;
+  };
+
+  if (excess > 0) {
+    for (const list of lists) {
+      const attempt = memory.attempts[list.key];
+      if (attempt && attempt.to === list.current) {
+        // Re-denials escalate the TTL (capped at a minute): a hidden row that
+        // stays tall would otherwise be probed every TTL forever, while one
+        // that changed shape is picked up on the next expiry. The count
+        // continues from ANY prior denial of this list — including a lapsed
+        // one, and regardless of the target (the frontier is monotone while
+        // active, so a different target means a lapse happened in between).
+        const count = (memory.denials[list.key]?.count ?? 0) + 1;
+        memory.denials[list.key] = {
+          to: attempt.to,
+          slack: attempt.slack + excess,
+          count,
+          expiresAt: now + Math.min(60_000, FIT_DENIAL_TTL_MS * 2 ** (count - 1)),
+        };
+      }
+      delete memory.attempts[list.key];
+    }
+    let remaining = excess;
+    for (const list of lists) {
+      if (remaining <= 0) break;
+      const drop = Math.min(list.current - list.min, Math.ceil(remaining / list.avgRow));
+      if (drop > 0) {
+        targets[list.key] = list.current - drop;
+        remaining = Math.max(0, remaining - drop * list.avgRow);
+      }
+    }
+    return targets;
+  }
+
+  for (const list of lists) {
+    // A standing attempt in the fitting branch means last commit's growth
+    // fit. That disproves a denial only when the growth reached the denied
+    // target — a smaller growth fitting says nothing about the larger one,
+    // and resetting on it would let the denied target be retried in a loop.
+    const attempt = memory.attempts[list.key];
+    const denied = memory.denials[list.key];
+    if (attempt && denied && attempt.to >= denied.to) delete memory.denials[list.key];
+    delete memory.attempts[list.key];
+  }
+  const slack = -excess;
+  for (let i = lists.length - 1; i >= 0; i--) {
+    const list = lists[i];
+    if (list.current >= list.max) continue;
+    // The slack alone may not cover this list's growth gate after a
+    // lower-priority list absorbed it (e.g. logs grew while an account
+    // growth was denied). A higher-priority growth may RECLAIM budget by
+    // shrinking lower-priority lists in the same step — without this, an
+    // expired denial finds no slack left and the list stays collapsed.
+    const unitCost = Math.max(1, Math.ceil(list.avgRow));
+    const gate = list.growOne ? unitCost + 1 : 2;
+    let usable = slack;
+    const funding: Array<{ key: string; to: number }> = [];
+    if (usable < gate) {
+      if (i === 0) continue; // no lower-priority lists to fund from — the gate stands
+      // Fund one row's ACTUAL cost, not the gate: the +1 hysteresis margin
+      // applies only to free-slack growth — a funded growth is protected
+      // from flapping by the denial memory, and demanding the margin here
+      // made a growth permanently unfundable when lower-priority lists
+      // could yield exactly the row's height and nothing more.
+      let deficit = unitCost - usable;
+      for (let j = 0; j < i && deficit > 0; j++) {
+        const funder = lists[j];
+        const dropMax = funder.current - funder.min;
+        if (dropMax <= 0) continue;
+        const drop = Math.min(dropMax, Math.ceil(deficit / funder.avgRow));
+        funding.push({ key: funder.key, to: funder.current - drop });
+        deficit -= drop * funder.avgRow;
+      }
+      if (deficit > 0) continue; // cannot fund this growth — try lower priority
+      usable = Math.max(usable, unitCost);
+    }
+    let target = list.growOne
+      ? list.current + 1
+      : Math.min(list.max, list.current + Math.max(1, Math.floor((usable - 1) / list.avgRow)));
+    const denied = activeDenial(list.key);
+    if (denied && usable < denied.slack) target = Math.min(target, denied.to - 1);
+    if (target <= list.current) continue; // denied or no room — funding is discarded
+    for (const fund of funding) targets[fund.key] = fund.to;
+    memory.attempts[list.key] = { to: target, slack: usable };
+    targets[list.key] = target;
+    break;
+  }
+  return targets;
+}
+
+/**
+ * Current terminal size, tracking resizes. rows/columns are 0 when unknown.
+ *
+ * Columns matter even where only rows is consumed: a width-only resize
+ * re-wraps text and changes the RENDERED height without changing the row
+ * count, and the fitting effect only runs on a React commit. Bailing out
+ * when rows is unchanged would leave the freshly wrapped, taller frame
+ * unmeasured until the next poll — reintroducing the scroll jump this hook
+ * exists to prevent.
+ */
+function useTerminalViewport(): { rows: number; columns: number } {
+  const { stdout } = useStdout();
+  const [viewport, setViewport] = useState({
+    rows: stdout?.rows ?? 0,
+    columns: stdout?.columns ?? 0,
+  });
+  useEffect(() => {
+    if (!stdout) return;
+    const onResize = () => setViewport(prev => {
+      const rows = stdout.rows ?? 0;
+      const columns = stdout.columns ?? 0;
+      return prev.rows === rows && prev.columns === columns ? prev : { rows, columns };
+    });
+    stdout.on("resize", onResize);
+    onResize();
+    return () => { stdout.off("resize", onResize); };
+  }, [stdout]);
+  return viewport;
+}
+
 interface HealthData {
   status: "ok" | "degraded";
+  /** Version of the code the daemon is running. Absent on daemons built
+   *  before the field existed — which itself proves they are outdated. */
+  version?: string;
   mode: string;
   target: string;
   operational?: OperationalStatus;
@@ -68,6 +707,7 @@ interface OperationalStatus {
   providers: {
     anthropic: ProviderOperationalStatus;
     openai: ProviderOperationalStatus;
+    xai?: ProviderOperationalStatus;
   };
   endpoints: {
     health: string;
@@ -137,6 +777,26 @@ export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps
     if (!data && (input === "q" || key.escape)) exit();
   });
 
+  // Live Grok plan name / code-access, refreshed on a slow cadence and merged
+  // synchronously into each 2s health poll — so the plan shows without a
+  // /v1/user round-trip every tick. Undefined until the first fetch lands, at
+  // which point `mergeGrokIntoHealth` falls back to its access-token tier.
+  const grokSnapshotsRef = useRef<GrokAccountSnapshot[] | undefined>(undefined);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const snapshots = await loadGrokHealthSnapshotsWithSubscription();
+        if (!cancelled) grokSnapshotsRef.current = snapshots;
+      } catch {
+        // Keep the last known snapshots; the poll degrades to the tier fallback.
+      }
+    };
+    refresh();
+    const timer = setInterval(refresh, GROK_SUBSCRIPTION_INTERVAL_MS);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -153,7 +813,7 @@ export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps
         });
         if (cancelled) return;
         if (res.ok) {
-          setData(await res.json() as HealthData);
+          setData(mergeGrokIntoHealth(await res.json() as HealthData, grokSnapshotsRef.current));
           setConnectError(null);
           setLastUpdate(Date.now());
           setRetryCount(0);
@@ -224,14 +884,37 @@ function LiveDashboard({
   data: HealthData; port: number; baseUrl: string; lastUpdate: number;
   api: AccountsApi; modelsApi: ModelsApi; onIntent?: (intent: "quit" | "addAccount") => void;
 }) {
+  const [cliRouting, setCliRouting] = useState(() => ({
+    claude: readClaudeRouting(),
+    codex: readCodexRouting(),
+  }));
+  const refreshCliRouting = useCallback(() => {
+    setCliRouting({
+      claude: readClaudeRouting(),
+      codex: readCodexRouting(),
+    });
+  }, []);
+  useEffect(() => {
+    const timer = setInterval(refreshCliRouting, POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [refreshCliRouting]);
   const { exit } = useApp();
-  const healthyCount = data.accounts.filter(a => a.healthy).length;
-  const updatedAgo = Math.round((Date.now() - lastUpdate) / 1000);
+  const orderedAccounts = orderAccountsForDashboard(data.accounts);
+  const healthyCount = orderedAccounts.filter(a => a.healthy).length;
+  // Fleet-wide weekly-cap rollup surfaced in the always-visible ACCOUNTS title,
+  // so the "N 7d full" signal is legible at a glance even when a provider group
+  // is scrolled out of the account window (or TOTALS is hidden in compact view).
+  const weeklyFullCount = orderedAccounts.filter(isWeeklyLimited).length;
   const logs = data.recentLogs;
 
   // ── Focus / mode ──────────────────────────────────────────────────────────
   const [focus, setFocus] = useState<Focus>("logs");
   const [mode, setMode] = useState<Mode>("view");
+  // Compact ("zen") view: hides TOTALS + RECENT ACTIVITY so the account list
+  // gets the whole vertical budget — the fix for a short terminal starving a
+  // long fleet (e.g. showing 1 of 11 accounts). Toggled with [z], view-only,
+  // never touches the default layout's carefully-tuned fit.
+  const [compact, setCompact] = useState(false);
 
   // Selected log by timestamp (existing)
   const [selectedTs, setSelectedTs] = useState<number | null>(null);
@@ -239,13 +922,117 @@ function LiveDashboard({
     ? Math.max(0, logs.findIndex(l => l.ts === selectedTs))
     : 0;
 
-  // Selected account by id
+  // ── Viewport fitting ──────────────────────────────────────────────────────
+  // The frame must fit the terminal or Ink cannot erase it between polls (see
+  // LOG_VISIBLE above). Two mechanisms cooperate:
+  //
+  // 1. A HARD bound applied synchronously from the terminal height on the
+  //    outer box — every commit is clipped at the bottom, so no settling
+  //    step, resize, or content growth can ever emit an oversized frame.
+  //    (One row of slack: a frame of exactly `rows` lines still scrolls by
+  //    one when the cursor advances past the last line.)
+  // 2. A post-render controller that measures the natural content height and
+  //    reallocates the two windowed lists so the clip normally has nothing to
+  //    cut: the activity list shrinks first (to MIN_LOG_VISIBLE), then the
+  //    accounts window (to one account). Growth is stepped and hysteretic so
+  //    variable-height rows cannot oscillate the layout.
+  const { rows: terminalRows, columns: terminalColumns } = useTerminalViewport();
+  const frameBound = terminalRows > 0 ? terminalRows - 1 : undefined;
+  const [logVisible, setLogVisible] = useState(MIN_LOG_VISIBLE);
+  const [accountsVisible, setAccountsVisible] = useState(Number.MAX_SAFE_INTEGER);
+  const [modelsVisible, setModelsVisible] = useState(MODEL_VISIBLE_ROWS);
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
+  const shownAccounts = Math.max(1, Math.min(accountsVisible, orderedAccounts.length || 1));
+  const contentRef = useRef<DOMElement>(null);
+  const accountRowsRef = useRef<DOMElement>(null);
+  const logRowsRef = useRef<DOMElement>(null);
+  const modelRowsRef = useRef<DOMElement>(null);
+  // Growing the accounts window estimates the NEXT (hidden, unmeasurable)
+  // row's height from the average of the visible ones. When that account is
+  // much taller than average, the growth overflows and is removed again —
+  // and without memory the same growth is retried every commit, forever
+  // (hundreds of repaints per second). A denied growth is remembered with
+  // the slack it would actually need (the slack it had plus the overflow it
+  // caused) and not retried below that; the memory resets when the
+  // viewport or the fleet changes, since either can change row heights.
+  const fitMemoryRef = useRef<FitMemory>({ attempts: {}, denials: {} });
+  const fitKeyRef = useRef("");
+  useEffect(() => {
+    // Denials are measured against concrete row heights, so the memory
+    // resets whenever those visibly change: viewport size, fleet size, model
+    // count, or the newest activity entry (new rows wrap differently).
+    // Deliberately NOT part of the key: the window offsets. They derive from
+    // the visible counts, so with a selection at the end of a list a
+    // controller-driven grow/shrink shifts them — keying on them wiped the
+    // pending attempt on the very commit that should have recorded the
+    // denial, re-enabling the grow/shrink oscillation. Geometry drift from
+    // scrolling (like every other content mutation the key cannot see) is
+    // covered by the denial TTL instead.
+    const fitKey = `${terminalRows}:${terminalColumns}:${orderedAccounts.length}:${modelsStatus?.models.length ?? 0}:${logs[0]?.ts ?? 0}:${compact}`;
+    if (fitKeyRef.current !== fitKey) {
+      fitKeyRef.current = fitKey;
+      fitMemoryRef.current = { attempts: {}, denials: {} };
+    }
+    if (frameBound === undefined) {
+      if (logVisible !== LOG_VISIBLE) setLogVisible(LOG_VISIBLE);
+      if (accountsVisible !== Number.MAX_SAFE_INTEGER) setAccountsVisible(Number.MAX_SAFE_INTEGER);
+      if (modelsVisible !== MODEL_VISIBLE_ROWS) setModelsVisible(MODEL_VISIBLE_ROWS);
+      return;
+    }
+    const modelsPanelOpen = focus === "models" || modelsStatus !== null;
+    const contentH = contentRef.current ? measureElement(contentRef.current).height : 0;
+    const accountsH = accountRowsRef.current ? measureElement(accountRowsRef.current).height : 0;
+    const logsH = logRowsRef.current ? measureElement(logRowsRef.current).height : 0;
+    const modelsH = modelRowsRef.current ? measureElement(modelRowsRef.current).height : 0;
+    const shownLogs = Math.min(logVisible, logs.length);
+    const shownModels = Math.min(modelsVisible, modelsStatus?.models.length ?? 0);
+
+    // Shrink priority order; growth walks it in reverse, so the models panel
+    // (the active surface while open) regrows first and the activity list
+    // last. Every list goes through the same measured-average + denial
+    // mechanics — each list got its own oscillation bug while the paths were
+    // separate (tall accounts, wrapped activity details, wrapped model ids).
+    const lists: FitList[] = [
+      // In compact view the activity list is not rendered, so it must not
+      // compete for rows — dropping it here hands the whole budget to accounts.
+      ...(compact ? [] : [{
+        key: "logs", current: logVisible, min: MIN_LOG_VISIBLE, max: LOG_VISIBLE,
+        avgRow: shownLogs > 0 ? Math.max(1, logsH / shownLogs) : 1,
+      }]),
+      {
+        key: "accounts", current: shownAccounts, min: 1, max: Math.max(1, orderedAccounts.length), growOne: true,
+        avgRow: shownAccounts > 0 ? Math.max(1, accountsH / shownAccounts) : 2,
+      },
+      ...(modelsPanelOpen ? [{
+        key: "models", current: modelsVisible, min: MIN_MODELS_VISIBLE, max: MODEL_VISIBLE_ROWS,
+        avgRow: shownModels > 0 ? Math.max(1, modelsH / shownModels) : 1,
+      }] : []),
+    ];
+    const targets = planViewportFit(contentH - frameBound, lists, fitMemoryRef.current, Date.now());
+    if (targets["logs"] !== undefined) setLogVisible(targets["logs"]);
+    if (targets["accounts"] !== undefined) setAccountsVisible(targets["accounts"]);
+    if (targets["models"] !== undefined) setModelsVisible(targets["models"]);
+  });
+
+  // First visible activity row. The stored position only moves on navigation;
+  // the derived value re-clamps every render because the selection is
+  // timestamp-anchored — new entries arriving between keypresses can push the
+  // selected row out of the stored window, and it must stay visible anyway.
+  const [logScrollTop, setLogScrollTop] = useState(0);
+  const logWindowTop = followScrollWindow(logScrollTop, selectedLogIndex, logs.length, logVisible);
+
+
   const selectedAccountIndex = selectedAccountId !== null
-    ? Math.max(0, data.accounts.findIndex(a => a.id === selectedAccountId))
+    ? Math.max(0, orderedAccounts.findIndex(a => a.id === selectedAccountId))
     : 0;
-  const selectedAccount = data.accounts[selectedAccountIndex] ?? null;
-  const selectedAccountIsAnthropic = selectedAccount?.provider !== "openai_subscription";
+  const selectedAccount = orderedAccounts[selectedAccountIndex] ?? null;
+
+  // Same follow-scroll for the accounts window: when the fitting controller
+  // shrinks the list below the fleet size, the selected account must stay on
+  // screen — account actions (caps, toggle, delete confirmation) target the
+  // selection, and acting on an invisible account is how a wrong one dies.
+  const [accountScrollTop, setAccountScrollTop] = useState(0);
+  const accountWindowTop = followScrollWindow(accountScrollTop, selectedAccountIndex, orderedAccounts.length, shownAccounts);
 
   const [modelsStatus, setModelsStatus] = useState<ModelsStatus | null>(null);
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
@@ -286,10 +1073,15 @@ function LiveDashboard({
   };
 
   // ── Async helpers (fire-and-forget with error → banner) ──────────────────
+  // Provider-agnostic: `PATCH /cc-router/accounts/:id` applies `enabled` to
+  // OpenAI accounts through the same transaction contract as Claude ones, and
+  // drops their sticky bindings on disable. The cap keys below never had a
+  // provider check; this one was left behind after the endpoint gained OpenAI
+  // support, so the dashboard was refusing an operation the server had.
   const doToggleEnabled = useCallback(async () => {
     if (!selectedAccount) return;
-    if (selectedAccount.provider === "openai_subscription") {
-      showBanner("OpenAI accounts are managed from the CLI", "yellow");
+    if (isXaiAccount(selectedAccount)) {
+      showBanner("Grok is read-only here — use grok login / grok logout", "yellow");
       return;
     }
     const newValue = !(selectedAccount.enabled !== false);
@@ -301,11 +1093,17 @@ function LiveDashboard({
     }
   }, [selectedAccount, api, showBanner]);
 
-  const doToggleProvider = useCallback(async (provider: "anthropic_subscription" | "openai_subscription") => {
+  const doToggleProvider = useCallback(async (
+    provider: "anthropic_subscription" | "openai_subscription" | "xai_subscription",
+  ) => {
     const providerStatus = provider === "anthropic_subscription"
       ? data.operational?.providers.anthropic
-      : data.operational?.providers.openai;
-    const label = provider === "anthropic_subscription" ? "Claude" : "OpenAI";
+      : provider === "openai_subscription"
+        ? data.operational?.providers.openai
+        : data.operational?.providers.xai;
+    const label = provider === "anthropic_subscription" ? "Claude"
+      : provider === "openai_subscription" ? "OpenAI"
+        : "Grok";
     if (!providerStatus?.configured || providerStatus.accounts === 0) {
       showBanner(`${label} accounts are not configured`, "yellow");
       return;
@@ -322,10 +1120,6 @@ function LiveDashboard({
 
   const doSetLimit = useCallback(async (field: "sessionLimitPercent" | "weeklyLimitPercent", value: number) => {
     if (!selectedAccount) return;
-    if (selectedAccount.provider === "openai_subscription") {
-      showBanner("OpenAI accounts do not use Anthropic caps", "yellow");
-      return;
-    }
     try {
       await api.patch(selectedAccount.id, { [field]: value });
       const label = field === "sessionLimitPercent" ? "5h cap" : "7d cap";
@@ -337,10 +1131,6 @@ function LiveDashboard({
 
   const doDelete = useCallback(async () => {
     if (!selectedAccount) return;
-    if (selectedAccount.provider === "openai_subscription") {
-      showBanner("Use cc-router accounts remove for OpenAI accounts", "yellow");
-      return;
-    }
     try {
       await api.remove(selectedAccount.id);
       showBanner(`Removed ${selectedAccount.id}`, "yellow");
@@ -361,6 +1151,23 @@ function LiveDashboard({
       showBanner(`Models error: ${errMsg(err)}`, "red");
     }
   }, [modelsApi, showBanner]);
+
+  const doToggleCli = useCallback((target: "claude" | "codex") => {
+    const current = target === "claude" ? cliRouting.claude.enabled : cliRouting.codex.enabled;
+    const result = target === "claude"
+      ? setClaudeRouting(!current)
+      : setCodexRouting(!current);
+    refreshCliRouting();
+    const label = target === "claude" ? "Claude CLI" : "Codex CLI";
+    if (!result.changed) {
+      showBanner(`${label} already ${result.enabled ? "on" : "off"}`, "gray");
+      return;
+    }
+    showBanner(
+      `${label} → ${result.enabled ? "proxy" : "native"}  (restart the CLI to pick up)`,
+      result.enabled ? "green" : "yellow",
+    );
+  }, [cliRouting, refreshCliRouting, showBanner]);
 
   const doSetSelectedModel = useCallback(async (provider: "claude" | "openai") => {
     if (!selectedModel) return;
@@ -443,6 +1250,8 @@ function LiveDashboard({
     }
 
     if (key.tab) {
+      // Compact view hides the activity list, so skip "logs" in the cycle.
+      if (compact) { setFocus(f => f === "models" ? "accounts" : "models"); return; }
       setFocus(f => f === "logs" ? "accounts" : f === "accounts" ? "models" : "logs");
       return;
     }
@@ -452,37 +1261,56 @@ function LiveDashboard({
       if (key.upArrow) {
         const next = Math.max(0, selectedLogIndex - 1);
         setSelectedTs(logs[next]?.ts ?? null);
+        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, logVisible));
       }
       if (key.downArrow) {
         const next = Math.min(logs.length - 1, selectedLogIndex + 1);
         setSelectedTs(logs[next]?.ts ?? null);
+        setLogScrollTop(followScrollWindow(logWindowTop, next, logs.length, logVisible));
       }
     }
 
     if (focus === "accounts") {
       if (key.upArrow) {
         const next = Math.max(0, selectedAccountIndex - 1);
-        setSelectedAccountId(data.accounts[next]?.id ?? null);
+        setSelectedAccountId(orderedAccounts[next]?.id ?? null);
+        setAccountScrollTop(followScrollWindow(accountWindowTop, next, orderedAccounts.length, shownAccounts));
       }
       if (key.downArrow) {
-        const next = Math.min(data.accounts.length - 1, selectedAccountIndex + 1);
-        setSelectedAccountId(data.accounts[next]?.id ?? null);
+        const next = Math.min(orderedAccounts.length - 1, selectedAccountIndex + 1);
+        setSelectedAccountId(orderedAccounts[next]?.id ?? null);
+        setAccountScrollTop(followScrollWindow(accountWindowTop, next, orderedAccounts.length, shownAccounts));
       }
 
       // Account actions (only when focus = accounts)
       if (input === "e") { void doToggleEnabled(); return; }
       if (input === "a") { void doToggleProvider("anthropic_subscription"); return; }
       if (input === "o") { void doToggleProvider("openai_subscription"); return; }
+      if (input === "g") { void doToggleProvider("xai_subscription"); return; }
       if (input === "w") {
-        if (!selectedAccountIsAnthropic) { showBanner("OpenAI accounts do not use Anthropic caps", "yellow"); return; }
+        if (selectedAccount && isXaiAccount(selectedAccount)) {
+          showBanner("Grok has no 7d cap in cc-router", "yellow");
+          return;
+        }
         setMode("editWeekly"); setEditBuffer(""); return;
       }
       if (input === "s") {
-        if (!selectedAccountIsAnthropic) { showBanner("OpenAI accounts do not use Anthropic caps", "yellow"); return; }
+        if (selectedAccount && isXaiAccount(selectedAccount)) {
+          showBanner("Grok has no 5h cap in cc-router", "yellow");
+          return;
+        }
         setMode("editSession"); setEditBuffer(""); return;
       }
+      // Also provider-agnostic: `DELETE /cc-router/accounts/:id` removes an
+      // OpenAI account through `deleteOpenAIAccountTransaction`, which is the
+      // same path `cc-router accounts remove` reaches. Sending the operator to
+      // the CLI for something the dashboard can do was left over from before
+      // that existed.
       if (input === "d") {
-        if (!selectedAccountIsAnthropic) { showBanner("Use cc-router accounts remove for OpenAI accounts", "yellow"); return; }
+        if (selectedAccount && isXaiAccount(selectedAccount)) {
+          showBanner("Grok accounts live in ~/.grok — run grok logout", "yellow");
+          return;
+        }
         setMode("confirmDelete"); return;
       }
     }
@@ -501,8 +1329,23 @@ function LiveDashboard({
       if (input === "o") { void doSetSelectedModel("openai"); return; }
     }
 
+    // CLI routing toggles — [c] is model-default only while MODELS is focused.
+    if (input === "c" && focus !== "models") { doToggleCli("claude"); return; }
+    if (input === "x") { doToggleCli("codex"); return; }
+
     if (input === "m") {
       void doLoadModels();
+      return;
+    }
+
+    // z = compact view — hide TOTALS + RECENT ACTIVITY so the account list
+    // gets the freed rows. On small terminals this is the difference between
+    // "showing 1–1" and the full fleet. Move focus off the (now hidden) logs.
+    if (input === "z") {
+      const next = !compact;
+      setCompact(next);
+      if (next && focus === "logs") setFocus("accounts");
+      showBanner(next ? "Compact on — activity & totals hidden" : "Compact off", "cyan");
       return;
     }
 
@@ -516,9 +1359,11 @@ function LiveDashboard({
   });
 
   const selectedLog = logs[selectedLogIndex] ?? null;
-  const visibleLogs = logs.slice(0, LOG_VISIBLE);
+  const visibleLogs = logs.slice(logWindowTop, logWindowTop + logVisible);
 
   return (
+    <Box flexDirection="column" height={frameBound} overflowY="hidden">
+    <Box flexDirection="column" flexShrink={0} ref={contentRef}>
     <Box flexDirection="column">
 
       {/* ── Header bar ── */}
@@ -526,16 +1371,86 @@ function LiveDashboard({
         <Text bold color="cyan"> CC-Router </Text>
         <Text color="gray">· </Text>
         <Text color="green">{data.mode}</Text>
-        <Text color="gray"> → {data.target}  · </Text>
+        <Text color="gray">  ·  </Text>
         <Text>up {formatUptime(data.uptime)}</Text>
-        <Text color="gray">  ·  updated {updatedAgo}s ago  ·  [q] quit</Text>
+        <Text color="gray">  ·  </Text>
+        <Text color="cyan">{data.totalRequests}</Text>
+        <Text color="gray"> req  </Text>
+        <Text color={data.totalErrors > 0 ? "red" : "green"}>{data.totalErrors}</Text>
+        <Text color="gray"> err</Text>
+        <CacheHealthBadge
+          read={data.totalCacheReadTokens}
+          created={data.totalCacheCreationTokens}
+          input={data.totalInputTokens}
+        />
+        <Text color="gray">  ·  [q] quit</Text>
       </Box>
+
+      {/* ── Inline prompt (edit / confirm) ──
+          Directly under the header bar, above EVERYTHING else: these prompts
+          arm keyboard input (`y` deletes), and any placement further down
+          can end up below the viewport clip in a short pane — an armed,
+          invisible destructive confirmation. Here they are visible in any
+          pane of three rows or more. */}
+      {mode === "editWeekly" && selectedAccount && (
+        <Box paddingLeft={2}>
+          <Text color="cyan">Set 7d cap for </Text>
+          <Text color="white" bold>{selectedAccount.id}</Text>
+          <Text color="cyan"> (0–100%): </Text>
+          <Text color="white" bold>{editBuffer}</Text>
+          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
+        </Box>
+      )}
+      {mode === "editSession" && selectedAccount && (
+        <Box paddingLeft={2}>
+          <Text color="cyan">Set 5h cap for </Text>
+          <Text color="white" bold>{selectedAccount.id}</Text>
+          <Text color="cyan"> (0–100%): </Text>
+          <Text color="white" bold>{editBuffer}</Text>
+          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
+        </Box>
+      )}
+      {mode === "confirmDelete" && selectedAccount && (
+        <Box paddingLeft={2}>
+          <Text color="red" bold>Delete "{selectedAccount.id}"?  [y] yes  [n/Esc] cancel</Text>
+        </Box>
+      )}
+
+      {/* A daemon left running by a service manager can be a different build
+          than the CLI rendering this dashboard — launchd keeps the old
+          versioned install path alive across package upgrades. Every log row
+          and account view below comes from THAT build, so any "still broken"
+          reading of this screen is wrong until the daemon is restarted.
+          `--keep-config` keeps the stop non-interactive (a bare stop prompts
+          about auto-start mid-chain); the following start re-installs the
+          service definition, which is what actually drops the pinned path. */}
+      {data.version !== DASHBOARD_VERSION && (
+        <Box>
+          <Text bold color="yellow"> ⚠ VERSION MISMATCH  </Text>
+          <Text color="yellow">
+            {data.version !== undefined
+              ? `daemon v${data.version}`
+              : "daemon version unreported (older build)"}
+            {` · dashboard v${DASHBOARD_VERSION}`}
+          </Text>
+          {LOCAL_TARGET_RE.test(baseUrl) ? (
+            <>
+              <Text color="gray">  —  restart: </Text>
+              <Text color="cyan">cc-router stop --keep-config && cc-router start</Text>
+            </>
+          ) : (
+            // A remote router can only be restarted where it runs; printing a
+            // local restart command here would never clear the banner.
+            <Text color="gray">  —  update and restart the daemon on {baseUrl}</Text>
+          )}
+        </Box>
+      )}
 
       <Box marginTop={1} />
 
       {data.operational && (
         <>
-          <OperationsPanel operational={data.operational} baseUrl={baseUrl} focus={focus} />
+          <OperationsPanel operational={data.operational} baseUrl={baseUrl} focus={focus} cliRouting={cliRouting} />
           <Box marginTop={1} />
         </>
       )}
@@ -546,6 +1461,8 @@ function LiveDashboard({
             status={modelsStatus}
             selectedIndex={selectedModelIndex}
             focused={focus === "models"}
+            visibleRows={modelsVisible}
+            rowsRef={modelRowsRef}
           />
           <Box marginTop={1} />
         </>
@@ -556,51 +1473,29 @@ function LiveDashboard({
         <Box>
           <Text bold>
             {" ACCOUNTS  "}
-            <Text color={healthyCount === data.accounts.length ? "green" : "yellow"}>
-              {healthyCount}/{data.accounts.length} healthy
+            <Text color={healthyCount === orderedAccounts.length ? "green" : "yellow"}>
+              {healthyCount}/{orderedAccounts.length} healthy
             </Text>
+            {weeklyFullCount > 0 && <Text color="red">{`  ·  ${weeklyFullCount} 7d full`}</Text>}
           </Text>
-          <Text color="gray">{"   "}</Text>
-          <Text color={focus === "accounts" ? "white" : "gray"}>
-            [Tab] focus  [e] toggle  [a] Claude all  [o] OpenAI all  [w] 7d cap  [s] 5h cap  [n] add  [d] delete
-          </Text>
+          {shownAccounts < orderedAccounts.length && (
+            <Text color="gray">
+              {"  ·  showing "}{accountWindowTop + 1}–{accountWindowTop + shownAccounts}
+            </Text>
+          )}
+          {compact && <Text color="cyan">{"  ·  compact"}</Text>}
         </Box>
 
-        <Box marginTop={1} flexDirection="column">
-          {data.accounts.map((a, i) => (
-            <AccountRow
-              key={a.id}
-              account={a}
-              selected={focus === "accounts" && i === selectedAccountIndex}
-            />
-          ))}
+        <Box marginTop={1} flexDirection="column" ref={accountRowsRef}>
+          <AccountGroups
+            visible={orderedAccounts.slice(accountWindowTop, accountWindowTop + shownAccounts)}
+            fleet={orderedAccounts}
+            windowTop={accountWindowTop}
+            selectedIndex={selectedAccountIndex}
+            focused={focus === "accounts"}
+          />
         </Box>
       </Box>
-
-      {/* ── Inline prompt (edit / confirm) ── */}
-      {mode === "editWeekly" && selectedAccount && (
-        <Box marginTop={1} paddingLeft={2}>
-          <Text color="cyan">Set 7d cap for </Text>
-          <Text color="white" bold>{selectedAccount.id}</Text>
-          <Text color="cyan"> (0–100%): </Text>
-          <Text color="white" bold>{editBuffer}</Text>
-          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
-        </Box>
-      )}
-      {mode === "editSession" && selectedAccount && (
-        <Box marginTop={1} paddingLeft={2}>
-          <Text color="cyan">Set 5h cap for </Text>
-          <Text color="white" bold>{selectedAccount.id}</Text>
-          <Text color="cyan"> (0–100%): </Text>
-          <Text color="white" bold>{editBuffer}</Text>
-          <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
-        </Box>
-      )}
-      {mode === "confirmDelete" && selectedAccount && (
-        <Box marginTop={1} paddingLeft={2}>
-          <Text color="red" bold>Delete "{selectedAccount.id}"?  [y] yes  [n/Esc] cancel</Text>
-        </Box>
-      )}
 
       {/* ── Banner (transient action feedback) ── */}
       {banner && (
@@ -609,111 +1504,116 @@ function LiveDashboard({
         </Box>
       )}
 
-      <Box marginTop={1} />
+      {/* ── Totals + activity title (hidden in compact view) ── */}
+      {!compact && (
+        <>
+          <Box marginTop={1} />
 
-      {/* ── Totals ── */}
-      <Box flexDirection="column">
-        <Box>
-          <Text bold> TOTALS  </Text>
-          <Text>requests </Text>
-          <Text color="cyan">{data.totalRequests}</Text>
-          <Text color="gray">  ·  </Text>
-          <Text>errors </Text>
-          <Text color={data.totalErrors > 0 ? "red" : "green"}>{data.totalErrors}</Text>
-          <Text color="gray">  ·  </Text>
-          <Text>refreshes </Text>
-          <Text color="yellow">{data.totalRefreshes}</Text>
-          <CacheHealthBadge
-            read={data.totalCacheReadTokens}
-            created={data.totalCacheCreationTokens}
-            input={data.totalInputTokens}
-          />
-        </Box>
-        <TokenSummary
-          cacheRead={data.totalCacheReadTokens}
-          cacheCreated={data.totalCacheCreationTokens}
-          uncached={data.totalInputTokens}
-          output={data.totalOutputTokens ?? 0}
-        />
-      </Box>
+          {/* ── Totals ── */}
+          <Box flexDirection="column">
+            <Box>
+              <Text bold> TOTALS  </Text>
+              <Text>requests </Text>
+              <Text color="cyan">{data.totalRequests}</Text>
+              <Text color="gray">  ·  </Text>
+              <Text>errors </Text>
+              <Text color={data.totalErrors > 0 ? "red" : "green"}>{data.totalErrors}</Text>
+              <Text color="gray">  ·  </Text>
+              <Text>refreshes </Text>
+              <Text color="yellow">{data.totalRefreshes}</Text>
+              <CacheHealthBadge
+                read={data.totalCacheReadTokens}
+                created={data.totalCacheCreationTokens}
+                input={data.totalInputTokens}
+              />
+            </Box>
+            <TokenSummary
+              cacheRead={data.totalCacheReadTokens}
+              cacheCreated={data.totalCacheCreationTokens}
+              uncached={data.totalInputTokens}
+              output={data.totalOutputTokens ?? 0}
+            />
+          </Box>
 
-      <Box marginTop={1} />
+          <Box marginTop={1} />
 
-      {/* ── Recent activity ── */}
-      <Box flexDirection="column">
-        <Text bold> RECENT ACTIVITY</Text>
-        <Box marginTop={1} flexDirection="column">
+          {/* ── Recent activity (title measures as "above", rows flex) ── */}
+          <Text bold> RECENT ACTIVITY</Text>
+          <Box marginTop={1} />
+        </>
+      )}
+    </Box>
+
+      {!compact && (
+        <Box flexDirection="column" ref={logRowsRef}>
           {visibleLogs.length === 0
             ? <Text color="gray">  No activity yet</Text>
             : visibleLogs.map((log, i) => (
-                <LogRow key={`${log.ts}-${i}`} log={log} selected={focus === "logs" && i === selectedLogIndex} />
+                <LogRow key={`${log.ts}-${i}`} log={log} selected={focus === "logs" && logWindowTop + i === selectedLogIndex} />
               ))
           }
         </Box>
-      </Box>
-
-      {/* ── Detail panel ── */}
-      {focus === "logs" && selectedLog && (
-        <>
-          <Box marginTop={1} />
-          <DetailPanel log={selectedLog} />
-        </>
       )}
 
+      {/* ── Detail panel ── */}
+      {!compact && focus === "logs" && selectedLog && (
+        <Box flexDirection="column">
+          <Box marginTop={1} />
+          <DetailPanel log={selectedLog} />
+        </Box>
+      )}
+
+      <Box marginTop={1}>
+        <Text color="gray">
+          {focus === "accounts"
+            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [z] compact  [q]"
+            : focus === "models"
+              ? " [Tab]  [m/r] refresh  [c]/[o] default  [Esc] logs  [z] compact  [q]"
+              : " [Tab]  [m] models  [z] compact  [q] quit"}
+        </Text>
+      </Box>
+
+    </Box>
     </Box>
   );
 }
 
-function OperationsPanel({ operational, baseUrl, focus }: { operational: OperationalStatus; baseUrl: string; focus: Focus }) {
+function OperationsPanel({ operational, baseUrl, focus, cliRouting }: {
+  operational: OperationalStatus;
+  baseUrl: string;
+  focus: Focus;
+  cliRouting: { claude: ClaudeRoutingStatus; codex: CodexRoutingStatus };
+}) {
   const authLabel = operational.auth.required ? "protected" : "open";
   const authColor = operational.auth.required ? "green" : "yellow";
   const claudeReady = operational.capabilities.anthropicMessages;
   const openAIReady = operational.capabilities.openAIResponses;
   const crossReady = operational.capabilities.crossProviderMessages;
-  const modelsReady = operational.capabilities.dynamicModels;
 
   return (
-    <Box flexDirection="column">
-      <Box>
-        <Text bold> OPERATIONS  </Text>
-        <Text color="gray">base </Text>
-        <Text color="cyan">{baseUrl}</Text>
-        <Text color="gray">  ·  auth </Text>
-        <Text color={authColor}>{authLabel}</Text>
-        <Text color="gray">  ·  models </Text>
-        <Text color={modelsReady ? "green" : "red"}>{modelsReady ? "dynamic" : "off"}</Text>
-      </Box>
-      <Box paddingLeft={2}>
-        <ProviderBadge label="Claude" status={operational.providers.anthropic} ready={claudeReady} />
-        <Text color="gray">  </Text>
-        <ProviderBadge label="OpenAI" status={operational.providers.openai} ready={openAIReady} />
-        <Text color="gray">  ·  cross-route </Text>
-        <Text color={crossReady ? "green" : "gray"}>{crossReady ? "ready" : "needs OpenAI"}</Text>
-      </Box>
-      <Box paddingLeft={2}>
-        <Text color="gray">endpoints </Text>
-        <Text color="white">{operational.endpoints.messages}</Text>
-        <Text color="gray"> </Text>
-        <Text color="white">{operational.endpoints.responses}</Text>
-        <Text color="gray"> </Text>
-        <Text color="white">{operational.endpoints.models}</Text>
-        <Text color="gray"> </Text>
-        <Text color="white">{operational.endpoints.accounts}</Text>
-      </Box>
-      <Box paddingLeft={2}>
-        <Text color="gray">routing </Text>
-        <Text color="white">claude={operational.routing.anthropicDefaultModel ?? "default"}</Text>
-        <Text color="gray"> aliases[{operational.routing.anthropicAliases.join(",") || "-"}]</Text>
-        <Text color="gray">  </Text>
-        <Text color="white">openai={operational.routing.openAIDefaultModel ?? "default"}</Text>
-        <Text color="gray"> aliases[{operational.routing.openAIAliases.join(",") || "-"}]</Text>
-      </Box>
-      <Box paddingLeft={2}>
-        <Text color="gray">models </Text>
-        <Text color={focus === "models" ? "white" : "cyan"}>[m] list/select</Text>
-        <Text color="gray">  change </Text>
-        <Text color={focus === "models" ? "white" : "cyan"}>[c] Claude [o] OpenAI</Text>
-      </Box>
+    <Box>
+      <Text bold> OPERATIONS  </Text>
+      <Text color="cyan">{baseUrl.replace(/^https?:\/\//, "")}</Text>
+      <Text color="gray">  ·  auth </Text>
+      <Text color={authColor}>{authLabel}</Text>
+      <Text color="gray">  ·  </Text>
+      <ProviderBadge label="Claude" status={operational.providers.anthropic} ready={claudeReady} />
+      <Text color="gray">  </Text>
+      <ProviderBadge label="ChatGPT" status={operational.providers.openai} ready={openAIReady} />
+      <Text color="gray">  </Text>
+      <ProviderBadge
+        label="Grok"
+        status={operational.providers.xai ?? { configured: false, accounts: 0, healthy: 0, enabled: 0 }}
+        ready={(operational.providers.xai?.healthy ?? 0) > 0}
+      />
+      {crossReady && <Text color="gray">  ·  cross-route</Text>}
+      <Text color="gray">  ·  cli </Text>
+      <Text color={cliRouting.claude.enabled ? "green" : "gray"}>C</Text>
+      <Text color="gray">/</Text>
+      <Text color={cliRouting.codex.enabled ? "green" : "gray"}>X</Text>
+      <Text color={focus === "models" ? "gray" : "cyan"}> [c]/[x]</Text>
+      <Text color="gray">  ·  </Text>
+      <Text color={focus === "models" ? "white" : "cyan"}>[m]</Text>
     </Box>
   );
 }
@@ -722,13 +1622,22 @@ function ModelsPanel({
   status,
   selectedIndex,
   focused,
+  visibleRows = MODEL_VISIBLE_ROWS,
+  rowsRef,
 }: {
   status: ModelsStatus | null;
   selectedIndex: number;
   focused: boolean;
+  /** Height-aware row budget from the fitting controller — the fixed
+   *  MODEL_VISIBLE_ROWS window could extend below the viewport clip while
+   *  [c]/[o] still applied the invisible selection. */
+  visibleRows?: number;
+  /** Measured by the fitting controller: wrapped model ids make a row taller
+   *  than one line, and unmeasured growth is how lists oscillate. */
+  rowsRef?: React.Ref<DOMElement>;
 }) {
   const models = status?.models ?? [];
-  const visible = getVisibleModelWindow(models, selectedIndex, MODEL_VISIBLE_ROWS);
+  const visible = getVisibleModelWindow(models, selectedIndex, Math.max(1, visibleRows));
 
   return (
     <Box flexDirection="column">
@@ -750,15 +1659,17 @@ function ModelsPanel({
             : (
                 <>
                   <Text color="gray">  showing {visible.start + 1}-{visible.end} of {models.length}</Text>
-                  {visible.rows.map((model, i) => (
-                    <ModelRow
-                      key={model.id}
-                      model={model}
-                      selected={focused && visible.start + i === selectedIndex}
-                      currentClaude={status.routing.anthropicDefaultModel}
-                      currentOpenAI={status.routing.openAIDefaultModel}
-                    />
-                  ))}
+                  <Box flexDirection="column" ref={rowsRef}>
+                    {visible.rows.map((model, i) => (
+                      <ModelRow
+                        key={model.id}
+                        model={model}
+                        selected={focused && visible.start + i === selectedIndex}
+                        currentClaude={status.routing.anthropicDefaultModel}
+                        currentOpenAI={status.routing.openAIDefaultModel}
+                      />
+                    ))}
+                  </Box>
                 </>
               )}
       </Box>
@@ -823,96 +1734,215 @@ function ProviderBadge({
 }) {
   const color = !status.configured ? "gray" : ready ? "green" : "yellow";
   const text = status.configured
-    ? `${label} ${status.healthy}/${status.accounts} healthy`
-    : `${label} not configured`;
+    ? `${label} ${status.healthy}/${status.accounts}`
+    : `${label} off`;
 
   return <Text color={color}>{text}</Text>;
 }
 
-// ─── Account row (two-line: status + utilization bars) ───────────────────────
+function AccountGroups({
+  visible,
+  fleet,
+  windowTop,
+  selectedIndex,
+  focused,
+}: {
+  visible: AccountStat[];
+  fleet: AccountStat[];
+  windowTop: number;
+  selectedIndex: number;
+  focused: boolean;
+}) {
+  const claudeVisible = visible.filter(isClaudeAccount);
+  const chatgptVisible = visible.filter(isOpenAIAccount);
+  const grokVisible = visible.filter(isXaiAccount);
+  const claudeFleet = fleet.filter(isClaudeAccount);
+  const chatgptFleet = fleet.filter(isOpenAIAccount);
+  const grokFleet = fleet.filter(isXaiAccount);
 
-function AccountRow({ account: a, selected }: { account: AccountStat; selected: boolean }) {
-  const rl = a.rateLimits ?? EMPTY_RL;
-  const isLimited = rl.status === "rate_limited";
-  const isDisabled = a.enabled === false;
+  if (visible.length === 0) {
+    return <Text color="gray">  No accounts</Text>;
+  }
 
-  const dot = isDisabled ? "⊘" : isLimited ? "⊘" : a.busy ? "◌" : a.healthy ? "●" : "●";
-  const dotColor = isDisabled ? "gray" : isLimited ? "red" : a.busy ? "yellow" : a.healthy ? "green" : "red";
-  const statusLabel = isDisabled ? "OFF    " : isLimited ? "LIMITED" : a.busy ? "busy   " : a.healthy ? "ok     " : "ERROR  ";
-  const statusColor = isDisabled ? "gray" : isLimited ? "red" : a.busy ? "yellow" : a.healthy ? "green" : "red";
+  const renderRows = (accounts: AccountStat[], offsetInVisible: number) =>
+    accounts.map((account, i) => (
+      <AccountRow
+        key={account.id}
+        account={account}
+        selected={focused && windowTop + offsetInVisible + i === selectedIndex}
+      />
+    ));
 
-  const expiryLabel = a.expiresInMs > 0 ? formatMs(a.expiresInMs) : "EXPIRED";
-  const expiryColor = a.expiresInMs < 10 * 60 * 1000 ? "red"
-    : a.expiresInMs < 30 * 60 * 1000 ? "yellow"
-    : "white";
-
-  const providerTag = a.provider === "openai_subscription"
-    ? " [OpenAI]"
-    : rl.plan ? ` [${rl.plan}]` : "";
-
-  // User-defined caps hint
-  const s5 = a.sessionLimitPercent ?? 100;
-  const w7 = a.weeklyLimitPercent ?? 100;
-  const hasCaps = s5 < 100 || w7 < 100;
-  const capsHint = hasCaps
-    ? ` cap${s5 < 100 ? ` 5h≤${s5}%` : ""}${w7 < 100 ? ` 7d≤${w7}%` : ""}`
-    : "";
-
-  const pointer = selected ? "▶" : " ";
-  const nameColor = isDisabled ? "gray" : undefined;
+  // Render a group whenever its provider has ANY account — even when the scroll
+  // window currently shows none of its rows. A fully-clipped group still emits
+  // its header + count so a tail provider (e.g. a single Grok account behind
+  // many Claude/ChatGPT ones on a short terminal) never vanishes without a
+  // trace. `offset` advances by VISIBLE rows only, so selection indexing is
+  // unaffected by header-only groups.
+  const groups: Array<{ key: string; visible: AccountStat[]; fleet: AccountStat[]; offset: number }> = [];
+  let offset = 0;
+  if (claudeFleet.length > 0) {
+    groups.push({ key: "CLAUDE", visible: claudeVisible, fleet: claudeFleet, offset });
+    offset += claudeVisible.length;
+  }
+  if (chatgptFleet.length > 0) {
+    groups.push({ key: "CHATGPT", visible: chatgptVisible, fleet: chatgptFleet, offset });
+    offset += chatgptVisible.length;
+  }
+  if (grokFleet.length > 0) {
+    groups.push({ key: "GROK", visible: grokVisible, fleet: grokFleet, offset });
+  }
 
   return (
     <Box flexDirection="column">
-      <Box>
-        <Text color={selected ? "cyan" : undefined}>{pointer}</Text>
-        <Text color={dotColor}> {dot} </Text>
-        <Text color={nameColor} dimColor={isDisabled}>{a.id.slice(0, 20).padEnd(20)}</Text>
-        <Text color={statusColor}>{statusLabel}</Text>
-        {providerTag && <Text color={a.provider === "openai_subscription" ? "cyan" : "magenta"}>{providerTag.padEnd(10)}</Text>}
-        {!providerTag && <Text>{"".padEnd(10)}</Text>}
-        <Text color="gray"> req </Text>
-        <Text color="white">{String(a.requestCount).padStart(5)}</Text>
-        <Text color="gray">  err </Text>
-        <Text color={a.errorCount > 0 ? "red" : "gray"}>{String(a.errorCount).padStart(3)}</Text>
-        <Text color="gray">  tok </Text>
-        <Text color={expiryColor}>{expiryLabel.padEnd(8)}</Text>
-        <Text color="gray">  last </Text>
-        <Text color="gray">{formatAgo(a.lastUsedMs)}</Text>
-        {capsHint && <Text color="yellow">{capsHint}</Text>}
-      </Box>
-      {rl.lastUpdated > 0 && (
-        <Box paddingLeft={4}>
-          <UtilBar label="5h" util={rl.fiveHourUtil} resetTs={rl.fiveHourReset} isActive={rl.claim === "five_hour"} cap={s5} />
-          <Text>   </Text>
-          <UtilBar label="7d" util={rl.sevenDayUtil} resetTs={rl.sevenDayReset} isActive={rl.claim === "seven_day"} cap={w7} />
+      {groups.map((group, index) => (
+        <Box key={group.key} flexDirection="column" marginTop={index === 0 ? 0 : 1}>
+          <GroupHeader label={group.key} accounts={group.fleet} />
+          {group.visible.length > 0 && <ColumnLegend />}
+          {renderRows(group.visible, group.offset)}
         </Box>
-      )}
+      ))}
     </Box>
   );
 }
 
-// ─── Utilization bar ─────────────────────────────────────────────────────────
-
-function UtilBar({ label, util, resetTs, isActive, cap }: { label: string; util: number; resetTs: number; isActive: boolean; cap: number }) {
-  const pct = Math.round(util * 100);
-  const BAR_W = 12;
-  const filled = Math.round(util * BAR_W);
-  const capPos = Math.round((cap / 100) * BAR_W);
-  const bar = "█".repeat(Math.min(filled, BAR_W)) + "░".repeat(Math.max(BAR_W - filled, 0));
-  const color = pct >= cap ? "red" : pct >= 90 ? "red" : pct >= 70 ? "yellow" : "green";
-
-  const resetLabel = resetTs > 0 ? formatResetIn(resetTs) : "";
-  const capLabel = cap < 100 ? ` cap ${cap}%` : "";
+function GroupHeader({ label, accounts }: { label: string; accounts: AccountStat[] }) {
+  const healthy = accounts.filter(account => account.healthy).length;
+  const weeklyFull = accounts.filter(isWeeklyLimited);
+  const color = healthy === accounts.length && weeklyFull.length === 0 ? "green" : "yellow";
+  const fableHint = label === "CLAUDE" ? exhaustedModelHint(accounts) : undefined;
+  // Grok has no usage windows, so surface its plan ("GrokPro") in the header —
+  // this is the one signal a clipped-out Grok row would otherwise hide.
+  const grokPlan = label === "GROK" && accounts[0] ? grokQuotaNote(accounts[0]) : undefined;
 
   return (
     <Box>
-      <Text color={isActive ? "white" : "gray"} bold={isActive}>{label} </Text>
-      <Text color={color}>{bar}</Text>
-      <Text color={color}>{String(pct).padStart(4)}%</Text>
-      {capLabel && <Text color="yellow">{capLabel}</Text>}
-      {resetLabel && <Text color="gray"> ↻{resetLabel}</Text>}
+      <Text bold color="gray"> {label}  </Text>
+      <Text color={color}>{healthy}/{accounts.length} ok</Text>
+      {weeklyFull.length > 0 && <Text color="red">{`  ·  ${weeklyFull.length} 7d full`}</Text>}
+      {fableHint && <Text color="red">{`  ·  ${fableHint}`}</Text>}
+      {grokPlan && <Text color="gray">{`  ·  ${grokPlan}`}</Text>}
     </Box>
   );
+}
+
+const COL = {
+  name: 22,
+  req: 5,
+  sess: 6,
+  pct: 4,
+  note: 22,
+  reset: 8,
+  rst: 5,
+} as const;
+
+function ColumnLegend() {
+  return (
+    <Text color="gray">
+      {`  ${"".padEnd(COL.name)} ${"req".padStart(COL.req)}${"s·n".padStart(COL.sess)}  ${"5h".padStart(COL.pct)} ${"7d".padStart(COL.pct)}  ${"note".padEnd(COL.note)} ${"↻5h".padEnd(COL.reset)} ${"↻7d".padEnd(COL.reset)} ${"rst".padStart(COL.rst)}`}
+    </Text>
+  );
+}
+
+function exhaustedModelHint(accounts: AccountStat[]): string | undefined {
+  const hits: string[] = [];
+  for (const account of accounts) {
+    for (const row of getAccountCapacityRows(account)) {
+      if ((row.utilization ?? 0) < 1 || row.color !== "red") continue;
+      hits.push(`${row.label} full`);
+    }
+  }
+  return hits[0];
+}
+
+// ─── Account row (one aligned line, no bars) ─────────────────────────────────
+
+function AccountRow({ account: a, selected }: { account: AccountStat; selected: boolean }) {
+  const rl = a.rateLimits ?? EMPTY_RL;
+  const usage = rl.usage;
+  const globalCapacity = getGlobalCapacityView(rl);
+  const isOpenAI = isOpenAIAccount(a);
+  const isXai = isXaiAccount(a);
+  const isLimited = isLimitedAccount(a);
+  const isDisabled = a.enabled === false;
+  const modelNote = isOpenAI || isXai ? undefined : noteModelLimit(a);
+  const extraCap = usage?.extraUsage;
+  const extraOff = extraCap !== undefined && extraCap.usable !== true
+    && (extraCap.spendLimitReached
+      || (modelNote !== undefined && modelNote.utilization >= 1 && extraCap.enabled === false));
+  const gapNote = openaiQuotaGapNote(a);
+  const grokNote = grokQuotaNote(a);
+  const note = [
+    modelNote
+      ? `${modelNote.label} ${Math.round(modelNote.utilization * 100)}%`
+      : "",
+    extraOff ? "extra off" : "",
+    gapNote ?? "",
+    grokNote ?? "",
+  ].filter(Boolean).join(" · ");
+  const codexWindows = getCodexDefaultWindows(a.codexRateLimits);
+  const sessionWindow = codexWindows.find(window => window.kind === "session");
+  const weeklyWindow = codexWindows.find(window => window.kind === "weekly");
+  const hasClaudeQuota = !isOpenAI && !isXai && (rl.lastUpdated > 0 || usage);
+  const fiveHour = isOpenAI
+    ? sessionWindow
+    : hasClaudeQuota ? globalCapacity.fiveHour : undefined;
+  const sevenDay = isOpenAI
+    ? weeklyWindow
+    : hasClaudeQuota ? globalCapacity.sevenDay : undefined;
+  const creditsLabel = resetCreditsColumnLabel(a);
+
+  const dot = isDisabled ? "⊘" : isLimited ? "⊘" : a.busy ? "◌" : a.healthy ? "●" : "●";
+  const dotColor = isDisabled ? "gray" : isLimited ? "red" : a.busy ? "yellow" : a.healthy ? "green" : "red";
+  const sessions = a.activeSessions ?? 0;
+  const inflight = a.inFlightRequests ?? 0;
+  const load = sessions <= 0 && inflight <= 0
+    ? ""
+    : inflight > 0
+      ? `${sessions}·${inflight}`
+      : String(sessions);
+
+  return (
+    <Box>
+      <Text color={selected ? "cyan" : undefined}>{selected ? "▶" : " "}</Text>
+      <Text color={dotColor}>{dot}</Text>
+      <Text color={selected ? "white" : isDisabled ? "gray" : undefined} dimColor={isDisabled}>
+        {` ${a.id.slice(0, COL.name).padEnd(COL.name)}`}
+      </Text>
+      <Text color="white">{String(a.requestCount).padStart(COL.req)}</Text>
+      <Text color="gray">{load.padStart(COL.sess)}</Text>
+      <Text>  </Text>
+      <QuotaCell util={fiveHour?.utilization} />
+      <Text> </Text>
+      <QuotaCell util={sevenDay?.utilization} />
+      <Text color={extraOff || gapNote ? "yellow" : modelNote?.color ?? "gray"}>
+        {`  ${note.padEnd(COL.note)}`}
+      </Text>
+      <Text> </Text>
+      <ResetCell resetTs={fiveHour?.resetAt} />
+      <Text> </Text>
+      <ResetCell resetTs={sevenDay?.resetAt} />
+      <Text> </Text>
+      <Text color="gray">{creditsLabel.padStart(COL.rst)}</Text>
+      {a.credentialsPendingWrite && <Text color="yellow">  unsaved</Text>}
+    </Box>
+  );
+}
+
+function QuotaCell({ util }: { util?: number }) {
+  if (util === undefined) {
+    return <Text color="gray">{"—".padStart(COL.pct)}</Text>;
+  }
+  const pct = Math.round(util * 100);
+  const color = pct >= 90 ? "red" : pct >= 70 ? "yellow" : "green";
+  return <Text color={color}>{`${pct}%`.padStart(COL.pct)}</Text>;
+}
+
+function ResetCell({ resetTs }: { resetTs?: number }) {
+  if (!resetTs || resetTs <= 0) {
+    return <Text color="gray">{"—".padEnd(COL.reset)}</Text>;
+  }
+  return <Text color="gray">{`↻${formatResetIn(resetTs)}`.padEnd(COL.reset)}</Text>;
 }
 
 function formatResetIn(unixSeconds: number): string {
@@ -932,8 +1962,9 @@ function LogRow({ log, selected }: { log: LogEntry; selected: boolean }) {
   const time = new Date(log.ts).toLocaleTimeString("en-GB", { hour12: false });
   const isError = log.type === "error";
   const isRefresh = log.type === "refresh";
-  const typeColor = isError ? "red" : isRefresh ? "yellow" : "gray";
-  const typeIcon = isError ? "✗" : isRefresh ? "↻" : "→";
+  const isWarn = log.type === "warn";
+  const typeColor = isError ? "red" : isWarn ? "yellow" : isRefresh ? "yellow" : "gray";
+  const typeIcon = isError ? "✗" : isWarn ? "⚠" : isRefresh ? "↻" : "→";
 
   const statusColor = log.statusCode === undefined ? undefined
     : log.statusCode >= 500 ? "red"
@@ -947,9 +1978,11 @@ function LogRow({ log, selected }: { log: LogEntry; selected: boolean }) {
   const sourceLabel = log.source === "cli" ? "cli"
     : log.source === "desktop" ? "dsk"
     : log.source === "api" ? "api"
+    : log.source === "codex" ? "cdx"
     : "   ";
   const sourceColor = log.source === "cli" ? "blue"
     : log.source === "desktop" ? "magenta"
+    : log.source === "codex" ? "cyan"
     : "gray";
 
   // Per-request token stats
@@ -995,73 +2028,38 @@ function LogRow({ log, selected }: { log: LogEntry; selected: boolean }) {
 // ─── Detail panel ─────────────────────────────────────────────────────────────
 
 function DetailPanel({ log }: { log: LogEntry }) {
-  const time = new Date(log.ts).toLocaleString("en-GB", {
-    hour12: false,
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
+  const time = new Date(log.ts).toLocaleTimeString("en-GB", { hour12: false });
   const isError = log.type === "error";
-  const statusLabel = log.statusCode === undefined ? "—"
+  const isWarn = log.type === "warn";
+  const statusLabel = log.statusCode === undefined ? ""
     : log.statusCode === 0 ? "connection error"
-    : `${log.statusCode} ${httpStatusText(log.statusCode)}`;
+    : String(log.statusCode);
   const statusColor = log.statusCode === undefined ? "gray"
     : log.statusCode === 0 ? "red"
     : log.statusCode >= 500 ? "red"
     : log.statusCode >= 400 ? "yellow"
     : "green";
+  const inputTok = (log.cacheReadTokens ?? 0) + (log.cacheCreationTokens ?? 0) + (log.inputTokens ?? 0);
+  const outputTok = log.outputTokens ?? 0;
+  const hitPct = inputTok > 0 ? Math.round(((log.cacheReadTokens ?? 0) / inputTok) * 100) : null;
 
   return (
     <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1}>
-      <Text bold color={isError ? "red" : "cyan"}> DETAILS </Text>
-      <Box marginTop={1} flexDirection="column" gap={0}>
-        <Box gap={2}>
-          <Field label="Time"    value={time} />
-          <Field label="Account" value={log.accountId} />
-        </Box>
-        <Box gap={2}>
-          <Field label="Method"  value={log.method ?? "—"} />
-          <Field label="Path"    value={log.path ?? "—"} />
-        </Box>
-        <Box gap={2}>
-          <FieldColored label="Status"   value={statusLabel} color={statusColor} />
-          <Field        label="Duration" value={log.durationMs !== undefined ? `${log.durationMs}ms` : "—"} />
-          <Field        label="Type"     value={log.type} />
-          <Field        label="Source"   value={sourceFullLabel(log.source)} />
-        </Box>
-        {log.details && (
-          <Box>
-            <Field label="Details" value={log.details} />
-          </Box>
-        )}
-        {log.cacheReadTokens !== undefined && (
-          <Box gap={2}>
-            <CacheBreakdown
-              read={log.cacheReadTokens}
-              created={log.cacheCreationTokens ?? 0}
-              input={log.inputTokens ?? 0}
-              output={log.outputTokens ?? 0}
-            />
-          </Box>
-        )}
+      <Text bold color={isError ? "red" : isWarn ? "yellow" : "cyan"}> DETAILS </Text>
+      <Box>
+        <Text color="gray">{time}  {log.accountId}</Text>
+        {log.method && log.path && <Text color="white">{`  ${log.method} ${log.path}`}</Text>}
+        {statusLabel !== "" && <Text color={statusColor}>{`  ${statusLabel}`}</Text>}
+        {log.durationMs !== undefined && <Text color="gray">{`  ${log.durationMs}ms`}</Text>}
+        <Text color="gray">{`  ${sourceFullLabel(log.source)}`}</Text>
+        {log.details && <Text color="gray">{`  ${log.details}`}</Text>}
       </Box>
-    </Box>
-  );
-}
-
-function Field({ label, value }: { label: string; value: string }) {
-  return (
-    <Box>
-      <Text color="gray">{label}: </Text>
-      <Text color="white">{value}</Text>
-    </Box>
-  );
-}
-
-function FieldColored({ label, value, color }: { label: string; value: string; color: string }) {
-  return (
-    <Box>
-      <Text color="gray">{label}: </Text>
-      <Text color={color}>{value}</Text>
+      {(inputTok > 0 || outputTok > 0) && (
+        <Text color="gray">
+          {`${fmtTok(inputTok)} in · ${fmtTok(outputTok)} out`}
+          {hitPct !== null ? ` · cache ${hitPct}%` : ""}
+        </Text>
+      )}
     </Box>
   );
 }
@@ -1082,29 +2080,6 @@ function CacheHealthBadge({ read, created, input }: { read: number; created: num
       <Text>cache </Text>
       <Text color={color}>{hitPct}% hit </Text>
       <Text color="gray">({label})</Text>
-    </>
-  );
-}
-
-// ─── Cache breakdown (per-request detail) ────────────────────────────────────
-
-function CacheBreakdown({ read, created, input, output }: { read: number; created: number; input: number; output: number }) {
-  const totalInput = read + created + input;
-  const hitPct = totalInput > 0 ? (read / totalInput) * 100 : 0;
-  const color = totalInput === 0 ? "gray" : hitPct >= 70 ? "green" : hitPct >= 30 ? "yellow" : "red";
-
-  return (
-    <>
-      <FieldColored
-        label="Cache hit"
-        value={totalInput > 0 ? `${fmtTok(read)} tok  (${hitPct.toFixed(1)}%)` : "—"}
-        color={color}
-      />
-      <Field label="Cache created" value={fmtTok(created) + " tok"} />
-      <Field label="Uncached"      value={fmtTok(input) + " tok"} />
-      <Field label="Total input"   value={fmtTok(totalInput) + " tok"} />
-      <Field label="Output"        value={fmtTok(output) + " tok"} />
-      <Field label="Total"         value={fmtTok(totalInput + output) + " tok"} />
     </>
   );
 }
@@ -1145,21 +2120,9 @@ function fmtTok(n: number): string {
 function sourceFullLabel(source: LogEntry["source"]): string {
   if (source === "cli") return "Claude Code";
   if (source === "desktop") return "Claude Desktop";
+  if (source === "codex") return "Codex CLI";
   if (source === "api") return "API";
   return "—";
-}
-
-// ─── HTTP status text ─────────────────────────────────────────────────────────
-
-function httpStatusText(code: number): string {
-  const map: Record<number, string> = {
-    200: "OK", 201: "Created", 204: "No Content",
-    400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
-    404: "Not Found", 429: "Too Many Requests",
-    500: "Internal Server Error", 502: "Bad Gateway",
-    503: "Service Unavailable", 529: "Overloaded",
-  };
-  return map[code] ?? "";
 }
 
 // ─── Formatters ───────────────────────────────────────────────────────────────
@@ -1171,18 +2134,4 @@ function formatUptime(seconds: number): string {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
-}
-
-function formatMs(ms: number): string {
-  const totalMin = Math.round(ms / 60_000);
-  if (totalMin >= 60) return `${Math.floor(totalMin / 60)}h ${totalMin % 60}m`;
-  return `${totalMin}m`;
-}
-
-function formatAgo(ts: number): string {
-  if (!ts) return "never";
-  const s = Math.round((Date.now() - ts) / 1_000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  return `${m}m ago`;
 }

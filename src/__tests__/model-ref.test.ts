@@ -18,7 +18,35 @@ describe("parseModelRef", () => {
     });
   });
 
-  it("keeps unprefixed models on the current Anthropic default path", () => {
+  it("routes unprefixed gpt-* models to OpenAI without a prefix", () => {
+    // Codex writes the bare slug from its own registry — `model = "gpt-5.6-sol"`
+    // in config.toml, or whatever its /model picker selects. Sending that to
+    // the Anthropic path produced a 501 from the Responses ingress, and no
+    // configuration could redirect it: `openAIAliases` is only consulted for
+    // already-prefixed names.
+    expect(parseModelRef("gpt-5.6-sol")).toEqual({
+      provider: "openai_subscription",
+      publicModel: "gpt-5.6-sol",
+      upstreamModel: "gpt-5.6-sol",
+    });
+  });
+
+  it("matches the gpt- prefix regardless of case", () => {
+    expect(parseModelRef("GPT-5.6-Sol").provider).toBe("openai_subscription");
+  });
+
+  it("applies openAIAliases to an unprefixed gpt-* model", () => {
+    // The same remapping the prefixed form gets, keyed on the bare name.
+    expect(parseModelRef("gpt-5.6-sol", {
+      openAIAliases: { "gpt-5.6-sol": "gpt-5.6-sol-2026-08-01" },
+    })).toEqual({
+      provider: "openai_subscription",
+      publicModel: "gpt-5.6-sol",
+      upstreamModel: "gpt-5.6-sol-2026-08-01",
+    });
+  });
+
+  it("leaves every other unprefixed model on the Anthropic default path", () => {
     expect(parseModelRef("claude-3-5-sonnet-latest")).toEqual({
       provider: "anthropic_subscription",
       publicModel: "claude-3-5-sonnet-latest",

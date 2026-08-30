@@ -1,4 +1,6 @@
+import { anthropicStopReasonForResponse } from "./openai-response-to-anthropic.js";
 import { OpenAIProtocolError, parseOpenAIFunctionArguments } from "./openai-function-call.js";
+import { terminalResponsePayload } from "./openai-responses-collect.js";
 
 interface OpenAIStreamEventItem {
   id?: string;
@@ -17,12 +19,14 @@ interface OpenAIStreamEvent {
   response?: {
     id?: string;
     model?: string;
+    incomplete_details?: { reason?: string };
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
     };
   };
 }
+
 
 type AnthropicStreamEvent = Record<string, unknown>;
 
@@ -44,13 +48,6 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
   let sawToolUse = false;
   let sawRefusal = false;
 
-  const reset = () => {
-    blocks = new Map();
-    nextIndex = 0;
-    sawToolUse = false;
-    sawRefusal = false;
-  };
-
   const openTextBlock = (outputIndex: number): AnthropicStreamEvent[] => {
     if (blocks.has(outputIndex)) return [];
     const block: OpenBlock = { index: nextIndex++, kind: "text", sentArguments: false, argumentsJson: "" };
@@ -69,6 +66,13 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
     return [{ type: "content_block_stop", index: block.index }];
   };
 
+  const reset = () => {
+    blocks = new Map();
+    nextIndex = 0;
+    sawToolUse = false;
+    sawRefusal = false;
+  };
+
   return {
     reset,
     convert(event: OpenAIStreamEvent): AnthropicStreamEvent[] {
@@ -76,19 +80,21 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
 
       if (event.type === "response.created") {
         reset();
-        return [{
-          type: "message_start",
-          message: {
-            id: event.response?.id ?? "",
-            type: "message",
-            role: "assistant",
-            model: event.response?.model ?? "",
-            content: [],
-            stop_reason: null,
-            stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
+        return [
+          {
+            type: "message_start",
+            message: {
+              id: event.response?.id ?? "",
+              type: "message",
+              role: "assistant",
+              model: event.response?.model ?? "",
+              content: [],
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
           },
-        }];
+        ];
       }
 
       if (event.type === "response.output_item.added") {
@@ -119,11 +125,14 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
       if (event.type === "response.output_text.delta") {
         const prefix = openTextBlock(outputIndex);
         const block = blocks.get(outputIndex);
-        return [...prefix, {
-          type: "content_block_delta",
-          index: block?.index ?? 0,
-          delta: { type: "text_delta", text: event.delta ?? "" },
-        }];
+        return [
+          ...prefix,
+          {
+            type: "content_block_delta",
+            index: block?.index ?? 0,
+            delta: { type: "text_delta", text: event.delta ?? "" },
+          },
+        ];
       }
 
       if (event.type === "response.refusal.delta") {
@@ -180,20 +189,40 @@ export function createOpenAIStreamToAnthropicNormalizer(): OpenAIStreamToAnthrop
         return [...argumentEvent, ...closeBlock(outputIndex)];
       }
 
-      if (event.type === "response.completed") {
+      // Both terminal Responses events must close the Anthropic message.
+      // Emitting nothing for `response.incomplete` would end the HTTP stream
+      // without `message_stop`, leaving the client waiting on a turn that is
+      // already over.
+      //
+      // The same predicate the collector and the usage observer use, not the
+      // event type alone: a terminal frame carrying no response object
+      // (`"response":null`, an array, a string) is not a result, and those two
+      // already treat it as a failed stream. Closing the message here anyway
+      // would emit `stop_reason: end_turn` — telling the client a truncated
+      // turn ended normally, the one outcome worse than a truncated stream.
+      // Emitting nothing ends the body without `message_stop`, which is what
+      // a stream that never reached a terminal event looks like, and what
+      // clients already detect and surface as an error.
+      if (terminalResponsePayload(event) !== undefined) {
         if ([...blocks.values()].some(block => block.kind === "tool_use")) {
           throw new OpenAIProtocolError("OpenAI function call ended before completion");
         }
+        const usage = event.response?.usage ?? {};
         const prefix = [...blocks.keys()].flatMap(closeBlock);
-        const stopReason = sawToolUse ? "tool_use" : sawRefusal ? "refusal" : "end_turn";
-        const outputTokens = event.response?.usage?.output_tokens ?? 0;
+        const stopReason = sawToolUse
+          ? "tool_use"
+          : sawRefusal
+            ? "refusal"
+            : anthropicStopReasonForResponse(event.response);
         reset();
         return [
           ...prefix,
           {
             type: "message_delta",
+            // Same helper the collected-response translator uses, so an
+            // incomplete turn reports the same stop reason on both paths.
             delta: { stop_reason: stopReason, stop_sequence: null },
-            usage: { output_tokens: outputTokens },
+            usage: { output_tokens: usage.output_tokens ?? 0 },
           },
           { type: "message_stop" },
         ];

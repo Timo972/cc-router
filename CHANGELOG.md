@@ -1,0 +1,628 @@
+# Changelog
+
+All notable changes to this project are documented here.
+
+This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [Unreleased]
+
+### Added
+
+- `cc-router cli claude` and `cc-router cli codex` toggle Claude Code / Codex
+  CLI routing without stopping the proxy: `start`, `stop`, `resume` (same as
+  start), and `status`. `cc-router cli` shows both. Short aliases
+  `cc-router claude` / `cc-router codex` still work. `configure --remove` now
+  also works with `configure codex --remove`. `stop --full` / `revert` and
+  `client disconnect` strip the Codex managed block as well as Claude Code
+  settings.
+- Dashboard `[c]` / `[x]` toggle Claude Code / Codex CLI routing without
+  stopping the proxy (`[c]` still sets the Claude model default while MODELS
+  is focused).
+- Status dashboard `rst` column shows Codex banked usage-limit reset count
+  (`0` = none available); Claude cells are `—`.
+- Automatic upstream failover and retry on both providers. A 429 or 5xx
+  received before any response byte is relayed no longer passes straight
+  through to the client: the router applies the existing cooldown/affinity
+  bookkeeping and retries the request itself, up to 3 upstream attempts
+  per request. A 429 (or an overload the provider cools down: Anthropic
+  529; Codex 503/529) always fails over to a *different* account; any
+  other 5xx keeps a session-bound request on its own account, retrying
+  after a short pause, while a session-less request re-routes the way a
+  fresh request would.
+  Covers Claude `/v1/messages`, Codex `/v1/responses`, and cross-routed
+  `/v1/messages`. When nothing is eligible or the budget is exhausted, the
+  last failed upstream response is relayed unchanged, exactly as before;
+  401s still pass through with a background token refresh, and the router
+  still never retries after response bytes have started. Failed attempts
+  show up in the activity log with a `:will-retry` suffix. On by
+  default — set `"autoFailover": false` in `~/.cc-router/config.json`
+  (restart required) to opt out and restore pure pass-through behavior.
+  Note that current Claude Code builds no longer retry 429s themselves,
+  so with failover off a rate limit surfaces directly in the session.
+
+### Changed
+
+- Claude-bound POST `/v1/messages` moved from the generic proxy middleware
+  to a dedicated transport (same byte-transparent relay contract: verbatim
+  status/headers, raw body bytes, no synthesized events) so the router can
+  decide to retry at upstream response headers. Every other `/v1` endpoint
+  stays on the generic proxy. Claude activity rows now record the requested
+  model and the full `/v1/messages` path.
+
+### Fixed
+
+- An account whose quota refills early — upgrading a Claude plan being the
+  common case — is returned to rotation as soon as the usage endpoint says
+  so, instead of staying benched for the rest of the pre-upgrade window. A
+  429 records a cooldown whose expiry comes from the reset timestamps on
+  that response, and both that cooldown and the header-derived
+  `rate_limited` flag were released only by the wall clock. Nothing
+  reconnected them to the usage refresher, so a plan upgrade produced an
+  account reporting `0%` on every window, `usage fresh`, and `busy` with a
+  multi-hour cooldown — and because it was benched, no new response could
+  ever arrive to correct it. In the reported case one stale cooldown on the
+  only account with capacity left the whole pool answering
+  `429 no-eligible`.
+
+  A usage snapshot now supersedes both blockers, under two conditions that
+  keep it from unbenching an account that is still limited.
+
+  The refresh must have been *initiated* after the block was recorded.
+  `fetchedAt` cannot answer that — it is stamped after the response body is
+  parsed, so a refresh already on the wire when a 429 lands completes
+  afterwards while describing the account as it was before. Neither can
+  wall-clock milliseconds: the 429, the headers taken from it, and the
+  refresh the router starts in response all happen in one event-loop turn
+  and read the same millisecond (measured at 199 ties in 200 runs), which
+  would have made that immediate refresh useless. Ordering now runs on a
+  process-wide monotonic sequence, with tokens on the usage snapshot, the
+  header snapshot, and each cooldown entry.
+
+  And the snapshot must report on the scope that caused the block: only the
+  claimed window releases a global cooldown, and only the matching family
+  releases a model cooldown. Blocks for limits no snapshot describes — an
+  upstream 529 overload, the `seven_day_oauth_apps` quota, an unattributed
+  claim — stay purely time-based. Cooldowns are grouped by scope — global by
+  limiting window, model by family — and within each scope every expiry keeps
+  the sequence of the event that produced it, so overlapping blocks neither
+  merge nor cancel each other: releasing a quota cooldown leaves a concurrent
+  overload running, a brief overload does not make a multi-hour cooldown
+  permanent, and a later shorter 429 cannot revive an expiry a refresh had
+  already retired.
+
+  Relatedly, a usage window with no usable figure — `five_hour: {}`, a
+  non-numeric utilization — no longer parses as `0`. It now arrives with the
+  figure absent, so missing data can never read as proof of capacity and
+  retire a live cooldown. Rolling a spent window over past its reset likewise
+  clears the reading instead of writing a `0` nobody reported. Blocking
+  decisions still treat both as `0`, and the dashboard still displays `0`,
+  exactly as before.
+
+  Which of the response headers and the usage snapshot describes an account's
+  current capacity is now decided on the same event order, rather than on
+  `fetchedAt` against `lastUpdated`. A refresh that starts before a response
+  and finishes after it holds the older picture despite the later clock
+  reading, and preferring it hid a fresher exhaustion signal behind a snapshot
+  that never saw it — while cooldown release, already running on the event
+  order, disagreed about which source was current. Snapshots predating the
+  ordering tokens still fall back to the timestamp comparison.
+
+  Within scope, releasing opens no hole: the same snapshot feeds the
+  exhausted-window check, so an account with no real capacity stays blocked
+  on its own merits.
+
+- The activity log's "cooldown expired — rate limit cleared" entry now marks
+  the moment an account is actually routable again. It hung off the
+  header `rate_limited` flag alone, which both over- and under-reports as soon
+  as anything else can block the account: a 429 overlapping a 529 announced
+  recovery while the overload cooldown still kept the account out of rotation,
+  and because that flag only flips once, the moment it genuinely came back
+  passed unannounced. The entry is now emitted when the last account-wide
+  blocker clears — header status, global cooldown, or a spent account-wide
+  window — whichever that turns out to be, including a cooldown that lapses
+  during an idle stretch with nothing routing or polling in the meantime. A
+  model-scoped limit never emits one, since the account kept serving every
+  other family and so never left the rotation to rejoin.
+
+---
+
+## [0.10.1] — 2026-08-20
+
+### Fixed
+
+- A passed-through upstream 5xx on the Anthropic path is logged and counted.
+  The proxy is byte-transparent and only special-cased 401/429/529, so a
+  plain upstream 500 left no trace: an overnight Anthropic 500 stopped an
+  unattended Claude session while the daemon log showed nothing and the
+  stats reported a clean night. It now produces an `[ERROR]` line, an
+  activity entry (`upstream-error`), and error counts — with no cooldown,
+  since a plain 5xx says nothing about the account's capacity and can even
+  be request-specific.
+- A client-cancelled stream abort is no longer logged as an error on the
+  OpenAI path. The Codex CLI aborts streams routinely, and each abort
+  rejects the relay's body read — the log printed an `[ERROR] ... relay
+  failed` line for every one (eight hours of them in one overnight
+  session) while the stats correctly classified them as cancellations. The
+  log line now waits for the cancellation check, so it fires only for real
+  relay failures.
+
+---
+
+## [0.10.0] — 2026-08-19
+
+### Added
+
+- OpenAI/Codex account usage is fetched proactively, so `cc-router status`
+  shows the 5h/weekly bars immediately after a restart — matching how
+  Anthropic accounts already behaved. Codex usage previously arrived only on
+  `x-codex-*` response headers, so a freshly restarted daemon rendered empty
+  OpenAI bars until the first request happened to route there. The daemon now
+  polls the usage endpoint the Codex CLI itself reads
+  (`GET chatgpt.com/backend-api/wham/usage`) on the same bounded scheduler the
+  Anthropic usage refresher uses (staggered startup, 5-minute cadence, failure
+  backoff, identity-owned application), feeding the JSON — the payload twin of
+  the response headers, parsed under the same trust rules — through the exact
+  merge the headers go through. A failed poll keeps whatever the account
+  already knew; an expired access token is refreshed before the first fetch
+  rather than 401-ing until traffic happens to fix it.
+- `cc-router accounts rename <id> <new-id>`. An account's id is the key its
+  routing state hangs off — in-flight counters and sticky session bindings are
+  both id-keyed — so on a running proxy the rename runs as a transaction
+  (`PATCH /cc-router/accounts/:id` with `{"id": ...}`): pool, session router,
+  and accounts.json move together, and are rolled back together if persistence
+  fails. Sticky sessions keep their prompt-cache affinity through the rename.
+  With no proxy running the record is renamed on disk. A proxy from before
+  this feature answers the PATCH with 200 having silently ignored the field —
+  that is detected and reported as an error rather than falling back to a disk
+  write its refresh loop would overwrite. The id namespace is shared across
+  both providers, so a rename onto any existing account name is refused (409).
+
+- The health endpoint reports the daemon's version, and the dashboard shows a
+  version-mismatch banner when the daemon runs a different build than the CLI
+  rendering it. A service manager can keep an old build alive long after an
+  upgrade — launchd pins the versioned pnpm store path in its plist, so the
+  daemon silently stays on the old version across upgrades and even reboots —
+  and every log row and account view on the dashboard comes from that build.
+  Until now nothing surfaced this: a fix could ship, the package could update,
+  and the dashboard would still render the old daemon's output as if the new
+  version were broken. A daemon that reports no version at all predates the
+  field, which is itself proof it is outdated, and banners the same way.
+- The activity list scrolls to follow its selection. The dashboard renders the
+  newest 20 of up to 50 entries, but the arrow keys would walk the selection
+  through all 50 — past row 20 the highlight left the screen while the detail
+  panel kept updating for rows that were not visible. The window now shifts by
+  one row when the selection steps past its bottom or top edge, stays put while
+  the selection moves inside it, and re-clamps when new entries push the
+  selected row (which is timestamp-anchored) out of the stored window.
+- OpenAI/Codex sticky session routing: sessions pin to one account for prompt-cache
+  locality (`session_id` → `x-claude-code-session-id` → `prompt_cache_key`), with
+  load- and headroom-aware selection for new sessions.
+- Codex usage tracking from `x-codex-*` response headers: default 5h/weekly windows
+  plus dynamically discovered model-scoped metered buckets, credits, and plan.
+- Scoped cooldowns on upstream failures: bucket-scoped via `x-codex-active-limit`,
+  account-global otherwise; local 429/503 responses when no account is eligible.
+- Dashboard: OpenAI accounts now show 5h/weekly bars, per-bucket rows, credits,
+  plan, request/error/in-flight/session counts, and cooldown state.
+- Unprefixed `gpt-*` models route to OpenAI. The Codex CLI writes the bare slug
+  from its own registry — `model = "gpt-5.6-sol"` in `config.toml`, or whatever
+  its `/model` picker selects — and an unprefixed name went to the Claude path,
+  where `/v1/responses` answers `501 Not Implemented`. No configuration could
+  redirect it, because `openAIAliases` is only consulted for names that are
+  already prefixed; those aliases now apply to the bare form as well. Every
+  other unprefixed model still routes to Claude.
+
+### Changed
+
+- OpenAI account records persist `scopes`, `sessionLimitPercent`, and
+  `weeklyLimitPercent`.
+- The stateless OpenAI round-robin picker was removed in favor of
+  `OpenAITokenPool`.
+
+### Fixed
+
+- The dashboard fits the terminal. The frame had a fixed shape — 20 activity
+  rows, a detail panel, and every account expanded — which with a real fleet
+  of accounts rendered ~70 lines. Ink can only erase as many lines as the
+  viewport holds, so on any shorter terminal every 2-second poll re-appended
+  the frame and scrolled the header and OPERATIONS panel permanently out of
+  view (the "jumps back down" effect, especially in split panes). The layout
+  is now height-aware: the activity list absorbs the deficit first (down to 3
+  rows), and if the chrome alone still exceeds the viewport the frame is
+  clipped at the bottom — the header always wins over the detail panel. The
+  fit tracks terminal resizes.
+
+- Anthropic activity rows show their cache rate and token counts. The proxy
+  captures usage by passively parsing the response body, but skipped any
+  compressed response — and since the proxy is byte-transparent, the client's
+  own `accept-encoding` makes upstream compress essentially every response, so
+  no `/messages` row ever carried token fields while Codex rows (whose relay
+  decompresses anyway) did. The capture now decompresses its own copy of the
+  stream (gzip/brotli/deflate) purely for parsing, stops paying for the
+  stream once both usage events have been seen, and remains strictly
+  best-effort: a corrupt or unsupported coding ends the capture, never the
+  response.
+- `cc-router stop` no longer terminates itself — or your editor sessions —
+  when it falls back to killing by port. The fallback listed every process
+  with a socket on the proxy port (`lsof -ti :port` reports both ends of
+  every connection), which included the stop CLI itself (its health-check
+  fetch leaves a keep-alive socket open) and any live Claude Code or Codex
+  session talking to the proxy. All of them received SIGTERM alongside the
+  daemon; the shell reported the stop command as `zsh: terminated`. The
+  listing now selects only the process LISTENING on the port, and killing by
+  port additionally never targets the process doing the killing.
+- Service-mode `cc-router start` no longer reports "nothing is answering" for
+  a service that comes up moments later. The post-bootstrap health wait was
+  10 seconds, but a stop→start restart re-bootstraps a label whose process
+  exited moments earlier, and launchd throttles that spawn by up to ~10s
+  (default ThrottleInterval) before the daemon even begins booting — so the
+  window regularly closed right as throttled spawns landed, and the very
+  next `cc-router status` connected fine. The wait now outlasts the throttle
+  (30s), says what it is waiting for, and a genuine timeout points to
+  `cc-router status` before suggesting the logs.
+- OpenAI activity rows carry the same columns as Claude ones. The OpenAI ingress
+  recorded a path but no method and no client, and the dashboard needs both
+  `method` and `path` to render the request — so those rows fell back to the
+  bare entry type and read `route` under a blank client column, beside
+  `POST /messages` and `cli` on the Claude rows. Codex CLI traffic now reports
+  a `codex` source of its own rather than borrowing `cli`, which the detail
+  panel spells out as "Claude Code"; a `/v1/messages` request that cross-routes
+  to an OpenAI backend is still classified by the client that sent it.
+- An OpenAI account's usage bars are labelled from each window's own duration
+  instead of by position. Codex reports its weekly window in the `primary` slot
+  and leaves `secondary` empty, but the bars assumed primary meant 5h and
+  secondary meant weekly — so an account at 100% of its weekly quota displayed
+  as `5h 100%` next to a `weekly 0%` bar that was really the empty slot. The
+  countdown gave it away: a 5h window cannot reset five days out.
+- A named Codex bucket no longer renders twice. Codex sends an absent window as
+  an all-zero placeholder rather than omitting it, so the empty `secondary` was
+  treated as real and emitted a second row — carrying the same label as the
+  first, because a zero-length window falls through to a guessed one.
+- An account id exactly as long as its column no longer runs into the status
+  next to it (`plus-developer-droidLIMITED`).
+- The status dashboard can enable, disable, and remove OpenAI accounts. Three
+  guards still sent the operator to the CLI for operations the management
+  endpoints had already gained: `e` answered "OpenAI accounts are managed from
+  the CLI", and delete refused both at the keypress and again inside the
+  confirmation, so the second gate would have caught anyone who got past the
+  first. The cap keys (`w`/`s`) never had such a check, which is what made the
+  inconsistency visible.
+- `cc-router start` no longer has to be run twice. In service mode it wrote the
+  LaunchAgent plist and immediately bootstrapped it, but `launchctl bootout`
+  returns as soon as launchd accepts the request — not once the job is gone.
+  Bootstrapping the same label during that window fails with
+  `Bootstrap failed: 5: Input/output error`, and the legacy `launchctl load`
+  fallback fails identically, so the command printed a warning and exited
+  successfully with nothing running. It now waits for launchd to release the
+  label before loading, and retries the bootstrap until a deadline.
+- A failed start is no longer reported as a success. Service mode installed the
+  service and returned without checking that anything was listening — the
+  background path already health-checked, the service path did not. It now
+  polls the health endpoint and exits non-zero with the log location if the
+  proxy never answers.
+- `cc-router stop` waits for the proxy to actually exit before reporting
+  success. With no PID file the stop fell through to killing by port, which
+  returned as soon as SIGTERM was sent; a `start` issued straight afterwards
+  then raced the still-running process. The port path now waits for the
+  process to die and escalates to SIGKILL, matching the PID path.
+- A service-managed proxy writes a PID file. `writePid`/`removePid` were gated
+  on `CC_ROUTER_DAEMON`, which the LaunchAgent and systemd unit never set —
+  they set `CC_ROUTER_SERVICE` — so every service-managed instance left no PID
+  behind and took the weaker port-based stop path.
+- A refresh token the OAuth server rejects as terminally expired
+  (`400 invalid_grant`) is no longer retried forever. Every rejection was
+  treated as transient, so the five-minute refresh loop kept re-POSTing a token
+  that could never succeed — one account issued roughly 2000 futile requests
+  over three weeks on the shared Claude Code `client_id`, and nothing marked it
+  as needing re-authentication. Such an account is now flagged, dropped from the
+  refresh loop, and reported once to the operator; the flag is persisted, so a
+  restart neither resumes the futile traffic nor returns the dead account to the
+  routing pool, where it would have answered every request with a `401`. Any
+  other rejection — a different 400, 401, 429, 5xx, a network error — is still
+  retried. Thanks to @ethanhawkes-gif.
+- `accounts list` no longer prints a count that contradicts the rows beneath it.
+  The proxy reads `accounts.json` once at startup and holds that snapshot, so
+  the two sources diverge the moment anything rewrites the file underneath it;
+  the count came from disk while the rows came from the live pool, and a real
+  drift surfaced only as "Accounts (4 configured)" above six rows. An account
+  could be routing live while its refresh token existed nowhere on disk — one
+  restart from needing re-authentication — with nothing to indicate it. The
+  count now describes the rows it sits above, and both directions of drift are
+  named: accounts missing from disk (a credential-loss risk, with the recovery)
+  and accounts on disk the proxy has not loaded (merely stale).
+- `accounts remove` accepts an account that exists only in the running proxy.
+  The guard validated the id against disk while the removal it guards prefers
+  the live pool — the same pool `list` displays — so an account you could see
+  and the code could remove was rejected as "not found". The inventory is now
+  the union of both sources.
+- An unexpected failure partway through an OpenAI request — an upstream
+  connection error, a rejected token refresh, a mid-stream abort — no longer
+  takes down the proxy. Both `/v1/responses` and the `/v1/messages` OpenAI
+  branch awaited the upstream call without catching a rejection, so a single
+  network blip could kill the daemon and lose every account's routing state.
+- `/v1/messages` no longer reports an upstream OpenAI failure as a success. A
+  stream ending in `response.failed`, an `error` event, a JSON error body, or
+  no completion event at all — a stream that stopped mid-flight, or an
+  event-stream response with no body — was translated into an empty Anthropic
+  message with HTTP 200; each now surfaces as an error response, so a rate
+  limit reads as a rate limit instead of an empty assistant turn. A non-2xx
+  upstream response (401, 429, 5xx) is now relayed with its real status, error
+  message, and safe headers — `Retry-After` included, so a client can honor the
+  backoff the server asked for — instead of being parsed as an event stream and
+  reported as a success or a generic failure; non-2xx Codex responses also keep
+  their real content type instead of being rewritten to `text/event-stream`.
+- A terminal event that carries no response object is no longer treated as a
+  successful result. `{"type":"response.completed","response":null}` — or any
+  other non-object payload — satisfied the completion check, so a
+  non-streaming request got HTTP 200 with a `null` body, and `/v1/messages` got
+  a fabricated empty assistant turn; a streamed `/v1/messages` turn was closed
+  with `message_stop` and `end_turn`, telling the client a truncated answer had
+  finished normally. The collected paths now report the `502` that a stream
+  ending without a terminal event already did, and the streamed path ends
+  without `message_stop`, which is what clients already surface as a
+  truncation.
+- A client that disconnects mid-response no longer leaves the upstream Codex
+  request running. Nothing propagated the disconnect, so the relay drained the
+  whole upstream body into a closed socket and held that connection open for a
+  response nobody would receive; the request is now cancelled as soon as the
+  client goes away.
+- A single malformed SSE frame no longer truncates a `/v1/messages` stream.
+  Parsing a chunk was all-or-nothing, so one bad frame discarded the valid
+  events beside it and ended the response as a clean `200` the client could
+  not tell apart from a complete answer.
+- OpenAI credentials are written back to the accounts file the proxy was
+  started with. Under `--accounts <path>` accounts were read from that file
+  but every refresh, add, delete, and update wrote the default
+  `accounts.json` — discarding the change and copying OAuth tokens into an
+  unrelated file.
+- OpenAI token refresh survives a malformed token response. A payload missing
+  `expires_in` produced a `NaN` expiry that read as "never needs refreshing",
+  so the account kept presenting a stale token indefinitely — as did a lifetime
+  large enough to overflow into an infinite expiry, while a zero or negative
+  one reported success on a token that was already due for another refresh.
+  Each is now treated as the failed refresh it is; a failure to
+  persist rotated credentials no longer fails the request that triggered the
+  refresh, and the write is now retried on subsequent requests (and the
+  background refresh loop) until it succeeds, so a rotated refresh token
+  still reaches disk.
+- `PATCH /cc-router/accounts/:id` works for OpenAI accounts instead of
+  returning `404`, so a single OpenAI account can be enabled, disabled, or
+  capped without toggling the whole provider. `POST /cc-router/accounts` now
+  rejects an out-of-range percentage cap the same way `PATCH` does, rather
+  than silently coercing it.
+- A Codex response that ends as `response.incomplete` — e.g. hitting the
+  output-token ceiling — is now delivered with its partial content and token
+  usage instead of being discarded. `/v1/responses` treated only
+  `response.completed` as a terminal event, so `response.incomplete` looked
+  identical to a stream that stopped mid-flight and turned a usable partial
+  answer into a `502 upstream_error`. A streamed `/v1/messages` turn that ends
+  incomplete now closes properly too — the Anthropic translation emitted no
+  `message_stop` for it, leaving the client waiting on a turn that was already
+  over. Both `/v1/messages` paths, streamed or collected, now report
+  `max_tokens` as the stop reason when the output-token ceiling was the cause,
+  instead of an `end_turn` that made a truncated answer look deliberate.
+
+---
+
+## [0.9.0] — 2026-08-04
+
+### Added
+
+- **Non-streaming `/v1/responses` requests are served correctly.** A caller that
+  posts `stream: false` — the public Responses API default — now receives a
+  single JSON Responses object. The Codex backend is SSE-only, so the router
+  reconciles the forced event stream into one body instead of returning raw SSE
+  bytes the client cannot parse. Streaming callers (the Codex CLI) are
+  unaffected.
+- A distinct `warn` activity type with its own `logWarn` console channel,
+  rendered as its own row style on the status dashboard so advisories are
+  visually separate from routing errors.
+
+### Changed
+
+- `/v1/responses` rejects an explicit `store: true` with a `400`
+  `invalid_request_error` instead of silently rewriting it to `false`. The Codex
+  subscription backend is stateless and cannot offer server-side response
+  retrieval by id. An omitted `store` is still normalized to `false` silently.
+- An explicit `max_output_tokens` is still dropped — the backend does not
+  support it — but each drop now surfaces as a warning in both the console log
+  and the dashboard activity feed, so the ignored cap is observable.
+
+### Fixed
+
+- Malformed upstream data from the Codex backend (a bad JSON body or a malformed
+  SSE stream) maps to a `502 upstream_error` instead of throwing out of the
+  async Express handler, which left the client connection hanging indefinitely.
+- Non-2xx Codex passthrough preserves the upstream content-type instead of
+  hardcoding `text/plain`, which broke SDK clients that parse errors by
+  content-type.
+
+---
+
+## [0.8.3] — 2026-08-04
+
+### Fixed
+
+- Accounts added while the proxy is running (`accounts add`, `add-openai`,
+  `login-openai`) are now loaded into the live pool immediately — routable and
+  visible in `accounts list` without a restart. Previously only removals were
+  applied at runtime; adds required restarting the proxy. When no proxy is
+  running the add still falls back to a plain disk write.
+
+---
+
+## [0.8.2] — 2026-08-03
+
+### Fixed
+
+- The interactive status dashboard no longer crashes when model-scoped usage
+  reports an unknown reset timestamp as zero.
+
+### Internal
+
+- GitHub Actions bumped to v7.
+- The Codex config-path test uses the platform-native location instead of a
+  hardcoded POSIX path.
+
+---
+
+## [0.8.1] — 2026-08-03
+
+### Fixed
+
+- Anthropic model-scoped usage rows using the current nested `scope.model`
+  shape are parsed correctly, so exhausting Fable capacity no longer creates
+  an account-global cooldown that also blocks Opus routing.
+
+### Changed
+
+- Hosting guidance about sharing accounts across a team was removed from the
+  docs.
+
+### Internal
+
+- CI installs with pnpm and runs the suite across the supported Node versions.
+
+---
+
+## [0.8.0] — 2026-08-01
+
+### Added
+
+- **Model-aware Anthropic allowance routing.** Requested Messages models now
+  participate in account eligibility and headroom ranking through dynamic
+  model-scoped weekly limits. Account-based session affinity is retained while
+  the bound account can serve the requested model.
+- Authenticated dashboard, health, and accounts views now show safe global and
+  model-scoped capacity, usage freshness, paid-extra state, and global or
+  requested-model cooldown summaries.
+
+### Changed
+
+- Anthropic cooldowns, upstream quota exhaustion, disabled or unhealthy state,
+  and invalid authentication are hard routing exclusions. The only fallback is
+  an explicit bypass of configured per-account percentage caps when every
+  otherwise eligible account is capped.
+- Usage snapshots refresh in memory from Anthropic's internal OAuth usage
+  endpoint with bounded concurrency, timeout, and backoff, while response
+  headers remain the graceful-degradation source when that endpoint is
+  unavailable.
+- The README leads with the fork's positioning, and the account-sharing use
+  case was dropped.
+
+### Fixed
+
+- When all accounts are hard-blocked, the router now returns a local
+  Anthropic-shaped 429 when any blocker is rate-limit or quota related, adding
+  the earliest trustworthy `Retry-After` only when known. A 503 is used only
+  for entirely non-rate-limit unavailability. These local errors make no
+  Anthropic Messages request, and fallback no longer sends requests to cooling
+  or upstream-rate-limited accounts.
+- `accounts remove` now removes the account from the running proxy instead of
+  only rewriting `accounts.json`, so a removed account stops being routed
+  without a restart.
+- A per-account cap of 100% is no longer treated as over-cap at full
+  utilization, so sessions on accounts running on paid extra usage stay sticky
+  on their bound account.
+
+### Internal
+
+- Package management switched from npm to pnpm (`pnpm-lock.yaml`,
+  `pnpm-workspace.yaml`).
+
+---
+
+## [0.7.0] — 2026-07-26
+
+First release of `@timo972/cc-router`, an independently maintained fork of
+[VictorMinemu/CC-Router](https://github.com/VictorMinemu/CC-Router). Adds
+cache-aware session routing and a round of security hardening.
+
+### ⚠️ Breaking
+
+- **The package moved to `@timo972/cc-router`.** The old package name is no
+  longer used by this project. Reinstall rather than upgrade in place:
+
+  ```bash
+  npm uninstall -g ai-cc-router
+  npm install -g @timo972/cc-router
+  ```
+
+  Update checks and the CLI's install hints now resolve against the new name.
+  Existing `~/.cc-router` configuration and accounts are unaffected.
+
+- **Auto-update is off by default.** New releases are announced but not
+  installed. Opt back in with `autoUpdate: true` in `~/.cc-router/config.json`
+  or `CC_ROUTER_AUTO_UPDATE=1`.
+
+- **Server mode now requires a proxy secret.** The "skip — no password" option
+  is gone, and the router refuses to bind a non-loopback interface without a
+  secret. Loopback-only setups are unchanged.
+
+- **Telemetry is opt-in.** Nothing is sent unless you run
+  `cc-router telemetry on`.
+
+### Added
+
+- **Cache-aware session routing.** Requests from one Claude Code session stay on
+  one account, preserving prompt-cache locality instead of scattering a
+  conversation's shared prefix across per-account caches. New sessions are
+  placed by fewest in-flight requests, then fewest bound sessions, then most
+  rate-limit headroom, with a rotating round-robin tie-break.
+- **Load-aware account leases** with ownership-checked acquisition and release,
+  so concurrent streams cannot corrupt each other's account state.
+- **Passive stream lifecycle diagnostics** on `cc-router status --json` and
+  `/cc-router/health`, for diagnosing stalled streams without buffering or
+  altering response bytes.
+- **[docs/session-routing.md](docs/session-routing.md)** — operational guide for
+  running the router across a team.
+
+### Changed
+
+- Streaming stays byte-transparent: no synthetic `message_stop`, and no retry
+  once response bytes have started. `proxyRequestTimeoutMs` now covers only the
+  pre-header phase and is disarmed once a response begins, so long thinking
+  pauses are no longer cut off.
+- `cc-router configure` manages Claude Code's event- and byte-level stream idle
+  watchdogs at 30 minutes. Restart running Claude Code processes to pick them up.
+- Unauthenticated `/cc-router/health` returns only `{status}`; the account
+  inventory and recent logs require the proxy secret.
+- `~/.cc-router` is created `0700`; `accounts.json` and `config.json` are written
+  `0600`, so other local users can no longer read OAuth tokens or the secret.
+
+### Fixed
+
+- Concurrent SSE streams are routed per Claude session rather than sharing state.
+- Token refresh serializes account ownership and joins an in-flight refresh
+  during request preparation, instead of racing a second refresh.
+- Refresh ownership is reserved across account deletion.
+- Claude config mutations are guarded and schema-validated, and watchdog backups
+  survive the config lifecycle.
+- Idle session counts expire on read rather than accumulating.
+- SSE lifecycle line retention is bounded.
+- Deflaked the started-stream timeout assertion, which allowed only 50 ms for the
+  upstream response and failed under parallel CI load.
+
+### Security
+
+- Strict semver validation on registry responses before the version reaches a
+  child process, and `shell:true` dropped from the update spawn — closes a
+  Windows command-injection path.
+- Release pipeline publishes with `--provenance` under least-privilege
+  permissions, with actions pinned by commit SHA.
+- mitmproxy root CA can now be removed at teardown (`cc-router client disconnect`)
+  instead of leaving a trusted root installed permanently.
+- Docker runs as non-root with digest-pinned images, `cap_drop: ALL`,
+  `no-new-privileges`, loopback-bound ports, and a required `LITELLM_MASTER_KEY`.
+  `--detailed_debug` was dropped — it logged the injected OAuth bearer.
+- `docs/security.md` corrected on telemetry, file permissions, and TLS.
+- `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
+  affected APIs are not used here.
+
+[0.9.0]: https://github.com/Timo972/cc-router/releases/tag/v0.9.0
+[0.8.3]: https://github.com/Timo972/cc-router/releases/tag/v0.8.3
+[0.8.2]: https://github.com/Timo972/cc-router/releases/tag/v0.8.2
+[0.8.1]: https://github.com/Timo972/cc-router/releases/tag/v0.8.1
+[0.8.0]: https://github.com/Timo972/cc-router/releases/tag/v0.8.0
+[0.7.0]: https://github.com/Timo972/cc-router/releases/tag/v0.7.0

@@ -3,25 +3,33 @@
 **Local multi-account router for Claude Max and OpenAI ChatGPT/Codex subscriptions.**  
 Distribute Claude Code requests across Claude subscriptions, and expose an OpenAI Responses-compatible route for Codex CLI through the same proxy.
 
-[![npm](https://img.shields.io/npm/v/ai-cc-router)](https://www.npmjs.com/package/ai-cc-router)
+[![npm](https://img.shields.io/npm/v/@timo972/cc-router)](https://www.npmjs.com/package/@timo972/cc-router)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> **An actively maintained fork of [VictorMinemu/CC-Router](https://github.com/VictorMinemu/CC-Router)**, published as
+> [`@timo972/cc-router`](https://www.npmjs.com/package/@timo972/cc-router) with bug fixes and added features — most
+> notably **cache-aware sticky session routing**, which pins each Claude Code session to one account so a conversation
+> keeps hitting the same prompt cache instead of scattering its shared prefix across accounts. Also includes
+> load-aware account leases, byte-transparent streaming fixes, and a round of security hardening.
+> See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
 ![CC-Router Dashboard](assets/dashboard.png)
 
 ### Features
 
-- **Round-robin token rotation** — distribute requests across 2-20 Claude Max accounts automatically
-- **Multi-provider routing** — route `openai/*` models to OpenAI ChatGPT/Codex subscription accounts and Claude models to Claude subscriptions
+- **Cache-aware session routing** — keep each Claude Code session on one account while distributing new sessions across 2-20 Claude Max accounts
+- **Multi-provider routing** — route `openai/*` and unprefixed `gpt-*` models to OpenAI ChatGPT/Codex subscription accounts and Claude models to Claude subscriptions
 - **Transparent Claude proxy** — Claude Code works normally; streaming, thinking, tool use, prompt caching all pass through
 - **Codex CLI support** — configure Codex to use CC-Router as a Responses-compatible provider
 - **Automatic token refresh** — OAuth tokens are refreshed before they expire, saved atomically to disk
-- **Rate limit awareness** — detects 429/529 responses and coolsdown accounts; picks the least-loaded one
-- **Client mode** — connect to a remote CC-Router from any machine with one command (`cc-router client connect <url>`)
+- **Model-aware rate limits** — avoids accounts whose requested-model or global allowance is exhausted, and respects scoped cooldowns
+- **Automatic failover & retry** — a 429 fails over to another account and a 5xx is retried inside the router, before any response byte is relayed, on both the Claude and Codex routes; on by default, opt out with `"autoFailover": false`
+- **Client mode** — connect another device you own to your private CC-Router (`cc-router client connect <url>`)
 - **Claude Desktop support** — route Cowork / Agent-mode traffic through CC-Router via mitmproxy interception (macOS, Windows, Linux)
 - **Guided setup wizard** — interactive `cc-router setup` extracts tokens from Keychain or credentials file, configures everything
 - **Live dashboard** — real-time terminal UI showing account health, request counts, token usage, recent activity
-- **Proxy authentication** — optional Bearer / x-api-key secret for internet-exposed deployments
-- **Auto-update** — patch/minor releases install automatically (opt-out available)
+- **Proxy authentication** — Bearer / x-api-key secret; required when binding a non-loopback interface
+- **Update notifications** — new releases are announced in the CLI; installing is opt-in (`autoUpdate: true`)
 - **Multiple deployment modes** — background daemon, native OS auto-start (launchd/systemd), foreground, Docker Compose
 - **Cross-platform** — macOS, Linux, Windows; Node.js 20+
 
@@ -62,6 +70,16 @@ Claude Desktop  ─[mitmproxy]─┐  (optional — intercepts api.anthropic.com
 
 All standard Claude Code features work transparently on the Claude route: streaming, extended thinking, tool use, prompt caching. OpenAI subscription routing is available for Codex-compatible Responses requests and Claude Code cross-routing with the limitations documented below.
 
+### Cache-aware Claude account routing
+
+CC-Router keeps requests from one Claude Code session on the same eligible Anthropic subscription account. This session affinity remains account-based and preserves prompt-cache locality instead of scattering a conversation's shared prefix across account-specific caches. The model requested by each Messages call affects whether the bound account is still eligible; changing models does not create a second binding, but it can make the existing binding fail over when that account cannot serve the new model. New sessions prefer the account with the fewest in-flight requests, then the fewest bound sessions, then included allowance over paid extra usage, then the most applicable global and requested-model headroom; exact ties use a rotating round-robin order.
+
+Anthropic cooldowns, effective global or requested-model quota exhaustion, disabled accounts, invalid authentication, and unhealthy accounts are hard exclusions. The configured per-account percentage caps are softer policy controls: when at least one account is otherwise usable but every usable account is over a configured cap, CC-Router may explicitly fall back to the least-loaded capped account. It never uses that fallback to bypass an Anthropic cooldown or exhausted effective quota.
+
+If an upstream account returns 429 or any 5xx before a single response byte has been relayed, CC-Router applies the failure's cooldown and affinity bookkeeping and then retries the request itself, up to 3 upstream attempts per request. A 429 (or an overload the provider cools down: Anthropic 529; Codex 503/529) always fails over to a *different* account. Any other 5xx keeps a session-bound request on its own account, retrying after a short pause; a session-less request re-routes the way a fresh request would — typically an idle other account, exactly where the client's own retry used to land. The failover is on by default; set `"autoFailover": false` in `~/.cc-router/config.json` (and restart the router) to opt out — every upstream failure then passes through unchanged and clients own all retries, as before. Be aware that current Claude Code builds no longer retry 429s themselves, so with failover off a rate limit surfaces directly in the session as an error. One trade-off worth knowing: once the router commits to a retry it abandons the original failure response, so a network error on the retry attempt surfaces as a local 502 rather than the original 429. When no other account is eligible or the budget is exhausted, the last failed upstream response is passed through unchanged, exactly as before. A 401 is always passed through (with a background token refresh), and the router never retries after response bytes have started — mid-stream failures reach the client untouched. If no account is usable before forwarding begins, the router instead returns a local Anthropic-shaped 429 whenever any account is blocked by a rate limit or exhausted quota. That 429 includes `Retry-After` only when a trustworthy unblock time is known. A local 503 is reserved for entirely non-rate-limit unavailability, such as all accounts being disabled or unhealthy. Either local response makes no Anthropic Messages request. Affinity mappings exist only in process memory, expire after one hour of inactivity, and are capped in size. Session IDs are never persisted or logged.
+
+Streaming remains byte-transparent. In particular, CC-Router never appends a synthetic `message_stop` event. `proxyRequestTimeoutMs` protects only the phase before Anthropic response headers arrive; once a response starts, its body continues through the native byte-exact proxy pipe. Automatic `cc-router configure` setup manages Claude Code's event-level and byte-level stream idle watchdogs at 30 minutes. Restart any existing Claude Code process after configuration so it inherits those values.
+
 **Claude Desktop support** is opt-in and requires a small interceptor (mitmproxy) because Claude Desktop doesn't expose a custom API endpoint setting. See [Claude Desktop support](#claude-desktop-support).
 
 ---
@@ -75,114 +93,9 @@ Claude Max has rate limits per account. If you hit them regularly mid-session �
 With two accounts you double your effective rate limit. With three, you triple it. The proxy distributes requests automatically; you don't change how you use Claude Code at all.
 
 ```text
-1 account  →  hit limit, wait 60s, continue
-3 accounts →  request rotates across all three, limit effectively tripled
+1 account  →  hit limit, session errors out (current Claude Code no longer retries 429s)
+3 accounts →  sessions spread across all three; a rate-limited request fails over mid-flight
 ```
-
----
-
-### Team sharing accounts — fewer subscriptions, same throughput
-
-A team of five doesn't need five Max subscriptions. In practice, developers don't all peak at the same time. Three accounts can comfortably serve five people working normal hours.
-
-#### Example setup: 5 devs, 3 accounts
-
-```text
-cc-router (hosted on a shared machine or VPS)
-     │
-     ├── max-account-1   ← alice's subscription
-     ├── max-account-2   ← bob's subscription
-     └── max-account-3   ← carol's subscription
-           │
-           └── serves: alice, bob, carol, dave, eve
-```
-
-Each developer sets their `ANTHROPIC_BASE_URL` to the shared proxy. Done. The proxy handles routing and token refresh invisibly.
-
-#### Cost example
-
-| Setup | Monthly cost |
-|-------|-------------|
-| 5 individual Max subscriptions | 5 × $100 = **$500/mo** |
-| 3 shared via cc-router | 3 × $100 = **$300/mo** |
-
-You save $200/mo without any loss in capability for a typical team workload.
-
----
-
-### Hosting cc-router on a shared machine
-
-Run cc-router on a machine everyone on the team can reach — a home server, a VPS, or a spare machine on the office network.
-
-#### On the server
-
-```bash
-npm install -g ai-cc-router
-cc-router setup          # configure the 3 shared accounts
-cc-router start          # first run asks: background/boot/server mode — choose "server mode"
-```
-
-When you enable server mode during `cc-router start`, the proxy automatically binds to all interfaces (`0.0.0.0`) and prints instructions for connecting clients.
-
-#### On each developer's machine
-
-No installation needed. Just set two environment variables in `~/.claude/settings.json`:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://192.168.1.50:3456",
-    "ANTHROPIC_AUTH_TOKEN": "proxy-managed"
-  }
-}
-```
-
-Replace `192.168.1.50` with the server's IP or hostname. Then run `claude` normally.
-
-Or use the CLI to write the settings automatically:
-
-```bash
-cc-router configure --port 3456
-# Then manually update ANTHROPIC_BASE_URL to the remote IP
-```
-
----
-
-### Hosting on a VPS (internet-accessible)
-
-If your team is distributed or works remotely, run cc-router on a VPS and expose it over HTTPS via a reverse proxy.
-
-#### Recommended nginx config
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name cc-router.yourcompany.com;
-
-    # ... SSL cert config (e.g. Let's Encrypt) ...
-
-    location / {
-        proxy_pass http://127.0.0.1:3456;
-        proxy_buffering off;          # required for SSE streaming
-        proxy_read_timeout 300s;      # required for long thinking requests
-        proxy_set_header X-Forwarded-For $remote_addr;
-    }
-}
-```
-
-For longer requests, set `proxyRequestTimeoutMs` in `~/.cc-router/config.json` (milliseconds) and keep `proxy_read_timeout` at least as high.
-
-Each developer then points to:
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "https://cc-router.yourcompany.com",
-    "ANTHROPIC_AUTH_TOKEN": "proxy-managed"
-  }
-}
-```
-
-**Security note:** if the proxy is internet-accessible, add authentication at the nginx level (basic auth, mTLS, or IP allowlist) so only your team can use it. cc-router does not implement user authentication itself.
 
 ---
 
@@ -190,7 +103,7 @@ Each developer then points to:
 
 ```bash
 # 1. Install
-npm install -g ai-cc-router
+npm install -g @timo972/cc-router
 
 # 2. Wizard: extract tokens + configure Claude Code automatically
 cc-router setup
@@ -216,7 +129,7 @@ cc-router start --reconfigure
 **Requirements:** Node.js 20 or 22.
 
 ```bash
-npm install -g ai-cc-router
+npm install -g @timo972/cc-router
 ```
 
 Verify:
@@ -307,7 +220,17 @@ cc-router configure codex    (Re)write ~/.codex/config.toml for Codex CLI
 cc-router configure codex --model openai/gpt-5-codex
 cc-router configure models --claude-model claude-sonnet-4-6 --openai-model gpt-5-codex
 cc-router configure --show   Show current Claude Code proxy settings
-cc-router configure --remove Remove cc-router settings (same as revert without stopping)
+cc-router configure --remove Remove cc-router settings from Claude Code (proxy stays up)
+cc-router configure codex --remove  Remove the Codex managed block (proxy stays up)
+
+cc-router cli                Show whether Claude Code and Codex are routing through the proxy
+cc-router cli claude start   Point Claude Code at the running proxy
+cc-router cli claude stop    Restore Claude Code to native Anthropic auth (proxy stays up)
+cc-router cli claude resume  Same as cli claude start
+cc-router cli codex start    Point Codex CLI at the running proxy
+cc-router cli codex stop     Restore Codex CLI to native OpenAI auth (proxy stays up)
+cc-router cli codex resume   Same as cli codex start
+cc-router claude … / cc-router codex …   Hidden shortcuts for the same commands
 
 cc-router client connect <url>       Connect Claude Code to a remote CC-Router
 cc-router client connect --desktop   Also configure Claude Desktop interception
@@ -361,6 +284,8 @@ See [docs/litellm-setup.md](docs/litellm-setup.md) for details.
 
 CC-Router exposes an OpenAI Responses-compatible endpoint for Codex CLI at `/v1/responses`. This lets Codex use OpenAI ChatGPT/Codex subscription accounts through the same local router that Claude Code uses for Claude subscriptions.
 
+**Features:** Sticky sessions pin each Codex conversation to one account for prompt-cache locality. Load- and headroom-aware account selection spreads new sessions across available capacity. Usage tracking from response headers reports account-level 5-hour and 7-day windows, dynamically discovered model-scoped metered buckets, credits, and plan. User caps (`sessionLimitPercent`/`weeklyLimitPercent`) apply to the default Codex bucket. The dashboard shows per-bucket rows, usage bars, credits, plan, and cooldown state for OpenAI accounts.
+
 Configure Codex:
 
 ```bash
@@ -406,11 +331,20 @@ CC_ROUTER_TOKEN=cc-rtr-your-secret codex -m openai/gpt-5.5
 
 Model prefixes:
 
-| Prefix | Upstream |
+| Model | Upstream |
 |--------|----------|
 | `openai/*` | OpenAI ChatGPT/Codex subscription route |
+| `gpt-*` (no prefix) | OpenAI ChatGPT/Codex subscription route |
 | `claude/*` | Claude subscription route |
 | `anthropic/*` | Claude subscription route |
+| anything else with no prefix | Claude subscription route |
+
+The unprefixed `gpt-*` rule exists for clients that do not speak this
+convention. The Codex CLI writes the bare slug from its own registry — either
+`model = "gpt-5.6-sol"` in `~/.codex/config.toml` or whatever its `/model`
+picker selects — so those names arrive without a prefix and would otherwise be
+routed to Claude, where `/v1/responses` answers `501`. Configured
+`openAIAliases` apply to the bare form too.
 
 Examples after the configuration above:
 
@@ -455,9 +389,9 @@ This prompts for the OpenAI access token, refresh token, expiry timestamp, and s
 
 ---
 
-## Client mode — connecting to an existing CC-Router
+## Client mode — connecting your own devices
 
-If someone on your team already hosts a CC-Router instance (on a VPS, home server, or another machine on the LAN), you don't need to install accounts locally. You just point your Claude Code at the remote proxy.
+Client mode lets you connect another device you own to your private CC-Router over a trusted private network. It is not intended for sharing subscription accounts or proxy access with other people, or for exposing CC-Router to the public internet.
 
 The setup wizard asks about this at the very first step:
 
@@ -465,13 +399,13 @@ The setup wizard asks about this at the very first step:
 cc-router setup
 # → What do you want to do?
 #   • Host CC-Router on this machine
-#   • Connect to an existing CC-Router server  ← pick this
+#   • Connect to your existing CC-Router server  ← pick this
 ```
 
 Or use the dedicated command directly:
 
 ```bash
-# Quick connect — just point Claude Code at the remote proxy
+# Connect another device you own over your private network
 cc-router client connect http://192.168.1.50:3456 --secret cc-rtr-abc123...
 
 # Check status
@@ -539,7 +473,7 @@ Then start the interceptor:
 cc-router client start-desktop
 ```
 
-Open Claude Desktop and send a message. The request will be intercepted, redirected to CC-Router, and round-robinned across your accounts just like Claude Code traffic.
+Open Claude Desktop and send a message. The request will be intercepted and redirected to CC-Router. Requests carrying exactly one valid `X-Claude-Code-Session-Id` receive cache-aware sticky affinity; requests without one valid session header use load-aware **unscoped** routing and do not receive sticky affinity. Claude Desktop traffic normally follows the unscoped path.
 
 ### Stopping / removing Desktop interception
 
@@ -578,6 +512,24 @@ mitmproxy's local mode is *process-scoped* — it only intercepts traffic from t
 
 ---
 
+## Toggle Claude Code or Codex while the proxy stays up
+
+`cc-router start` / `stop` control the proxy process. To send only one CLI back to native auth (or point it at the proxy again) without tearing the router down:
+
+```bash
+cc-router cli                 # Claude Code + Codex routing state
+cc-router cli claude stop     # Claude Code → native Anthropic auth
+cc-router cli claude resume   # Claude Code → running proxy (alias of start)
+cc-router cli codex start     # Codex CLI → running proxy
+cc-router cli codex stop      # Codex CLI → native OpenAI auth
+```
+
+`cc-router claude …` and `cc-router codex …` are shortcuts for the same commands. `cli` is the grouping — not `provider`, which already means the Anthropic/OpenAI account pool. `cc-router client` remains remote client-mode (connect this machine to another CC-Router).
+
+These rewrite `~/.claude/settings.json` or the managed block in `~/.codex/config.toml`. The proxy keeps listening. Restart any already-running Claude Code or Codex process so it picks up the new config. From `cc-router status`, `[c]` / `[x]` do the same toggles.
+
+---
+
 ## Reverting to normal Claude Code
 
 To stop using cc-router and go back to normal Claude Code authentication:
@@ -605,7 +557,7 @@ cc-router status
   Claude 2/2 healthy  OpenAI 1/1 healthy  ·  cross-route ready
   endpoints /v1/messages /v1/responses /v1/models /cc-router/accounts
   routing claude=claude-sonnet-4-6 aliases[sonnet]  openai=gpt-5-codex aliases[codex]
-  models [m] list/select  change [c] Claude [o] OpenAI
+  cli Claude on Codex off [c]/[x]  ·  models [m] then [c]/[o] defaults
 
  MODELS  [m/r] refresh  [↑/↓] select  [c] Claude default  [o] OpenAI default
   current claude=claude-sonnet-4-6  openai=gpt-5-codex
@@ -627,7 +579,7 @@ cc-router status
 
 Press `q` to quit. Run with `--json` for non-interactive output; the JSON includes an `operational` block with capabilities, endpoints, provider readiness, auth status, and model routing. Secrets and account tokens are never included.
 
-The dashboard is also a control surface. In local mode it controls the local proxy; in client mode it controls the remote CC-Router configured by `cc-router client connect`.
+The dashboard is also a control surface. In local mode it controls the local proxy; in client mode it controls the remote CC-Router configured by `cc-router client connect`. Authenticated account views include dynamic model-scoped allowance rows, their reset times, applicable global or requested-model cooldowns, paid-extra state, and whether the usage snapshot is fresh, stale, or unavailable. A stale row is shown as unknown rather than as authoritative available capacity.
 
 | Key | Action |
 |-----|--------|
@@ -637,7 +589,8 @@ The dashboard is also a control surface. In local mode it controls the local pro
 | `w` / `s` | Change selected Claude account weekly/session cap |
 | `d` | Delete selected Claude account |
 | `m` / `r` | Load or refresh discovered provider models |
-| `c` | Set selected `anthropic/*` model as Claude default |
+| `c` | Toggle Claude Code routing (or set Claude model default when MODELS is focused) |
+| `x` | Toggle Codex CLI routing (proxy stays up) |
 | `o` | Set selected `openai/*` model as OpenAI default |
 
 List and change models without waiting for a package update:
@@ -705,6 +658,7 @@ Check status anytime: `cc-router telemetry status`.
 >
 > **Read Anthropic's Terms of Service before using this tool.**  
 > Using multiple Max subscriptions to increase throughput may violate the ToS. Anthropic has been known to ban accounts for unusual OAuth usage patterns.
+> Do not share subscription accounts, OAuth credentials, or CC-Router proxy access with other people.
 >
 > The authors are not responsible for any account bans, loss of access, or other consequences resulting from the use of this software. Use at your own risk.
 
@@ -714,10 +668,15 @@ Check status anytime: `cc-router telemetry status`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Bug reports → [GitHub Issues](https://github.com/VictorMinemu/CC-Router/issues)
+Bug reports → [GitHub Issues](https://github.com/Timo972/cc-router/issues)
 
 ---
 
 ## License
 
 [MIT](LICENSE)
+
+This project began as a fork of [VictorMinemu/CC-Router](https://github.com/VictorMinemu/CC-Router)
+and is now maintained independently as [`@timo972/cc-router`](https://www.npmjs.com/package/@timo972/cc-router).
+It is not affiliated with the upstream project, and issues should be filed here rather than upstream.
+The original MIT copyright notice is retained in [LICENSE](LICENSE).

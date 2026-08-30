@@ -10,11 +10,22 @@ import {
   type RunPreferences,
 } from "../config/manager.js";
 import { writeClaudeSettings } from "../utils/claude-config.js";
-import { checkForUpdate, performUpdate } from "../utils/self-update.js";
-import { launchDaemon } from "../daemon/launcher.js";
+import { checkForUpdate, performUpdate, PKG_NAME } from "../utils/self-update.js";
+import { launchDaemon, waitForHealth } from "../daemon/launcher.js";
 import { isProxyRunning } from "../daemon/pid.js";
 import { installService } from "../daemon/service.js";
 import { getLocalIPs } from "../utils/network.js";
+
+/**
+ * How long service-mode start waits for the proxy to answer after the
+ * LaunchAgent/systemd unit is loaded. This must outlast more than daemon
+ * startup: a stop→start restart re-bootstraps a label whose process exited
+ * moments earlier, and launchd throttles that spawn by up to ~10s (default
+ * ThrottleInterval) before the daemon even begins booting. The previous 10s
+ * budget ended right as throttled spawns typically landed, reporting
+ * "nothing answering" for a service that came up seconds later.
+ */
+export const SERVICE_HEALTH_TIMEOUT_MS = 30_000;
 
 export function registerStart(program: Command): void {
   program
@@ -105,6 +116,19 @@ export function registerStart(program: Command): void {
 
       if (prefs.mode === "service") {
         await installService(prefs.serverMode);
+        // Installing the service is not the same as the proxy being up: if
+        // launchd rejects the load, `installService` only warns. Verify, so a
+        // failed start is not reported as a success.
+        console.log(chalk.gray(`  Waiting for the proxy on port ${port} (a quick restart can be throttled by the service manager)...`));
+        if (await waitForHealth(port, SERVICE_HEALTH_TIMEOUT_MS)) {
+          console.log(chalk.green(`✓ CC-Router running on port ${port}`));
+        } else {
+          console.log(chalk.yellow(`\n⚠ Service configured, but nothing answered on port ${port} within ${Math.round(SERVICE_HEALTH_TIMEOUT_MS / 1000)}s.`));
+          console.log(chalk.gray(`  It may still come up — check: cc-router status`));
+          console.log(chalk.gray(`  If it does not: cc-router logs, then try again: cc-router start`));
+          process.exitCode = 1;
+          return;
+        }
       } else {
         // background mode
         await launchDaemon({
@@ -171,25 +195,20 @@ async function askRunPreferences(): Promise<RunPreferences> {
 }
 
 async function maybeSetupPassword(cfg: ReturnType<typeof readConfig>): Promise<void> {
-  console.log(chalk.yellow("\n  Server mode is enabled — a password is recommended to protect the proxy.\n"));
+  console.log(chalk.yellow(
+    "\n  Server mode binds the proxy to the network. A password is REQUIRED —" +
+    "\n  without it, anyone who can reach the port could use your accounts.\n",
+  ));
 
   const pwChoice = await select({
     message: "Set a proxy password?",
     choices: [
       { name: "Generate automatically  (recommended)", value: "generate" },
       { name: "Enter my own password", value: "manual" },
-      { name: "Skip — no password protection", value: "skip" },
     ],
   });
 
-  if (pwChoice === "generate") {
-    const secret = generateProxySecret();
-    cfg.proxySecret = secret;
-    writeConfig(cfg);
-    console.log(chalk.yellow("\n  *** Save this password — you cannot recover it later ***"));
-    console.log("      " + chalk.bold(secret));
-    console.log(chalk.gray("  Clients will need this to connect.\n"));
-  } else if (pwChoice === "manual") {
+  if (pwChoice === "manual") {
     const raw = await passwordPrompt({
       message: "Enter proxy password:",
       validate: (v) => v.trim().length >= 8 || "Minimum 8 characters",
@@ -197,7 +216,15 @@ async function maybeSetupPassword(cfg: ReturnType<typeof readConfig>): Promise<v
     cfg.proxySecret = raw.trim();
     writeConfig(cfg);
     console.log(chalk.green("  ✓ Password saved.\n"));
+    return;
   }
+
+  const secret = generateProxySecret();
+  cfg.proxySecret = secret;
+  writeConfig(cfg);
+  console.log(chalk.yellow("\n  *** Save this password — you cannot recover it later ***"));
+  console.log("      " + chalk.bold(secret));
+  console.log(chalk.gray("  Clients will need this to connect.\n"));
 }
 
 async function ensureClaudeCodeConfigured(
@@ -234,7 +261,7 @@ async function maybeUpdate(): Promise<void> {
   // From here, errors should be visible
   if (check.diff === "major") {
     console.log(chalk.yellow(`\n  New major version available: v${check.current} → v${check.latest}`));
-    console.log(chalk.gray(`  Update manually: npm i -g ai-cc-router@${check.latest}\n`));
+    console.log(chalk.gray(`  Update manually: npm i -g ${PKG_NAME}@${check.latest}\n`));
     return;
   }
 
@@ -294,6 +321,17 @@ function printServerModeInstructions(port: number, secret?: string): void {
   console.log(chalk.cyan(`  │    ${chalk.gray(`}`)}                                                    │`));
   console.log(chalk.cyan(`  │  ${chalk.gray(`}`)}                                                      │`));
   console.log(chalk.bold.cyan(`  └${"─".repeat(56)}┘\n`));
+
+  // Plaintext-HTTP warning: the proxy speaks HTTP only. Over a non-loopback
+  // link the proxy secret and every prompt/response travel in the clear.
+  console.log(chalk.yellow.bold("  ⚠ This link is plain HTTP — not encrypted."));
+  console.log(chalk.yellow(
+    `    The password above and all prompts/responses are sent in cleartext and\n` +
+    `    can be read by anyone on the network path. For anything beyond a trusted\n` +
+    `    LAN, put CC-Router behind a TLS-terminating reverse proxy (Caddy, nginx,\n` +
+    `    Cloudflare Tunnel) and hand clients the https:// URL.\n` +
+    `    See: docs/security.md → "Transport security (TLS)".\n`,
+  ));
 }
 
 // ─── Foreground start (direct server import) ────────────────────────────────

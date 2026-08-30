@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, chmodSync } from "fs";
 import { randomBytes } from "crypto";
 import { CONFIG_DIR, ACCOUNTS_PATH, CONFIG_PATH } from "./paths.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
@@ -8,10 +8,32 @@ import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 
 export const DEFAULT_PROXY_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
+/** Owner-only permissions for files/dirs that hold OAuth tokens or the proxy secret. */
+const SECRET_FILE_MODE = 0o600;
+const SECRET_DIR_MODE = 0o700;
+
 export function ensureConfigDir(): void {
   if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
+    mkdirSync(CONFIG_DIR, { recursive: true, mode: SECRET_DIR_MODE });
+    return;
   }
+  // Tighten an existing dir that may predate this hardening. No-op on Windows.
+  try { chmodSync(CONFIG_DIR, SECRET_DIR_MODE); } catch { /* best effort */ }
+}
+
+/**
+ * Atomic + private write for credential files: write tmp as 0600 (umask can
+ * clear bits, so chmod defensively), then rename. rename preserves the source
+ * inode's mode, so the destination ends up 0600 even if it previously existed
+ * world-readable. On Windows `mode` is largely ignored; the file lives under
+ * the user profile and is protected by the profile ACL.
+ */
+function writeFileSecureSync(path: string, data: string): void {
+  const tmp = path + ".tmp";
+  writeFileSync(tmp, data, { encoding: "utf-8", mode: SECRET_FILE_MODE });
+  try { chmodSync(tmp, SECRET_FILE_MODE); } catch { /* best effort */ }
+  renameSync(tmp, path);
+  try { chmodSync(path, SECRET_FILE_MODE); } catch { /* best effort */ }
 }
 
 export function accountsFileExists(path?: string): boolean {
@@ -43,9 +65,8 @@ export function writeAccountsAtomic(data: unknown[]): void {
 }
 
 function writeAccountsAtomicToPath(path: string, data: unknown[]): void {
-  const tmp = path + ".tmp";
-  writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
-  renameSync(tmp, path);
+  // accounts.json holds plaintext OAuth access + refresh tokens — owner-only.
+  writeFileSecureSync(path, JSON.stringify(data, null, 2));
 }
 
 export function writeAnthropicAccountsPreservingOtherProviders(data: AccountRecord[]): void {
@@ -77,12 +98,32 @@ export function removeAccountRecordById(id: string): AccountRecord | null {
   return removed;
 }
 
-export type AccountProvider = "anthropic_subscription" | "openai_subscription";
+/**
+ * Rename a stored account record in place, keeping every other field. The
+ * uniqueness check spans ALL providers — both live in one accounts.json and
+ * one URL namespace, so two records sharing an id would be unaddressable.
+ * Returns the renamed record, or null if no record has `oldId`.
+ */
+export function renameAccountRecordById(oldId: string, newId: string): AccountRecord | null {
+  ensureConfigDir();
+  const existing = readAccountsRaw() as AccountRecord[];
+  const target = existing.find(a => a.id === oldId) ?? null;
+  if (!target) return null;
+  if (newId !== oldId && existing.some(a => a.id === newId)) {
+    throw new Error(`An account named "${newId}" already exists`);
+  }
+
+  target.id = newId;
+  writeAccountsAtomicToPath(ACCOUNTS_PATH, existing);
+  return target;
+}
+
+export type AccountProvider = "anthropic_subscription" | "openai_subscription" | "xai_subscription";
 
 function normalizeAccountProvider(record: AccountRecord): AccountProvider {
-  return record.provider === "openai_subscription"
-    ? "openai_subscription"
-    : "anthropic_subscription";
+  if (record.provider === "openai_subscription") return "openai_subscription";
+  if (record.provider === "xai_subscription") return "xai_subscription";
+  return "anthropic_subscription";
 }
 
 export function migrateLegacyAccountProviders(path = ACCOUNTS_PATH): boolean {
@@ -130,12 +171,18 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
       refreshToken: a.refreshToken,
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
+      ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
+      ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
+      ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
     }));
 }
 
-export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void {
+/** Persist OpenAI subscription accounts to an explicit accounts file, preserving
+ *  every other provider's records already in that file. Shared by `saveOpenAIAccounts`
+ *  (default path) and any caller bound to a custom `--accounts <path>`. */
+export function saveOpenAIAccountsToPath(accounts: OpenAISubscriptionAccount[], path: string): void {
   ensureConfigDir();
-  const existing = readAccountsRaw() as AccountRecord[];
+  const existing = readRawFromPath(path) as AccountRecord[];
   const nonOpenAI = existing.filter(a => a.provider !== "openai_subscription");
   const records: AccountRecord[] = accounts.map(a => ({
     id: a.id,
@@ -143,10 +190,41 @@ export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void 
     accessToken: a.accessToken,
     refreshToken: a.refreshToken,
     expiresAt: a.expiresAt,
-    scopes: ["openid", "profile", "email", "offline_access"],
+    scopes: a.scopes ?? ["openid", "profile", "email", "offline_access"],
     enabled: a.enabled,
+    ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
+    ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
   }));
-  writeAccountsAtomicToPath(ACCOUNTS_PATH, [...nonOpenAI, ...records]);
+  writeAccountsAtomicToPath(path, [...nonOpenAI, ...records]);
+}
+
+export function saveOpenAIAccounts(accounts: OpenAISubscriptionAccount[]): void {
+  saveOpenAIAccountsToPath(accounts, ACCOUNTS_PATH);
+}
+
+export interface XaiSubscriptionAccount {
+  id: string;
+  provider: "xai_subscription";
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  enabled: boolean;
+  scopes?: string[];
+}
+
+export function loadXaiAccounts(path?: string): XaiSubscriptionAccount[] {
+  const records = readRawFromPath(path ?? ACCOUNTS_PATH) as AccountRecord[];
+  return records
+    .filter(a => a.provider === "xai_subscription")
+    .map(a => ({
+      id: a.id,
+      provider: "xai_subscription" as const,
+      accessToken: a.accessToken,
+      refreshToken: a.refreshToken,
+      expiresAt: a.expiresAt,
+      enabled: a.enabled !== false,
+      ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
+    }));
 }
 
 // ─── Proxy config (password, future settings) ─────────────────────────────────
@@ -180,26 +258,66 @@ export interface RunPreferences {
   configureClaudeCode?: boolean;
 }
 
+export interface ManagedClaudeEnvValueBackup {
+  existed: boolean;
+  value?: string;
+}
+
+export interface ManagedClaudeEnvBackup {
+  CLAUDE_STREAM_IDLE_TIMEOUT_MS: ManagedClaudeEnvValueBackup;
+  CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: ManagedClaudeEnvValueBackup;
+}
+
 export interface ProxyConfig {
   proxySecret?: string;
   /** Upstream proxy request timeout in milliseconds. Default: 300000 (5 minutes). */
   proxyRequestTimeoutMs?: number;
   /** Deprecated typo-compatible alias for proxyRequestTimeoutMs. */
   proxyRequesTime?: number;
-  /** Auto-update on patch/minor releases. Default: true (enabled). Set to false to disable. */
+  /** Auto-update on patch/minor releases. Default: false (notify-only). Set to true to
+   *  opt in to unattended installs from the npm registry. */
   autoUpdate?: boolean;
+  /** Router-side failover/retry of upstream 429/5xx responses before the first
+   *  relayed byte. Default: true. Set to false to opt out — every upstream
+   *  failure then passes through unchanged and the client owns all retries. */
+  autoFailover?: boolean;
   /** Default and alias model routing for Claude and OpenAI subscription providers. */
   modelRouting?: ModelRoutingConfig;
   /** Present only when this machine is in "client" mode (connected to a remote CC-Router) */
   client?: ClientConfig;
   /** Run preferences — asked once on first start, reused on subsequent starts */
   runPreferences?: RunPreferences;
+  /** Original Claude watchdog values saved while CC-Router manages them. */
+  claudeEnvBackup?: ManagedClaudeEnvBackup;
+}
+
+function parseProxyConfig(raw: string): ProxyConfig {
+  const parsed = JSON.parse(raw) as unknown;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new TypeError(`${CONFIG_PATH} must contain a JSON object`);
+  }
+  return parsed as ProxyConfig;
+}
+
+/**
+ * Read config for a read-modify-write operation.
+ *
+ * Unlike readConfig(), this deliberately propagates read and parse failures so
+ * callers cannot replace an unreadable or malformed user config with defaults.
+ */
+export function readConfigStrict(): ProxyConfig {
+  try {
+    return parseProxyConfig(readFileSync(CONFIG_PATH, "utf-8"));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw err;
+  }
 }
 
 export function readConfig(): ProxyConfig {
   if (!existsSync(CONFIG_PATH)) return {};
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as ProxyConfig;
+    return readConfigStrict();
   } catch (err) {
     console.warn(`Warning: ${CONFIG_PATH} contains invalid JSON: ${(err as Error).message}`);
     try {
@@ -220,6 +338,16 @@ export function getProxyRequestTimeoutMs(): number {
     : DEFAULT_PROXY_REQUEST_TIMEOUT_MS;
 }
 
+/**
+ * Whether the router may retry upstream 429/5xx failures itself. Enabled
+ * unless the config explicitly says `"autoFailover": false` — a missing or
+ * malformed value keeps the default on, matching how the other optional
+ * proxy settings degrade.
+ */
+export function getAutoFailoverEnabled(): boolean {
+  return readConfig().autoFailover !== false;
+}
+
 function normalizeProxyConfig(cfg: ProxyConfig): ProxyConfig {
   const { proxyRequesTime, ...normalized } = cfg;
   const timeoutMs = normalized.proxyRequestTimeoutMs ?? proxyRequesTime;
@@ -232,9 +360,8 @@ function normalizeProxyConfig(cfg: ProxyConfig): ProxyConfig {
 
 export function writeConfig(cfg: ProxyConfig): void {
   ensureConfigDir();
-  const tmp = CONFIG_PATH + ".tmp";
-  writeFileSync(tmp, JSON.stringify(normalizeProxyConfig(cfg), null, 2), "utf-8");
-  renameSync(tmp, CONFIG_PATH);
+  // config.json holds proxySecret and client.remoteSecret — owner-only.
+  writeFileSecureSync(CONFIG_PATH, JSON.stringify(normalizeProxyConfig(cfg), null, 2));
 }
 
 export function generateProxySecret(): string {
@@ -252,13 +379,18 @@ function deserialize(records: AccountRecord[]): Account[] {
       expiresAt: a.expiresAt,
       scopes: a.scopes ?? ["user:inference", "user:profile"],
     },
-    healthy: true,
+    // An authExpired account must come back unhealthy. `needsRefresh()` skips
+    // it, so the startup refresh that would otherwise fail and clear `healthy`
+    // never runs — and TokenPool.hardBlock() gates only on `enabled && healthy`,
+    // so defaulting to true here would route live traffic to a dead token.
+    healthy: a.authExpired !== true,
     busy: false,
     requestCount: 0,
     errorCount: 0,
     lastUsed: 0,
     lastRefresh: 0,
     consecutiveErrors: 0,
+    authExpired: a.authExpired === true,
     rateLimits: { ...DEFAULT_RATE_LIMITS },
     enabled: a.enabled !== false,                         // default true
     sessionLimitPercent: a.sessionLimitPercent !== undefined
@@ -282,5 +414,6 @@ export function serialize(accounts: Account[]): AccountRecord[] {
     enabled: a.enabled,
     sessionLimitPercent: a.sessionLimitPercent,
     weeklyLimitPercent: a.weeklyLimitPercent,
+    ...(a.authExpired ? { authExpired: true } : {}),
   }));
 }

@@ -1,15 +1,16 @@
 import chalk from "chalk";
 
 function ts(): string {
-  return new Date().toISOString().slice(11, 19); // HH:MM:SS
+  return new Date().toISOString().slice(0, 19).replace("T", " "); // YYYY-MM-DD HH:MM:SS
 }
 
-export function logRoute(accountId: string, requestCount: number, expiresInMin: number): void {
+export function logRoute(accountId: string, requestCount: number, expiresInMin: number, reason?: string): void {
   console.log(
     chalk.gray(`[${ts()}]`) +
     chalk.green(` → ${accountId}`) +
     chalk.gray(` req#${requestCount}`) +
-    chalk.yellow(` exp=${expiresInMin}min`)
+    chalk.yellow(` exp=${expiresInMin}min`) +
+    (reason ? chalk.cyan(` ${reason}`) : "")
   );
 }
 
@@ -24,6 +25,10 @@ export function logRefresh(accountId: string, ok: boolean, expiresInMin?: number
 export function logError(accountId: string, status: number, message: string): void {
   const statusStr = status > 0 ? ` HTTP ${status}` : "";
   console.log(chalk.red(`[${ts()}] [ERROR] ${accountId}:${statusStr} ${message}`));
+}
+
+export function logWarn(context: string, message: string): void {
+  console.log(chalk.yellow(`[${ts()}] [WARN] ${context}: ${message}`));
 }
 
 export interface StartupAccountCounts {

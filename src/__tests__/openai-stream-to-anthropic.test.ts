@@ -70,6 +70,65 @@ describe("openAIStreamEventToAnthropicEvents", () => {
     ]);
   });
 
+  it("closes the message on response.incomplete, mapping the token ceiling to max_tokens", () => {
+    const normalizer = createOpenAIStreamToAnthropicNormalizer();
+    normalizer.convert({ type: "response.created", response: { id: "resp_1", model: "gpt-5.6-luna" } });
+    normalizer.convert({ type: "response.output_text.delta", delta: "Par" });
+
+    // Without terminating the message the client is left waiting on a stream
+    // that has already ended.
+    expect(normalizer.convert({
+      type: "response.incomplete",
+      response: {
+        id: "resp_1",
+        incomplete_details: { reason: "max_output_tokens" },
+        usage: { output_tokens: 7 },
+      },
+    })).toEqual([
+      { type: "content_block_stop", index: 0 },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "max_tokens", stop_sequence: null },
+        usage: { output_tokens: 7 },
+      },
+      { type: "message_stop" },
+    ]);
+  });
+
+  it("emits nothing for a terminal event carrying no response object", () => {
+    const normalizer = createOpenAIStreamToAnthropicNormalizer();
+    normalizer.convert({ type: "response.created", response: { id: "resp_1" } });
+    normalizer.convert({ type: "response.output_text.delta", delta: "Par" });
+
+    // The collector and the usage observer both read this frame as a failed
+    // stream. Closing the message here would emit end_turn — telling the
+    // client a truncated turn finished normally. Ending without message_stop
+    // is what a truncated stream looks like, and what clients surface as the
+    // error it is.
+    for (const response of [null, [], "nope", 42]) {
+      expect(normalizer.convert(
+        { type: "response.incomplete", response } as Parameters<typeof normalizer.convert>[0],
+      )).toEqual([]);
+    }
+  });
+
+  it("falls back to end_turn for an incomplete response with another reason", () => {
+    const normalizer = createOpenAIStreamToAnthropicNormalizer();
+    normalizer.convert({ type: "response.created", response: { id: "resp_1" } });
+
+    expect(normalizer.convert({
+      type: "response.incomplete",
+      response: { id: "resp_1", incomplete_details: { reason: "content_filter" }, usage: {} },
+    })).toEqual([
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: 0 },
+      },
+      { type: "message_stop" },
+    ]);
+  });
+
   it("keeps text block state isolated per normalizer instance", () => {
     const first = createOpenAIStreamToAnthropicNormalizer();
     const second = createOpenAIStreamToAnthropicNormalizer();

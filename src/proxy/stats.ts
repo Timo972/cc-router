@@ -1,19 +1,63 @@
+import type { StreamLifecycleState } from "./stream-lifecycle.js";
+import type { CodexUsageTotals } from "../protocol/openai-responses-collect.js";
+
 export interface LogEntry {
   ts: number;
   accountId: string;
   model: string;
-  type: "route" | "refresh" | "error";
+  type: "route" | "refresh" | "error" | "warn";
   details?: string;
   statusCode?: number;
   durationMs?: number;
   method?: string;
   path?: string;
-  source?: "cli" | "desktop" | "api";
+  /** Which client sent the request. `codex` is the Codex CLI on `/v1/responses`;
+   *  a Claude-shaped client whose model routes to OpenAI stays `cli`/`desktop`/`api`. */
+  source?: "cli" | "desktop" | "api" | "codex";
   // Token usage from Anthropic response (message_start + message_delta events)
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
   inputTokens?: number;
   outputTokens?: number;
+  streamLifecycle?: StreamLifecycleState;
+}
+
+export type LocalRoutingErrorReason = "rate_limited" | "unavailable";
+
+/**
+ * Longest model identifier retained in an activity entry. Model names arrive
+ * in request bodies the JSON parsers accept up to megabytes, and every entry
+ * stays resident until MAX_LOG_ENTRIES newer ones push it out — and is
+ * re-serialized into each health response meanwhile. Retaining one verbatim
+ * would let a handful of requests pin hundreds of megabytes. Real model names
+ * are far shorter than this; the same 64 that `normalizeModelSlug` and
+ * `normalizeModelFamily` already clamp their identifiers to.
+ */
+const MAX_LOG_MODEL_LENGTH = 64;
+
+/**
+ * Clamp a caller-supplied model identifier to a length that is safe to retain.
+ * Truncation only — an empty model stays empty so routing lookups behave
+ * exactly as they did on the untruncated value.
+ */
+export function boundModelId(model: string): string {
+  return model.length > MAX_LOG_MODEL_LENGTH ? model.slice(0, MAX_LOG_MODEL_LENGTH) : model;
+}
+
+/** Build a bounded diagnostic for a request rejected before account selection. */
+export function createLocalRoutingErrorLog(
+  reason: LocalRoutingErrorReason,
+  modelFamily?: string,
+  now = Date.now(),
+): LogEntry {
+  return {
+    ts: now,
+    accountId: "proxy",
+    model: modelFamily ? boundModelId(modelFamily) : "-",
+    type: "error",
+    details: `no-eligible:${reason.replace("_", "-")}`,
+    statusCode: reason === "rate_limited" ? 429 : 503,
+  };
 }
 
 const MAX_LOG_ENTRIES = 100;
@@ -45,3 +89,36 @@ class ProxyStats {
 
 // Singleton — shared across server and health endpoint
 export const stats = new ProxyStats();
+
+/**
+ * Record Anthropic input-side usage (message_start, or a non-streaming JSON
+ * body) on both the request's log entry and the running totals. Mutates an
+ * entry that is typically already stored — the dashboard picks the values up
+ * on its next poll.
+ */
+export function applyAnthropicInputUsage(entry: LogEntry, usage: Record<string, number>): void {
+  entry.cacheReadTokens = usage["cache_read_input_tokens"] ?? 0;
+  entry.cacheCreationTokens = usage["cache_creation_input_tokens"] ?? 0;
+  entry.inputTokens = usage["input_tokens"] ?? 0;
+
+  stats.totalCacheReadTokens += entry.cacheReadTokens;
+  stats.totalCacheCreationTokens += entry.cacheCreationTokens;
+  stats.totalInputTokens += entry.inputTokens;
+}
+
+/** Record Anthropic output-side usage (message_delta) — see input counterpart. */
+export function applyAnthropicOutputUsage(entry: LogEntry, usage: Record<string, number>): void {
+  entry.outputTokens = usage["output_tokens"] ?? 0;
+  stats.totalOutputTokens += entry.outputTokens;
+}
+
+/** Record Codex token usage on both the request's log entry and the running totals. */
+export function applyCodexUsage(entry: LogEntry, usage: CodexUsageTotals | undefined): void {
+  if (!usage) return;
+  entry.inputTokens = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
+  entry.outputTokens = usage.outputTokens;
+  entry.cacheReadTokens = usage.cachedInputTokens;
+  stats.totalInputTokens += entry.inputTokens;
+  stats.totalOutputTokens += usage.outputTokens;
+  stats.totalCacheReadTokens += usage.cachedInputTokens;
+}
