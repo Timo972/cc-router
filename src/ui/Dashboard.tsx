@@ -19,6 +19,9 @@ import { mergeGrokIntoHealth, loadGrokHealthSnapshotsWithSubscription } from "..
 import type { GrokAccountSnapshot } from "../providers/xai/overview.js";
 
 const POLL_INTERVAL_MS = 2_000;
+/** Progress banner for the manual reload; replaced by the result banner, so
+ *  only the failure case (client gave up) ever lets it expire. */
+const REFRESH_ALL_BANNER_MS = 120_000;
 /** Grok's plan/code-access rarely change; refresh far slower than the 2s poll. */
 const GROK_SUBSCRIPTION_INTERVAL_MS = 60_000;
 /** Most activity rows the dashboard will show — the list shrinks below this
@@ -782,20 +785,22 @@ export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps
   // /v1/user round-trip every tick. Undefined until the first fetch lands, at
   // which point `mergeGrokIntoHealth` falls back to its access-token tier.
   const grokSnapshotsRef = useRef<GrokAccountSnapshot[] | undefined>(undefined);
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = async () => {
-      try {
-        const snapshots = await loadGrokHealthSnapshotsWithSubscription();
-        if (!cancelled) grokSnapshotsRef.current = snapshots;
-      } catch {
-        // Keep the last known snapshots; the poll degrades to the tier fallback.
-      }
-    };
-    refresh();
-    const timer = setInterval(refresh, GROK_SUBSCRIPTION_INTERVAL_MS);
-    return () => { cancelled = true; clearInterval(timer); };
+  const refreshGrokSnapshots = useCallback(async () => {
+    try {
+      grokSnapshotsRef.current = await loadGrokHealthSnapshotsWithSubscription();
+    } catch {
+      // Keep the last known snapshots; the poll degrades to the tier fallback.
+    }
   }, []);
+  useEffect(() => {
+    refreshGrokSnapshots();
+    const timer = setInterval(refreshGrokSnapshots, GROK_SUBSCRIPTION_INTERVAL_MS);
+    return () => { clearInterval(timer); };
+  }, [refreshGrokSnapshots]);
+
+  // The manual reload key re-runs the same poll immediately so the freshly
+  // fetched usage shows up without waiting for the next 2s tick.
+  const pollRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
     let cancelled = false;
@@ -827,10 +832,16 @@ export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps
       }
     };
 
+    pollRef.current = poll;
     poll();
     const timer = setInterval(poll, POLL_INTERVAL_MS);
     return () => { cancelled = true; clearInterval(timer); };
   }, [resolvedBase, authToken]);
+
+  const refreshLocalViews = useCallback(async () => {
+    await refreshGrokSnapshots();
+    await pollRef.current();
+  }, [refreshGrokSnapshots]);
 
   if (connectError) {
     return <ErrorScreen error={connectError} port={port} retries={retryCount} />;
@@ -853,6 +864,7 @@ export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps
       api={api}
       modelsApi={modelsApi}
       onIntent={onIntent}
+      onRefreshAll={refreshLocalViews}
     />
   );
 }
@@ -879,10 +891,12 @@ function ErrorScreen({ error, port, retries }: { error: string; port: number; re
 // ─── Live dashboard ───────────────────────────────────────────────────────────
 
 function LiveDashboard({
-  data, port, baseUrl, lastUpdate, api, modelsApi, onIntent,
+  data, port, baseUrl, lastUpdate, api, modelsApi, onIntent, onRefreshAll,
 }: {
   data: HealthData; port: number; baseUrl: string; lastUpdate: number;
   api: AccountsApi; modelsApi: ModelsApi; onIntent?: (intent: "quit" | "addAccount") => void;
+  /** Re-read dashboard-side state (Grok snapshots, health) after a server reload. */
+  onRefreshAll?: () => Promise<void>;
 }) {
   const [cliRouting, setCliRouting] = useState(() => ({
     claude: readClaudeRouting(),
@@ -1051,13 +1065,13 @@ function LiveDashboard({
   // setBanner can fire on an unmounted component after `n` exits Ink.
   const [banner, setBanner] = useState<{ text: string; color: string } | null>(null);
   const bannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showBanner = useCallback((text: string, color: string) => {
+  const showBanner = useCallback((text: string, color: string, durationMs = 4_000) => {
     if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
     setBanner({ text, color });
     bannerTimerRef.current = setTimeout(() => {
       setBanner(null);
       bannerTimerRef.current = null;
-    }, 4_000);
+    }, durationMs);
   }, []);
   useEffect(() => () => {
     if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
@@ -1151,6 +1165,48 @@ function LiveDashboard({
       showBanner(`Models error: ${errMsg(err)}`, "red");
     }
   }, [modelsApi, showBanner]);
+
+  // ── Reload everything ────────────────────────────────────────────────────
+  // One key for "make it look like I just restarted the router": the server
+  // sweeps cooldowns, re-tries due/quarantined tokens and re-fetches every
+  // account's usage; the dashboard then re-reads Grok, CLI routing, the
+  // model list (if already loaded) and polls health right away.
+  const refreshAllInFlightRef = useRef(false);
+  const doRefreshAll = useCallback(async () => {
+    if (refreshAllInFlightRef.current) {
+      showBanner("Reload already running…", "gray");
+      return;
+    }
+    refreshAllInFlightRef.current = true;
+    // Stays up until the result banner replaces it: a reload with several
+    // slow providers can outlive the default banner lifetime.
+    showBanner("Reloading accounts, usage and models…", "cyan", REFRESH_ALL_BANNER_MS);
+    try {
+      const result = await api.refreshAll();
+      refreshCliRouting();
+      if (modelsStatus) {
+        try {
+          const status = await modelsApi.list();
+          setModelsStatus(status);
+        } catch {
+          // The account reload succeeded; a stale model list is not worth a red banner.
+        }
+      }
+      await onRefreshAll?.();
+      const problems = [
+        result.usageFailed > 0 ? `${result.usageFailed} usage fetch failed` : "",
+        result.tokenRefreshFailed > 0 ? `${result.tokenRefreshFailed} token refresh failed` : "",
+      ].filter(Boolean);
+      showBanner(
+        `Reloaded ${result.accounts} accounts — usage fresh for ${result.usageRefreshed}${problems.length ? `, ${problems.join(", ")}` : ""}`,
+        problems.length ? "yellow" : "green",
+      );
+    } catch (err) {
+      showBanner(`Reload error: ${errMsg(err)}`, "red");
+    } finally {
+      refreshAllInFlightRef.current = false;
+    }
+  }, [api, modelsApi, modelsStatus, onRefreshAll, refreshCliRouting, showBanner]);
 
   const doToggleCli = useCallback((target: "claude" | "codex") => {
     const current = target === "claude" ? cliRouting.claude.enabled : cliRouting.codex.enabled;
@@ -1248,6 +1304,8 @@ function LiveDashboard({
       onIntent?.("quit"); exit();
       return;
     }
+
+    if (input === "R") { void doRefreshAll(); return; }
 
     if (key.tab) {
       // Compact view hides the activity list, so skip "logs" in the cycle.
@@ -1566,10 +1624,10 @@ function LiveDashboard({
       <Box marginTop={1}>
         <Text color="gray">
           {focus === "accounts"
-            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [z] compact  [q]"
+            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [R] reload  [z] compact  [q]"
             : focus === "models"
-              ? " [Tab]  [m/r] refresh  [c]/[o] default  [Esc] logs  [z] compact  [q]"
-              : " [Tab]  [m] models  [z] compact  [q] quit"}
+              ? " [Tab]  [m/r] refresh  [c]/[o] default  [R] reload all  [Esc] logs  [z] compact  [q]"
+              : " [Tab]  [m] models  [R] reload  [z] compact  [q] quit"}
         </Text>
       </Box>
 

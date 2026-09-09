@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createServer, request as httpRequest, type ClientRequest } from "http";
+import { createServer, request as httpRequest, type ClientRequest, type ServerResponse } from "http";
 import type { AddressInfo } from "net";
 import express from "express";
 import { ReadableStream } from "stream/web";
@@ -46,8 +46,8 @@ function mountWithPool(
   accounts: OpenAIAccount[],
   forwardOpenAI: ForwardOpenAI,
   extra: Partial<MessagesCrossProviderRouteOptions> = {},
+  app = express(),
 ) {
-  const app = express();
   const openAIPool = new OpenAITokenPool(accounts);
   const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
   const activity: LogEntry[] = [];
@@ -71,6 +71,36 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(done => { resolve = done; });
   return { promise, resolve };
+}
+
+function forceFirstWriteBackpressure(app: ReturnType<typeof express>): {
+  blocked: Promise<void>;
+  response: () => ServerResponse;
+} {
+  const blocked = deferred<void>();
+  let response: ServerResponse | undefined;
+  app.use((_req, res, next) => {
+    response = res;
+    const write = res.write.bind(res);
+    let firstWrite = true;
+    res.write = ((chunk: string | Uint8Array) => {
+      const accepted = write(chunk);
+      if (firstWrite) {
+        firstWrite = false;
+        blocked.resolve();
+        return false;
+      }
+      return accepted;
+    }) as typeof res.write;
+    next();
+  });
+  return {
+    blocked: blocked.promise,
+    response: () => {
+      if (!response) throw new Error("response not initialized");
+      return response;
+    },
+  };
 }
 
 function postMessages(baseUrl: string, body: Record<string, unknown>, headers: Record<string, string> = {}) {
@@ -505,6 +535,43 @@ describe("mountMessagesCrossProviderRoute", () => {
       expect(text).toContain("data: {\"type\":\"message_start\"");
       expect(text).toContain("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}");
       expect(text).toContain("data: {\"type\":\"message_stop\"}");
+    });
+  });
+
+  it("pauses upstream reads while a translated stream waits for downstream drain", async () => {
+    const app = express();
+    const pressure = forceFirstWriteBackpressure(app);
+    const encoder = new TextEncoder();
+    const frames = [
+      "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n",
+      "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+      "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+    ];
+    let pulls = 0;
+    const forward: ForwardOpenAI = async () => new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pulls++;
+          const frame = frames.shift();
+          if (frame === undefined) controller.close();
+          else controller.enqueue(encoder.encode(frame));
+        },
+      }, { highWaterMark: 0 }) as BodyInit,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    mountWithPool([makeRuntimeAccount("openai-victor")], forward, {}, app);
+
+    await withServer(app, async baseUrl => {
+      const responsePromise = postMessages(baseUrl, { stream: true });
+      await pressure.blocked;
+
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(pulls).toBe(1);
+
+      pressure.response().emit("drain");
+      const res = await responsePromise;
+      expect(await res.text()).toContain("message_stop");
+      expect(pulls).toBe(4);
     });
   });
 

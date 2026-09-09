@@ -7,6 +7,11 @@
  */
 
 const REQUEST_TIMEOUT_MS = 3_000;
+// Worst case is every account timing out: OpenAI token refreshes are
+// sequential with a 15s deadline each, usage fetches run two at a time with
+// 10s each. The server single-flights the pass, so a client that does give
+// up and presses again joins the running one rather than stacking another.
+const REFRESH_ALL_TIMEOUT_MS = 120_000;
 const MAX_PUBLIC_ROWS = 12;
 
 export interface AccountPatch {
@@ -51,9 +56,20 @@ export interface AccountSafeView {
   modelCooldowns?: Array<{ modelFamily: string; untilMs: number }>;
 }
 
+export interface RefreshAllResult {
+  accounts: number;
+  usageRefreshed: number;
+  usageFailed: number;
+  tokenRefreshFailed: number;
+  durationMs: number;
+}
+
 export interface AccountsApi {
   /** Read the authenticated, disclosure-safe account status view. */
   list(): Promise<AccountSafeView[]>;
+  /** Ask the router to sweep cooldowns, re-try due tokens and re-fetch every
+   *  account's usage — a restart's worth of freshness without a restart. */
+  refreshAll(): Promise<RefreshAllResult>;
   /** Apply a partial update to an account. Throws on non-2xx or network error. */
   patch(id: string, patch: AccountPatch): Promise<void>;
   /** Enable or disable every configured account for a provider. */
@@ -63,7 +79,8 @@ export interface AccountsApi {
 }
 
 export function createAccountsApi(baseUrl: string, authToken?: string): AccountsApi {
-  const base = baseUrl.replace(/\/+$/, "") + "/cc-router/accounts";
+  const root = baseUrl.replace(/\/+$/, "");
+  const base = root + "/cc-router/accounts";
   const authHeaders: Record<string, string> = authToken ? { authorization: `Bearer ${authToken}` } : {};
 
   async function send(method: "PATCH" | "DELETE", path: string, body?: unknown): Promise<void> {
@@ -90,11 +107,36 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
     return Array.isArray(payload.accounts) ? payload.accounts.flatMap(publicAccountSafeView) : [];
   }
 
+  async function refreshAll(): Promise<RefreshAllResult> {
+    // Usage fetches for every account run behind this call, so it gets its
+    // own, longer budget than the account mutations above.
+    const res = await fetch(root + "/cc-router/refresh", {
+      method: "POST",
+      headers: authHeaders,
+      signal: AbortSignal.timeout(REFRESH_ALL_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await res.json() as { refresh?: unknown };
+    return publicRefreshResult(payload.refresh);
+  }
+
   return {
     list,
+    refreshAll,
     patch(id, patch) { return send("PATCH", `/${encodeURIComponent(id)}`, patch); },
     setProviderEnabled(provider, enabled) { return send("PATCH", `/providers/${encodeURIComponent(provider)}`, { enabled }); },
     remove(id) { return send("DELETE", `/${encodeURIComponent(id)}`); },
+  };
+}
+
+function publicRefreshResult(value: unknown): RefreshAllResult {
+  const record = isRecord(value) ? value : {};
+  return {
+    accounts: publicInteger(record.accounts),
+    usageRefreshed: publicInteger(record.usageRefreshed),
+    usageFailed: publicInteger(record.usageFailed),
+    tokenRefreshFailed: publicInteger(record.tokenRefreshFailed),
+    durationMs: publicInteger(record.durationMs),
   };
 }
 

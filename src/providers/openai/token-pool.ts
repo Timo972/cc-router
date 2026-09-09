@@ -268,6 +268,7 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
   }
 
   private hardBlock(account: OpenAIAccount, context?: RouteContext): HardBlock | null {
+    if (account.authState === "quarantined") return { reason: "unavailable" };
     if (!account.enabled || !account.healthy) return { reason: "unavailable" };
 
     const nowMs = this.now();

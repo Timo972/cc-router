@@ -6,7 +6,8 @@ import type { IncomingMessage } from "http";
 import type { Socket } from "net";
 import type { Request } from "express";
 import { TokenPool } from "./token-pool.js";
-import { needsRefresh, refreshAccountIfCurrent, saveAccounts, startRefreshLoop } from "./token-refresher.js";
+import { needsRefresh, refreshAccountIfCurrent, refreshAccountsOnce, saveAccounts, startRefreshLoop } from "./token-refresher.js";
+import { createRefreshAllRunner, describeRefreshAll, refreshAllAccounts } from "./pool-refresh.js";
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
 import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
@@ -24,6 +25,7 @@ import {
   hasPendingCredentialWrite,
   markOpenAICredentialsPersisted,
   prepareOpenAIAccountForRequest,
+  refreshOpenAIAccountsOnce,
   refreshAndPersistOpenAIAccount,
   startOpenAIRefreshLoop,
   type OpenAISubscriptionAccount,
@@ -110,6 +112,10 @@ export interface HealthAccountView {
    *  the write lands would fall back to the old refresh token, which the
    *  provider already invalidated, and require re-authentication. */
   credentialsPendingWrite?: boolean;
+  /** Safe runtime-only OAuth routing state; no provider response details or
+   * credentials are exposed through health. */
+  authState?: "ok" | "quarantined";
+  authFailure?: "permanent" | "transient";
   /** Spend-tier from the Grok CLI access-token claims. Dashboard-only. */
   xai?: { tier: number };
 }
@@ -209,6 +215,7 @@ export interface OperationalStatus {
     health: string;
     accounts: string;
     allowance: string;
+    refresh: string;
     messages: string;
     responses: string;
     models: string;
@@ -260,6 +267,7 @@ export function createOperationalStatus(opts: {
       health: "/cc-router/health",
       accounts: "/cc-router/accounts",
       allowance: "/cc-router/allowance",
+      refresh: "/cc-router/refresh",
       messages: "/v1/messages",
       responses: "/v1/responses",
       models: "/v1/models",
@@ -448,7 +456,7 @@ function publicOpenAIAccountView(
     enabled: a.enabled !== false,
     sessionLimitPercent: a.sessionLimitPercent,
     weeklyLimitPercent: a.weeklyLimitPercent,
-    healthy: a.enabled !== false && a.healthy && expiresInMs > 0,
+    healthy: a.enabled !== false && a.healthy && a.authState !== "quarantined" && expiresInMs > 0,
     busy: routing.metrics.coolingDown,
     cooldownUntilMs: routing.metrics.cooldownUntilMs ?? 0,
     globalCooldownUntilMs: routing.cooldowns.globalUntilMs,
@@ -461,6 +469,8 @@ function publicOpenAIAccountView(
     lastRefreshMs: a.lastRefresh,
     codexRateLimits: publicCodexRateLimits(a, routing.cooldowns),
     ...(hasPendingCredentialWrite(a) ? { credentialsPendingWrite: true } : {}),
+    ...(a.authState === "quarantined" ? { authState: "quarantined" as const } : {}),
+    ...(a.authFailure ? { authFailure: a.authFailure } : {}),
   };
 }
 
@@ -845,6 +855,59 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       loadGrokHealthSnapshots(),
     );
     res.json(createAllowanceView(views, Date.now()));
+  });
+
+  // ─── Manual reload (authenticated) ────────────────────────────────────────
+  // The dashboard's "reload everything" key. Gives the operator what a
+  // restart would — swept cooldowns, due/quarantined tokens re-tried, every
+  // account's usage re-fetched — without dropping in-flight requests or
+  // sticky sessions. Each provider contributes its own hooks; the route
+  // itself knows nothing about OAuth or usage formats.
+  const runRefreshAll = createRefreshAllRunner(() => {
+    const onError = (provider: string, error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      logError(provider, 0, `manual refresh: ${message}`);
+    };
+    return refreshAllAccounts([
+      {
+        provider: "anthropic",
+        getAll: () => pool.getAll(),
+        refreshTokens: async () => {
+          let failed = 0;
+          await refreshAccountsOnce(pool.getAll(), { onError: error => { failed++; onError("anthropic", error); } });
+          return { failed };
+        },
+        refreshUsage: account => usageRefresher.refreshNow(account as Account),
+      },
+      {
+        provider: "openai",
+        getAll: () => openAIAccounts,
+        refreshTokens: () => refreshOpenAIAccountsOnce(openAIAccounts, persistOpenAIAccounts, {
+          onError: error => onError("openai", error),
+        }),
+        refreshUsage: account => openAIUsageRefresher.refreshNow(account as OpenAIAccount),
+      },
+    ], {
+      sweepCooldowns: () => {
+        pool.sweepExpiredCooldowns();
+        openAIPool.sweepExpiredCooldowns();
+      },
+      onError,
+    });
+  });
+  app.post("/cc-router/refresh", async (_req, res) => {
+    let summary;
+    try {
+      summary = await runRefreshAll();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError("refresh", 0, `manual refresh failed: ${message}`);
+      res.status(500).json({ error: `Refresh failed: ${message}` });
+      return;
+    }
+    const details = `manual refresh — ${describeRefreshAll(summary)}`;
+    stats.addLog({ ts: Date.now(), accountId: "proxy", model: "-", type: "refresh", details });
+    res.json({ refresh: summary });
   });
 
   // ─── Account management endpoints (authenticated) ─────────────────────────
@@ -1326,6 +1389,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
+    timeoutMs: proxyRequestTimeoutMs,
   });
 
   mountMessagesCrossProviderRoute(app, {
@@ -1334,6 +1398,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
+    timeoutMs: proxyRequestTimeoutMs,
   });
 
   // ─── Proxy middleware ──────────────────────────────────────────────────────
