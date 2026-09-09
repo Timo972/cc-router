@@ -32,6 +32,7 @@ import {
   type OpenAIIngressRelayResult,
   type OpenAIRelayReport,
 } from "./openai-ingress.js";
+import { waitForWritable } from "./transport-timing.js";
 
 declare module "express-serve-static-core" {
   interface Request {
@@ -49,6 +50,7 @@ export interface MessagesCrossProviderRouteOptions {
   recordActivity?: (entry: LogEntry) => void;
   now?: () => number;
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
+  timeoutMs?: number;
 }
 
 const MESSAGES_ENVELOPE: OpenAIIngressEnvelope = {
@@ -108,6 +110,7 @@ async function sendOpenAIAsAnthropic(
   requestedStream: boolean,
   entry: LogEntry,
   report: OpenAIRelayReport,
+  now: () => number,
 ): Promise<OpenAIIngressRelayResult> {
   const onUsage = (usage: CodexUsageTotals | undefined) => applyCodexUsage(entry, usage);
 
@@ -144,7 +147,7 @@ async function sendOpenAIAsAnthropic(
       // Headers are already flushed by the time a mid-stream failure surfaces,
       // so the client keeps the partial stream; reporting 502 here keeps the
       // activity log and error totals honest about what happened.
-      const failure = await sendOpenAIStreamAsAnthropic(upstream, res, onUsage, report);
+      const failure = await sendOpenAIStreamAsAnthropic(upstream, res, entry, onUsage, report, now);
       return { statusCode: failure === undefined ? upstream.status : 502 };
     }
 
@@ -310,8 +313,10 @@ async function collectOpenAIStreamAsAnthropicMessage(
 async function sendOpenAIStreamAsAnthropic(
   upstream: globalThis.Response,
   res: Response,
+  entry: LogEntry,
   onUsage: ((usage: CodexUsageTotals | undefined) => void) | undefined,
   report: OpenAIRelayReport,
+  now: () => number,
 ): Promise<string | undefined> {
   res.status(upstream.status);
   res.setHeader("content-type", "text/event-stream");
@@ -338,6 +343,7 @@ async function sendOpenAIStreamAsAnthropic(
   let totals: CodexUsageTotals | undefined;
   let failure: string | undefined;
   let completed = false;
+  let cleanEof = false;
 
   const inspect = (event: unknown): void => {
     totals = usageFromTerminalEvent(event) ?? totals;
@@ -356,13 +362,23 @@ async function sendOpenAIStreamAsAnthropic(
     }
   };
 
-  const relayEvents = (events: unknown[]): void => {
+  const relayEvents = async (events: unknown[]): Promise<boolean> => {
     for (const event of events) {
       inspect(event);
       for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
-        res.write(encodeSseEvent(mapped));
+        if (!res.write(encodeSseEvent(mapped))) {
+          // Do not consume another translated event or upstream chunk while
+          // Node is buffering for a slow client. A close/error while waiting
+          // ends the relay and explicitly releases the upstream reader.
+          const drained = await waitForWritable(res);
+          if (!drained) {
+            await reader.cancel().catch(() => {});
+            return false;
+          }
+        }
       }
     }
+    return true;
   };
 
   try {
@@ -374,21 +390,25 @@ async function sendOpenAIStreamAsAnthropic(
       // not honour the signal.
       const { value, done } = await reader.read();
       if (done) break;
+      if (entry.firstByteDurationMs === undefined) entry.firstByteDurationMs = now() - entry.ts;
 
       // Tolerant: one malformed frame must not abort the relay (which would
       // silently truncate the client's stream) nor discard the valid events
       // decoded from the same chunk.
       const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }), { tolerant: true });
       remainder = parsed.remainder;
-      relayEvents(parsed.events);
+      if (!await relayEvents(parsed.events)) return undefined;
     }
 
     const tail = decoder.decode();
     if (tail || remainder) {
-      relayEvents(parseSseLines(remainder + tail + "\n", { tolerant: true }).events);
+      if (!await relayEvents(parseSseLines(remainder + tail + "\n", { tolerant: true }).events)) {
+        return undefined;
+      }
     }
+    cleanEof = true;
   } finally {
-    res.end();
+    if (cleanEof && !res.destroyed && !res.writableEnded) res.end();
     onUsage?.(totals);
   }
   // Mirrors collectOpenAIStreamAsAnthropicMessage: tolerant parsing skips a
@@ -460,8 +480,9 @@ export function mountMessagesCrossProviderRoute(
         now,
         envelope: MESSAGES_ENVELOPE,
         onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
+        timeoutMs: opts.timeoutMs,
         relay: (upstream, res, entry, report) =>
-          sendOpenAIAsAnthropic(upstream, res, requestedStream, entry, report),
+          sendOpenAIAsAnthropic(upstream, res, requestedStream, entry, report, now),
       });
     },
   );

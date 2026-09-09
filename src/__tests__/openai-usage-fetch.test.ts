@@ -265,6 +265,26 @@ describe("OpenAIUsageRefresher", () => {
     refresher.stop();
   });
 
+  it("does not let advisory usage results overwrite permanent OAuth quarantine", async () => {
+    const account = makeAccount("quarantined");
+    account.authState = "quarantined";
+    account.authFailure = "permanent";
+    let result = { ok: false, reason: "auth" } as const;
+    const refresher = new OpenAIUsageRefresher(poolOf(account), {
+      fetchUsage: async () => result,
+    });
+
+    await refresher.refreshNow(account);
+    expect(account.authState).toBe("quarantined");
+    expect(account.authFailure).toBe("permanent");
+
+    result = { ok: true, update: { buckets: [] } } as const;
+    await refresher.refreshNow(account);
+    expect(account.authState).toBe("quarantined");
+    expect(account.authFailure).toBe("permanent");
+    refresher.stop();
+  });
+
   it("fetches every account on start, so usage is visible without any traffic", async () => {
     const a = makeAccount("a");
     const b = makeAccount("b");

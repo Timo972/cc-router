@@ -1,5 +1,6 @@
 import type { OpenAIResponsesRequest } from "../../protocol/openai-responses-types.js";
 import type { OpenAISubscriptionAccount } from "./token-refresher.js";
+import { createHeaderDeadline, withStreamIdleTimeout } from "../../proxy/transport-timing.js";
 
 const CODEX_RESPONSES_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_CODEX_INSTRUCTIONS = "You are a concise coding assistant.";
@@ -11,23 +12,38 @@ export interface ForwardOpenAICodexResponseOptions {
   /** Aborted when the client disconnects, so a request nobody is waiting for
    *  stops occupying an upstream slot on the account. */
   signal?: AbortSignal;
+  /** Header deadline and reset-on-progress stream idle limit. */
+  timeoutMs?: number;
 }
 
 export async function forwardOpenAICodexResponse(
   opts: ForwardOpenAICodexResponseOptions,
 ): Promise<Response> {
   const body = toCodexBackendRequest(opts.body);
-  const upstream = await fetch(CODEX_RESPONSES_ENDPOINT, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${opts.account.accessToken}`,
-      "content-type": "application/json",
-      accept: "text/event-stream",
-    },
-    body: JSON.stringify(body),
-    ...(opts.signal ? { signal: opts.signal } : {}),
-  });
-  return ensureEventStreamContentType(upstream);
+  const deadline = createHeaderDeadline(opts.timeoutMs, opts.signal);
+  let upstream: Response;
+  try {
+    upstream = await fetch(CODEX_RESPONSES_ENDPOINT, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${opts.account.accessToken}`,
+        "content-type": "application/json",
+        accept: "text/event-stream",
+      },
+      body: JSON.stringify(body),
+      ...(deadline.signal ? { signal: deadline.signal } : {}),
+    });
+  } finally {
+    // The header deadline must not become an absolute generation deadline.
+    // Body progress and cancellation are owned by the stream wrapper below.
+    deadline.dispose();
+  }
+  const timedBody = withStreamIdleTimeout(upstream.body, opts.timeoutMs, opts.signal);
+  return ensureEventStreamContentType(new Response(timedBody, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: upstream.headers,
+  }));
 }
 
 export function toCodexBackendRequest(body: OpenAIResponsesRequest): OpenAIResponsesRequest & {

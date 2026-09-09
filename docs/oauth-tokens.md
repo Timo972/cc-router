@@ -150,3 +150,31 @@ The proxy refreshes OpenAI subscription tokens in two places:
 Successful refreshes are persisted atomically and preserve Claude account records in the same `accounts.json` file.
 
 Treat OpenAI Codex refresh tokens as account credentials. Do not copy `~/.codex/auth.json` into bug reports, commits, logs, screenshots, or shared chat threads.
+
+## OpenAI subscription recovery
+
+OpenAI subscription credentials are kept separate from routing state. A documented
+permanent refresh rejection (such as `invalid_grant`) quarantines the in-memory
+account without changing its user-owned `enabled` setting. It remains out of
+rotation even after ordinary cooldowns expire, and becomes routable again only
+after a successful credential refresh or replacement. Transient transport,
+usage-endpoint, and single upstream-request failures do not permanently disable
+an account.
+
+Quarantine is runtime-only: restarting the router reloads credentials without
+the previous quarantine state. Replace rejected credentials before restarting
+if the account should stay usable. Health reports `authState: "quarantined"`
+and a safe `authFailure` category; usage authentication failures are advisory
+and do not override the account's enabled setting.
+
+The existing proxy request timeout also bounds Codex response headers and
+each pending upstream body read. Progressing streams can run longer than that
+interval, and time waiting for downstream drain does not count as upstream
+inactivity. OAuth refresh has a separate 15-second deadline covering headers
+and the JSON response body. A failed partial stream closes the connection so
+clients can detect truncation.
+
+Deleting and re-adding an account with valid credentials also clears its runtime
+quarantine without restarting the router. Quarantined accounts are still checked
+by the existing background refresh loop, allowing a successful refresh to recover
+them; repeated permanent rejections remain excluded from inference routing.

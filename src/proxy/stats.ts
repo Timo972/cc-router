@@ -9,6 +9,11 @@ export interface LogEntry {
   details?: string;
   statusCode?: number;
   durationMs?: number;
+  /** Safe phase timing for provider diagnostics; no payload timing/content. */
+  refreshDurationMs?: number;
+  headerDurationMs?: number;
+  firstByteDurationMs?: number;
+  correlationId?: string;
   method?: string;
   path?: string;
   /** Which client sent the request. `codex` is the Codex CLI on `/v1/responses`;
