@@ -14,10 +14,12 @@ function jwtWith(claims: Record<string, unknown>): string {
 
 describe("loadGrokAccountSnapshots", () => {
   const now = () => Date.parse("2026-08-21T10:00:00Z");
+  const grokHome = path.join(os.tmpdir(), "grok-home");
+  const missingGrokHome = path.join(os.tmpdir(), "missing-grok-home");
 
   it("returns an empty list when grok is not logged in", () => {
     expect(loadGrokAccountSnapshots({
-      grokHome: "/tmp/missing-grok-home",
+      grokHome: missingGrokHome,
       fileExists: () => false,
     })).toEqual([]);
   });
@@ -29,7 +31,7 @@ describe("loadGrokAccountSnapshots", () => {
       exp: Math.floor(now() / 1000) + 3600,
     });
     const files: Record<string, string> = {
-      "/tmp/grok-home/auth.json": JSON.stringify({
+      [path.join(grokHome, "auth.json")]: JSON.stringify({
         "https://auth.x.ai::client": {
           key: token,
           auth_mode: "oidc",
@@ -38,14 +40,14 @@ describe("loadGrokAccountSnapshots", () => {
           refresh_token: "secret-refresh",
         },
       }),
-      "/tmp/grok-home/active_sessions.json": JSON.stringify([
+      [path.join(grokHome, "active_sessions.json")]: JSON.stringify([
         { session_id: "sess-live", pid: 111, opened_at: "2026-08-21T09:00:00Z" },
         { session_id: "sess-dead", pid: 222, opened_at: "2026-08-21T08:00:00Z" },
       ]),
     };
 
     const views = loadGrokAccountSnapshots({
-      grokHome: "/tmp/grok-home",
+      grokHome,
       now,
       fileExists: path => path in files,
       readFile: path => files[path]!,
@@ -74,7 +76,7 @@ describe("loadGrokAccountSnapshots", () => {
 
   it("marks an expired Grok login unhealthy", () => {
     const views = loadGrokAccountSnapshots({
-      grokHome: "/tmp/grok-home",
+      grokHome,
       now,
       fileExists: () => true,
       readFile: () => JSON.stringify({
@@ -94,6 +96,7 @@ describe("loadGrokAccountSnapshots", () => {
 describe("loadGrokHealthSnapshotsWithSubscription", () => {
   const now = () => Date.parse("2026-08-21T10:00:00Z");
   const expiresAt = Date.parse("2026-08-21T14:00:00Z");
+  const missingGrokHome = path.join(os.tmpdir(), "missing-grok-home");
   let tmpDir: string;
   let accountsPath: string;
   const prevAccountsPath = process.env["ACCOUNTS_PATH"];
@@ -121,7 +124,7 @@ describe("loadGrokHealthSnapshotsWithSubscription", () => {
   it("enriches the stored account with the live plan and code-access flag", async () => {
     const snapshots = await loadGrokHealthSnapshotsWithSubscription({
       now,
-      grokHome: "/tmp/missing-grok-home",
+      grokHome: missingGrokHome,
       fileExists: () => false,
       fetchSubscription: async () => ({ ok: true, subscriptionTier: "GrokPro", hasCodeAccess: true }),
     });
@@ -137,7 +140,7 @@ describe("loadGrokHealthSnapshotsWithSubscription", () => {
   it("keeps the access-token tier fallback when the live lookup fails", async () => {
     const snapshots = await loadGrokHealthSnapshotsWithSubscription({
       now,
-      grokHome: "/tmp/missing-grok-home",
+      grokHome: missingGrokHome,
       fileExists: () => false,
       fetchSubscription: async () => ({ ok: false, reason: "network" }),
     });

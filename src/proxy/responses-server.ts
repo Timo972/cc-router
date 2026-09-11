@@ -34,12 +34,23 @@ export interface ResponsesRoutesOptions {
   now?: () => number;
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
   timeoutMs?: number;
+  /** Upstream attempts per client request (default 3). `1` disables
+   *  router-side failover/retry entirely — the `autoFailover: false`
+   *  config opt-out is wired through here. */
+  maxAttempts?: number;
+  /** Delay before re-sending to the SAME account (test override). */
+  sameAccountRetryDelayMs?: number;
+  /** Longest a failover account's token refresh may hold the ready-to-relay
+   *  upstream failure (test override; default 15s). */
+  retryRefreshTimeoutMs?: number;
 }
 
 const RESPONSES_ENVELOPE: OpenAIIngressEnvelope = {
   wrap: (type, message) => ({ error: { type, message } }),
   sendNoEligible: (error, res, nowMs) => sendOpenAINoEligibleResponse(error, res, nowMs),
 };
+
+const RESPONSES_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
 
 function isResponsesRequest(value: unknown): value is OpenAIResponsesRequest {
   return (
@@ -121,7 +132,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
   const recordActivity = opts.recordActivity ?? ((entry: LogEntry) => stats.addLog(entry));
   const now = opts.now ?? Date.now;
 
-  app.post("/v1/responses", express.json({ limit: "10mb" }), async (req: Request, res: Response) => {
+  app.post("/v1/responses", express.json({ limit: RESPONSES_BODY_LIMIT_BYTES }), async (req: Request, res: Response) => {
     if (!isResponsesRequest(req.body)) {
       res.status(400).json({
         error: {
@@ -195,6 +206,13 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       envelope: RESPONSES_ENVELOPE,
       onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
       timeoutMs: opts.timeoutMs,
+      ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
+      ...(opts.sameAccountRetryDelayMs !== undefined
+        ? { sameAccountRetryDelayMs: opts.sameAccountRetryDelayMs }
+        : {}),
+      ...(opts.retryRefreshTimeoutMs !== undefined
+        ? { retryRefreshTimeoutMs: opts.retryRefreshTimeoutMs }
+        : {}),
       relay: async (upstream, res, entry, report) => {
         if (body.stream === true) {
           const observer = createCodexUsageObserver();

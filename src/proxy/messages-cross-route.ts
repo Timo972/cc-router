@@ -3,11 +3,16 @@ import type { Express, NextFunction, Request, Response } from "express";
 import { selectRoute } from "../providers/route-selector.js";
 import { anthropicToOpenAIResponses } from "../protocol/anthropic-to-openai.js";
 import { openAIResponseToAnthropicMessage } from "../protocol/openai-response-to-anthropic.js";
+import { OpenAIProtocolError } from "../protocol/openai-function-call.js";
 import { createOpenAIStreamToAnthropicNormalizer } from "../protocol/openai-stream-to-anthropic.js";
 import { encodeSseEvent, parseSseLines } from "../protocol/sse.js";
 import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.js";
 import type { AnthropicMessagesRequest } from "../protocol/anthropic-types.js";
-import type { OpenAIResponseCompleted } from "../protocol/openai-responses-types.js";
+import type {
+  OpenAIFunctionCall,
+  OpenAIResponseCompleted,
+  OpenAIResponseOutputItem,
+} from "../protocol/openai-responses-types.js";
 import {
   terminalResponsePayload,
   usageFromTerminalEvent,
@@ -51,6 +56,15 @@ export interface MessagesCrossProviderRouteOptions {
   now?: () => number;
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
   timeoutMs?: number;
+  /** Upstream attempts per client request (default 3). `1` disables
+   *  router-side failover/retry entirely — the `autoFailover: false`
+   *  config opt-out is wired through here. */
+  maxAttempts?: number;
+  /** Delay before re-sending to the SAME account (test override). */
+  sameAccountRetryDelayMs?: number;
+  /** Longest a failover account's token refresh may hold the ready-to-relay
+   *  upstream failure (test override; default 15s). */
+  retryRefreshTimeoutMs?: number;
 }
 
 const MESSAGES_ENVELOPE: OpenAIIngressEnvelope = {
@@ -206,19 +220,26 @@ async function collectOpenAIStreamAsAnthropicMessage(
   let remainder = "";
   let id = "";
   let model = "";
-  let text = "";
   let failure: string | undefined;
   let completed = false;
   let usage: OpenAIResponseCompleted["usage"] = {};
   let status: string | undefined;
   let incompleteDetails: { reason?: string } | undefined;
+  const textByIndex = new Map<number, string>();
+  const refusalByIndex = new Map<number, string>();
+  const argumentsByIndex = new Map<number, string>();
+  const pendingCallsByIndex = new Map<number, OpenAIFunctionCall>();
+  const callsByIndex = new Map<number, OpenAIFunctionCall>();
 
   const applyEvent = (event: unknown) => {
     if (typeof event !== "object" || event === null) return;
     const openAIEvent = event as {
       type?: string;
       delta?: string;
+      arguments?: string;
+      output_index?: number;
       error?: { message?: string };
+      item?: { type?: string; call_id?: string; name?: string; arguments?: string };
       response?: {
         id?: string;
         model?: string;
@@ -228,6 +249,7 @@ async function collectOpenAIStreamAsAnthropicMessage(
         usage?: OpenAIResponseCompleted["usage"];
       };
     };
+    const outputIndex = openAIEvent.output_index ?? 0;
 
     // Reported the moment it is seen, not when this function returns: the
     // read after it can be cut short by a client disconnect, and losing the
@@ -251,7 +273,61 @@ async function collectOpenAIStreamAsAnthropicMessage(
     }
 
     if (openAIEvent.type === "response.output_text.delta") {
-      text += openAIEvent.delta ?? "";
+      textByIndex.set(outputIndex, (textByIndex.get(outputIndex) ?? "") + (openAIEvent.delta ?? ""));
+      return;
+    }
+
+    if (openAIEvent.type === "response.refusal.delta") {
+      refusalByIndex.set(outputIndex, (refusalByIndex.get(outputIndex) ?? "") + (openAIEvent.delta ?? ""));
+      return;
+    }
+
+    if (openAIEvent.type === "response.output_item.added") {
+      const item = openAIEvent.item;
+      if (item?.type === "function_call") {
+        if (!item.call_id?.trim() || !item.name?.trim()) {
+          throw new OpenAIProtocolError("Invalid OpenAI function call metadata");
+        }
+        pendingCallsByIndex.set(outputIndex, {
+          type: "function_call",
+          call_id: item.call_id,
+          name: item.name,
+          arguments: item.arguments ?? "",
+        });
+      }
+      return;
+    }
+
+    if (openAIEvent.type === "response.function_call_arguments.delta") {
+      if (!pendingCallsByIndex.has(outputIndex)) return;
+      argumentsByIndex.set(outputIndex, (argumentsByIndex.get(outputIndex) ?? "") + (openAIEvent.delta ?? ""));
+      return;
+    }
+
+    if (openAIEvent.type === "response.function_call_arguments.done") {
+      if (pendingCallsByIndex.has(outputIndex) && !argumentsByIndex.has(outputIndex) && openAIEvent.arguments) {
+        argumentsByIndex.set(outputIndex, openAIEvent.arguments);
+      }
+      return;
+    }
+
+    if (openAIEvent.type === "response.output_item.done") {
+      const item = openAIEvent.item;
+      const pending = pendingCallsByIndex.get(outputIndex);
+      if (item?.type === "function_call" || pending) {
+        const callId = item?.call_id || pending?.call_id;
+        const name = item?.name || pending?.name;
+        if (!callId?.trim() || !name?.trim()) {
+          throw new OpenAIProtocolError("Invalid OpenAI function call metadata");
+        }
+        callsByIndex.set(outputIndex, {
+          type: "function_call",
+          call_id: callId,
+          name,
+          arguments: item?.arguments || argumentsByIndex.get(outputIndex) || pending?.arguments || "",
+        });
+        pendingCallsByIndex.delete(outputIndex);
+      }
       return;
     }
 
@@ -282,15 +358,34 @@ async function collectOpenAIStreamAsAnthropicMessage(
     parseSseLines(remainder + tail + "\n", { tolerant: true }).events.forEach(applyEvent);
   }
 
+  const output: OpenAIResponseOutputItem[] = [...new Set([
+    ...textByIndex.keys(),
+    ...refusalByIndex.keys(),
+    ...callsByIndex.keys(),
+  ])]
+    .sort((a, b) => a - b)
+    .flatMap((index): OpenAIResponseOutputItem[] => {
+      const call = callsByIndex.get(index);
+      if (call) return [{ ...call, arguments: call.arguments || argumentsByIndex.get(index) || "" }];
+      const text = textByIndex.get(index);
+      const refusal = refusalByIndex.get(index);
+      const content = [
+        ...(text ? [{ type: "output_text" as const, text }] : []),
+        ...(refusal ? [{ type: "refusal" as const, refusal }] : []),
+      ];
+      return content.length > 0 ? [{ type: "message", role: "assistant", content }] : [];
+    });
+
+  const protocolFailure = pendingCallsByIndex.size > 0
+    ? "OpenAI function call ended before completion"
+    : undefined;
+  if (protocolFailure) report.upstreamReportedFailure = true;
+
   return {
     message: openAIResponseToAnthropicMessage({
       id,
       model,
-      output: text ? [{
-        type: "message",
-        role: "assistant",
-        content: [{ type: "output_text", text }],
-      }] : [],
+      output,
       usage,
       ...(status ? { status } : {}),
       ...(incompleteDetails ? { incomplete_details: incompleteDetails } : {}),
@@ -305,7 +400,9 @@ async function collectOpenAIStreamAsAnthropicMessage(
     // mid-flight) is a failure rather than an empty success. An explicit
     // `response.failed`/`error` message wins, since it says more about what
     // went wrong.
-    failure: failure ?? (completed ? undefined : "Upstream stream ended without a terminal response event"),
+    failure: failure
+      ?? protocolFailure
+      ?? (completed ? undefined : "Upstream stream ended without a terminal response event"),
   };
 }
 
@@ -344,11 +441,28 @@ async function sendOpenAIStreamAsAnthropic(
   let failure: string | undefined;
   let completed = false;
   let cleanEof = false;
+  const pendingToolCalls = new Set<number>();
+
+  const writeProtocolError = () => {
+    res.write(encodeSseEvent({
+      type: "error",
+      error: {
+        type: "api_error",
+        message: "Invalid or incomplete response from OpenAI",
+      },
+    }));
+  };
 
   const inspect = (event: unknown): void => {
     totals = usageFromTerminalEvent(event) ?? totals;
     if (typeof event !== "object" || event === null) return;
-    const typed = event as { type?: unknown; error?: { message?: string }; response?: { error?: { message?: string } } };
+    const typed = event as {
+      type?: unknown;
+      output_index?: number;
+      item?: { type?: string };
+      error?: { message?: string };
+      response?: { error?: { message?: string } };
+    };
     // Recorded as observed — an aborted read can reject on the very next
     // chunk, and this verdict has to outlive that.
     if (typed.type === "response.failed") {
@@ -359,6 +473,11 @@ async function sendOpenAIStreamAsAnthropic(
       report.upstreamReportedFailure = true;
     } else if (terminalResponsePayload(event) !== undefined) {
       completed = true;
+    }
+    if (typed.type === "response.output_item.added" && typed.item?.type === "function_call") {
+      pendingToolCalls.add(typed.output_index ?? 0);
+    } else if (typed.type === "response.output_item.done") {
+      pendingToolCalls.delete(typed.output_index ?? 0);
     }
   };
 
@@ -407,6 +526,18 @@ async function sendOpenAIStreamAsAnthropic(
       }
     }
     cleanEof = true;
+    if (!completed && pendingToolCalls.size > 0 && failure === undefined) {
+      failure = "OpenAI function call ended before completion";
+      report.upstreamReportedFailure = true;
+      writeProtocolError();
+    }
+  } catch (error) {
+    if (!(error instanceof OpenAIProtocolError)) throw error;
+    failure = error.message;
+    report.upstreamReportedFailure = true;
+    writeProtocolError();
+    cleanEof = true;
+    await reader.cancel().catch(() => {});
   } finally {
     if (cleanEof && !res.destroyed && !res.writableEnded) res.end();
     onUsage?.(totals);
@@ -481,6 +612,13 @@ export function mountMessagesCrossProviderRoute(
         envelope: MESSAGES_ENVELOPE,
         onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
         timeoutMs: opts.timeoutMs,
+        ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
+        ...(opts.sameAccountRetryDelayMs !== undefined
+          ? { sameAccountRetryDelayMs: opts.sameAccountRetryDelayMs }
+          : {}),
+        ...(opts.retryRefreshTimeoutMs !== undefined
+          ? { retryRefreshTimeoutMs: opts.retryRefreshTimeoutMs }
+          : {}),
         relay: (upstream, res, entry, report) =>
           sendOpenAIAsAnthropic(upstream, res, requestedStream, entry, report, now),
       });
