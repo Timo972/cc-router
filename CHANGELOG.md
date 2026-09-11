@@ -10,20 +10,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [0.12.0-rc.1] — 2026-08-30
-
-### Fixed
-
-- OpenAI Responses function calls and their outputs remain top-level input
-  items across the Anthropic Messages bridge. JSON and SSE responses now
-  preserve call IDs, streamed or atomic arguments, refusal text, and
-  `tool_use` stop reasons. Invalid metadata, malformed arguments, and tool
-  streams that end before completion fail closed instead of fabricating a
-  successful assistant turn.
-
----
-
-## [0.12.0-rc.0] — 2026-08-30
+## [0.12.0] — 2026-09-11
 
 ### Added
 
@@ -48,11 +35,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Codex configuration rewrites now use TOML-aware parsing and validation rather
   than line-oriented edits, including safe CLI start/stop toggles for the
   managed block.
-- The status dashboard uses compact provider groups, keeps account headers
-  visible in short terminals, and exposes the fleet-wide weekly-full count.
+- The status dashboard has been redesigned with a more compact layout,
+  allowing even more accounts to be displayed at once. Compact provider
+  groups keep account headers visible in short terminals, and the dashboard
+  exposes the fleet-wide weekly-full count.
 
 ### Fixed
 
+- OpenAI Responses function calls and their outputs remain top-level input
+  items across the Anthropic Messages bridge. JSON and SSE responses now
+  preserve call IDs, streamed or atomic arguments, refusal text, and
+  `tool_use` stop reasons. Invalid metadata, malformed arguments, and tool
+  streams that end before completion fail closed instead of fabricating a
+  successful assistant turn.
 - `/v1/models` reports real context windows and includes bare `gpt-*` slugs used
   by the Codex CLI.
 - Codex routing accepts both dashed session-header spellings, logs route
@@ -670,8 +665,7 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
-[0.12.0-rc.1]: https://github.com/Timo972/cc-router/releases/tag/v0.12.0-rc.1
-[0.12.0-rc.0]: https://github.com/Timo972/cc-router/releases/tag/v0.12.0-rc.0
+[0.12.0]: https://github.com/Timo972/cc-router/releases/tag/v0.12.0
 [0.11.0]: https://github.com/Timo972/cc-router/releases/tag/v0.11.0
 [0.9.0]: https://github.com/Timo972/cc-router/releases/tag/v0.9.0
 [0.8.3]: https://github.com/Timo972/cc-router/releases/tag/v0.8.3
