@@ -57,6 +57,10 @@ export interface OpenAIAccount extends OpenAISubscriptionAccount {
   lastRefresh: number;
   rateLimits: CodexRateLimits;
   modelBuckets: Map<string, ModelBucketMapping>;
+  /** Runtime-only: permanent OAuth rejection holds this account out until a
+   * later successful refresh proves its replacement credentials work. */
+  authState: "ok" | "quarantined";
+  authFailure?: "permanent" | "transient";
 }
 
 /**
@@ -103,6 +107,7 @@ export function createOpenAIAccount(record: OpenAISubscriptionAccount): OpenAIAc
     lastRefresh: 0,
     rateLimits,
     modelBuckets: new Map(),
+    authState: "ok",
   };
 }
 

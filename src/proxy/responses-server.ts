@@ -22,6 +22,7 @@ import {
   type ForwardOpenAI,
   type OpenAIIngressEnvelope,
 } from "./openai-ingress.js";
+import { waitForWritable } from "./transport-timing.js";
 
 export interface ResponsesRoutesOptions {
   openAIRouter: SessionRouter<OpenAIAccount>;
@@ -32,6 +33,7 @@ export interface ResponsesRoutesOptions {
   recordActivity?: (entry: LogEntry) => void;
   now?: () => number;
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
+  timeoutMs?: number;
   /** Upstream attempts per client request (default 3). `1` disables
    *  router-side failover/retry entirely — the `autoFailover: false`
    *  config opt-out is wired through here. */
@@ -87,26 +89,40 @@ async function sendUpstreamResponse(
   // releases a stalled stream, so the account's upstream slot is not held for
   // a response nobody will receive.
   const DISCONNECTED = Symbol("client-disconnected");
+  let resolveDisconnected: ((value: typeof DISCONNECTED) => void) | undefined;
+  const onClose = () => resolveDisconnected?.(DISCONNECTED);
   const disconnected = new Promise<typeof DISCONNECTED>(resolve => {
+    resolveDisconnected = resolve;
     if (res.destroyed) resolve(DISCONNECTED);
-    else res.once("close", () => resolve(DISCONNECTED));
+    else res.once("close", onClose);
   });
+  let completed = false;
   try {
     while (true) {
       const next = await Promise.race([reader.read(), disconnected]);
       if (next === DISCONNECTED) {
         await reader.cancel().catch(() => {});
-        break;
+        return;
       }
       const { value, done } = next;
       if (done) break;
       if (value) {
-        res.write(Buffer.from(value));
         onChunk?.(value);
+        if (!res.write(Buffer.from(value))) {
+          // Backpressure is a contract: do not consume another upstream chunk
+          // until Node drains, or until the peer goes away.
+          const drained = await waitForWritable(res);
+          if (!drained) {
+            await reader.cancel().catch(() => {});
+            return;
+          }
+        }
       }
     }
+    completed = true;
   } finally {
-    res.end();
+    res.removeListener("close", onClose);
+    if (completed && !res.destroyed && !res.writableEnded) res.end();
   }
 }
 
@@ -189,6 +205,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       now,
       envelope: RESPONSES_ENVELOPE,
       onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
+      timeoutMs: opts.timeoutMs,
       ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
       ...(opts.sameAccountRetryDelayMs !== undefined
         ? { sameAccountRetryDelayMs: opts.sameAccountRetryDelayMs }
@@ -212,6 +229,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
           // (or be cut short) after upstream has already announced a failure,
           // and the verdict has to survive that.
           await sendUpstreamResponse(upstream, res, chunk => {
+            if (entry.firstByteDurationMs === undefined) entry.firstByteDurationMs = now() - entry.ts;
             observer.push(chunk);
             if (observer.explicitFailure() !== undefined) report.upstreamReportedFailure = true;
           });

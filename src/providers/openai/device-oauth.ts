@@ -1,7 +1,7 @@
 import { createOpenAIAccountRecord, type OpenAIAccountRecord } from "./account-record.js";
 
 const DEFAULT_ISSUER = "https://auth.openai.com";
-const DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+export const DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_SCOPE = "openid profile email offline_access";
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 

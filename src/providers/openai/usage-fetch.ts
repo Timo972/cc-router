@@ -91,7 +91,18 @@ export class OpenAIUsageRefresher extends UsageRefresher<OpenAIAccount, CodexUsa
       },
       cancelledResult: () => ({ ok: false, reason: "network" }),
       applyResult: (account, result) => {
-        if (result.ok) applyCodexRateLimits(account, result.update, now());
+        if (result.ok) {
+          applyCodexRateLimits(account, result.update, now());
+          // A successful authenticated poll clears only the advisory usage
+          // trouble state; permanent OAuth quarantine is owned by refresh.
+          if (account.authFailure === "transient") account.authFailure = undefined;
+        } else if (result.reason === "auth") {
+          // A usage endpoint 403 can be entitlement/scope related. Surface it
+          // as transient diagnostic state but never quarantine on this alone.
+          // Refresh owns permanent quarantine, so an advisory poll must not
+          // overwrite that stronger diagnosis.
+          if (account.authState !== "quarantined") account.authFailure = "transient";
+        }
       },
       ...(options.now !== undefined ? { now: options.now } : {}),
       ...(options.startupStaggerMs !== undefined ? { startupStaggerMs: options.startupStaggerMs } : {}),

@@ -8,6 +8,50 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Dashboard `[R]` reloads account usage and due tokens without restarting the
+  router or dropping active requests and sticky sessions. It also refreshes
+  Grok snapshots, CLI routing state, and an already-loaded model list, with
+  progress and partial-failure summaries.
+- `POST /cc-router/refresh` runs a shared Claude/OpenAI refresh pass, sweeps
+  expired cooldowns, and returns per-provider results. Concurrent reloads
+  join the same pass instead of starting duplicate work.
+- OpenAI transport diagnostics include correlation IDs and refresh, response
+  header, and first-byte timings. Failure logs use bounded diagnostic fields
+  rather than raw upstream error messages.
+
+### Changed
+
+- The configured proxy request timeout now bounds Codex response headers and
+  upstream stream inactivity on both `/v1/responses` and OpenAI-routed
+  `/v1/messages`, including failover attempts. Progressing streams can outlive
+  that interval; time spent waiting for a slow client does not count as
+  upstream inactivity.
+- Permanently rejected OpenAI refresh credentials are quarantined from
+  inference routing without changing the account's saved `enabled` setting.
+  Health reports expose the authentication state and failure category.
+  Successful refresh or credential replacement restores eligibility;
+  quarantine is runtime-only and does not survive a router restart.
+
+### Fixed
+
+- OpenAI OAuth refresh sends the required public `client_id` and has a
+  15-second deadline covering response headers and JSON body parsing, so a
+  stalled refresh cannot retain its lock indefinitely.
+- Refresh deduplication is scoped to the account object, preventing a deleted
+  and re-added account from sharing an old account's in-flight refresh.
+- OpenAI usage authentication failures remain advisory rather than disabling
+  an account or overriding permanent credential quarantine. Background and
+  manual token refreshes continue to check quarantined accounts for recovery.
+- OpenAI response relays honor downstream backpressure and cancel upstream
+  reads when the client disconnects. Failed partial streams close the
+  connection instead of appearing complete, and router-side stream failures
+  are no longer misclassified as client cancellations.
+- Codex header timeouts return a safe HTTP 504 response, including after
+  account failover, while preserving the existing retry budget and shared
+  request correlation.
+
 ---
 
 ## [0.12.0] — 2026-09-11

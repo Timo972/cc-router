@@ -992,7 +992,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     }
   });
 
-  it("does not forward after the client disconnects during token refresh (P2 disconnect)", async () => {
+  it.each([true, false])("does not charge a disconnect during token refresh (refresh succeeds: %s)", async (refreshSucceeds) => {
     const account = makeRuntimeAccount("openai-victor");
     const refreshStarted = deferred<void>();
     const refreshResult = deferred<boolean>();
@@ -1031,11 +1031,13 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
 
       // Resolve the refresh only after the disconnect was observed — the
       // handler must see the terminated response and stop before forwarding.
-      refreshResult.resolve(true);
+      refreshResult.resolve(refreshSucceeds);
       await new Promise(resolve => setImmediate(resolve));
 
       expect(forward).not.toHaveBeenCalled();
       expect(openAIPool.getInFlight(account.id)).toBe(0);
+      expect(account.errorCount).toBe(0);
+      if (!refreshSucceeds) expect(openAIPool.tryAcquire(account.id)).toBeNull();
     } finally {
       refreshResult.resolve(true);
       client?.destroy();
@@ -1162,7 +1164,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
   });
 
-  it("tears down gracefully and still records an error entry when the relay throws after bytes were already flushed (F1e)", async () => {
+  it("destroys a partial response and records an error when the upstream body fails (F1e)", async () => {
     const forward: ForwardOpenAI = async () => {
       let calls = 0;
       const reader = {
@@ -1191,17 +1193,18 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
         body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
       });
 
-      // Status/headers were already committed before the failure — the best
-      // we can do is stop, not retract what was already sent.
+      // Status/headers were already committed before the failure. The client
+      // must observe a broken response rather than a normal EOF that makes a
+      // partial generation look complete.
       expect(res.status).toBe(200);
-      expect(await res.text()).toBe("data: partial\n\n");
+      await expect(res.text()).rejects.toThrow();
     });
 
-    expect(activity.some(entry => entry.type === "error")).toBe(true);
+    await vi.waitFor(() => expect(activity.some(entry => entry.type === "error")).toBe(true));
     // A REAL relay failure (no client disconnect) must still reach the log —
     // deferring the log line for the cancellation check must not swallow it.
     expect(
-      logSpy.mock.calls.map(call => String(call[0])).filter(line => line.includes("relay failed")),
+      logSpy.mock.calls.map(call => String(call[0])).filter(line => line.includes("operation=relay")),
     ).toHaveLength(1);
   });
 

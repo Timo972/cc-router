@@ -1,11 +1,20 @@
 import type { ProviderAccount } from "../types.js";
 import { decodeOpenAIPlan } from "./usage.js";
+import { createHeaderDeadline } from "../../proxy/transport-timing.js";
+import { logError } from "../../proxy/logger.js";
+import {
+  createCorrelationId,
+  formatTransportDiagnostic,
+  safeCauseCode,
+} from "../../proxy/transport-diagnostics.js";
+import { DEFAULT_CLIENT_ID } from "./device-oauth.js";
 
 const TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
 const REFRESH_BUFFER_MS = 10 * 60 * 1000;
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
+export const OPENAI_REFRESH_TIMEOUT_MS = 15_000;
 
-const refreshLocks = new Map<string, Promise<boolean>>();
+const refreshLocks = new WeakMap<OpenAISubscriptionAccount, Promise<boolean>>();
 
 /**
  * Accounts whose most recently rotated credentials have NOT been confirmed
@@ -100,6 +109,8 @@ type OpenAIRuntimeHealthFields = {
   consecutiveErrors?: number;
   lastRefresh?: number;
   rateLimits?: { plan?: string };
+  authState?: "ok" | "quarantined";
+  authFailure?: "permanent" | "transient";
 };
 
 export function needsOpenAIRefresh(account: Pick<OpenAISubscriptionAccount, "expiresAt">): boolean {
@@ -107,15 +118,15 @@ export function needsOpenAIRefresh(account: Pick<OpenAISubscriptionAccount, "exp
 }
 
 export async function refreshOpenAISubscriptionToken(account: OpenAISubscriptionAccount): Promise<boolean> {
-  const existing = refreshLocks.get(account.id);
+  const existing = refreshLocks.get(account);
   if (existing) return existing;
 
   const promise = doRefresh(account);
-  refreshLocks.set(account.id, promise);
+  refreshLocks.set(account, promise);
   try {
     return await promise;
   } finally {
-    refreshLocks.delete(account.id);
+    refreshLocks.delete(account);
   }
 }
 
@@ -124,7 +135,9 @@ export async function prepareOpenAIAccountForRequest(
   allAccounts: OpenAISubscriptionAccount[],
   saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
 ): Promise<boolean> {
-  if (!needsOpenAIRefresh(account)) {
+  const runtime = account as OpenAISubscriptionAccount & OpenAIRuntimeHealthFields;
+  // A revoked but unexpired access token must not bypass the refresh gate.
+  if (!needsOpenAIRefresh(account) && runtime.authState !== "quarantined") {
     // No refresh due, but a previous rotation from this account never made it
     // to disk (e.g. a transient disk-full). This is the retry path: piggyback
     // on this otherwise-idle request to flush the still-current in-memory
@@ -157,21 +170,41 @@ export async function refreshAndPersistOpenAIAccount(
   return ok;
 }
 
+export interface RefreshOpenAIAccountsOnceOptions {
+  onError?: (error: unknown) => void;
+}
+
+/**
+ * One scheduled refresh pass over every OpenAI account: due tokens are
+ * refreshed, quarantined ones re-tried. Shared by the background loop and
+ * the manual reload endpoint so both isolate failures per account the same
+ * way. Returns how many accounts did not come out with usable credentials —
+ * an expected refresh rejection counts, not only a thrown error.
+ */
+export async function refreshOpenAIAccountsOnce(
+  accounts: OpenAISubscriptionAccount[],
+  saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
+  options: RefreshOpenAIAccountsOnceOptions = {},
+): Promise<{ failed: number }> {
+  let failed = 0;
+  for (const account of [...accounts]) {
+    // One account's refresh throwing must not skip every account after it
+    // in this tick — isolate failures per-account.
+    try {
+      if (!await prepareOpenAIAccountForRequest(account, accounts, saveAccounts)) failed++;
+    } catch (error) {
+      failed++;
+      (options.onError ?? console.error)(error);
+    }
+  }
+  return { failed };
+}
+
 export function startOpenAIRefreshLoop(
   accounts: OpenAISubscriptionAccount[],
   saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
 ): () => void {
-  const check = async () => {
-    for (const account of accounts) {
-      // One account's refresh throwing must not skip every account after it
-      // in this tick — isolate failures per-account.
-      try {
-        await prepareOpenAIAccountForRequest(account, accounts, saveAccounts);
-      } catch (error) {
-        console.error(error);
-      }
-    }
-  };
+  const check = () => refreshOpenAIAccountsOnce(accounts, saveAccounts);
 
   const timer = setInterval(() => { check().catch(console.error); }, CHECK_INTERVAL_MS);
   queueMicrotask(() => { check().catch(console.error); });
@@ -179,44 +212,126 @@ export function startOpenAIRefreshLoop(
   return () => clearInterval(timer);
 }
 
+function refreshErrorCode(payload: unknown, depth = 0): string | undefined {
+  if (typeof payload === "string") return payload;
+  if (depth >= 3 || typeof payload !== "object" || payload === null) return undefined;
+
+  const record = payload as Record<string, unknown>;
+  for (const key of ["code", "type", "error"] as const) {
+    const code = refreshErrorCode(record[key], depth + 1);
+    if (code) return code;
+  }
+  return undefined;
+}
+
+function rejectIsPermanent(status: number, payload: unknown): boolean {
+  if (status !== 400 && status !== 401) return false;
+  const code = refreshErrorCode(payload);
+  // `token_expired` is the code the real endpoint returns for a refresh token it
+  // can no longer validate; like the OAuth2-standard codes it means re-auth, not
+  // a retriable blip, so it must quarantine rather than cooldown-loop forever.
+  return code === "invalid_grant" || code === "invalid_token" || code === "token_revoked" || code === "token_expired";
+}
+
+function markRefreshFailure(account: OpenAISubscriptionAccount, permanent: boolean): void {
+  const runtime = account as OpenAISubscriptionAccount & OpenAIRuntimeHealthFields;
+  if (permanent) {
+    runtime.authFailure = "permanent";
+    runtime.authState = "quarantined";
+  } else if (runtime.authState !== "quarantined") {
+    runtime.authFailure = "transient";
+  }
+}
+
+function logRefreshFailure(
+  account: OpenAISubscriptionAccount,
+  correlationId: string,
+  status: number | undefined,
+  error?: unknown,
+): void {
+  logError(account.id, status !== undefined && status >= 400 ? status : 0, formatTransportDiagnostic({
+    correlationId,
+    operation: "refresh",
+    ...(status !== undefined ? { status } : {}),
+    causeCode: safeCauseCode(error),
+  }));
+}
+
 async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: account.refreshToken,
+    // The token endpoint validates client_id before the grant; without it the
+    // refresh 400s as `missing_required_parameter` and never reaches token
+    // validation. Same public client the tokens were minted under (device-oauth).
+    client_id: DEFAULT_CLIENT_ID,
   });
 
   let data: OpenAIRefreshResponse;
+  let responseStatus: number | undefined;
+  const correlationId = createCorrelationId();
+  const deadline = createHeaderDeadline(OPENAI_REFRESH_TIMEOUT_MS);
   try {
     const res = await fetch(TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
+      signal: deadline.signal,
     });
+    responseStatus = res.status;
 
-    if (!res.ok) return false;
+    if (!res.ok) {
+      let payload: unknown;
+      try { payload = await res.json(); } catch { /* intentionally do not retain response bodies */ }
+      markRefreshFailure(account, rejectIsPermanent(res.status, payload));
+      logRefreshFailure(account, correlationId, res.status);
+      return false;
+    }
 
     data = await res.json() as OpenAIRefreshResponse;
-  } catch {
+  } catch (error) {
     // Network failure (or malformed response body) must resolve to `false`,
     // exactly like a non-ok HTTP response — never propagate as a rejection.
+    markRefreshFailure(account, false);
+    logRefreshFailure(account, correlationId, responseStatus, error);
     return false;
+  } finally {
+    // OAuth is a small JSON exchange: unlike inference, the deadline covers
+    // both headers and body parsing so a stalled body cannot retain the lock.
+    deadline.dispose();
   }
 
   // A 200 with an unusable payload is a failed refresh, not a successful one.
   // Writing it through would leave `expiresAt` as NaN, which then reads as
   // "never needs refreshing" in `needsOpenAIRefresh` and permanently strands
   // the account on a broken token.
-  if (typeof data?.access_token !== "string" || data.access_token.length === 0) return false;
+  if (typeof data?.access_token !== "string" || data.access_token.length === 0) {
+    markRefreshFailure(account, false);
+    logRefreshFailure(account, correlationId, 200);
+    return false;
+  }
   // The lifetime has to be positive and has to still name a finite instant
   // once converted. A zero or negative `expires_in` would report success on a
   // token that is already due for another refresh, so every request re-enters
   // the refresh path; a value big enough to overflow the multiplication would
   // set `expiresAt` to Infinity, which `needsOpenAIRefresh` can never reach —
   // the same permanent strand as NaN, from the opposite direction.
-  if (typeof data.expires_in !== "number" || !Number.isFinite(data.expires_in)) return false;
-  if (data.expires_in <= 0) return false;
+  if (typeof data.expires_in !== "number" || !Number.isFinite(data.expires_in)) {
+    markRefreshFailure(account, false);
+    logRefreshFailure(account, correlationId, 200);
+    return false;
+  }
+  if (data.expires_in <= 0) {
+    markRefreshFailure(account, false);
+    logRefreshFailure(account, correlationId, 200);
+    return false;
+  }
   const expiresAt = Date.now() + data.expires_in * 1000;
-  if (!Number.isFinite(expiresAt)) return false;
+  if (!Number.isFinite(expiresAt)) {
+    markRefreshFailure(account, false);
+    logRefreshFailure(account, correlationId, 200);
+    return false;
+  }
 
   account.accessToken = data.access_token;
   account.refreshToken = data.refresh_token ?? account.refreshToken;
@@ -230,6 +345,8 @@ async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
   if (runtime.healthy !== undefined) runtime.healthy = true;
   if (runtime.consecutiveErrors !== undefined) runtime.consecutiveErrors = 0;
   if (runtime.lastRefresh !== undefined) runtime.lastRefresh = Date.now();
+  runtime.authState = "ok";
+  runtime.authFailure = undefined;
 
   // The rotated access token can carry a different plan than the one decoded
   // at account creation (e.g. a Plus->Pro upgrade). Mirrors createOpenAIAccount's
