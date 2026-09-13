@@ -1282,7 +1282,7 @@ function LiveDashboard({
       // unknown outcome or encourage another redemption.
       try { await onRefreshAll?.(); } catch { /* the regular poll will retry */ }
     } catch {
-      showBanner(`Reset outcome unknown for ${id}; Meta+r retries the same redemption (keep dashboard open)`, "red");
+      showBanner(`Reset outcome unknown for ${id}; Ctrl+R retries the same redemption (keep dashboard open)`, "red");
     } finally {
       resetSession.inFlight = false;
     }
@@ -1349,9 +1349,9 @@ function LiveDashboard({
       return;
     }
 
-    // Ink 5 receives Meta+r as ESC r. Cmd+r requires a terminal mapping;
-    // intercept before the model-refresh handler so focus cannot redirect it.
-    if (input === "r" && key.meta) {
+    // Intercept Ctrl+R before model refresh so it only acts on account focus.
+    // Ink exposes the standard DC2 control character as input r + key.ctrl.
+    if (input === "r" && key.ctrl) {
       if (focus !== "accounts" || !selectedAccount) return;
       if (resetSession.inFlight) { showBanner("Reset already running", "yellow"); return; }
       if (selectedAccount.provider !== "openai_subscription") {
@@ -1689,7 +1689,7 @@ function LiveDashboard({
       <Box marginTop={1}>
         <Text color="gray">
           {focus === "accounts"
-            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [Meta+r] reset  [R] reload  [z] compact  [q]"
+            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [Ctrl+R] reset  [R] reload  [z] compact  [q]"
             : focus === "models"
               ? " [Tab]  [m/r] refresh  [c]/[o] default  [R] reload all  [Esc] logs  [z] compact  [q]"
               : " [Tab]  [m] models  [R] reload  [z] compact  [q] quit"}

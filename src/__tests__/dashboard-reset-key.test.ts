@@ -69,7 +69,7 @@ function health() {
   };
 }
 
-describe("dashboard account reset", () => {
+describe("dashboard Ctrl+R account reset", () => {
   it("requires account focus and confirmation, then spends once for the selected account", async () => {
     const dash = renderDashboard(health(), {}, { rows: 40, columns: 240 });
     try {
@@ -83,18 +83,21 @@ describe("dashboard account reset", () => {
         }
         return Promise.resolve(Response.json(health()));
       });
-      await dash.press("\u001br");
+      await dash.press("\u0012");
       expect(dash.lastFrame()).not.toContain("Redeem 1 reset");
       await dash.press("\t");
+      await dash.press("r");
       await dash.press("\u001br");
+      expect(dash.lastFrame()).not.toContain("Redeem 1 reset");
+      await dash.press("\u0012");
       await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "chatgpt-1"'));
       expect(requests).toHaveLength(0);
       await dash.press("n");
       expect(requests).toHaveLength(0);
-      await dash.press("\u001br");
+      await dash.press("\u0012");
       await dash.press("y");
       await dash.waitUntil(() => expect(requests).toHaveLength(1));
-      await dash.press("\u001br");
+      await dash.press("\u0012");
       await dash.press("y");
       expect(requests).toHaveLength(1);
       expect(requests[0].method).toBe("POST");
@@ -120,7 +123,7 @@ describe("dashboard account reset", () => {
         return Promise.resolve(Response.json(health()));
       });
       await dash.press("\t");
-      await dash.press("\u001br");
+      await dash.press("\u0012");
       await dash.press("y");
       await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset outcome unknown"));
       offline = true;
@@ -128,7 +131,7 @@ describe("dashboard account reset", () => {
       offline = false;
       await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
       await dash.press("\t");
-      await dash.press("\u001br");
+      await dash.press("\u0012");
       await dash.press("y");
       await dash.waitUntil(() => expect(ids).toHaveLength(2));
       expect(ids[1]).toBe(ids[0]);
@@ -143,7 +146,7 @@ describe("dashboard account reset", () => {
     try {
       await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
       await dash.press("\t");
-      await dash.press("\u001br");
+      await dash.press("\u0012");
       expect(dash.lastFrame()).not.toContain("Redeem 1 reset");
       await dash.press("y");
       expect(vi.mocked(globalThis.fetch).mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
@@ -166,7 +169,7 @@ it("keeps in-flight redemption ownership through a health reconnect", async () =
       return offline ? Promise.reject(new Error("offline")) : Promise.resolve(Response.json(health()));
     });
     await dash.press("\t");
-    await dash.press("\u001br");
+    await dash.press("\u0012");
     await dash.press("y");
     await dash.waitUntil(() => expect(requests).toBe(1));
     offline = true;
@@ -174,7 +177,7 @@ it("keeps in-flight redemption ownership through a health reconnect", async () =
     offline = false;
     await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
     await dash.press("\t");
-    await dash.press("\u001br");
+    await dash.press("\u0012");
     await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset already running"));
     await dash.press("y");
     expect(requests).toBe(1);
@@ -200,7 +203,7 @@ it("redeems the focused account rather than the first account", async () => {
     });
     await dash.press("\t");
     await dash.press("\u001b[B");
-    await dash.press("\u001br");
+    await dash.press("\u0012");
     await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "chatgpt-2"'));
     await dash.press("y");
     await dash.waitUntil(() => expect(targets).toEqual(["http://localhost:3456/cc-router/accounts/chatgpt-2/reset-usage"]));

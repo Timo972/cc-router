@@ -588,7 +588,7 @@ The dashboard is also a control surface. In local mode it controls the local pro
 | `e` | Enable/disable selected Claude account |
 | `w` / `s` | Change selected Claude account weekly/session cap |
 | `d` | Delete selected Claude account |
-| `Meta+r` | Confirm redeeming one banked usage-limit reset for the focused ChatGPT account |
+| `Ctrl+R` | Confirm redeeming one banked usage-limit reset for the focused ChatGPT account |
 | `R` | Reload account usage and due credentials without restarting the router |
 | `m` / `r` | Load or refresh discovered provider models |
 | `c` | Toggle Claude Code routing (or set Claude model default when MODELS is focused) |
@@ -596,16 +596,13 @@ The dashboard is also a control surface. In local mode it controls the local pro
 | `o` | Set selected `openai/*` model as OpenAI default |
 
 To redeem a ChatGPT reset, press `Tab` to focus accounts, select the account
-with the arrow keys, then press `Meta+r` and confirm with `y` (`n` or `Esc`
+with the arrow keys, then press `Ctrl+R` and confirm with `y` (`n` or `Esc`
 cancels). The `rst` column shows banked reset credits. Accounts with zero or
 unknown credits cannot start a new redemption. This spends a real reset credit;
 it is not the same as refreshing usage with uppercase `R`.
 
-**macOS Cmd+R:** Ink 5 reads terminal Meta sequences, not the native Command key.
-Configure your terminal's Cmd+R shortcut to send `\x1br` (Escape followed by
-lowercase `r`). Option/Alt+R also works when configured to send Meta. Without
-that terminal mapping, Cmd+R may be intercepted by the terminal and never reach
-cc-router. The footer uses `Meta+r` to describe the sequence the app receives.
+Press **Control + R** (not Command + R or Shift + R). This uses the standard
+terminal Ctrl+R sequence and does not require a custom Meta/Option key mapping.
 
 Redemption targets only that account and refreshes its usage afterward. If the
 network outcome is unknown, keep the dashboard open and retry the shortcut: it
