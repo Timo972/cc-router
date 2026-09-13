@@ -77,6 +77,9 @@ A model's provider prefix decides which upstream serves it.
 | `anthropic/*` | Claude subscription route |
 | anything else with no prefix | Claude subscription route |
 
+There is no `grok/*` prefix: Grok/xAI accounts are tracked for visibility only
+and never receive proxied requests. See [Grok / xAI](grok.md).
+
 Claude Code can also send a `/v1/messages` request with an `openai/*` model.
 CC-Router translates that Anthropic Messages request into an OpenAI Responses
 request and converts the response back into Anthropic shape — text and function

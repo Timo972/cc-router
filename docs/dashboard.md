@@ -37,6 +37,11 @@ The dashboard is also a control surface. In local mode it controls the local
 proxy; in client mode it controls the remote CC-Router configured by
 `cc-router client connect`.
 
+Accounts are shown in per-provider groups. Claude and ChatGPT rows carry
+routing and usage data; Grok rows are an overview — plan, code access, active
+sessions and token health — because Grok is not a routed provider. See
+[Grok / xAI](grok.md).
+
 Authenticated account views include dynamic model-scoped allowance rows, their
 reset times, applicable global or requested-model cooldowns, paid-extra state,
 and whether the usage snapshot is fresh, stale or unavailable. **A stale row is

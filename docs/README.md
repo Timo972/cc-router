@@ -9,6 +9,7 @@ Start with the [README](../README.md) for what CC-Router is and a quickstart.
 | [Installation & deployment](installation.md) | Requirements, per-platform token extraction, run modes, Docker |
 | [CLI reference](cli-reference.md) | Every command and flag |
 | [Codex CLI & OpenAI](codex.md) | Responses endpoint, model prefixes, OpenAI subscription accounts |
+| [Grok / xAI](grok.md) | Adding Grok accounts, and why they are overview-only |
 | [Claude Desktop](claude-desktop.md) | Routing Claude Desktop / Cowork through mitmproxy |
 | [Client mode](client-mode.md) | Connecting another device you own to your router |
 | [LiteLLM](litellm-setup.md) | Optional logging, rate limiting and web dashboard layer |

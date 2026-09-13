@@ -75,6 +75,17 @@ cc-router accounts login-openai
 
 See [Codex CLI & OpenAI](codex.md).
 
+### Grok / xAI accounts
+
+Grok accounts are tracked for visibility rather than routed — see
+[Grok / xAI](grok.md) for what that means. Add one either by importing an
+existing Grok CLI login or with a device-code sign-in:
+
+```bash
+cc-router accounts add-grok     # import ~/.grok/auth.json
+cc-router accounts login-grok   # device-code sign-in
+```
+
 ## Run modes
 
 On the first `cc-router start` you're asked how you want the router to run, and

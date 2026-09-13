@@ -51,6 +51,7 @@ thinking, tool use and prompt caching — passed through byte for byte.
 - **Model-aware rate limits** — skips accounts whose global or per-model allowance is spent, and respects scoped cooldowns
 - **Automatic token refresh** — OAuth tokens refresh before expiry and are written atomically ([details](docs/oauth-tokens.md))
 - **Live dashboard** — terminal UI for account health, usage windows, live activity, and routing toggles ([details](docs/dashboard.md))
+- **Grok CLI overview** — your Grok/xAI subscription's plan and session state in the same dashboard, alongside the accounts that are routed ([details](docs/grok.md))
 - **Guided setup** — `cc-router setup` pulls tokens from the Keychain or credentials file and wires up your clients
 - **Client mode** — point another device you own at your private router ([details](docs/client-mode.md))
 - **Flexible deployment** — background daemon, native auto-start (launchd/systemd), foreground, or Docker Compose ([details](docs/installation.md))
@@ -58,13 +59,19 @@ thinking, tool use and prompt caching — passed through byte for byte.
 
 ## Supported platforms and harnesses
 
-**AI platforms**
+**Routed** — requests are proxied to these:
 
 | Platform | Auth | Route |
 |---|---|---|
 | Claude Max / Pro subscriptions | OAuth (subscription) | `/v1/messages` |
 | OpenAI ChatGPT / Codex subscriptions | OAuth device code | `/v1/responses` |
 | Anything LiteLLM supports (optional) | API keys, via LiteLLM | `/v1/messages` ([setup](docs/litellm-setup.md)) |
+
+**Monitored** — tracked and shown in the dashboard, not proxied:
+
+| Platform | Auth | What you get |
+|---|---|---|
+| Grok / xAI subscriptions | Device code, or import from Grok CLI | Plan, code access, active sessions, token health ([details](docs/grok.md)) |
 
 **Harnesses**
 
@@ -112,6 +119,7 @@ Per-platform token extraction, Codex CLI, Docker and everything else lives in
 | [Architecture](docs/architecture.md) | Request path and components |
 | [Dashboard](docs/dashboard.md) | Live TUI, keybindings, model management |
 | [Codex CLI & OpenAI](docs/codex.md) | Responses endpoint, model prefixes, OpenAI accounts |
+| [Grok / xAI](docs/grok.md) | Adding Grok accounts, and why they're overview-only |
 | [Claude Desktop](docs/claude-desktop.md) | mitmproxy interception setup |
 | [Client mode](docs/client-mode.md) | Connecting your other devices |
 | [LiteLLM](docs/litellm-setup.md) | Optional logging and rate-limiting layer |

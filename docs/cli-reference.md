@@ -26,11 +26,15 @@ cc-router logs               View proxy logs (background mode)
 cc-router logs -f            Follow log output in real time
 cc-router logs --lines 100   Show last 100 lines
 
-cc-router accounts list      List configured accounts (live stats if proxy is running)
-cc-router accounts add       Add an account interactively
+cc-router accounts list      List Claude, ChatGPT and Grok accounts (live stats if proxy is running)
+cc-router accounts list --json  Same, as JSON
+cc-router accounts add       Add a Claude account interactively
 cc-router accounts login-openai  Sign in to OpenAI subscription auth with device code
 cc-router accounts add-openai  Add an OpenAI subscription account manually (experimental)
-cc-router accounts remove <id>  Remove a Claude or OpenAI account
+cc-router accounts login-grok  Sign in to a Grok / xAI account with device code
+cc-router accounts add-grok  Import the Grok CLI login from ~/.grok/auth.json
+cc-router accounts rename <id> <new-id>  Rename an account
+cc-router accounts remove <id>  Remove a Claude, OpenAI or Grok account
 
 cc-router configure          (Re)write ~/.claude/settings.json
 cc-router configure codex    (Re)write ~/.codex/config.toml for Codex CLI
