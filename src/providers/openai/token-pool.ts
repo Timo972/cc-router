@@ -6,7 +6,7 @@ import {
 } from "../../proxy/account-pool.js";
 import type { RouteContext } from "../../proxy/types.js";
 import { bucketForModel, bucketIdForModel, sweepCodexRateLimits, type CodexCooldownCause, type OpenAIAccount } from "./account-state.js";
-import { DEFAULT_CODEX_LIMIT_ID, type CodexLimitBucket, type CodexRateWindow } from "./usage.js";
+import { DEFAULT_CODEX_LIMIT_ID, type CodexLimitBucket, type CodexRateLimitsUpdate, type CodexRateWindow } from "./usage.js";
 
 const MAX_TRUSTED_RATE_LIMIT_RESET_MS = 8 * 24 * 60 * 60 * 1_000;
 /** Matches the bucket-snapshot cap in account-state.ts: a real account has the
@@ -21,6 +21,10 @@ interface OpenAICooldowns {
    *  30s rate limit both apply, and folding them into one horizon would keep
    *  answering 429 for 90 seconds after the quota itself had cleared. */
   rateLimitedUntil: number;
+  /** Retained independently so redeeming quota never drops an overload hold. */
+  unavailableUntil: number;
+  /** Changes on every quota signal, even same-tick/equal-expiry ones. */
+  quotaRevision: number;
   bucketUntil: Map<string, number>;
 }
 
@@ -116,7 +120,12 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     // Each cause extends its own horizon, so neither can misrepresent the
     // other's duration in either direction.
     state.globalUntil = Math.max(state.globalUntil, expiry);
-    if (cause === "rate_limit") state.rateLimitedUntil = Math.max(state.rateLimitedUntil, expiry);
+    if (cause === "rate_limit") {
+      state.rateLimitedUntil = Math.max(state.rateLimitedUntil, expiry);
+      state.quotaRevision++;
+    } else {
+      state.unavailableUntil = Math.max(state.unavailableUntil, expiry);
+    }
   }
 
   setBucketCooldownForAccount(account: OpenAIAccount, limitId: string, durationMs: number): void {
@@ -125,6 +134,7 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     const state = this.cooldownsFor(account);
     if (!state.bucketUntil.has(limitId)) this.makeRoomForBucketCooldown(state);
     state.bucketUntil.set(limitId, Math.max(state.bucketUntil.get(limitId) ?? 0, expiry));
+    state.quotaRevision++;
   }
 
   /**
@@ -157,6 +167,30 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
       }
     }
     if (soonestId !== undefined) state.bucketUntil.delete(soonestId);
+  }
+
+  /** Capture before a redemption. Apply only after confirmed redemption and a
+   * fresh post-redemption usage fetch. New quota evidence conservatively fences
+   * the whole reconciliation; unrelated overload holds retain their own expiry. */
+  captureUsageReset(account: OpenAIAccount): (update: CodexRateLimitsUpdate) => void {
+    const state = this.cooldowns.get(account);
+    const revision = state?.quotaRevision;
+    return update => {
+      if (!state || this.findById(account.id) !== account
+        || this.cooldowns.get(account) !== state || state.quotaRevision !== revision) return;
+      for (const bucket of update.buckets) {
+        const windows = [bucket.primary, bucket.secondary].filter(window => window !== undefined);
+        // An omitted bucket/window is not evidence of recovery. Exhaustion in
+        // retained windows is still independently enforced by hardBlock().
+        if (windows.length === 0 || windows.some(window => window.utilization >= 1)) continue;
+        if (bucket.limitId === DEFAULT_CODEX_LIMIT_ID) {
+          state.rateLimitedUntil = 0;
+          state.globalUntil = state.unavailableUntil;
+        }
+        state.bucketUntil.delete(bucket.limitId);
+      }
+      this.sweepExpiredCooldowns();
+    };
   }
 
   getCooldownView(accountId: string): OpenAICooldownView {
@@ -416,7 +450,7 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
   private cooldownsFor(account: OpenAIAccount): OpenAICooldowns {
     let state = this.cooldowns.get(account);
     if (!state) {
-      state = { globalUntil: 0, rateLimitedUntil: 0, bucketUntil: new Map() };
+      state = { globalUntil: 0, rateLimitedUntil: 0, unavailableUntil: 0, quotaRevision: 0, bucketUntil: new Map() };
       this.cooldowns.set(account, state);
     }
     return state;
@@ -428,6 +462,7 @@ export class OpenAITokenPool implements AccountPool<OpenAIAccount> {
     if (!state) return false;
     const now = this.now();
     let recovered = false;
+    if (state.unavailableUntil > 0 && state.unavailableUntil <= now) state.unavailableUntil = 0;
     if (state.rateLimitedUntil > 0 && state.rateLimitedUntil <= now) state.rateLimitedUntil = 0;
     if (state.globalUntil > 0 && state.globalUntil <= now) {
       state.globalUntil = 0;

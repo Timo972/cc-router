@@ -1,3 +1,4 @@
+import type { CodexResetCode } from "../providers/openai/usage-reset.js";
 /**
  * Tiny authenticated HTTP client for /cc-router/accounts.
  *
@@ -64,7 +65,10 @@ export interface RefreshAllResult {
   durationMs: number;
 }
 
+export interface UsageResetResult { code: CodexResetCode; usageRefreshed: boolean }
+
 export interface AccountsApi {
+  resetUsage(id: string, redeemRequestId: string): Promise<UsageResetResult>;
   /** Read the authenticated, disclosure-safe account status view. */
   list(): Promise<AccountSafeView[]>;
   /** Ask the router to sweep cooldowns, re-try due tokens and re-fetch every
@@ -123,6 +127,20 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
   return {
     list,
     refreshAll,
+    async resetUsage(id, redeemRequestId) {
+      const response = await fetch(`${base}/${encodeURIComponent(id)}/reset-usage`, {
+        method: "POST",
+        headers: { ...authHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ redeemRequestId }),
+        signal: AbortSignal.timeout(REFRESH_ALL_TIMEOUT_MS),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const body: unknown = await response.json();
+      const reset = isRecord(body) ? body.reset : undefined;
+      if (!isRecord(reset) || typeof reset.code !== "string" || !["reset", "nothing_to_reset", "no_credit", "already_redeemed"].includes(reset.code)
+        || typeof reset.usageRefreshed !== "boolean") throw new Error("Invalid reset response");
+      return { code: reset.code as CodexResetCode, usageRefreshed: reset.usageRefreshed };
+    },
     patch(id, patch) { return send("PATCH", `/${encodeURIComponent(id)}`, patch); },
     setProviderEnabled(provider, enabled) { return send("PATCH", `/providers/${encodeURIComponent(provider)}`, { enabled }); },
     remove(id) { return send("DELETE", `/${encodeURIComponent(id)}`); },
