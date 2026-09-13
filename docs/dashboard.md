@@ -4,34 +4,12 @@
 cc-router status
 ```
 
-```text
- CC-Router  ·  standalone → api.anthropic.com  ·  up 2h 14m  ·  [q] quit
+![CC-Router dashboard](../assets/dashboard.png)
 
- OPERATIONS  base http://localhost:3456  ·  auth protected  ·  models dynamic
-  Claude 2/2 healthy  OpenAI 1/1 healthy  ·  cross-route ready
-  endpoints /v1/messages /v1/responses /v1/models /cc-router/accounts
-  routing claude=claude-sonnet-4-6 aliases[sonnet]  openai=gpt-5-codex aliases[codex]
-  cli Claude on Codex off [c]/[x]  ·  models [m] then [c]/[o] defaults
-
- MODELS  [m/r] refresh  [↑/↓] select  [c] Claude default  [o] OpenAI default
-  current claude=claude-sonnet-4-6  openai=gpt-5-codex
-  ▶ anthropic/claude-sonnet-4-6 Claude
-    openai/gpt-5-codex OpenAI
-
- ACCOUNTS  2/2 healthy
-
-  ● max-account-1    ok      req   142  err   0  expires  6h 48m  last  2s ago
-  ● max-account-2    ok      req   139  err   0  expires  6h 51m  last  5s ago
-
- TOTALS  requests 281  ·  errors 0  ·  refreshes 2
-
- RECENT ACTIVITY
-  14:23:01  → max-account-1    route
-  14:22:58  → max-account-2    route
-  14:22:45  ↻ max-account-1    refresh
-```
-
-Press `q` to quit. The view refreshes every 2 seconds.
+Press `q` to quit. The view refreshes every 2 seconds. Accounts are grouped by
+provider, with per-account request counts, in-flight and bound-session counts,
+5-hour and 7-day utilisation, model-scoped allowance notes, cooldown timers and
+banked reset credits.
 
 The dashboard is also a control surface. In local mode it controls the local
 proxy; in client mode it controls the remote CC-Router configured by
