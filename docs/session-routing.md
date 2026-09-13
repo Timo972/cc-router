@@ -65,15 +65,32 @@ session must have one unambiguous identity. Anything malformed falls back to
 
 ## Failure handling
 
-When an upstream account returns **401, 429, or 529**, cc-router:
+If an upstream account fails **before a single response byte has been relayed**,
+cc-router applies that failure's cooldown and affinity bookkeeping and then
+retries the request itself, up to **3 upstream attempts** per request.
 
-1. Passes the response through **unchanged** — it does not mask upstream errors,
-2. Invalidates that session's affinity,
-3. Lets the client's own retry pick a different account.
+| Upstream failure | What cc-router does |
+|---|---|
+| `429`, or a provider overload it cools down (Anthropic `529`; Codex `503`/`529`) | Always fails over to a **different** account |
+| Any other `5xx`, session-bound request | Retries on the **same** account after a short pause |
+| Any other `5xx`, session-less request | Re-routes like a fresh request — typically an idle other account |
+| `401` | Always passed through, with a background token refresh |
 
-cc-router deliberately does **not** retry on your behalf, and **never** retries
-after response bytes have started. A half-streamed answer is never silently
-restarted or stitched together from two accounts.
+This is on by default. Set `"autoFailover": false` in `~/.cc-router/config.json`
+and restart the router to opt out; every upstream failure then passes through
+unchanged and clients own all retries. Be aware that **current Claude Code builds
+no longer retry 429s themselves**, so with failover off a rate limit surfaces
+directly in the session as an error.
+
+One trade-off worth knowing: once the router commits to a retry it abandons the
+original failure response, so a network error on the retry attempt surfaces as a
+local `502` rather than the original `429`. When no other account is eligible or
+the attempt budget is exhausted, the last failed upstream response is passed
+through unchanged.
+
+cc-router **never** retries after response bytes have started. A half-streamed
+answer is never silently restarted or stitched together from two accounts —
+mid-stream failures reach the client untouched.
 
 When every account is hard-blocked before forwarding begins, cc-router makes no
 Anthropic Messages request. It returns an Anthropic-shaped local **429** when
