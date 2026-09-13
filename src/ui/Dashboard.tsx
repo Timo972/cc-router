@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Box, Text, useInput, useApp, useStdout, measureElement } from "ink";
 import type { DOMElement } from "ink";
@@ -742,7 +743,9 @@ interface ProviderOperationalStatus {
 }
 
 type Focus = "logs" | "accounts" | "models";
-type Mode = "view" | "editSession" | "editWeekly" | "confirmDelete";
+interface ResetSession { inFlight: boolean; pendingIds: Map<string, string> }
+
+type Mode = "view" | "editSession" | "editWeekly" | "confirmDelete" | "confirmReset";
 
 // ─── Dashboard component ──────────────────────────────────────────────────────
 
@@ -761,6 +764,9 @@ export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps
   const [connectError, setConnectError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<number>(0);
   const [retryCount, setRetryCount] = useState(0);
+  // LiveDashboard unmounts on a health-poll failure. Redemption ownership and
+  // retry IDs must survive that transition, not just a change in focus.
+  const resetSession = useRef<ResetSession>({ inFlight: false, pendingIds: new Map() });
 
   const resolvedBase = baseUrl
     ? baseUrl.replace(/\/+$/, "")
@@ -865,6 +871,7 @@ export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps
       modelsApi={modelsApi}
       onIntent={onIntent}
       onRefreshAll={refreshLocalViews}
+      resetSession={resetSession.current}
     />
   );
 }
@@ -891,12 +898,13 @@ function ErrorScreen({ error, port, retries }: { error: string; port: number; re
 // ─── Live dashboard ───────────────────────────────────────────────────────────
 
 function LiveDashboard({
-  data, port, baseUrl, lastUpdate, api, modelsApi, onIntent, onRefreshAll,
+  data, port, baseUrl, lastUpdate, api, modelsApi, onIntent, onRefreshAll, resetSession,
 }: {
   data: HealthData; port: number; baseUrl: string; lastUpdate: number;
   api: AccountsApi; modelsApi: ModelsApi; onIntent?: (intent: "quit" | "addAccount") => void;
   /** Re-read dashboard-side state (Grok snapshots, health) after a server reload. */
   onRefreshAll?: () => Promise<void>;
+  resetSession: ResetSession;
 }) {
   const [cliRouting, setCliRouting] = useState(() => ({
     claude: readClaudeRouting(),
@@ -924,6 +932,7 @@ function LiveDashboard({
   // ── Focus / mode ──────────────────────────────────────────────────────────
   const [focus, setFocus] = useState<Focus>("logs");
   const [mode, setMode] = useState<Mode>("view");
+  const [resetTarget, setResetTarget] = useState<string | null>(null);
   // Compact ("zen") view: hides TOTALS + RECENT ACTIVITY so the account list
   // gets the whole vertical budget — the fix for a short terminal starving a
   // long fleet (e.g. showing 1 of 11 accounts). Toggled with [z], view-only,
@@ -1252,6 +1261,33 @@ function LiveDashboard({
     }
   }, [modelsApi, selectedModel, showBanner]);
 
+  const doResetUsage = useCallback(async (id: string) => {
+    if (resetSession.inFlight) return;
+    resetSession.inFlight = true;
+    const requestId = resetSession.pendingIds.get(id) ?? randomUUID();
+    resetSession.pendingIds.set(id, requestId);
+    showBanner(`Redeeming usage reset for ${id}…`, "yellow", REFRESH_ALL_BANNER_MS);
+    try {
+      const result = await api.resetUsage(id, requestId);
+      resetSession.pendingIds.delete(id);
+      const messages = {
+        reset: `Usage reset redeemed for ${id}`,
+        already_redeemed: `Usage reset already redeemed for ${id}`,
+        nothing_to_reset: `Nothing to reset for ${id}`,
+        no_credit: `No reset credits available for ${id}`,
+      };
+      showBanner(messages[result.code] + (result.usageRefreshed ? "" : " — usage refresh failed; reload with R"),
+        result.usageRefreshed && (result.code === "reset" || result.code === "already_redeemed") ? "green" : "yellow");
+      // Failure to poll the dashboard must not turn a confirmed spend into an
+      // unknown outcome or encourage another redemption.
+      try { await onRefreshAll?.(); } catch { /* the regular poll will retry */ }
+    } catch {
+      showBanner(`Reset outcome unknown for ${id}; Meta+r retries the same redemption (keep dashboard open)`, "red");
+    } finally {
+      resetSession.inFlight = false;
+    }
+  }, [api, onRefreshAll, resetSession, showBanner]);
+
   // ── Keyboard handler ──────────────────────────────────────────────────────
   useInput((input, key) => {
     // ── Text editing mode (w / s) ───────────────────────────────────────
@@ -1283,6 +1319,14 @@ function LiveDashboard({
       return;
     }
 
+    if (mode === "confirmReset") {
+      if ((input === "y" || input === "Y") && resetTarget) void doResetUsage(resetTarget);
+      else showBanner("Reset cancelled", "gray");
+      setResetTarget(null);
+      setMode("view");
+      return;
+    }
+
     // ── Confirm delete (y/n) ────────────────────────────────────────────
     if (mode === "confirmDelete") {
       if (input === "y" || input === "Y") {
@@ -1302,6 +1346,22 @@ function LiveDashboard({
     if (key.escape) {
       if (focus === "accounts" || focus === "models") { setFocus("logs"); return; }
       onIntent?.("quit"); exit();
+      return;
+    }
+
+    // Ink 5 receives Meta+r as ESC r. Cmd+r requires a terminal mapping;
+    // intercept before the model-refresh handler so focus cannot redirect it.
+    if (input === "r" && key.meta) {
+      if (focus !== "accounts" || !selectedAccount) return;
+      if (resetSession.inFlight) { showBanner("Reset already running", "yellow"); return; }
+      if (selectedAccount.provider !== "openai_subscription") {
+        showBanner("Usage resets are only available for ChatGPT accounts", "yellow"); return;
+      }
+      if (!resetSession.pendingIds.has(selectedAccount.id) && (selectedAccount.codexRateLimits?.resetCredits?.available ?? 0) <= 0) {
+        showBanner("No reset credits available", "yellow"); return;
+      }
+      setResetTarget(selectedAccount.id);
+      setMode("confirmReset");
       return;
     }
 
@@ -1468,6 +1528,11 @@ function LiveDashboard({
           <Text color="gray">█  [Enter] save  [Esc] cancel</Text>
         </Box>
       )}
+      {mode === "confirmReset" && resetTarget && (
+        <Box paddingLeft={2}>
+          <Text color="yellow" bold>Redeem 1 reset for "{resetTarget}"?  [y] yes  [n/Esc] cancel</Text>
+        </Box>
+      )}
       {mode === "confirmDelete" && selectedAccount && (
         <Box paddingLeft={2}>
           <Text color="red" bold>Delete "{selectedAccount.id}"?  [y] yes  [n/Esc] cancel</Text>
@@ -1624,7 +1689,7 @@ function LiveDashboard({
       <Box marginTop={1}>
         <Text color="gray">
           {focus === "accounts"
-            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [R] reload  [z] compact  [q]"
+            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [Meta+r] reset  [R] reload  [z] compact  [q]"
             : focus === "models"
               ? " [Tab]  [m/r] refresh  [c]/[o] default  [R] reload all  [Esc] logs  [z] compact  [q]"
               : " [Tab]  [m] models  [R] reload  [z] compact  [q] quit"}

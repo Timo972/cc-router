@@ -10,6 +10,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Dashboard `Meta+r` confirms redemption of one banked usage-limit reset for
+  the focused ChatGPT account, with duplicate-submission protection and stable
+  retry IDs for uncertain outcomes. macOS Cmd+R can be mapped to Meta+r in the
+  terminal. Account usage is refreshed after redemption.
+
 - Dashboard `[R]` reloads account usage and due tokens without restarting the
   router or dropping active requests and sticky sessions. It also refreshes
   Grok snapshots, CLI routing state, and an already-loaded model list, with
