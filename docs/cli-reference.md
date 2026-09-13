@@ -30,7 +30,7 @@ cc-router accounts list      List Claude, ChatGPT and Grok accounts (live stats 
 cc-router accounts list --json  Same, as JSON
 cc-router accounts add       Add a Claude account interactively
 cc-router accounts login-openai  Sign in to OpenAI subscription auth with device code
-cc-router accounts add-openai  Add an OpenAI subscription account manually (experimental)
+cc-router accounts add-openai  Add an OpenAI ChatGPT/Codex subscription account manually
 cc-router accounts login-grok  Sign in to a Grok / xAI account with device code
 cc-router accounts add-grok  Import the Grok CLI login from ~/.grok/auth.json
 cc-router accounts rename <id> <new-id>  Rename an account

@@ -78,7 +78,7 @@ thinking, tool use and prompt caching — passed through byte for byte.
 | Harness | Support | Notes |
 |---|---|---|
 | Claude Code | First class | Configured automatically by `cc-router setup` |
-| Codex CLI | Experimental | Responses-compatible provider ([setup](docs/codex.md)) |
+| Codex CLI | First class | Configured by `cc-router configure codex` ([setup](docs/codex.md)) |
 | Claude Desktop (chat + Cowork) | Opt-in | Needs a mitmproxy interceptor ([setup](docs/claude-desktop.md)) |
 | Any Anthropic Messages client | Works | Point `ANTHROPIC_BASE_URL` at the router |
 | Any OpenAI Responses client | Works | Point the base URL at `/v1` |

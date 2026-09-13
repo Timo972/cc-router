@@ -1,8 +1,5 @@
 # Codex CLI & OpenAI subscriptions
 
-> **Experimental.** The Responses route works, but expect rougher edges than the
-> Claude route.
-
 CC-Router exposes an OpenAI Responses-compatible endpoint at `/v1/responses`.
 This lets Codex CLI use your OpenAI ChatGPT/Codex subscription accounts through
 the same local router Claude Code uses for Claude subscriptions.
@@ -25,9 +22,10 @@ This uses the Codex device-code auth flow: the CLI prints a verification URL and
 a one-time code, you approve the login in your browser, and CC-Router saves the
 resulting account record.
 
-Manual entry is available for debugging — it prompts for the access token,
-refresh token, expiry timestamp and scopes, validates the record shape, and saves
-it without touching Claude accounts:
+Device-code login is the supported path. Manual entry is also available for
+debugging — it prompts for the access token, refresh token, expiry timestamp and
+scopes, validates the record shape, and saves it without touching Claude
+accounts:
 
 ```bash
 cc-router accounts add-openai
