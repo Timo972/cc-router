@@ -22,6 +22,14 @@ import { boundModelId, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { logError, logRoute } from "./logger.js";
 import {
+  annotateActiveSpan,
+  modelFamilyOf,
+  recordRuntimeError,
+  recordUpstreamStatus,
+  startTelemetrySpan,
+} from "../telemetry/facade.js";
+import type { Outcome, SafeSpanAttributes, StreamOutcome } from "../telemetry/facade.js";
+import {
   MAX_UPSTREAM_ATTEMPTS,
   RETRY_REFRESH_TIMEOUT_MS,
   SAME_ACCOUNT_RETRY_DELAY_MS,
@@ -247,8 +255,18 @@ export function mountAnthropicMessagesRoute(
       ? "desktop" as const
       : "api" as const;
     const model = boundModelId(context?.requestedModel ?? "-");
+    const modelFamily = modelFamilyOf(model);
+    const streaming = (req.body as { stream?: unknown } | undefined)?.stream === true;
     const startedAt = now();
     stats.totalRequests++;
+    annotateActiveSpan("proxy.request", {
+      provider: "anthropic",
+      route: "messages",
+      modelFamily,
+      requestSource: source,
+      streaming,
+      accountPoolSize: opts.pool.getAll().length,
+    });
 
     // A client that hangs up takes the in-flight upstream attempt (and any
     // pending retry) with it. `writableEnded` guards the normal-completion
@@ -270,6 +288,23 @@ export function mountAnthropicMessagesRoute(
     for (let attempt = 1; ; attempt++) {
       const account = route.account;
       const attemptStartedAt = now();
+      const attemptSpan = startTelemetrySpan("provider.inference", {
+        provider: "anthropic",
+        route: "messages",
+        modelFamily,
+        streaming,
+        attempt,
+      });
+      /** Close this attempt's span exactly once, on the outcome it ended with. */
+      const endAttempt = (outcome: Outcome, extra: SafeSpanAttributes = {}): void => {
+        attemptSpan.annotate({
+          ...extra,
+          outcome,
+          attempt,
+          operationDurationMs: now() - attemptStartedAt,
+        });
+        attemptSpan.end(outcome === "complete" ? "ok" : "error");
+      };
       req._ccAccount = account;
       logRoute(
         account.id,
@@ -296,9 +331,16 @@ export function mountAnthropicMessagesRoute(
         // is a cancellation, not an upstream failure — there is no client
         // left to receive a 502, and the generic proxy does not log client
         // resets either.
-        if (clientGone.signal.aborted || res.writableEnded) return;
+        if (clientGone.signal.aborted || res.writableEnded) {
+          endAttempt("cancelled", { streamOutcome: "cancelled" });
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         stats.totalErrors++;
+        recordRuntimeError(error, { operation: "provider.inference", provider: "anthropic" }, {
+          attempt,
+          durationMs: now() - attemptStartedAt,
+        });
         logError("proxy", 0, message);
         recordActivity({
           ts: attemptStartedAt,
@@ -320,11 +362,18 @@ export function mountAnthropicMessagesRoute(
             error: { type: "proxy_error", message },
           });
         }
+        endAttempt("upstream_error", { httpStatusCode: 502, streamOutcome: "upstream_error" });
         return;
       }
       req.socket.setTimeout(0);
 
       const status = upstream.statusCode ?? 0;
+      if (status === 401 || status === 403 || status === 429 || status >= 500) {
+        recordUpstreamStatus("provider.inference", "anthropic", status, {
+          attempt,
+          durationMs: now() - attemptStartedAt,
+        });
+      }
       // Routing state changes implied by the failure — cooldowns and sticky
       // binding invalidation — run before any retry decision, so the
       // re-acquisition below already sees the failed account excluded.
@@ -463,10 +512,15 @@ export function mountAnthropicMessagesRoute(
           next?.release();
           release();
           upstream.destroy();
+          endAttempt("cancelled", { httpStatusCode: status, streamOutcome: "cancelled" });
           return;
         }
         if (next) {
           // Committed: record the failed attempt and abandon its response.
+          endAttempt(status === 429 ? "rate_limited" : "upstream_error", {
+            httpStatusCode: status,
+            streamOutcome: "upstream_error",
+          });
           entry.details = `${entry.details}:will-retry`;
           recordActivity(entry);
           upstream.destroy();
@@ -511,6 +565,7 @@ export function mountAnthropicMessagesRoute(
         recordActivity(entry);
         upstream.destroy();
         release();
+        endAttempt("cancelled", { httpStatusCode: status, streamOutcome: "cancelled" });
         return;
       }
 
@@ -528,6 +583,7 @@ export function mountAnthropicMessagesRoute(
         entry.details = `${entry.details}:held-response-lost`;
         recordActivity(entry);
         release();
+        endAttempt("upstream_error", { httpStatusCode: 502, streamOutcome: "upstream_error" });
         logError(account.id, 502, `upstream ${status} response was lost before it could be relayed`);
         res.status(502).json({
           type: "error",
@@ -544,6 +600,30 @@ export function mountAnthropicMessagesRoute(
       // usage capture; the dashboard picks the values up on its next poll —
       // same contract as the generic proxy path.
       recordActivity(entry);
+      const outcome: Outcome = status === 429 ? "rate_limited"
+        : status >= 400 ? "upstream_error"
+        : "complete";
+      annotateActiveSpan("proxy.request", {
+        httpStatusCode: status,
+        outcome,
+        attempt,
+        operationDurationMs: now() - startedAt,
+      });
+      // Tokens and the stream verdict are only known once the relayed body
+      // settles; the span stays open until then and never outlives the
+      // response, whose close always fires.
+      res.once("close", () => {
+        const truncated = status < 400 && !res.writableEnded;
+        const streamOutcome: StreamOutcome = status >= 400 ? "upstream_error"
+          : truncated ? "cancelled"
+          : "complete";
+        endAttempt(truncated ? "cancelled" : outcome, {
+          httpStatusCode: status,
+          streamOutcome,
+          ...(entry.inputTokens !== undefined ? { inputTokens: entry.inputTokens } : {}),
+          ...(entry.outputTokens !== undefined ? { outputTokens: entry.outputTokens } : {}),
+        });
+      });
       attachAnthropicResponseCapture(upstream, res, entry, startedAt);
       relayUpstreamResponse(upstream, req, res);
       return;

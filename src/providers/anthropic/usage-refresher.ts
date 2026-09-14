@@ -1,6 +1,11 @@
 import type { Account, AccountUsageSnapshot } from "../../proxy/types.js";
 import { UsageRefresher } from "../../proxy/usage-refresher.js";
 import { fetchAnthropicUsage, type UsageFetchResult } from "./usage.js";
+import {
+  recordRuntimeError,
+  recordUpstreamStatus,
+  withTelemetrySpan,
+} from "../../telemetry/facade.js";
 
 export interface UsageAccountPool {
   getAll(): Account[];
@@ -23,8 +28,22 @@ export interface AnthropicUsageRefresherOptions {
 export class AnthropicUsageRefresher extends UsageRefresher<Account, UsageFetchResult> {
   constructor(pool: UsageAccountPool, options: AnthropicUsageRefresherOptions = {}) {
     const now = options.now ?? Date.now;
+    const fetchUsage = options.fetchUsage ?? fetchAnthropicUsage;
     super(pool, {
-      fetchUsage: options.fetchUsage ?? fetchAnthropicUsage,
+      fetchUsage: account => withTelemetrySpan("provider.usage_refresh", { provider: "anthropic" },
+        async () => {
+          let result: UsageFetchResult;
+          try {
+            result = await fetchUsage(account);
+          } catch (error) {
+            recordRuntimeError(error, { operation: "provider.usage_refresh", provider: "anthropic" });
+            throw error;
+          }
+          if (!result.ok && result.status !== undefined) {
+            recordUpstreamStatus("provider.usage_refresh", "anthropic", result.status);
+          }
+          return result;
+        }),
       cancelledResult: () => ({ ok: false, reason: "network" }),
       applyResult: (account, result) => {
         if (result.ok) {

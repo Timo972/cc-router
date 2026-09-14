@@ -12,8 +12,17 @@ import { needsRefresh, refreshAccountIfCurrent, refreshAccountsOnce, saveAccount
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
 import { createRefreshAllRunner, describeRefreshAll, refreshAllAccounts } from "./pool-refresh.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
-import { trackEvent, startHeartbeat } from "../utils/telemetry.js";
-import { loadTelemetryState } from "../config/telemetry.js";
+import {
+  annotateActiveSpan,
+  httpOutcome,
+  modelFamilyOf,
+  recordProxyStarted,
+  runtimeMode,
+  shutdownTelemetryWithin,
+  startProxyHeartbeat,
+  telemetryRequestMiddleware,
+} from "../telemetry/facade.js";
+import { startTelemetryRuntime } from "../telemetry/runtime.js";
 import { logRoute, logError, logStartup } from "./logger.js";
 import { createLocalRoutingErrorLog, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
@@ -70,6 +79,9 @@ import {
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
 import { createAllowanceView } from "./allowance.js";
+
+/** Upper bound on how long a shutdown may wait for telemetry to drain. */
+const TELEMETRY_SHUTDOWN_DEADLINE_MS = 1_000;
 
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
@@ -583,6 +595,9 @@ export function createOpenAIPersister(
 }
 
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
+  // Best effort and non-throwing: a telemetry runtime that cannot start just
+  // leaves every later facade call inert.
+  startTelemetryRuntime({ tracing: true, runtimeMode: runtimeMode() });
   const port = opts.port ?? PROXY_PORT;
 
   // Direct-to-Anthropic (standalone) or via LiteLLM (full mode).
@@ -1348,6 +1363,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     refreshAndPersistOpenAIAccount(account, openAIAccounts, persistOpenAIAccounts).catch(() => {});
   };
 
+  // Wraps only /v1/messages and /v1/responses in a server span; every other
+  // route passes straight through.
+  app.use(telemetryRequestMiddleware());
+
   mountResponsesRoutes(app, {
     openAIRouter,
     openAIPool,
@@ -1467,6 +1486,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const durationMs = (req as Request)._startTime
           ? Date.now() - (req as Request)._startTime!
           : undefined;
+        annotateActiveSpan("proxy.request", {
+          httpStatusCode: status,
+          outcome: httpOutcome(status),
+          ...(durationMs !== undefined ? { operationDurationMs: durationMs } : {}),
+        });
 
         // Complete the pending log entry with response info
         const pendingLog = (req as Request)._pendingLog ?? {
@@ -1626,6 +1650,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       ? "desktop" as const
       : "api" as const;
 
+    annotateActiveSpan("proxy.request", {
+      provider: "anthropic",
+      route: "messages",
+      modelFamily: modelFamilyOf(req._ccRouteContext?.requestedModel ?? "-"),
+      requestSource: source,
+      accountPoolSize: pool.getAll().length,
+      concurrency: pool.getInFlight(account.id),
+    });
+
     req._pendingLog = {
       ts: Date.now(),
       accountId: account.id,
@@ -1654,7 +1687,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   }));
 
   // ─── Graceful shutdown ────────────────────────────────────────────────────
-  const shutdown = () => {
+  let shuttingDown = false;
+  const shutdown = async (): Promise<void> => {
+    // A second signal while the bounded telemetry flush runs must not repeat
+    // the persistence work below.
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(chalk.yellow("\nShutting down — saving tokens..."));
     usageRefresher.stop();
     openAIUsageRefresher.stop();
@@ -1662,10 +1700,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     if (managesPidFile()) {
       removePid();
     }
+    await shutdownTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS);
     process.exit(0);
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", () => { void shutdown(); });
+  process.on("SIGINT", () => { void shutdown(); });
 
   // ─── Update handling ──────────────────────────────────────────────────────
   // Auto-update is OFF by default: installing code unattended from the npm
@@ -1747,21 +1786,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       ? chalk.gray("  Auto-failover: on — 429/5xx retried across accounts before the first relayed byte")
       : chalk.gray("  Auto-failover: off — upstream failures pass through; clients own retries"));
 
-    // Anonymous telemetry — fire-and-forget, never blocks proxy startup.
-    try {
-      const telemetryState = loadTelemetryState();
-      // First-run detection: if the install is brand new, emit app_started too
-      const firstRunAge = Date.now() - new Date(telemetryState.firstRunAt).getTime();
-      if (firstRunAge < 5 * 60 * 1000) {
-        void trackEvent("app_started", { first_run: true });
-      }
-      void trackEvent("proxy_started", {
-        account_count: totalAccountCount,
-        mode,
-      });
-      startHeartbeat(totalAccountCount);
-    } catch {
-      // never let telemetry break the proxy
-    }
+    recordProxyStarted(totalAccountCount);
+    startProxyHeartbeat(() => pool.getAll().length + openAIPool.getAll().length);
   });
 }
