@@ -1,7 +1,17 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
+    // Telemetry is off for the whole suite so tests neither read the
+    // developer's ~/.cc-router/telemetry.json nor reach PostHog. Telemetry
+    // tests opt back in by clearing the kill switch and pointing
+    // TELEMETRY_PATH at their own fixture.
+    env: {
+      CC_ROUTER_TELEMETRY: "0",
+      TELEMETRY_PATH: join(tmpdir(), "cc-router-vitest-telemetry.json"),
+    },
     typecheck: {
       tsconfig: "./tsconfig.test.json",
     },

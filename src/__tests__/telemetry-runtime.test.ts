@@ -22,6 +22,8 @@ const LOG_PATH = "/i/v1/logs";
 const ENV_KEYS = [
   "NODE_ENV",
   "TELEMETRY_PATH",
+  "CC_ROUTER_TELEMETRY",
+  "DO_NOT_TRACK",
   "CC_ROUTER_TEST_OTLP_TRACE_URL",
   "CC_ROUTER_TEST_OTLP_LOG_URL",
 ] as const;
@@ -131,6 +133,8 @@ beforeEach(async () => {
   for (const key of ENV_KEYS) originalEnv[key] = process.env[key];
   process.env["NODE_ENV"] = "test";
   process.env["TELEMETRY_PATH"] = telemetryPath;
+  delete process.env["CC_ROUTER_TELEMETRY"];
+  delete process.env["DO_NOT_TRACK"];
   process.env["CC_ROUTER_TEST_OTLP_TRACE_URL"] = capture.endpoint(TRACE_PATH);
   process.env["CC_ROUTER_TEST_OTLP_LOG_URL"] = capture.endpoint(LOG_PATH);
   vi.spyOn(globalThis, "fetch").mockImplementation(async input => {

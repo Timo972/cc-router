@@ -7,7 +7,7 @@ const OTHER_INSTALL_ID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
 const DIAGNOSTIC_ID = "ad94f035-1e08-4e29-8517-fd56bdc83d99";
 const NEXT_DIAGNOSTIC_ID = "57b50aa2-fb24-40af-965b-cd5f2e506cdc";
 // privacy.ts derives the same root from its own module URL.
-const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url)).replace(/\/+$/, "");
+const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url)).replace(/[\\/]+$/, "");
 
 const context = {
   category: "setup",

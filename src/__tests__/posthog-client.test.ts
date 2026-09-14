@@ -14,7 +14,7 @@ import { reconstructAnalyticsEvent, sanitizeException } from "../telemetry/priva
 const INSTALL_ID = "70d8062e-1fa0-4ae4-a115-bf782ecca462";
 const OTHER_INSTALL_ID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
 const DIAGNOSTIC_ID = "ad94f035-1e08-4e29-8517-fd56bdc83d99";
-const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url)).replace(/\/+$/, "");
+const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url)).replace(/[\\/]+$/, "");
 const CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174010";
 const NEXT_CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174011";
 
