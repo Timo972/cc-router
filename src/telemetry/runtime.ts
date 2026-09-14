@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { context, propagation, trace, type Context, type TextMapPropagator } from "@opentelemetry/api";
 import { logs } from "@opentelemetry/api-logs";
 import { resourceFromAttributes } from "@opentelemetry/resources";
@@ -17,6 +18,7 @@ import {
   type TelemetryConsentGate,
   type TelemetrySnapshot,
 } from "../config/telemetry.js";
+import { TELEMETRY_PATH } from "../config/paths.js";
 import { getCurrentVersion } from "../utils/self-update.js";
 import type {
   CpuArchitecture,
@@ -28,13 +30,74 @@ import type {
 } from "./contracts.js";
 import { createPostHogOtlpExporters } from "./otel-exporters.js";
 import { createPostHogTelemetryClient, type PostHogTelemetryClient } from "./posthog-client.js";
-import { sanitizeException } from "./privacy.js";
+import { rebuildSanitizedException, sanitizeException } from "./privacy.js";
 
 const TRACE_SAMPLE_RATIO = 0.1;
 const QUEUE_SIZE = 100;
 const BATCH_SIZE = 20;
 const EXPORT_DELAY_MS = 500;
 const EXPORT_TIMEOUT_MS = 2_000;
+/**
+ * Fatal exceptions cannot be sent from a crashing process (Node exits as soon
+ * as the monitor returns), so the sanitized record is written here
+ * synchronously and delivered by the next start that still holds consent.
+ */
+const MAX_PENDING_EXCEPTIONS = 20;
+
+// Resolved lazily (like the state path itself) so the module loads even when
+// the paths module is partially mocked; every caller runs inside a try/catch.
+function pendingExceptionsPath(): string {
+  return `${TELEMETRY_PATH}.pending.json`;
+}
+
+interface PendingException {
+  installationId: string;
+  consentGeneration: string;
+  exception: Omit<SafeExceptionContract, "error">;
+}
+
+function readPendingExceptions(): unknown[] {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(pendingExceptionsPath(), "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistFatalException(exception: SafeExceptionContract, snapshot: TelemetrySnapshot): void {
+  const { error: _error, ...record } = exception;
+  const pending: PendingException[] = [
+    ...readPendingExceptions().slice(-(MAX_PENDING_EXCEPTIONS - 1)) as PendingException[],
+    { installationId: snapshot.state.installId, consentGeneration: snapshot.state.consentGeneration, exception: record },
+  ];
+  const target = pendingExceptionsPath();
+  const candidate = `${target}.${process.pid}.tmp`;
+  writeFileSync(candidate, JSON.stringify(pending), { mode: 0o600 });
+  renameSync(candidate, target);
+}
+
+/** Deliver records left by a crash, only under the consent they were written with. */
+function deliverPendingExceptions(consent: TelemetryConsentGate, posthog: PostHogTelemetryClient): void {
+  try {
+    const records = readPendingExceptions();
+    // Remove first: a crash during delivery must never resend the same records.
+    unlinkSync(pendingExceptionsPath());
+    const current = consent.getSnapshot();
+    if (!current) return;
+    for (const raw of records) {
+      if (typeof raw !== "object" || raw === null) continue;
+      const record = raw as Partial<PendingException>;
+      if (record.installationId !== current.state.installId) continue;
+      // A different generation means an explicit choice happened in between.
+      if (record.consentGeneration !== current.state.consentGeneration) continue;
+      const exception = rebuildSanitizedException(record.exception);
+      if (exception) posthog.captureException(exception, current.state.consentGeneration);
+    }
+  } catch {
+    // Nothing pending, or an unreadable file: never affects startup.
+  }
+}
 
 /** Telemetry must never join or emit a distributed trace outside this process. */
 export const noopPropagator: TextMapPropagator = {
@@ -201,8 +264,10 @@ export function startTelemetryRuntime(options: StartTelemetryRuntimeOptions): bo
         });
         if (!exception) return;
         // Node's default handler prints the Error itself; add correlation only.
+        // The process exits as soon as this monitor returns, so the record is
+        // persisted synchronously and sent by the next consenting start.
+        persistFatalException(exception, current);
         console.error(`[cc-router] Unexpected runtime failure (diagnostic ID: ${exception.diagnosticId})`);
-        void posthog.captureExceptionImmediate(exception, current.state.consentGeneration);
       } catch {
         // The monitor observes only; it never changes Node's crash behavior.
       }
@@ -230,6 +295,7 @@ export function startTelemetryRuntime(options: StartTelemetryRuntimeOptions): bo
     process.on("uncaughtExceptionMonitor", fatalMonitor);
     process.once("exit", runtime.exitCleanup);
     activeRuntime = runtime;
+    deliverPendingExceptions(consent, posthog);
     return true;
   } catch {
     return false;

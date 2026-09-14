@@ -11,6 +11,7 @@ import {
   MAX_ATTEMPT,
   MAX_CONCURRENCY,
   MAX_DURATION_MS,
+  ERROR_KINDS,
   MAX_STACK_FRAMES,
   MAX_STACK_FRAME_PATH_LENGTH,
   MAX_TIMESTAMP_MS,
@@ -618,4 +619,56 @@ export function reconstructAnalyticsEvent(
   const output: SafeAnalyticsEvent = { event, properties, installationId: trustedInstallationId };
   assignIfDefined(output, "diagnosticId", trustedDiagnosticId);
   return output;
+}
+
+/**
+ * Rebuild a sanitized exception that was persisted for crash-safe delivery.
+ * The record is re-validated against the same closed schema as a live
+ * sanitization; anything outside it (including an edited file) is dropped.
+ */
+export function rebuildSanitizedException(input: unknown): SafeExceptionContract | undefined {
+  if (!isRecord(input)) return undefined;
+  const category = input.category === "setup" || input.category === "runtime" ? input.category : undefined;
+  const reason = member(SETUP_REASONS, input.reason);
+  const errorKind = member(ERROR_KINDS, input.errorKind);
+  const fingerprint = typeof input.fingerprint === "string" && /^[0-9a-f]{64}$/.test(input.fingerprint)
+    ? input.fingerprint
+    : undefined;
+  const diagnosticId = uuid(input.diagnosticId);
+  if (!category || !reason || !errorKind || !fingerprint || !diagnosticId || !Array.isArray(input.frames)) {
+    return undefined;
+  }
+  const frames: SafeStackFrame[] = [];
+  for (const frame of input.frames.slice(0, MAX_STACK_FRAMES)) {
+    if (!isRecord(frame) || typeof frame.path !== "string") return undefined;
+    const path = frame.path;
+    if (!/^(dist|node_modules)\//.test(path) || path.length > MAX_STACK_FRAME_PATH_LENGTH || !safePathSegments(path)) {
+      return undefined;
+    }
+    const line = frame.line === undefined ? undefined : boundedInteger(frame.line, Number.MAX_SAFE_INTEGER, 1);
+    const column = frame.column === undefined ? undefined : boundedInteger(frame.column, Number.MAX_SAFE_INTEGER, 1);
+    if ((frame.line !== undefined && line === undefined) || (frame.column !== undefined && column === undefined)) {
+      return undefined;
+    }
+    const safeFrame: SafeStackFrame = { path: path as SafeStackFrame["path"] };
+    assignIfDefined(safeFrame, "line", line);
+    assignIfDefined(safeFrame, "column", column);
+    frames.push(safeFrame);
+  }
+  const contract: SafeExceptionContract = {
+    error: sanitizedError(reason, frames),
+    category,
+    reason,
+    errorKind,
+    frames,
+    fingerprint,
+    diagnosticId,
+  };
+  assignIfDefined(contract, "systemErrorCode", member(SYSTEM_ERROR_CODES, input.systemErrorCode));
+  assignIfDefined(contract, "httpStatusCode", httpStatusCode(input.httpStatusCode));
+  assignIfDefined(contract, "operation", member(OPERATIONS, input.operation));
+  assignIfDefined(contract, "provider", member(PROVIDERS, input.provider));
+  assignIfDefined(contract, "setupStage", member(SETUP_STAGES, input.setupStage));
+  assignIfDefined(contract, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode));
+  return contract;
 }

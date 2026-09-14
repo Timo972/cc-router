@@ -72,7 +72,10 @@ if (!process.env["NO_UPDATE_NOTIFIER"] && !process.env["CI"]) {
   }).catch(() => { /* silent */ });
 }
 
-recordApplicationStart();
+// Claimed only once a command action runs: Commander exits synchronously for
+// --version/--help before any action, which would otherwise consume the
+// one-time first-start claim without ever draining it.
+program.hook("preAction", () => { recordApplicationStart(); });
 
 // Short-lived commands get a bounded flush of whatever they queued. Commands
 // that call process.exit() early simply lose their in-flight telemetry. A

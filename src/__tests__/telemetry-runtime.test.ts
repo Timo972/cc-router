@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ROOT_CONTEXT, TraceFlags, context, trace } from "@opentelemetry/api";
@@ -43,6 +43,7 @@ let telemetryPath: string;
 let runtime: typeof import("../telemetry/runtime.js");
 let facade: typeof import("../telemetry/facade.js");
 const originalEnv: Record<string, string | undefined> = {};
+const blockedTargets: string[] = [];
 
 function writeState(overrides: { enabled?: boolean; consentGeneration?: string } = {}): void {
   writeFileSync(telemetryPath, JSON.stringify({
@@ -138,12 +139,14 @@ beforeEach(async () => {
   process.env["CC_ROUTER_TEST_OTLP_TRACE_URL"] = capture.endpoint(TRACE_PATH);
   process.env["CC_ROUTER_TEST_OTLP_LOG_URL"] = capture.endpoint(LOG_PATH);
   const realFetch = globalThis.fetch.bind(globalThis);
+  blockedTargets.length = 0;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const target = typeof input === "string"
       ? input
       : input instanceof URL ? input.href : input.url;
     // Only the loopback capture server is reachable; PostHog and everything else are blocked.
     if (target.startsWith("http://127.0.0.1:")) return realFetch(input, init);
+    blockedTargets.push(target);
     throw new Error(`telemetry runtime test blocked a network request to ${target}`);
   });
   vi.resetModules();
@@ -358,5 +361,38 @@ describe("telemetry runtime", () => {
     expect(trace.getSpanContext(extracted)).toEqual(trace.getSpanContext(trusted));
     expect(runtime.noopPropagator.fields()).toEqual([]);
     expect(injected).toEqual({});
+  });
+
+  it("persists a fatal exception synchronously and delivers it only under the same consent", async () => {
+    const pendingPath = `${telemetryPath}.pending.json`;
+    expect(runtime.startTelemetryRuntime({ tracing: false, runtimeMode: "daemon" })).toBe(true);
+    const fatal = new Error("PRIVATE fatal detail /Users/alice/secret.js");
+    fatal.stack = `Error: PRIVATE fatal detail /Users/alice/secret.js\n    at crash (/Users/alice/secret.js:1:2)`;
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    process.emit("uncaughtExceptionMonitor", fatal, "uncaughtException");
+
+    const persisted = readFileSync(pendingPath, "utf8");
+    expect(persisted).not.toContain("PRIVATE");
+    expect(persisted).not.toContain("alice");
+    expect(persisted).toContain(CONSENT_GENERATION);
+    expect(stderr.mock.calls.join("\n")).toContain("diagnostic ID");
+    await runtime.shutdownTelemetryRuntimeWithin(500);
+
+    // Same consent on the next start: the record is handed to PostHog and the file is gone.
+    expect(runtime.startTelemetryRuntime({ tracing: false, runtimeMode: "daemon" })).toBe(true);
+    expect(existsSync(pendingPath)).toBe(false);
+    await runtime.flushTelemetryRuntimeWithin(2_000);
+    expect(blockedTargets.some(target => target.includes("eu.i.posthog.com"))).toBe(true);
+    await runtime.shutdownTelemetryRuntimeWithin(500);
+
+    // A rotated generation is an explicit choice made in between: the record is dropped unsent.
+    blockedTargets.length = 0;
+    writeFileSync(pendingPath, JSON.stringify(JSON.parse(persisted)));
+    writeState({ consentGeneration: NEXT_CONSENT_GENERATION });
+    expect(runtime.startTelemetryRuntime({ tracing: false, runtimeMode: "daemon" })).toBe(true);
+    expect(existsSync(pendingPath)).toBe(false);
+    await runtime.flushTelemetryRuntimeWithin(2_000);
+    expect(blockedTargets).toEqual([]);
   });
 });
