@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect as connectSocket, type AddressInfo } from "node:net";
 import express from "express";
 import type { Request } from "express";
 import { context, propagation, trace } from "@opentelemetry/api";
@@ -614,13 +614,32 @@ describe("proxy telemetry", () => {
     const upstreamPort = await listen(upstream);
     try {
       await withApp(mountAnthropic(upstreamPort, 50), async baseUrl => {
-        // The route also arms the incoming socket with the same timeout (parity
-        // with the generic proxy), so the client may see a 502 or a closed socket.
-        await fetch(`${baseUrl}/v1/messages`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ model: "claude-sonnet-5", messages: [], stream: false }),
-        }).then(res => res.text(), () => undefined);
+        // The route arms the incoming socket with the same idle timeout as the
+        // upstream request. Trickling a pipelined second request keeps the
+        // client socket busy so the upstream timeout is the one that fires.
+        const { port } = new URL(baseUrl);
+        const body = JSON.stringify({ model: "claude-sonnet-5", messages: [], stream: false });
+        const first = `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n`
+          + `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+        const trickle = Array.from("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        await new Promise<void>((resolve, reject) => {
+          const socket = connectSocket(Number(port), "127.0.0.1", () => socket.write(first));
+          const timer = setInterval(() => {
+            const next = trickle.shift();
+            if (next !== undefined) socket.write(next);
+          }, 5);
+          let received = "";
+          socket.on("data", chunk => {
+            received += chunk.toString("utf8");
+            if (received.includes("HTTP/1.1 502")) {
+              clearInterval(timer);
+              socket.destroy();
+              resolve();
+            }
+          });
+          socket.on("error", reject);
+          socket.on("close", () => { clearInterval(timer); resolve(); });
+        });
         await waitFor(() => spansNamed("provider.inference").length >= 1);
       });
     } finally {
