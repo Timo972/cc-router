@@ -213,4 +213,31 @@ describe("anthropic manual-token setup", () => {
     expect(recorded.failures).toEqual([]);
     expect(recorded.exceptions).toEqual([]);
   });
+
+  it("reports a manual-token setup when file extraction fails and the user pastes tokens", async () => {
+    answers.selects = ["credentials"];
+    answers.confirms = [true, true]; // paste manually, then default expiry
+    answers.passwords = [PRIVATE_ACCESS, PRIVATE_REFRESH];
+    answers.inputs = [PRIVATE_ACCOUNT];
+    stubValidation({ ok: true, status: 200 });
+
+    const { account, attempt } = await setupSingleAccountWithAttempt(1);
+
+    expect(account?.id).toBe(PRIVATE_ACCOUNT);
+    expect(attempt.method).toBe("manual_token");
+    // The file attempt closes as an expected failure; the manual attempt carries the rest.
+    expect(recorded.failures).toEqual([expect.objectContaining({
+      method: "claude_credentials_file",
+      stage: "credential_read",
+    })]);
+    const manualStages = recorded.stages.filter(stage => stage["method"] === "manual_token");
+    expect(manualStages.map(stage => stage["stage"])).toEqual([
+      "attempt_start",
+      "credential_source_selection",
+      "credential_read",
+      "credential_parse",
+      "token_validation",
+    ]);
+    expect(recorded.results).toEqual([]);
+  });
 });

@@ -87,6 +87,19 @@ function fetchOf(opts: OpenAIDeviceOAuthOptions): FetchImpl {
   return opts.fetchImpl ?? fetch;
 }
 
+/** A malformed body is attributed to the stage that received it; the message is unchanged. */
+async function parseJsonAt<T>(stage: OpenAIDeviceSetupStage, res: Response): Promise<T> {
+  try {
+    return await res.json() as T;
+  } catch (error) {
+    throw new SetupDiagnosticError(
+      error instanceof Error ? error.message : String(error),
+      { stage, reason: "unexpected_response_shape", expected: true, httpStatusCode: res.status },
+      { cause: error },
+    );
+  }
+}
+
 function parseAccessTokenExpiry(accessToken: string): number {
   const [, payload] = accessToken.split(".");
   if (!payload) {
@@ -96,7 +109,16 @@ function parseAccessTokenExpiry(accessToken: string): number {
       expected: false,
     });
   }
-  const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8")) as { exp?: unknown };
+  let claims: { exp?: unknown };
+  try {
+    claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8")) as { exp?: unknown };
+  } catch (error) {
+    throw new SetupDiagnosticError(
+      error instanceof Error ? error.message : String(error),
+      { stage: "access_token_parse", reason: "unexpected_response_shape", expected: true },
+      { cause: error },
+    );
+  }
   if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp)) {
     throw new SetupDiagnosticError("OpenAI access token JWT does not contain a numeric exp claim", {
       stage: "access_token_parse",
@@ -136,7 +158,7 @@ export async function requestOpenAIDeviceCode(opts: OpenAIDeviceOAuthOptions = {
     );
   }
 
-  const body = await res.json() as RequestDeviceCodeResponse;
+  const body = await parseJsonAt<RequestDeviceCodeResponse>("device_code_request", res);
   const userCode = body.user_code ?? body.usercode;
   if (!body.device_auth_id || !userCode) {
     throw new SetupDiagnosticError("OpenAI device code response is missing device_auth_id or user_code", {
@@ -177,7 +199,7 @@ async function pollAuthorizationCode(opts: ExchangeOpenAIDeviceCodeOptions): Pro
       throw classifyNetworkSetupFailure("authorization_polling", error);
     }
 
-    if (res.ok) return await res.json() as PollDeviceCodeResponse;
+    if (res.ok) return await parseJsonAt<PollDeviceCodeResponse>("authorization_polling", res);
     if (res.status !== 403 && res.status !== 404) {
       throw classifyHttpSetupFailure(
         "authorization_polling",
@@ -229,7 +251,7 @@ export async function exchangeOpenAIDeviceCodeForTokens(
     );
   }
 
-  const tokens = await res.json() as TokenResponse;
+  const tokens = await parseJsonAt<TokenResponse>("token_exchange", res);
   opts.onStageCompleted?.("token_exchange");
   const expiresAt = parseAccessTokenExpiry(tokens.access_token);
   opts.onStageCompleted?.("access_token_parse");

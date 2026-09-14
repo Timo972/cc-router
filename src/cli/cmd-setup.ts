@@ -83,12 +83,14 @@ export async function setupSingleAccountWithAttempt(
       : method === "credentials" ? "claude_credentials_file" : "manual_token",
   });
   attempt.stageCompleted("credential_source_selection");
+  // Shared by reference: the file-extraction fallback swaps in a manual-token attempt.
+  const current = { attempt };
   let reached: SetupStage = "credential_read";
   try {
-    return await collectAnthropicAccount(index, method, attempt, stage => { reached = stage; });
+    return await collectAnthropicAccount(index, method, current, stage => { reached = stage; });
   } catch (error) {
     // A thrown prompt or extraction error must still close the funnel record.
-    const outcome = failAttemptFromError(attempt, error, reached);
+    const outcome = failAttemptFromError(current.attempt, error, reached);
     if (outcome) printDiagnosticId(outcome);
     throw error;
   }
@@ -97,9 +99,10 @@ export async function setupSingleAccountWithAttempt(
 async function collectAnthropicAccount(
   index: number,
   method: "keychain" | "credentials" | "manual",
-  attempt: SetupAttempt,
+  current: { attempt: SetupAttempt },
   reached: (stage: SetupStage) => void,
 ): Promise<{ account: Account | null; attempt: SetupAttempt }> {
+  let attempt = current.attempt;
   let tokens: OAuthTokens | null = null;
 
   if (method === "keychain") {
@@ -132,12 +135,17 @@ async function collectAnthropicAccount(
     } else {
       console.log(chalk.red("  ✗ ~/.claude/.credentials.json not found or unreadable."));
       console.log(chalk.gray("  Make sure Claude Code is installed and you've run `claude login`."));
-      printDiagnosticId(attempt.stageFailed(extraction.error, "credential_read"));
       const retry = await confirm({ message: "Paste tokens manually instead?", default: true });
       if (!retry) {
+        printDiagnosticId(attempt.stageFailed(extraction.error, "credential_read"));
         attempt.cancelled();
         return { account: null, attempt };
       }
+      // The file-based attempt failed; the pasted tokens are a manual-token setup.
+      printDiagnosticId(attempt.failed(extraction.error, "credential_read"));
+      attempt = createSetupAttempt({ provider: "anthropic", method: "manual_token" });
+      current.attempt = attempt;
+      attempt.stageCompleted("credential_source_selection");
       tokens = await promptManualTokens();
     }
   }

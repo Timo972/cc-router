@@ -24,6 +24,7 @@ import type { LogEntry } from "./stats.js";
 import { logError, logRoute } from "./logger.js";
 import {
   annotateActiveSpan,
+  classifyExpectedRuntimeFailure,
   modelFamilyOf,
   recordRuntimeError,
   recordUpstreamStatus,
@@ -180,7 +181,12 @@ function forwardAttempt(opts: {
     });
     upstreamRequest.on("error", reject);
     upstreamRequest.on("timeout", () => {
-      upstreamRequest.destroy(new Error(`Upstream request timed out after ${opts.timeoutMs}ms`));
+      // The `code` lets telemetry classify this as an expected timeout; the
+      // message and the client-facing response are unchanged.
+      upstreamRequest.destroy(Object.assign(
+        new Error(`Upstream request timed out after ${opts.timeoutMs}ms`),
+        { code: "ETIMEDOUT" },
+      ));
     });
   });
   upstreamRequest.end(opts.body);
@@ -360,6 +366,9 @@ export function mountAnthropicMessagesRoute(
           attempt,
           durationMs: now() - attemptStartedAt,
         });
+        const forwardOutcome: Outcome = classifyExpectedRuntimeFailure(error) === "timeout"
+          ? "timeout"
+          : "upstream_error";
         logError("proxy", 0, message);
         recordActivity({
           ts: attemptStartedAt,
@@ -381,8 +390,8 @@ export function mountAnthropicMessagesRoute(
             error: { type: "proxy_error", message },
           });
         }
-        endAttempt("upstream_error", { httpStatusCode: 502, streamOutcome: "upstream_error" });
-        settleRequest("upstream_error", { httpStatusCode: 502, attempt });
+        endAttempt(forwardOutcome, { httpStatusCode: 502, streamOutcome: forwardOutcome });
+        settleRequest(forwardOutcome, { httpStatusCode: 502, attempt });
         return;
       }
       req.socket.setTimeout(0);

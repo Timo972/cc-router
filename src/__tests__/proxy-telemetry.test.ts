@@ -366,7 +366,7 @@ describe("proxy telemetry", () => {
     expect(telemetryText()).not.toContain(SECRET.anthropicAccount);
   });
 
-  function mountAnthropic(upstreamPort: number) {
+  function mountAnthropic(upstreamPort: number, timeoutMs = 5_000) {
     const pool = new TokenPool([anthropicAccount(SECRET.anthropicAccount)]);
     const app = express();
     app.use(telemetryRequestMiddleware());
@@ -383,7 +383,7 @@ describe("proxy telemetry", () => {
     );
     mountAnthropicMessagesRoute(app, {
       target: `http://127.0.0.1:${upstreamPort}`,
-      timeoutMs: 5_000,
+      timeoutMs,
       pool,
       sessionRouter: new SessionRouter(pool),
       needsRefresh: () => false,
@@ -604,5 +604,41 @@ describe("proxy telemetry", () => {
     });
     await waitFor(() => spansNamed("proxy.request").length >= 1);
     expect(spansNamed("proxy.request")[0]?.attributes["cc_router.outcome"]).toBe("upstream_error");
+  });
+
+  it("classifies a pre-response provider timeout as an expected timeout, not an exception", async () => {
+    const upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+      // Never answer; the proxy's pre-response timeout must fire.
+      req.once("close", () => res.destroy());
+    });
+    const upstreamPort = await listen(upstream);
+    try {
+      await withApp(mountAnthropic(upstreamPort, 50), async baseUrl => {
+        // The route also arms the incoming socket with the same timeout (parity
+        // with the generic proxy), so the client may see a 502 or a closed socket.
+        await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "claude-sonnet-5", messages: [], stream: false }),
+        }).then(res => res.text(), () => undefined);
+        await waitFor(() => spansNamed("provider.inference").length >= 1);
+      });
+    } finally {
+      await close(upstream);
+    }
+    await waitFor(() => spansNamed("provider.inference").length >= 1);
+
+    expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
+      "cc_router.outcome": "timeout",
+      "cc_router.stream_outcome": "timeout",
+    });
+    const failures = recordedLogs().filter(log => log.body === "runtime.failure");
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.attributes).toMatchObject({
+      "cc_router.operation": "provider.inference",
+      "cc_router.reason": "timeout",
+      "cc_router.outcome": "timeout",
+    });
+    expect(telemetryText()).not.toContain("timed out after");
   });
 });
