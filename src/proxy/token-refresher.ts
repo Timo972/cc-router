@@ -2,6 +2,11 @@ import type { Account, RefreshResponse } from "./types.js";
 import { writeAnthropicAccountsPreservingOtherProviders, serialize } from "../config/manager.js";
 import { logRefresh } from "./logger.js";
 import { stats } from "./stats.js";
+import {
+  recordRuntimeError,
+  recordUpstreamStatus,
+  withTelemetrySpan,
+} from "../telemetry/facade.js";
 
 /**
  * Official Claude Code CLI client_id for the OAuth PKCE flow.
@@ -76,7 +81,7 @@ export async function refreshAccountToken(account: Account): Promise<boolean> {
   const existing = rawRefreshLocks.get(account);
   if (existing) return existing;
 
-  const promise = _doRefresh(account);
+  const promise = withTelemetrySpan("oauth.refresh", { provider: "anthropic" }, () => _doRefresh(account));
   rawRefreshLocks.set(account, promise);
   try {
     return await promise;
@@ -199,6 +204,7 @@ async function _doRefresh(account: Account): Promise<boolean> {
 
     if (!res.ok) {
       const body = await res.text();
+      recordUpstreamStatus("oauth.refresh", "anthropic", res.status);
       logRefresh(account.id, false);
       console.error(`  Status: ${res.status} — ${body}`);
       account.consecutiveErrors++;
@@ -234,6 +240,7 @@ async function _doRefresh(account: Account): Promise<boolean> {
     logRefresh(account.id, true, expiresInMin);
     return true;
   } catch (err) {
+    recordRuntimeError(err, { operation: "oauth.refresh", provider: "anthropic" });
     logRefresh(account.id, false);
     console.error(`  Error:`, err);
     account.consecutiveErrors++;

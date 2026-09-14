@@ -26,7 +26,6 @@ import {
   openNetworkExtensionSettings,
 } from "../interceptor/mitmproxy-manager.js";
 import { printDesktopSupportExplainer, printNetworkExtensionInstructions } from "./cmd-client.js";
-import { trackEvent } from "../utils/telemetry.js";
 
 // ─── Public registration ──────────────────────────────────────────────────────
 
@@ -249,8 +248,6 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
 
   saveAccounts(merged);
   console.log(chalk.green(`  ✓ ${merged.length} account(s) saved to ~/.cc-router/accounts.json`));
-
-  void trackEvent("setup_completed", { account_count: merged.length });
 
   // ─── Post-setup interactive flow ─────────────────────────────────────────
   await runPostSetupFlow(merged.length);

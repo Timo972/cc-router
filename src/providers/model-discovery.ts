@@ -1,5 +1,7 @@
 import type { OpenAISubscriptionAccount } from "./openai/token-refresher.js";
 import type { Account } from "../proxy/types.js";
+import { withTelemetrySpan } from "../telemetry/facade.js";
+import type { Provider } from "../telemetry/facade.js";
 
 export const ANTHROPIC_MODELS_ENDPOINT = "https://api.anthropic.com/v1/models";
 export const OPENAI_CODEX_MODELS_ENDPOINT = "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
@@ -23,7 +25,7 @@ export async function fetchAnthropicModels(
   account: Account,
   fetchImpl: FetchLike = fetch,
 ): Promise<string[]> {
-  return fetchModels(ANTHROPIC_MODELS_ENDPOINT, {
+  return fetchModels("anthropic", ANTHROPIC_MODELS_ENDPOINT, {
     method: "GET",
     headers: {
       authorization: `Bearer ${account.tokens.accessToken}`,
@@ -38,7 +40,7 @@ export async function fetchOpenAICodexModels(
   account: OpenAISubscriptionAccount,
   fetchImpl: FetchLike = fetch,
 ): Promise<string[]> {
-  return fetchModels(OPENAI_CODEX_MODELS_ENDPOINT, {
+  return fetchModels("openai", OPENAI_CODEX_MODELS_ENDPOINT, {
     method: "GET",
     headers: {
       authorization: `Bearer ${account.accessToken}`,
@@ -48,18 +50,21 @@ export async function fetchOpenAICodexModels(
   }, fetchImpl);
 }
 
-async function fetchModels(
+function fetchModels(
+  provider: Provider,
   url: string,
   init: RequestInit,
   fetchImpl: FetchLike,
 ): Promise<string[]> {
-  try {
-    const res = await fetchImpl(url, init);
-    if (!res.ok) return [];
-    return normalizeModelIds(await res.json());
-  } catch {
-    return [];
-  }
+  return withTelemetrySpan("model.discovery", { provider }, async () => {
+    try {
+      const res = await fetchImpl(url, init);
+      if (!res.ok) return [];
+      return normalizeModelIds(await res.json());
+    } catch {
+      return [];
+    }
+  });
 }
 
 function getModelValues(payload: unknown): unknown[] {

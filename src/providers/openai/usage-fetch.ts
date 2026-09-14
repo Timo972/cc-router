@@ -3,6 +3,11 @@ import { applyCodexRateLimits } from "./account-state.js";
 import { parseCodexUsagePayload, type CodexRateLimitsUpdate } from "./usage.js";
 import { UsageRefresher } from "../../proxy/usage-refresher.js";
 import type { RefreshableAccountPool } from "../../proxy/usage-refresher.js";
+import {
+  recordRuntimeError,
+  recordUpstreamStatus,
+  withTelemetrySpan,
+} from "../../telemetry/facade.js";
 
 /**
  * The endpoint the Codex CLI's own backend client reads rate limits from
@@ -21,9 +26,17 @@ export interface FetchCodexUsageOptions {
   now?: () => number;
 }
 
-export async function fetchCodexUsage(
+export function fetchCodexUsage(
   account: Pick<OpenAIAccount, "accessToken">,
   options: FetchCodexUsageOptions = {},
+): Promise<CodexUsageFetchResult> {
+  return withTelemetrySpan("provider.usage_refresh", { provider: "openai" }, () =>
+    runCodexUsageFetch(account, options));
+}
+
+async function runCodexUsageFetch(
+  account: Pick<OpenAIAccount, "accessToken">,
+  options: FetchCodexUsageOptions,
 ): Promise<CodexUsageFetchResult> {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   const now = options.now ?? Date.now;
@@ -34,8 +47,12 @@ export async function fetchCodexUsage(
       headers: { authorization: `Bearer ${account.accessToken}` },
       signal: AbortSignal.timeout(10_000),
     });
-  } catch {
+  } catch (error) {
+    recordRuntimeError(error, { operation: "provider.usage_refresh", provider: "openai" });
     return { ok: false, reason: "network" };
+  }
+  if (!response.ok) {
+    recordUpstreamStatus("provider.usage_refresh", "openai", response.status);
   }
   if (response.status === 401 || response.status === 403) return { ok: false, reason: "auth" };
   if (!response.ok) return { ok: false, reason: "http" };
