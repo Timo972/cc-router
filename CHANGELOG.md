@@ -8,13 +8,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.12.1] — 2026-09-14
+
 ### Added
 
 - Dashboard `Ctrl+R` confirms redemption of one banked usage-limit reset for
   the focused ChatGPT account, with duplicate-submission protection and stable
   retry IDs for uncertain outcomes. No custom Meta key mapping is needed.
   Account usage is refreshed after redemption.
-
 - Dashboard `[R]` reloads account usage and due tokens without restarting the
   router or dropping active requests and sticky sessions. It also refreshes
   Grok snapshots, CLI routing state, and an already-loaded model list, with
@@ -28,6 +31,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Streamlined the README and split detailed setup and reference material into
+  dedicated guides, including the full dashboard UI and keybindings, first-class
+  Codex CLI setup, and Grok/xAI account monitoring (overview-only, not proxied).
+  Updated the dashboard screenshot with anonymized account names.
 - The configured proxy request timeout now bounds Codex response headers and
   upstream stream inactivity on both `/v1/responses` and OpenAI-routed
   `/v1/messages`, including failover attempts. Progressing streams can outlive
@@ -714,6 +721,7 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
+[0.12.1]: https://github.com/Timo972/cc-router/releases/tag/v0.12.1
 [0.12.0]: https://github.com/Timo972/cc-router/releases/tag/v0.12.0
 [0.11.0]: https://github.com/Timo972/cc-router/releases/tag/v0.11.0
 [0.9.0]: https://github.com/Timo972/cc-router/releases/tag/v0.9.0
