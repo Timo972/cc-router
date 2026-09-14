@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import {
   ANALYTICS_EVENT_NAMES,
   CPU_ARCHITECTURES,
@@ -31,14 +32,11 @@ import {
   SPAN_STATUS_CODES,
   STREAM_OUTCOMES,
   SYSTEM_ERROR_CODES,
-} from "./constants.js";
+} from "./contracts.js";
 import type {
   AnalyticsEventName,
-  CpuArchitecture,
-  DurationBucket,
   ErrorKind,
   HttpMethod,
-  InstallationId,
   InstrumentationScope,
   ModelFamily,
   Operation,
@@ -49,9 +47,8 @@ import type {
   Route,
   RuntimeMode,
   SafeAnalyticsEvent,
-  SafeExceptionContract,
   SafeExceptionContext,
-  SafeFingerprint,
+  SafeExceptionContract,
   SafeLog,
   SafeResource,
   SafeRuntimeEventProperties,
@@ -69,15 +66,77 @@ import type {
   SpanStatusCode,
   StreamOutcome,
   SystemErrorCode,
-  TrustedExceptionSource,
   TrustedTelemetryIdentity,
-  DiagnosticId,
 } from "./contracts.js";
 
 type UnknownRecord = Record<string, unknown>;
 
+// Only frames under this package's own dist/ or node_modules/ survive, so the
+// user's home directory and workspace layout never reach a stack trace.
+const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url))
+  .replace(/\\/g, "/")
+  .replace(/\/+$/, "");
+const CASE_INSENSITIVE_ROOT = process.platform === "win32";
+const COMPARISON_ROOT = CASE_INSENSITIVE_ROOT ? PROJECT_ROOT.toLowerCase() : PROJECT_ROOT;
+
+/** OTel attribute name for every field of the closed span schema. */
+export const SPAN_ATTRIBUTE_KEYS: Record<keyof SafeSpanAttributes, string> = {
+  httpMethod: "http.request.method",
+  httpStatusCode: "http.response.status_code",
+  provider: "cc_router.provider",
+  route: "cc_router.route",
+  modelFamily: "cc_router.model_family",
+  requestSource: "cc_router.request_source",
+  runtimeMode: "cc_router.runtime_mode",
+  streaming: "cc_router.streaming",
+  streamOutcome: "cc_router.stream_outcome",
+  outcome: "cc_router.outcome",
+  attempt: "cc_router.attempt",
+  accountPoolSize: "cc_router.account_pool_size",
+  concurrency: "cc_router.concurrency",
+  inputTokens: "cc_router.input_tokens",
+  outputTokens: "cc_router.output_tokens",
+  operationDurationMs: "cc_router.operation_duration_ms",
+};
+
+/** OTel attribute name for every field of both closed log schemas. */
+export const LOG_ATTRIBUTE_KEYS: Record<string, string> = {
+  operation: "cc_router.operation",
+  provider: "cc_router.provider",
+  method: "cc_router.method",
+  stage: "cc_router.stage",
+  reason: "cc_router.reason",
+  outcome: "cc_router.outcome",
+  httpStatusCode: "http.response.status_code",
+  durationBucket: "cc_router.duration_bucket",
+  attempt: "cc_router.attempt",
+  accountPoolSize: "cc_router.account_pool_size",
+  concurrency: "cc_router.concurrency",
+  operationDurationMs: "cc_router.operation_duration_ms",
+  serviceVersion: "service.version",
+  osFamily: "os.type",
+  runtimeMode: "cc_router.runtime_mode",
+  diagnosticId: "cc_router.diagnostic_id",
+};
+
+/** OTel attribute name for every field of the closed resource schema. */
+export const RESOURCE_ATTRIBUTE_KEYS: Record<string, string> = {
+  serviceName: "service.name",
+  serviceVersion: "service.version",
+  serviceInstanceId: "service.instance.id",
+  nodeVersion: "process.runtime.version",
+  osFamily: "os.type",
+  cpuArchitecture: "host.arch",
+  runtimeMode: "cc_router.runtime_mode",
+};
+
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function own(input: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(input, key);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
 }
 
 function member<const T extends readonly string[]>(values: T, value: unknown): T[number] | undefined {
@@ -92,19 +151,13 @@ function otherEnum<const T extends readonly string[]>(values: T, value: unknown)
 }
 
 function boundedInteger(value: unknown, maximum: number, minimum = 0): number | undefined {
-  return typeof value === "number"
-    && Number.isSafeInteger(value)
-    && value >= minimum
-    && value <= maximum
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum && value <= maximum
     ? value
     : undefined;
 }
 
 function boundedNumber(value: unknown, maximum: number, minimum = 0): number | undefined {
-  return typeof value === "number"
-    && Number.isFinite(value)
-    && value >= minimum
-    && value <= maximum
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum && value <= maximum
     ? value
     : undefined;
 }
@@ -122,17 +175,15 @@ function uuid(value: unknown): string | undefined {
     : undefined;
 }
 
-function installationId(identity: TrustedTelemetryIdentity): InstallationId | undefined {
-  return uuid(identity?.installationId) as InstallationId | undefined;
+function installationId(identity: TrustedTelemetryIdentity): string | undefined {
+  return uuid(identity?.installationId);
 }
 
-function diagnosticId(
-  identity: TrustedTelemetryIdentity,
-  trustedInstallationId: InstallationId,
-): DiagnosticId | undefined {
+/** A per-occurrence diagnostic id must never collapse onto the stable install id. */
+function diagnosticId(identity: TrustedTelemetryIdentity, trustedInstallationId: string): string | undefined {
   if (identity?.diagnosticId === undefined) return undefined;
   const value = uuid(identity.diagnosticId);
-  return value && value !== trustedInstallationId ? value as DiagnosticId : undefined;
+  return value && value !== trustedInstallationId ? value : undefined;
 }
 
 function hexId(value: unknown, length: 16 | 32): string | undefined {
@@ -161,104 +212,72 @@ function assignIfDefined<T extends object, K extends string, V>(target: T, key: 
   if (value !== undefined) Object.assign(target, { [key]: value });
 }
 
-function ownDataProperty(input: object, key: string): unknown {
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(input, key);
-    return descriptor && "value" in descriptor ? descriptor.value : undefined;
-  } catch {
-    return undefined;
+/** Project a reconstructed record onto its OTel attribute names. */
+export function toOtelAttributes(
+  keys: Record<string, string>,
+  safe: object,
+): Record<string, string | number | boolean> {
+  const output: Record<string, string | number | boolean> = {};
+  for (const [field, attribute] of Object.entries(keys)) {
+    const value = own(safe, field);
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      output[attribute] = value;
+    }
   }
+  return output;
 }
 
-function isErrorObject(input: unknown): input is Error {
-  try {
-    return input instanceof Error;
-  } catch {
-    return false;
+/** Read an untrusted OTel attribute bag back into candidate record fields. */
+export function fromOtelAttributes(
+  keys: Record<string, string>,
+  attributes: object,
+): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  for (const [field, attribute] of Object.entries(keys)) {
+    output[field] = own(attributes, attribute);
   }
+  return output;
 }
 
 function errorKind(input: Error): ErrorKind {
-  try {
-    if (typeof AggregateError !== "undefined" && input instanceof AggregateError) return "aggregate_error";
-    if (input instanceof TypeError) return "type_error";
-    if (input instanceof RangeError) return "range_error";
-    if (input instanceof ReferenceError) return "reference_error";
-    if (input instanceof SyntaxError) return "syntax_error";
-    if (input instanceof URIError) return "uri_error";
-    if (input instanceof EvalError) return "eval_error";
-  } catch {
-    return "error";
-  }
+  if (typeof AggregateError !== "undefined" && input instanceof AggregateError) return "aggregate_error";
+  if (input instanceof TypeError) return "type_error";
+  if (input instanceof RangeError) return "range_error";
+  if (input instanceof ReferenceError) return "reference_error";
+  if (input instanceof SyntaxError) return "syntax_error";
+  if (input instanceof URIError) return "uri_error";
+  if (input instanceof EvalError) return "eval_error";
   return "error";
 }
 
+// UUID-shaped segments are stripped: a temp/cache directory name can identify
+// an install as reliably as a home directory does.
 function safePathSegments(path: string): boolean {
-  const segments = path.split("/");
-  return segments.every((segment) => segment.length > 0
+  return path.split("/").every((segment) => segment.length > 0
     && segment !== "."
     && segment !== ".."
     && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment)
     && /^[0-9A-Za-z@._+~-]+$/.test(segment));
 }
 
-interface TrustedProjectRoot {
-  comparisonPath: string;
-  caseInsensitive: boolean;
-}
-
-function trustedProjectRoot(input: unknown): TrustedProjectRoot | undefined {
-  if (!isRecord(input)) return undefined;
-  let candidate: unknown;
-  try {
-    candidate = input.projectRoot;
-  } catch {
-    return undefined;
-  }
-  if (typeof candidate !== "string" || candidate.length === 0) return undefined;
-
-  let path = candidate.replace(/\\/g, "/");
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(path) || /[?#\u0000-\u001f\u007f]/.test(path)) {
-    return undefined;
-  }
-  while (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
-
-  const windowsAbsolute = /^[A-Za-z]:\//.test(path);
-  const posixAbsolute = path.startsWith("/") && !path.startsWith("//");
-  if (!windowsAbsolute && !posixAbsolute) return undefined;
-  const segments = path.replace(/^[A-Za-z]:\//, "").replace(/^\//, "").split("/");
-  if (segments.length === 0 || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
-    return undefined;
-  }
-
-  return {
-    comparisonPath: windowsAbsolute ? path.toLowerCase() : path,
-    caseInsensitive: windowsAbsolute,
-  };
-}
-
-function normalizedFramePath(
-  rawPath: string,
-  projectRoot: TrustedProjectRoot,
-): SafeStackFrame["path"] | undefined {
+function normalizedFramePath(rawPath: string): SafeStackFrame["path"] | undefined {
   let path = rawPath.trim().replace(/\\/g, "/");
   const openingParenthesis = path.lastIndexOf("(");
   if (openingParenthesis >= 0) path = path.slice(openingParenthesis + 1);
   if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(path) && !path.startsWith("file://")) return undefined;
   if (path.startsWith("file://")) path = path.slice("file://".length);
   if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
-  if (/[?#\u0000-\u001f\u007f]/.test(path)) return undefined;
 
-  const comparisonPath = projectRoot.caseInsensitive ? path.toLowerCase() : path;
-  const projectDistPrefix = `${projectRoot.comparisonPath}/dist/`;
+  const comparisonPath = CASE_INSENSITIVE_ROOT ? path.toLowerCase() : path;
+  const projectDistPrefix = `${COMPARISON_ROOT}/dist/`;
   if (comparisonPath.startsWith(projectDistPrefix)) {
     const relative = `dist/${path.slice(projectDistPrefix.length)}`;
-    if (relative.length > MAX_STACK_FRAME_PATH_LENGTH || !safePathSegments(relative)) return undefined;
-    return relative as SafeStackFrame["path"];
+    return relative.length <= MAX_STACK_FRAME_PATH_LENGTH && safePathSegments(relative)
+      ? relative as SafeStackFrame["path"]
+      : undefined;
   }
 
-  const dependencyMarker = "/node_modules/";
-  const dependencyIndex = path.lastIndexOf(dependencyMarker);
+  const dependencyIndex = path.lastIndexOf("/node_modules/");
   if (dependencyIndex >= 0) {
     const relative = path.slice(dependencyIndex + 1);
     const segments = relative.split("/");
@@ -281,29 +300,19 @@ function stackHeaderName(kind: ErrorKind): string {
     case "uri_error": return "URIError";
     case "eval_error": return "EvalError";
     case "aggregate_error": return "AggregateError";
-    case "error": return "Error";
-    case "unexpected_error": return "Error";
+    default: return "Error";
   }
 }
 
-function normalizedFrames(
-  input: Error,
-  kind: ErrorKind,
-  projectRoot: TrustedProjectRoot,
-): readonly SafeStackFrame[] {
-  let stack: unknown;
-  try {
-    stack = input.stack;
-  } catch {
-    return [];
-  }
+function normalizedFrames(input: Error, kind: ErrorKind): readonly SafeStackFrame[] {
+  const stack = input.stack;
   if (typeof stack !== "string") return [];
 
-  const rawMessage = ownDataProperty(input, "message");
+  // The header carries the raw message. Parse frames only after removing it
+  // verbatim, so a multiline message can never inject a frame.
+  const rawMessage = own(input, "message");
   if (rawMessage !== undefined && typeof rawMessage !== "string") return [];
-  const message = rawMessage ?? "";
-  const header = `${stackHeaderName(kind)}${message.length === 0 ? "" : `: ${message}`}`;
-  if (stack === header) return [];
+  const header = `${stackHeaderName(kind)}${rawMessage ? `: ${rawMessage}` : ""}`;
   if (!stack.startsWith(`${header}\n`)) return [];
 
   const frames: SafeStackFrame[] = [];
@@ -311,7 +320,7 @@ function normalizedFrames(
     if (frames.length >= MAX_STACK_FRAMES) break;
     const match = line.match(/(?:\(|\bat\s+)(.+):(\d+):(\d+)\)?\s*$/);
     if (!match) continue;
-    const path = normalizedFramePath(match[1], projectRoot);
+    const path = normalizedFramePath(match[1]);
     const frameLine = boundedInteger(Number(match[2]), Number.MAX_SAFE_INTEGER, 1);
     const column = boundedInteger(Number(match[3]), Number.MAX_SAFE_INTEGER, 1);
     if (!path || frameLine === undefined || column === undefined) continue;
@@ -324,7 +333,7 @@ function sanitizedError(reason: SetupReason, frames: readonly SafeStackFrame[]):
   const error = new Error(reason);
   error.stack = [
     `Error: ${reason}`,
-    ...frames.map((frame) => `    at ${frame.path}${frame.line === undefined ? "" : `:${frame.line}`}${frame.column === undefined ? "" : `:${frame.column}`}`),
+    ...frames.map(frame => `    at ${frame.path}:${frame.line}:${frame.column}`),
   ].join("\n");
   return error;
 }
@@ -335,8 +344,8 @@ function fingerprint(
   systemErrorCode: SystemErrorCode | undefined,
   status: number | undefined,
   frames: readonly SafeStackFrame[],
-): SafeFingerprint {
-  const safeInput = {
+): string {
+  return createHash("sha256").update(JSON.stringify({
     errorKind: kind,
     category: context.category,
     reason: context.reason,
@@ -347,8 +356,7 @@ function fingerprint(
     systemErrorCode,
     httpStatusCode: status,
     frames,
-  };
-  return createHash("sha256").update(JSON.stringify(safeInput)).digest("hex") as SafeFingerprint;
+  })).digest("hex");
 }
 
 function exceptionContext(input: unknown): SafeExceptionContext | undefined {
@@ -366,43 +374,45 @@ function exceptionContext(input: unknown): SafeExceptionContext | undefined {
 }
 
 /**
- * Reconstruct an exception from closed safe values. No original Error object or
- * arbitrary thrown-value property escapes this boundary.
+ * Reconstruct an exception from closed safe values. No original Error object,
+ * message, cause, or arbitrary thrown-value property escapes this boundary;
+ * a hostile thrown value can only cause the occurrence to be dropped.
  */
 export function sanitizeException(
   input: unknown,
   candidateContext: unknown,
   identity: TrustedTelemetryIdentity,
-  trustedSource: TrustedExceptionSource,
 ): SafeExceptionContract | undefined {
-  const trustedInstallationId = installationId(identity);
-  if (!trustedInstallationId) return undefined;
-  const trustedDiagnosticId = diagnosticId(identity, trustedInstallationId);
-  const context = exceptionContext(candidateContext);
-  const projectRoot = trustedProjectRoot(trustedSource);
-  if (!trustedDiagnosticId || !context || !projectRoot) return undefined;
+  try {
+    const trustedInstallationId = installationId(identity);
+    if (!trustedInstallationId) return undefined;
+    const trustedDiagnosticId = diagnosticId(identity, trustedInstallationId);
+    const context = exceptionContext(candidateContext);
+    if (!trustedDiagnosticId || !context) return undefined;
 
-  const isError = isErrorObject(input);
-  const kind: ErrorKind = isError ? errorKind(input) : "unexpected_error";
-  const frames = isError ? normalizedFrames(input, kind, projectRoot) : [];
-  const code = isError
-    ? member(SYSTEM_ERROR_CODES, ownDataProperty(input, "code")) as SystemErrorCode | undefined
-    : undefined;
-  const status = isError
-    ? httpStatusCode(ownDataProperty(input, "statusCode"))
-      ?? httpStatusCode(ownDataProperty(input, "status"))
-    : undefined;
-  const output: SafeExceptionContract = {
-    error: sanitizedError(context.reason, frames),
-    ...context,
-    errorKind: kind,
-    frames,
-    fingerprint: fingerprint(kind, context, code, status, frames),
-    diagnosticId: trustedDiagnosticId,
-  };
-  assignIfDefined(output, "systemErrorCode", code);
-  assignIfDefined(output, "httpStatusCode", status);
-  return output;
+    const isError = input instanceof Error;
+    const kind: ErrorKind = isError ? errorKind(input) : "unexpected_error";
+    const frames = isError ? normalizedFrames(input, kind) : [];
+    const code = isError
+      ? member(SYSTEM_ERROR_CODES, own(input, "code")) as SystemErrorCode | undefined
+      : undefined;
+    const status = isError
+      ? httpStatusCode(own(input, "statusCode")) ?? httpStatusCode(own(input, "status"))
+      : undefined;
+    const output: SafeExceptionContract = {
+      error: sanitizedError(context.reason, frames),
+      ...context,
+      errorKind: kind,
+      frames,
+      fingerprint: fingerprint(kind, context, code, status, frames),
+      diagnosticId: trustedDiagnosticId,
+    };
+    assignIfDefined(output, "systemErrorCode", code);
+    assignIfDefined(output, "httpStatusCode", status);
+    return output;
+  } catch {
+    return undefined;
+  }
 }
 
 export function reconstructResource(
@@ -435,7 +445,6 @@ export function reconstructResource(
 function reconstructSpanAttributes(input: unknown): SafeSpanAttributes {
   if (!isRecord(input)) return {};
   const output: SafeSpanAttributes = {};
-
   assignIfDefined(output, "httpMethod", member(HTTP_METHODS, input.httpMethod) as HttpMethod | undefined);
   assignIfDefined(output, "httpStatusCode", httpStatusCode(input.httpStatusCode));
   assignIfDefined(output, "provider", otherEnum(PROVIDERS, input.provider) as Provider | undefined);
@@ -485,7 +494,10 @@ export function reconstructSpan(input: unknown): SafeSpan | undefined {
   return output;
 }
 
-function setupAttributes(input: unknown, trustedDiagnosticId: DiagnosticId): SafeSetupDiagnosticAttributes | undefined {
+function setupAttributes(
+  input: unknown,
+  trustedDiagnosticId: string,
+): SafeSetupDiagnosticAttributes | undefined {
   if (!isRecord(input)) return undefined;
   const provider = member(PROVIDERS, input.provider);
   if (provider !== "anthropic" && provider !== "openai") return undefined;
@@ -493,16 +505,11 @@ function setupAttributes(input: unknown, trustedDiagnosticId: DiagnosticId): Saf
   const stage = member(SETUP_STAGES, input.stage) as SetupStage | undefined;
   if (!method || !stage) return undefined;
 
-  const output: SafeSetupDiagnosticAttributes = {
-    provider,
-    method,
-    stage,
-    diagnosticId: trustedDiagnosticId,
-  };
+  const output: SafeSetupDiagnosticAttributes = { provider, method, stage, diagnosticId: trustedDiagnosticId };
   assignIfDefined(output, "reason", otherEnum(SETUP_REASONS, input.reason) as SetupReason | undefined);
   assignIfDefined(output, "outcome", otherEnum(OUTCOMES, input.outcome) as Outcome | undefined);
   assignIfDefined(output, "httpStatusCode", httpStatusCode(input.httpStatusCode));
-  assignIfDefined(output, "durationBucket", member(DURATION_BUCKETS, input.durationBucket) as DurationBucket | undefined);
+  assignIfDefined(output, "durationBucket", member(DURATION_BUCKETS, input.durationBucket));
   assignIfDefined(output, "serviceVersion", version(input.serviceVersion));
   assignIfDefined(output, "osFamily", otherEnum(OS_FAMILIES, input.osFamily) as OsFamily | undefined);
   assignIfDefined(output, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode) as RuntimeMode | undefined);
@@ -511,12 +518,13 @@ function setupAttributes(input: unknown, trustedDiagnosticId: DiagnosticId): Saf
 
 function runtimeFailureAttributes(
   input: unknown,
-  trustedDiagnosticId: DiagnosticId | undefined,
+  trustedDiagnosticId: string | undefined,
 ): SafeRuntimeFailureAttributes | undefined {
   if (!isRecord(input)) return undefined;
   const operation = member(OPERATIONS, input.operation) as Operation | undefined;
   const reason = otherEnum(SETUP_REASONS, input.reason) as SetupReason | undefined;
   if (!operation || !reason) return undefined;
+
   const output: SafeRuntimeFailureAttributes = { operation, reason };
   assignIfDefined(output, "provider", otherEnum(PROVIDERS, input.provider) as Provider | undefined);
   assignIfDefined(output, "outcome", otherEnum(OUTCOMES, input.outcome) as Outcome | undefined);
@@ -541,25 +549,21 @@ export function reconstructLog(input: unknown, identity: TrustedTelemetryIdentit
   const trustedInstallationId = installationId(identity);
   if (!scope || !body || !severity || timestampMs === undefined || !trustedInstallationId) return undefined;
 
-  const trustedDiagnosticId = diagnosticId(
-    identity,
-    trustedInstallationId,
-  );
-  if (body === "account.setup.diagnostic" && !trustedDiagnosticId) return undefined;
+  const trustedDiagnosticId = diagnosticId(identity, trustedInstallationId);
   if (identity.diagnosticId !== undefined && !trustedDiagnosticId) return undefined;
+  if (body === "account.setup.diagnostic" && !trustedDiagnosticId) return undefined;
 
   const attributes = body === "account.setup.diagnostic"
-    ? setupAttributes(input.attributes, trustedDiagnosticId as DiagnosticId)
+    ? setupAttributes(input.attributes, trustedDiagnosticId as string)
     : runtimeFailureAttributes(input.attributes, trustedDiagnosticId);
   if (!attributes) return undefined;
 
   const context: { traceId?: string; spanId?: string } = {};
   assignIfDefined(context, "traceId", hexId(input.traceId, 32));
   assignIfDefined(context, "spanId", hexId(input.spanId, 16));
-  if (body === "account.setup.diagnostic") {
-    return { scope, body, severity, timestampMs, ...context, attributes: attributes as SafeSetupDiagnosticAttributes };
-  }
-  return { scope, body, severity, timestampMs, ...context, attributes: attributes as SafeRuntimeFailureAttributes };
+  return body === "account.setup.diagnostic"
+    ? { scope, body, severity, timestampMs, ...context, attributes: attributes as SafeSetupDiagnosticAttributes }
+    : { scope, body, severity, timestampMs, ...context, attributes: attributes as SafeRuntimeFailureAttributes };
 }
 
 function runtimeEventProperties(input: unknown): SafeRuntimeEventProperties | undefined {
@@ -574,7 +578,7 @@ function runtimeEventProperties(input: unknown): SafeRuntimeEventProperties | un
 
 function setupEventProperties(
   input: unknown,
-  trustedDiagnosticId: DiagnosticId,
+  trustedDiagnosticId: string,
 ): SafeSetupEventProperties | undefined {
   const attributes = setupAttributes(input, trustedDiagnosticId);
   if (!attributes) return undefined;
@@ -598,31 +602,20 @@ export function reconstructAnalyticsEvent(
 ): SafeAnalyticsEvent | undefined {
   if (!isRecord(input)) return undefined;
   const event = member(ANALYTICS_EVENT_NAMES, input.event) as AnalyticsEventName | undefined;
-  const distinctId = installationId(identity);
-  if (!event || !distinctId) return undefined;
+  const trustedInstallationId = installationId(identity);
+  if (!event || !trustedInstallationId) return undefined;
 
   const isSetupEvent = event.startsWith("account_setup.");
-  const trustedDiagnosticId = diagnosticId(identity, distinctId);
-  if (isSetupEvent && !trustedDiagnosticId) return undefined;
+  const trustedDiagnosticId = diagnosticId(identity, trustedInstallationId);
   if (identity.diagnosticId !== undefined && !trustedDiagnosticId) return undefined;
+  if (isSetupEvent && !trustedDiagnosticId) return undefined;
 
   const properties = isSetupEvent
-    ? setupEventProperties(input.properties, trustedDiagnosticId as DiagnosticId)
+    ? setupEventProperties(input.properties, trustedDiagnosticId as string)
     : runtimeEventProperties(input.properties);
   if (!properties) return undefined;
 
-  const privacy = { distinctId, processPersonProfile: false as const, disableGeoip: true as const };
-  switch (event) {
-    case "app.first_start":
-      return { event, ...privacy, properties: properties as SafeRuntimeEventProperties };
-    case "account_setup.started":
-    case "account_setup.stage_completed":
-    case "account_setup.succeeded":
-    case "account_setup.cancelled":
-    case "account_setup.failed":
-      return { event, ...privacy, properties: properties as SafeSetupEventProperties };
-    case "proxy.started":
-    case "proxy.heartbeat":
-      return { event, ...privacy, properties: properties as SafeRuntimeEventProperties };
-  }
+  const output: SafeAnalyticsEvent = { event, properties, installationId: trustedInstallationId };
+  assignIfDefined(output, "diagnosticId", trustedDiagnosticId);
+  return output;
 }

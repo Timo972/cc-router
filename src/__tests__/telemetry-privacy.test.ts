@@ -177,14 +177,13 @@ describe("closed telemetry reconstruction", () => {
     expect(result?.attributes).not.toBe(validLog.attributes);
   });
 
-  it("reconstructs a typed analytics event with privacy flags forced on", () => {
+  it("reconstructs a typed analytics event from trusted identity only", () => {
     const result = reconstructAnalyticsEvent(validEvent, trustedIdentity);
 
     expect(result).toEqual({
       event: "account_setup.failed",
-      distinctId: INSTALL_ID,
-      processPersonProfile: false,
-      disableGeoip: true,
+      installationId: INSTALL_ID,
+      diagnosticId: DIAGNOSTIC_ID,
       properties: {
         provider: "openai",
         method: "device_oauth",
@@ -365,7 +364,7 @@ describe("reconstruction is the privacy boundary", () => {
     }, trustedIdentity);
 
     expect(resource?.["service.instance.id"]).toBe(INSTALL_ID);
-    expect(event?.distinctId).toBe(INSTALL_ID);
+    expect(event?.installationId).toBe(INSTALL_ID);
     expect(JSON.stringify({ resource, event })).not.toContain(candidateIdentity);
   });
 

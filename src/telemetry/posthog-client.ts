@@ -1,10 +1,5 @@
-import { randomUUID } from "node:crypto";
 import { PostHog, type PostHogOptions } from "posthog-node";
-import {
-  createTelemetryConsentGate,
-  getTelemetrySnapshot,
-  type TelemetrySnapshot,
-} from "../config/telemetry.js";
+import type { TelemetrySnapshot } from "../config/telemetry.js";
 import {
   ERROR_KINDS,
   MAX_STACK_FRAMES,
@@ -21,8 +16,9 @@ import {
   SETUP_REASONS,
   SETUP_STAGES,
   SYSTEM_ERROR_CODES,
-} from "./constants.js";
-import type { SafeAnalyticsEvent, SafeExceptionContract } from "./contracts.js";
+  type SafeAnalyticsEvent,
+  type SafeExceptionContract,
+} from "./contracts.js";
 import { reconstructAnalyticsEvent } from "./privacy.js";
 
 export type PostHogTransport = NonNullable<PostHogOptions["fetch"]>;
@@ -30,38 +26,35 @@ export type PostHogTransport = NonNullable<PostHogOptions["fetch"]>;
 export type PostHogSdkClient = Pick<
   PostHog,
   | "capture"
-  | "captureImmediate"
   | "captureException"
   | "captureExceptionImmediate"
   | "flush"
   | "shutdown"
-  | "getPersistedProperty"
   | "setPersistedProperty"
 >;
 
 export interface PostHogTelemetryClient {
   captureAnalytics(event: SafeAnalyticsEvent, consentGeneration: string): void;
-  captureAnalyticsImmediate(event: SafeAnalyticsEvent, consentGeneration: string): Promise<void>;
   captureException(exception: SafeExceptionContract, consentGeneration: string): void;
   captureExceptionImmediate(exception: SafeExceptionContract, consentGeneration: string): Promise<void>;
+  discardPending(): void;
   flushWithin(deadlineMs: number): Promise<void>;
   shutdownWithin(deadlineMs: number): Promise<void>;
-  discardPending(): void;
 }
 
 export interface PostHogTelemetryClientOptions {
-  getSnapshot?: () => TelemetrySnapshot;
-  transport?: PostHogTransport;
+  /** Consent gate: undefined means "capture nothing, contact nothing". */
+  getSnapshot: () => TelemetrySnapshot | undefined;
   createSdkClient?: (token: string, options: PostHogOptions) => PostHogSdkClient;
+  fetch?: PostHogTransport;
 }
 
 type UnknownRecord = Record<string, unknown>;
 type SdkEvent = Parameters<PostHog["capture"]>[0];
 type PersistedKey = Parameters<PostHog["setPersistedProperty"]>[0];
 
-const CAPTURE_GENERATION_PROPERTY = "__cc_router_capture_generation";
-const CAPTURE_ID_PROPERTY = "__cc_router_capture_id";
-const CAPTURE_CONSENT_GENERATION_PROPERTY = "__cc_router_consent_generation";
+/** Stamped on every capture and re-checked in before_send against live consent. */
+const CONSENT_GENERATION_PROPERTY = "cc_router.consent_generation";
 const QUEUE_KEYS = ["queue", "ai_queue", "logs_queue"] as const;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -88,9 +81,7 @@ function uuid(value: unknown): string | undefined {
 }
 
 function positiveInteger(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1
-    ? value
-    : undefined;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : undefined;
 }
 
 function httpStatusCode(value: unknown): number | undefined {
@@ -170,7 +161,8 @@ function reconstructExceptionList(input: unknown, reason: string): UnknownRecord
   }];
 }
 
-function reconstructExceptionEvent(event: SdkEvent, installationId: string, captureId: string): SdkEvent | null {
+/** Rebuild the SDK's own $exception payload from the closed allowlist. */
+function reconstructExceptionEvent(event: SdkEvent, installationId: string): SdkEvent | null {
   if (event.event !== "$exception" || !isRecord(event.properties)) return null;
   const properties = event.properties;
   const category = own(properties, "category");
@@ -204,7 +196,7 @@ function reconstructExceptionEvent(event: SdkEvent, installationId: string, capt
     return null;
   }
 
-  const safeProperties: Record<string, unknown> = {
+  const safeProperties: UnknownRecord = {
     $exception_list: exceptionList,
     $exception_level: "error",
     $exception_fingerprint: fingerprint,
@@ -222,29 +214,11 @@ function reconstructExceptionEvent(event: SdkEvent, installationId: string, capt
   safeProperties.$process_person_profile = false;
   safeProperties.$geoip_disable = true;
 
-  return {
-    event: "$exception",
-    distinctId: installationId,
-    disableGeoip: true,
-    uuid: captureId,
-    properties: safeProperties,
-  };
+  return { event: "$exception", distinctId: installationId, disableGeoip: true, properties: safeProperties };
 }
 
 function noOpResponse(): Awaited<ReturnType<PostHogTransport>> {
-  return {
-    status: 204,
-    text: async () => "",
-    json: async () => ({}),
-    headers: { get: () => null },
-  };
-}
-
-function defaultTransport(): PostHogTransport {
-  return async (url, options) => {
-    const response = await globalThis.fetch(url, options as RequestInit);
-    return response;
-  };
+  return { status: 204, text: async () => "", json: async () => ({}), headers: { get: () => null } };
 }
 
 function boundedDeadline(value: number): number {
@@ -256,9 +230,7 @@ async function settleWithin(operation: () => Promise<void> | void, deadlineMs: n
   try {
     await Promise.race([
       Promise.resolve().then(operation).catch(() => undefined),
-      new Promise<void>(resolve => {
-        timeout = setTimeout(resolve, boundedDeadline(deadlineMs));
-      }),
+      new Promise<void>(resolve => { timeout = setTimeout(resolve, boundedDeadline(deadlineMs)); }),
     ]);
   } catch {
     // Telemetry lifecycle failures must never affect application behavior.
@@ -269,11 +241,9 @@ async function settleWithin(operation: () => Promise<void> | void, deadlineMs: n
 
 function exceptionProperties(
   exception: SafeExceptionContract,
-  generation: number,
-  captureId: string,
   consentGeneration: string,
-): Record<string, unknown> {
-  const properties: Record<string, unknown> = {
+): UnknownRecord {
+  const properties: UnknownRecord = {
     $exception_fingerprint: exception.fingerprint,
     category: exception.category,
     reason: exception.reason,
@@ -281,9 +251,7 @@ function exceptionProperties(
     diagnosticId: exception.diagnosticId,
     $process_person_profile: false,
     $geoip_disable: true,
-    [CAPTURE_GENERATION_PROPERTY]: generation,
-    [CAPTURE_ID_PROPERTY]: captureId,
-    [CAPTURE_CONSENT_GENERATION_PROPERTY]: consentGeneration,
+    [CONSENT_GENERATION_PROPERTY]: consentGeneration,
   };
   if (exception.systemErrorCode !== undefined) properties.systemErrorCode = exception.systemErrorCode;
   if (exception.httpStatusCode !== undefined) properties.httpStatusCode = exception.httpStatusCode;
@@ -294,73 +262,52 @@ function exceptionProperties(
   return properties;
 }
 
+/**
+ * posthog-node wrapper pinned to the EU host with no person profiles and no
+ * GeoIP. Consent is enforced three times: when a capture is prepared, in
+ * before_send (which also rebuilds every event from the closed allowlist), and
+ * in the transport, which answers 204 without a request once consent is gone.
+ */
 export function createPostHogTelemetryClient(
-  options: PostHogTelemetryClientOptions = {},
+  options: PostHogTelemetryClientOptions,
 ): PostHogTelemetryClient {
-  const getSnapshot = options.getSnapshot ?? getTelemetrySnapshot;
-  const transport = options.transport ?? defaultTransport();
-  const createSdkClient = options.createSdkClient ?? ((token, sdkOptions) => new PostHog(token, sdkOptions));
+  const getSnapshot = options.getSnapshot;
+  const transport = options.fetch ?? ((url, init) => globalThis.fetch(url, init as RequestInit));
+  const createSdkClient = options.createSdkClient
+    ?? ((token, sdkOptions) => new PostHog(token, sdkOptions));
   let sdkClient: PostHogSdkClient | undefined;
   let initializationFailed = false;
   let shutdownStarted = false;
-  let captureGeneration = 0;
-  const preparedCaptures = new Map<string, { generation: number; consentGeneration: string }>();
-  const activeTransportControllers = new Set<AbortController>();
+  const activeTransports = new Set<AbortController>();
+
   const abortActiveTransports = (): void => {
-    for (const controller of activeTransportControllers) controller.abort();
-    activeTransportControllers.clear();
+    for (const controller of activeTransports) controller.abort();
+    activeTransports.clear();
   };
 
-  const discardPendingInternal = (): void => {
-    captureGeneration += 1;
-    preparedCaptures.clear();
+  const discardPending = (): void => {
     abortActiveTransports();
-    const client = sdkClient;
-    if (!client) return;
     for (const key of QUEUE_KEYS) {
       try {
-        client.setPersistedProperty(key as PersistedKey, []);
+        sdkClient?.setPersistedProperty(key as PersistedKey, []);
       } catch {
-        // Queue cleanup failures are isolated by the final transport gate.
+        // Queue cleanup failures are still caught by the transport gate.
       }
-    }
-  };
-  const consent = createTelemetryConsentGate(getSnapshot, undefined, discardPendingInternal);
-
-  const rememberPreparedCapture = (
-    captureId: string,
-    generation: number,
-    consentGeneration: string,
-  ): void => {
-    preparedCaptures.set(captureId, { generation, consentGeneration });
-    while (preparedCaptures.size > POSTHOG_MAX_QUEUE_SIZE) {
-      const oldestCaptureId = preparedCaptures.keys().next().value as string | undefined;
-      if (!oldestCaptureId) break;
-      preparedCaptures.delete(oldestCaptureId);
     }
   };
 
   const beforeSend = (event: SdkEvent | null): SdkEvent | null => {
     try {
       if (!event || !isRecord(event.properties)) return null;
-      const snapshot = consent.getSnapshot();
-      if (!snapshot) return null;
-      const eventGeneration = own(event.properties, CAPTURE_GENERATION_PROPERTY);
-      const eventConsentGeneration = uuid(own(event.properties, CAPTURE_CONSENT_GENERATION_PROPERTY));
-      const captureId = uuid(own(event.properties, CAPTURE_ID_PROPERTY));
-      if (!Number.isSafeInteger(eventGeneration)
-        || eventGeneration !== captureGeneration
-        || !eventConsentGeneration
-        || eventConsentGeneration !== consent.acceptedGeneration
-        || !captureId) return null;
-      const installationId = uuid(snapshot.state.installId);
-      if (!installationId) return null;
-
-      if (event.event === "$exception") {
-        const safe = reconstructExceptionEvent(event, installationId, captureId);
-        if (safe) rememberPreparedCapture(captureId, eventGeneration as number, eventConsentGeneration);
-        return safe;
+      const snapshot = getSnapshot();
+      const installationId = snapshot && uuid(snapshot.state.installId);
+      if (!snapshot || !installationId) return null;
+      if (own(event.properties, CONSENT_GENERATION_PROPERTY) !== snapshot.state.consentGeneration) {
+        return null;
       }
+
+      if (event.event === "$exception") return reconstructExceptionEvent(event, installationId);
+
       const diagnosticId = own(event.properties, "diagnosticId");
       const safe = reconstructAnalyticsEvent({
         event: event.event,
@@ -370,17 +317,11 @@ export function createPostHogTelemetryClient(
         ...(typeof diagnosticId === "string" ? { diagnosticId } : {}),
       });
       if (!safe) return null;
-      rememberPreparedCapture(captureId, eventGeneration as number, eventConsentGeneration);
       return {
         event: safe.event,
-        distinctId: safe.distinctId,
+        distinctId: safe.installationId,
         disableGeoip: true,
-        uuid: captureId,
-        properties: {
-          ...safe.properties,
-          $process_person_profile: false,
-          $geoip_disable: true,
-        },
+        properties: { ...safe.properties, $process_person_profile: false, $geoip_disable: true },
       };
     } catch {
       return null;
@@ -389,71 +330,32 @@ export function createPostHogTelemetryClient(
 
   const gatedFetch: PostHogTransport = async (url, fetchOptions) => {
     try {
-      if (typeof fetchOptions.body !== "string") return noOpResponse();
-      const payload: unknown = JSON.parse(fetchOptions.body);
-      if (!isRecord(payload)) return noOpResponse();
-      const batch = own(payload, "batch");
-      if (!Array.isArray(batch)) return noOpResponse();
-
-      const captureIds: string[] = [];
-      const activeBatch: unknown[] = [];
-      for (const candidate of batch) {
-        if (!isRecord(candidate)) continue;
-        const captureId = uuid(own(candidate, "uuid"));
-        if (!captureId) continue;
-        captureIds.push(captureId);
-        const prepared = preparedCaptures.get(captureId);
-        if (prepared?.generation === captureGeneration
-          && prepared.consentGeneration === consent.acceptedGeneration) {
-          activeBatch.push(candidate);
-        }
-      }
-
-      if (!consent.getSnapshot() || activeBatch.length === 0) {
-        for (const captureId of captureIds) preparedCaptures.delete(captureId);
-        return noOpResponse();
-      }
-
+      if (!getSnapshot()) return noOpResponse();
       const controller = new AbortController();
-      const inheritedSignal = fetchOptions.signal;
+      const inherited = fetchOptions.signal;
       const forwardAbort = (): void => { controller.abort(); };
-      if (inheritedSignal?.aborted) controller.abort();
-      else inheritedSignal?.addEventListener("abort", forwardAbort, { once: true });
-      activeTransportControllers.add(controller);
-      let response: Awaited<ReturnType<PostHogTransport>>;
+      if (inherited?.aborted) controller.abort();
+      else inherited?.addEventListener("abort", forwardAbort, { once: true });
+      activeTransports.add(controller);
       try {
-        response = await transport(url, {
-          ...fetchOptions,
-          body: JSON.stringify({ ...payload, batch: activeBatch }),
-          signal: controller.signal,
-        });
+        return await transport(url, { ...fetchOptions, signal: controller.signal });
       } finally {
-        inheritedSignal?.removeEventListener("abort", forwardAbort);
-        activeTransportControllers.delete(controller);
+        inherited?.removeEventListener("abort", forwardAbort);
+        activeTransports.delete(controller);
       }
-      const path = new URL(url).pathname;
-      const accepted = response.status >= 200 && (path === "/batch/" ? response.status < 400 : response.status < 300);
-      if (accepted) {
-        for (const captureId of captureIds) preparedCaptures.delete(captureId);
-      }
-      return response;
     } catch {
       throw new Error("PostHog transport failed");
     }
   };
 
-  const getClient = (
+  const activeClient = (
     capturedConsentGeneration: string,
-  ): { client: PostHogSdkClient; installationId: string; consentGeneration: string } | undefined => {
+  ): { client: PostHogSdkClient; installationId: string } | undefined => {
     if (shutdownStarted || initializationFailed) return undefined;
-    const provenance = uuid(capturedConsentGeneration);
-    if (!provenance) return undefined;
-    const snapshot = consent.getSnapshot();
+    const snapshot = getSnapshot();
     const installationId = snapshot && uuid(snapshot.state.installId);
-    if (!snapshot
-      || !installationId
-      || snapshot.state.consentGeneration !== provenance
-      || consent.acceptedGeneration !== provenance) return undefined;
+    if (!snapshot || !installationId) return undefined;
+    if (snapshot.state.consentGeneration !== capturedConsentGeneration) return undefined;
     if (!sdkClient) {
       try {
         sdkClient = createSdkClient(POSTHOG_PROJECT_TOKEN, {
@@ -476,16 +378,14 @@ export function createPostHogTelemetryClient(
         return undefined;
       }
     }
-    return { client: sdkClient, installationId, consentGeneration: provenance };
+    return { client: sdkClient, installationId };
   };
 
   return {
-    captureAnalytics(event, capturedConsentGeneration) {
+    captureAnalytics(event, consentGeneration) {
       try {
-        const active = getClient(capturedConsentGeneration);
-        if (!active) return;
-        const captureId = randomUUID();
-        active.client.capture({
+        const active = activeClient(consentGeneration);
+        active?.client.capture({
           event: event.event,
           distinctId: active.installationId,
           disableGeoip: true,
@@ -493,76 +393,43 @@ export function createPostHogTelemetryClient(
             ...event.properties,
             $process_person_profile: false,
             $geoip_disable: true,
-            [CAPTURE_GENERATION_PROPERTY]: captureGeneration,
-            [CAPTURE_ID_PROPERTY]: captureId,
-            [CAPTURE_CONSENT_GENERATION_PROPERTY]: active.consentGeneration,
+            [CONSENT_GENERATION_PROPERTY]: consentGeneration,
           },
         });
       } catch {
         // Capture is best effort only.
       }
     },
-    async captureAnalyticsImmediate(event, capturedConsentGeneration) {
-      let captureId: string | undefined;
+    captureException(exception, consentGeneration) {
       try {
-        const active = getClient(capturedConsentGeneration);
-        if (!active) return;
-        captureId = randomUUID();
-        await active.client.captureImmediate({
-          event: event.event,
-          distinctId: active.installationId,
-          disableGeoip: true,
-          properties: {
-            ...event.properties,
-            $process_person_profile: false,
-            $geoip_disable: true,
-            [CAPTURE_GENERATION_PROPERTY]: captureGeneration,
-            [CAPTURE_ID_PROPERTY]: captureId,
-            [CAPTURE_CONSENT_GENERATION_PROPERTY]: active.consentGeneration,
-          },
-        });
-      } catch {
-        // Immediate CLI capture must not change command behavior.
-      } finally {
-        if (captureId) preparedCaptures.delete(captureId);
-      }
-    },
-    captureException(exception, capturedConsentGeneration) {
-      try {
-        const active = getClient(capturedConsentGeneration);
-        if (!active) return;
-        const captureId = randomUUID();
-        active.client.captureException(
+        const active = activeClient(consentGeneration);
+        active?.client.captureException(
           exception.error,
           active.installationId,
-          exceptionProperties(exception, captureGeneration, captureId, active.consentGeneration),
+          exceptionProperties(exception, consentGeneration),
         );
       } catch {
         // Capture is best effort only.
       }
     },
-    async captureExceptionImmediate(exception, capturedConsentGeneration) {
-      let captureId: string | undefined;
+    async captureExceptionImmediate(exception, consentGeneration) {
       try {
-        const active = getClient(capturedConsentGeneration);
+        const active = activeClient(consentGeneration);
         if (!active) return;
-        captureId = randomUUID();
         await active.client.captureExceptionImmediate(
           exception.error,
           active.installationId,
-          exceptionProperties(exception, captureGeneration, captureId, active.consentGeneration),
+          exceptionProperties(exception, consentGeneration),
         );
       } catch {
-        // Immediate CLI capture must not change command behavior.
-      } finally {
-        if (captureId) preparedCaptures.delete(captureId);
+        // A crash-path capture must not change process behavior.
       }
     },
     async flushWithin(deadlineMs) {
       const client = sdkClient;
       if (!client) return;
-      if (!consent.getSnapshot()) {
-        discardPendingInternal();
+      if (!getSnapshot()) {
+        discardPending();
         return;
       }
       await settleWithin(() => client.flush(), deadlineMs);
@@ -573,11 +440,8 @@ export function createPostHogTelemetryClient(
       if (!client) return;
       await settleWithin(() => client.shutdown(boundedDeadline(deadlineMs)), deadlineMs);
       abortActiveTransports();
-      preparedCaptures.clear();
       sdkClient = undefined;
     },
-    discardPending() {
-      discardPendingInternal();
-    },
+    discardPending,
   };
 }
