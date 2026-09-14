@@ -1,4 +1,5 @@
-import { Command, CommanderError } from "commander";
+#!/usr/bin/env node
+import { Command } from "commander";
 import { registerSetup } from "./cmd-setup.js";
 import { registerStart } from "./cmd-start.js";
 import { registerStop, registerRevert } from "./cmd-stop.js";
@@ -11,18 +12,16 @@ import { registerClient } from "./cmd-client.js";
 import { registerTelemetry } from "./cmd-telemetry.js";
 import { registerLogs } from "./cmd-logs.js";
 import { registerModels } from "./cmd-models.js";
+import { registerCliTargets } from "./cmd-cli-targets.js";
 import { getCurrentVersion, checkForUpdate, printUpdateBanner } from "../utils/self-update.js";
-import { recordApplicationStart } from "../telemetry/facade.js";
-import { CliExitError } from "./errors.js";
+import { recordApplicationStart, shutdownTelemetryWithin } from "../telemetry/facade.js";
 
 const program = new Command();
-program.exitOverride();
 
 program
   .name("cc-router")
   .description(
-    "Round-robin proxy for Claude Max OAuth tokens.\n" +
-    "Distributes Claude Code requests across multiple Claude Max accounts."
+    "Round-robin proxy for Claude Max and ChatGPT/Codex subscriptions, with a Grok CLI overview."
   )
   .version(getCurrentVersion())
   .addHelpText("after", `
@@ -35,10 +34,16 @@ Examples:
   $ cc-router status             # Live dashboard with account stats
   $ cc-router models list        # List dynamically discovered provider models
   $ cc-router logs               # View proxy logs (background mode)
-  $ cc-router accounts list      # Show all configured accounts
+  $ cc-router accounts list      # Show Claude, ChatGPT, and Grok accounts
+  $ cc-router accounts add-grok  # Import the Grok CLI login
+  $ cc-router accounts login-grok# Sign in to Grok with device code
   $ cc-router revert             # Restore Claude Code to normal (remove all proxy config)
   $ cc-router docker up          # Full stack: cc-router + LiteLLM in Docker
   $ cc-router client connect <url>   # Route Claude Code through a remote CC-Router
+  $ cc-router cli claude stop        # Point Claude Code at native auth (proxy stays up)
+  $ cc-router cli claude resume      # Point Claude Code back at the running proxy
+  $ cc-router cli codex start        # Point Codex CLI at the running proxy
+  $ cc-router cli                    # Show Claude Code + Codex routing state
 `);
 
 registerSetup(program);
@@ -49,6 +54,7 @@ registerStatus(program);
 registerModels(program);
 registerAccounts(program);
 registerConfigure(program);
+registerCliTargets(program);
 registerDocker(program);
 registerUpdate(program);
 registerClient(program);
@@ -65,15 +71,8 @@ if (!process.env["NO_UPDATE_NOTIFIER"] && !process.env["CI"]) {
   }).catch(() => { /* silent */ });
 }
 
-export async function runCli(): Promise<void> {
-  recordApplicationStart();
-  try {
-    await program.parseAsync();
-  } catch (error) {
-    if (error instanceof CommanderError || error instanceof CliExitError) {
-      process.exitCode = error.exitCode;
-      return;
-    }
-    throw error;
-  }
-}
+recordApplicationStart();
+
+// Short-lived commands get a bounded flush of whatever they queued. Commands
+// that call process.exit() early simply lose their in-flight telemetry.
+void program.parseAsync().finally(() => shutdownTelemetryWithin(500));

@@ -1,661 +1,151 @@
+<div align="center">
+
 # CC-Router
 
-**Local multi-account router for Claude Max and OpenAI ChatGPT/Codex subscriptions.**  
-Distribute Claude Code requests across Claude subscriptions, and expose an OpenAI Responses-compatible route for Codex CLI through the same proxy.
+**One local proxy. All of your Claude and ChatGPT subscriptions.**
+
+Route Claude Code, Codex CLI and Claude Desktop across every subscription you own —
+cache-aware, with automatic failover, and without changing how you work.
 
 [![npm](https://img.shields.io/npm/v/@timo972/cc-router)](https://www.npmjs.com/package/@timo972/cc-router)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen)](https://nodejs.org)
 
-> **An actively maintained fork of [VictorMinemu/CC-Router](https://github.com/VictorMinemu/CC-Router)**, published as
-> [`@timo972/cc-router`](https://www.npmjs.com/package/@timo972/cc-router) with bug fixes and added features — most
-> notably **cache-aware sticky session routing**, which pins each Claude Code session to one account so a conversation
-> keeps hitting the same prompt cache instead of scattering its shared prefix across accounts. Also includes
-> load-aware account leases, byte-transparent streaming fixes, and a round of security hardening.
-> See [CHANGELOG.md](CHANGELOG.md) for the full list.
+[Quickstart](#quickstart) · [Documentation](docs/) · [Changelog](CHANGELOG.md) · [Disclaimer](#disclaimer)
 
 ![CC-Router Dashboard](assets/dashboard.png)
 
-### Features
-
-- **Cache-aware session routing** — keep each Claude Code session on one account while distributing new sessions across 2-20 Claude Max accounts
-- **Multi-provider routing** — route `openai/*` and unprefixed `gpt-*` models to OpenAI ChatGPT/Codex subscription accounts and Claude models to Claude subscriptions
-- **Transparent Claude proxy** — Claude Code works normally; streaming, thinking, tool use, prompt caching all pass through
-- **Codex CLI support** — configure Codex to use CC-Router as a Responses-compatible provider
-- **Automatic token refresh** — OAuth tokens are refreshed before they expire, saved atomically to disk
-- **Model-aware rate limits** — avoids accounts whose requested-model or global allowance is exhausted, and respects scoped cooldowns
-- **Automatic failover & retry** — a 429 fails over to another account and a 5xx is retried inside the router, before any response byte is relayed, on both the Claude and Codex routes; on by default, opt out with `"autoFailover": false`
-- **Client mode** — connect another device you own to your private CC-Router (`cc-router client connect <url>`)
-- **Claude Desktop support** — route Cowork / Agent-mode traffic through CC-Router via mitmproxy interception (macOS, Windows, Linux)
-- **Guided setup wizard** — interactive `cc-router setup` extracts tokens from Keychain or credentials file, configures everything
-- **Live dashboard** — real-time terminal UI showing account health, request counts, token usage, recent activity
-- **Proxy authentication** — Bearer / x-api-key secret; required when binding a non-loopback interface
-- **Update notifications** — new releases are announced in the CLI; installing is opt-in (`autoUpdate: true`)
-- **Multiple deployment modes** — background daemon, native OS auto-start (launchd/systemd), foreground, Docker Compose
-- **Cross-platform** — macOS, Linux, Windows; Node.js 20+
+</div>
 
 ---
 
-> **Warning**  
-> Read the [disclaimer](#disclaimer) before using this tool.
+## Why
 
----
+One Claude Max subscription is one rate limit. If you spend your day in Claude Code you
+know the shape of it: a long session, a wall of `429`, and a cooldown you have to sit out.
+Current Claude Code builds no longer retry rate limits themselves, so it surfaces as an
+error mid-conversation.
 
-## How it works
-
-```
-Claude Code  (terminal)  ─┐
-                          │  ANTHROPIC_BASE_URL=http://localhost:3456
-                          │
-Claude Desktop  ─[mitmproxy]─┐  (optional — intercepts api.anthropic.com)
-                             │
-                             ▼
-┌─────────────────────────────────────┐
-│  CC-Router  :3456                   │
-│                                     │
-│  1. Receives /v1/messages or        │
-│     /v1/responses                   │
-│  2. Parses model provider prefix    │
-│  3. Picks a Claude or OpenAI account│
-│  4. Refreshes token if expiring     │
-│  5. Injects Authorization: Bearer   │
-│  6. Forwards to Anthropic, OpenAI   │
-│     Codex backend, or LiteLLM       │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-        api.anthropic.com
-        (authenticated with
-         OAuth token of account N)
-```
-
-All standard Claude Code features work transparently on the Claude route: streaming, extended thinking, tool use, prompt caching. OpenAI subscription routing is available for Codex-compatible Responses requests and Claude Code cross-routing with the limitations documented below.
-
-### Cache-aware Claude account routing
-
-CC-Router keeps requests from one Claude Code session on the same eligible Anthropic subscription account. This session affinity remains account-based and preserves prompt-cache locality instead of scattering a conversation's shared prefix across account-specific caches. The model requested by each Messages call affects whether the bound account is still eligible; changing models does not create a second binding, but it can make the existing binding fail over when that account cannot serve the new model. New sessions prefer the account with the fewest in-flight requests, then the fewest bound sessions, then included allowance over paid extra usage, then the most applicable global and requested-model headroom; exact ties use a rotating round-robin order.
-
-Anthropic cooldowns, effective global or requested-model quota exhaustion, disabled accounts, invalid authentication, and unhealthy accounts are hard exclusions. The configured per-account percentage caps are softer policy controls: when at least one account is otherwise usable but every usable account is over a configured cap, CC-Router may explicitly fall back to the least-loaded capped account. It never uses that fallback to bypass an Anthropic cooldown or exhausted effective quota.
-
-If an upstream account returns 429 or any 5xx before a single response byte has been relayed, CC-Router applies the failure's cooldown and affinity bookkeeping and then retries the request itself, up to 3 upstream attempts per request. A 429 (or an overload the provider cools down: Anthropic 529; Codex 503/529) always fails over to a *different* account. Any other 5xx keeps a session-bound request on its own account, retrying after a short pause; a session-less request re-routes the way a fresh request would — typically an idle other account, exactly where the client's own retry used to land. The failover is on by default; set `"autoFailover": false` in `~/.cc-router/config.json` (and restart the router) to opt out — every upstream failure then passes through unchanged and clients own all retries, as before. Be aware that current Claude Code builds no longer retry 429s themselves, so with failover off a rate limit surfaces directly in the session as an error. One trade-off worth knowing: once the router commits to a retry it abandons the original failure response, so a network error on the retry attempt surfaces as a local 502 rather than the original 429. When no other account is eligible or the budget is exhausted, the last failed upstream response is passed through unchanged, exactly as before. A 401 is always passed through (with a background token refresh), and the router never retries after response bytes have started — mid-stream failures reach the client untouched. If no account is usable before forwarding begins, the router instead returns a local Anthropic-shaped 429 whenever any account is blocked by a rate limit or exhausted quota. That 429 includes `Retry-After` only when a trustworthy unblock time is known. A local 503 is reserved for entirely non-rate-limit unavailability, such as all accounts being disabled or unhealthy. Either local response makes no Anthropic Messages request. Affinity mappings exist only in process memory, expire after one hour of inactivity, and are capped in size. Session IDs are never persisted or logged.
-
-Streaming remains byte-transparent. In particular, CC-Router never appends a synthetic `message_stop` event. `proxyRequestTimeoutMs` protects only the phase before Anthropic response headers arrive; once a response starts, its body continues through the native byte-exact proxy pipe. Automatic `cc-router configure` setup manages Claude Code's event-level and byte-level stream idle watchdogs at 30 minutes. Restart any existing Claude Code process after configuration so it inherits those values.
-
-**Claude Desktop support** is opt-in and requires a small interceptor (mitmproxy) because Claude Desktop doesn't expose a custom API endpoint setting. See [Claude Desktop support](#claude-desktop-support).
-
----
-
-## Use cases
-
-### Heavy user — one account isn't enough
-
-Claude Max has rate limits per account. If you hit them regularly mid-session — waiting for cooldowns, getting 429s — you're a good candidate.
-
-With two accounts you double your effective rate limit. With three, you triple it. The proxy distributes requests automatically; you don't change how you use Claude Code at all.
+CC-Router is a local proxy that sits between your tooling and the providers. It spreads
+sessions across every subscription you own and fails a rate-limited request over to
+another account *before a single response byte reaches the client*.
 
 ```text
-1 account  →  hit limit, session errors out (current Claude Code no longer retries 429s)
-3 accounts →  sessions spread across all three; a rate-limited request fails over mid-flight
+1 account   →  hit the limit, the session errors out
+3 accounts  →  sessions spread across all three; a 429 fails over mid-flight
 ```
 
----
+The part that makes it usable day to day: each conversation stays **pinned to one
+account**. A Claude Code turn resends its whole prior context, and Anthropic caches that
+prefix *per account* — scatter the turns and you re-pay for the cache every time. CC-Router
+distributes *new* sessions instead of individual requests, so your cache stays warm.
+
+Everything else is unchanged. Same `claude`, same `codex`, same streaming, extended
+thinking, tool use and prompt caching — passed through byte for byte.
+
+## Features
+
+- **Cache-aware session routing** — pins each session to one account, spreads new sessions across 2–20 accounts ([details](docs/session-routing.md))
+- **Automatic failover & retry** — a `429` moves to another account, a `5xx` is retried in-router, always before the first response byte
+- **Multi-provider routing** — model prefixes send `claude/*` to Claude subscriptions and `openai/*` / `gpt-*` to ChatGPT/Codex ([details](docs/codex.md))
+- **Model-aware rate limits** — skips accounts whose global or per-model allowance is spent, and respects scoped cooldowns
+- **Automatic token refresh** — OAuth tokens refresh before expiry and are written atomically ([details](docs/oauth-tokens.md))
+- **Live dashboard** — terminal UI for account health, usage windows, live activity, and routing toggles ([details](docs/dashboard.md))
+- **Grok CLI overview** — your Grok/xAI subscription's plan and session state in the same dashboard, alongside the accounts that are routed ([details](docs/grok.md))
+- **Guided setup** — `cc-router setup` pulls tokens from the Keychain or credentials file and wires up your clients
+- **Client mode** — point another device you own at your private router ([details](docs/client-mode.md))
+- **Flexible deployment** — background daemon, native auto-start (launchd/systemd), foreground, or Docker Compose ([details](docs/installation.md))
+- **Locked down by default** — tokens stay on your machine, proxy auth is required on non-loopback binds ([details](docs/security.md))
+
+## Supported platforms and harnesses
+
+**Routed** — requests are proxied to these:
+
+| Platform | Auth | Route |
+|---|---|---|
+| Claude Max / Pro subscriptions | OAuth (subscription) | `/v1/messages` |
+| OpenAI ChatGPT / Codex subscriptions | OAuth device code | `/v1/responses` |
+| Anything LiteLLM supports (optional) | API keys, via LiteLLM | `/v1/messages` ([setup](docs/litellm-setup.md)) |
+
+**Monitored** — tracked and shown in the dashboard, not proxied:
+
+| Platform | Auth | What you get |
+|---|---|---|
+| Grok / xAI subscriptions | Device code, or import from Grok CLI | Plan, code access, active sessions, token health ([details](docs/grok.md)) |
+
+**Harnesses**
+
+| Harness | Support | Notes |
+|---|---|---|
+| Claude Code | First class | Configured automatically by `cc-router setup` |
+| Codex CLI | First class | Configured by `cc-router configure codex` ([setup](docs/codex.md)) |
+| Claude Desktop (chat + Cowork) | Opt-in | Needs a mitmproxy interceptor ([setup](docs/claude-desktop.md)) |
+| Any Anthropic Messages client | Works | Point `ANTHROPIC_BASE_URL` at the router |
+| Any OpenAI Responses client | Works | Point the base URL at `/v1` |
 
 ## Quickstart
+
+Requires **Node.js 20 or 22** on macOS, Linux or Windows.
 
 ```bash
 # 1. Install
 npm install -g @timo972/cc-router
 
-# 2. Wizard: extract tokens + configure Claude Code automatically
+# 2. Extract tokens and configure your clients
 cc-router setup
 
 # 3. Start the proxy
 cc-router start
 
-# 4. Use Claude Code normally — the proxy is transparent
+# 4. Use Claude Code as usual — the proxy is transparent
 claude
 ```
 
-That's it. Claude Code will route through the proxy without any further changes.
-
-On first run, `cc-router start` asks how you want to run (background/foreground, auto-start on boot, server mode) and remembers your choice. Next time, it just starts. To change preferences later:
-```bash
-cc-router start --reconfigure
-```
-
----
-
-## Installation
-
-**Requirements:** Node.js 20 or 22.
-
-```bash
-npm install -g @timo972/cc-router
-```
-
-Verify:
-```bash
-cc-router --version
-```
-
----
-
-## Setup by platform
-
-### macOS
-
-cc-router can extract OAuth tokens directly from the macOS Keychain — no manual copy-pasting needed.
-
-```bash
-cc-router setup
-# Select "Extract automatically from macOS Keychain"
-```
-
-For multiple accounts, you need to switch accounts in Claude Code between extractions:
-```bash
-# Account 1 is already logged in — run setup and extract
-cc-router setup
-
-# To add account 2:
-claude logout && claude login   # log in with account 2
-cc-router setup --add           # extract and merge
-claude logout && claude login   # log back in with account 1
-```
-
-### Linux
-
-Tokens are read from `~/.claude/.credentials.json`:
-```bash
-cc-router setup
-# Select "Read from ~/.claude/.credentials.json"
-```
-
-Make sure Claude Code is installed and you have run `claude login` at least once.
-
-### Windows
-
-Same as Linux — tokens are read from `~/.claude/.credentials.json` (Windows path: `%USERPROFILE%\.claude\.credentials.json`).
-
-```bash
-cc-router setup
-```
-
----
-
-## CLI Reference
-
-```text
-cc-router setup              Interactive wizard: extract tokens + configure Claude Code
-cc-router setup --add        Add another account to an existing configuration
-
-cc-router start              Start proxy (asks preferences on first run, then remembers)
-cc-router start --foreground Run in the foreground (stays in terminal)
-cc-router start --reconfigure  Re-ask run preferences (background/service/server mode)
-cc-router start --litellm    Start with LiteLLM in Docker (advanced mode)
-
-cc-router stop               Stop proxy (offers to remove auto-start / config)
-cc-router stop --keep-config Stop proxy only (keep settings.json)
-cc-router stop --full        Stop + remove auto-start + revert Claude Code (no prompts)
-cc-router revert             Same as stop --full
-
-cc-router status             Live dashboard (updates every 2s, press q to quit)
-cc-router status --json      Print current stats as JSON and exit
-
-cc-router models list        List models discovered live from provider APIs
-cc-router models list --json Print discovered models + routing as JSON
-cc-router models set --claude-model anthropic/claude-sonnet-4-6
-cc-router models set --openai-model openai/gpt-5-codex
-
-cc-router logs               View proxy logs (background mode)
-cc-router logs -f            Follow log output in real time
-cc-router logs --lines 100   Show last 100 lines
-
-cc-router accounts list      List configured accounts (live stats if proxy is running)
-cc-router accounts add       Add an account interactively
-cc-router accounts login-openai  Sign in to OpenAI subscription auth with device code
-cc-router accounts add-openai  Add an OpenAI subscription account manually (experimental)
-cc-router accounts remove <id>  Remove a Claude or OpenAI account
-
-cc-router configure          (Re)write ~/.claude/settings.json
-cc-router configure codex    (Re)write ~/.codex/config.toml for Codex CLI
-cc-router configure codex --model openai/gpt-5-codex
-cc-router configure models --claude-model claude-sonnet-4-6 --openai-model gpt-5-codex
-cc-router configure --show   Show current Claude Code proxy settings
-cc-router configure --remove Remove cc-router settings (same as revert without stopping)
-
-cc-router client connect <url>       Connect Claude Code to a remote CC-Router
-cc-router client connect --desktop   Also configure Claude Desktop interception
-cc-router client disconnect          Revert all client configuration
-cc-router client status              Show connection + remote server health
-cc-router client start-desktop       Start mitmproxy interceptor for Claude Desktop
-cc-router client stop-desktop        Stop mitmproxy interceptor
-
-cc-router docker up          Start full Docker stack (cc-router + LiteLLM)
-cc-router docker up --build  Rebuild cc-router image before starting
-cc-router docker down        Stop Docker containers
-cc-router docker logs        Tail all Docker logs
-cc-router docker ps          Show container status
-cc-router docker restart [service]  Restart a service
-```
-
----
-
-## Modes of operation
-
-### Standalone (default — no Docker)
-
-```text
-Claude Code → cc-router:3456 → api.anthropic.com
-```
-
-Best for personal use. No Docker required. Runs in the background by default, auto-starts on boot if you choose.
-
-```bash
-cc-router start
-```
-
-### Full mode with LiteLLM (optional — requires Docker)
-
-```text
-Claude Code → cc-router:3456 → LiteLLM:4000 → api.anthropic.com
-```
-
-Adds a LiteLLM layer for usage logging, rate limiting, and a web dashboard at `http://localhost:4000/ui`.
-
-```bash
-cc-router docker up
-# or: cc-router start --litellm
-```
-
-See [docs/litellm-setup.md](docs/litellm-setup.md) for details.
-
----
-
-## Codex CLI support (experimental)
-
-CC-Router exposes an OpenAI Responses-compatible endpoint for Codex CLI at `/v1/responses`. This lets Codex use OpenAI ChatGPT/Codex subscription accounts through the same local router that Claude Code uses for Claude subscriptions.
-
-**Features:** Sticky sessions pin each Codex conversation to one account for prompt-cache locality. Load- and headroom-aware account selection spreads new sessions across available capacity. Usage tracking from response headers reports account-level 5-hour and 7-day windows, dynamically discovered model-scoped metered buckets, credits, and plan. User caps (`sessionLimitPercent`/`weeklyLimitPercent`) apply to the default Codex bucket. The dashboard shows per-bucket rows, usage bars, credits, plan, and cooldown state for OpenAI accounts.
-
-Configure Codex:
-
-```bash
-cc-router configure codex --model openai/gpt-5-codex
-```
-
-This writes a managed provider block to `~/.codex/config.toml`:
-
-```toml
-model = "openai/gpt-5-codex"
-model_provider = "cc-router"
-
-[model_providers.cc-router]
-name = "CC-Router"
-base_url = "http://localhost:3456/v1"
-wire_api = "responses"
-env_key = "CC_ROUTER_TOKEN"
-```
-
-Configure router-side model defaults and aliases:
-
-```bash
-cc-router configure models \
-  --claude-model claude-sonnet-4-6 \
-  --openai-model gpt-5-codex
-```
-
-This writes `modelRouting` to `~/.cc-router/config.json`. It sets the Claude default, the OpenAI default, and practical aliases so `claude/sonnet`, `sonnet`, `openai/default`, and `openai/codex` resolve to the models you selected. Restart the router after changing these values.
-
-Model discovery is dynamic. `GET /v1/models` returns an OpenAI-compatible model list by querying the configured Anthropic and OpenAI subscription APIs live:
-
-```bash
-curl http://localhost:3456/v1/models
-```
-
-Results are provider-prefixed, for example `anthropic/claude-sonnet-4-6` and `openai/gpt-5-codex`. Configured aliases such as `openai/codex` are added when their upstream model is available. If one provider is temporarily unavailable, CC-Router still returns the models discovered from the other providers.
-
-Then run Codex with the proxy secret in `CC_ROUTER_TOKEN` when your router is password-protected:
-
-```bash
-CC_ROUTER_TOKEN=cc-rtr-your-secret codex -m openai/gpt-5.5
-```
-
-Model prefixes:
-
-| Model | Upstream |
-|--------|----------|
-| `openai/*` | OpenAI ChatGPT/Codex subscription route |
-| `gpt-*` (no prefix) | OpenAI ChatGPT/Codex subscription route |
-| `claude/*` | Claude subscription route |
-| `anthropic/*` | Claude subscription route |
-| anything else with no prefix | Claude subscription route |
-
-The unprefixed `gpt-*` rule exists for clients that do not speak this
-convention. The Codex CLI writes the bare slug from its own registry — either
-`model = "gpt-5.6-sol"` in `~/.codex/config.toml` or whatever its `/model`
-picker selects — so those names arrive without a prefix and would otherwise be
-routed to Claude, where `/v1/responses` answers `501`. Configured
-`openAIAliases` apply to the bare form too.
-
-Examples after the configuration above:
-
-| Public model | Routed upstream model |
-|--------------|----------------------|
-| `openai/codex` | `gpt-5-codex` |
-| `openai/default` | `gpt-5-codex` |
-| `claude/sonnet` | `claude-sonnet-4-6` |
-
-Claude Code can also send a `/v1/messages` request with an `openai/*` model. CC-Router translates that Anthropic Messages request into an OpenAI Responses request and converts JSON or basic text SSE responses back into Anthropic-shaped message responses.
-
-Current limitation: OpenAI-to-Anthropic streaming currently covers text deltas and final usage. Streaming tool-call normalization is still experimental.
-
-OpenAI subscription account records are separated from Claude accounts with `provider: "openai_subscription"` so they do not enter the Anthropic token pool:
-
-```json
-{
-  "id": "openai-primary",
-  "provider": "openai_subscription",
-  "accessToken": "eyJ...",
-  "refreshToken": "...",
-  "expiresAt": 1999999999000,
-  "scopes": ["openid", "profile", "email", "offline_access"]
-}
-```
-
-Recommended OpenAI subscription login:
-
-```bash
-cc-router accounts login-openai
-```
-
-This uses the Codex device-code auth flow: the CLI prints a verification URL and one-time code, you approve the login in your browser, and CC-Router saves the resulting OpenAI subscription account record.
-
-Manual account entry is also available for debugging:
-
-```bash
-cc-router accounts add-openai
-```
-
-This prompts for the OpenAI access token, refresh token, expiry timestamp, and scopes, validates the record shape, and saves it without overwriting Claude accounts.
-
----
-
-## Client mode — connecting your own devices
-
-Client mode lets you connect another device you own to your private CC-Router over a trusted private network. It is not intended for sharing subscription accounts or proxy access with other people, or for exposing CC-Router to the public internet.
-
-The setup wizard asks about this at the very first step:
-
-```bash
-cc-router setup
-# → What do you want to do?
-#   • Host CC-Router on this machine
-#   • Connect to your existing CC-Router server  ← pick this
-```
-
-Or use the dedicated command directly:
-
-```bash
-# Connect another device you own over your private network
-cc-router client connect http://192.168.1.50:3456 --secret cc-rtr-abc123...
-
-# Check status
-cc-router client status
-
-# Disconnect (restores Claude Code defaults)
-cc-router client disconnect
-```
-
-Client mode writes `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` into `~/.claude/settings.json`, so Claude Code talks directly to the remote proxy. Nothing runs locally — no accounts, no proxy process, no resources.
-
-### CLI reference
-
-```text
-cc-router client connect <url>       Connect Claude Code to a CC-Router server
-cc-router client connect --desktop   Also configure Claude Desktop interception
-cc-router client connect -s <secret> Pass the proxy secret inline (or use --secret)
-cc-router client disconnect          Revert all client configuration
-cc-router client status              Show current connection + remote server health
-cc-router client start-desktop       Start the Claude Desktop mitmproxy interceptor
-cc-router client stop-desktop        Stop the Claude Desktop interceptor
-```
-
----
-
-## Claude Desktop support
-
-Claude Desktop (chat + Cowork) **can be routed through CC-Router**, but unlike Claude Code it does not respect `ANTHROPIC_BASE_URL`. It talks directly to `api.anthropic.com` via an embedded Anthropic SDK. To redirect its traffic, CC-Router uses [mitmproxy](https://mitmproxy.org/) in *local redirect mode* — a process-scoped interceptor that only captures Claude Desktop's network traffic and forwards it to the proxy.
-
-This is **opt-in** — the setup wizard will ask if you want it.
-
-### Requirements
-
-- **mitmproxy ≥ 10.1.5** (macOS, Windows) or **≥ 11.1** (Linux — requires kernel ≥ 6.8)
-- Admin access to install the mitmproxy CA certificate
-- On macOS: manual approval of mitmproxy's Network Extension (one time, via System Settings)
-
-### Installing mitmproxy
-
-```bash
-# macOS
-brew install mitmproxy
-
-# Windows
-# Download the installer from https://mitmproxy.org/downloads/
-# (or: pip install mitmproxy)
-
-# Linux
-pip install mitmproxy        # kernel 6.8+ required for local mode
-```
-
-### Enabling Desktop interception
-
-During `cc-router setup` or `cc-router client connect`, answer **Yes** when asked about Claude Desktop. The wizard will:
-
-1. Check that mitmproxy is installed
-2. Generate the mitmproxy CA certificate (if not already present)
-3. Install the CA into the OS trust store (requires sudo/admin)
-4. Write the redirect addon to `~/.cc-router/interceptor/addon.py`
-5. On macOS, prompt you to approve the Network Extension
-
-Then start the interceptor:
-
-```bash
-cc-router client start-desktop
-```
-
-Open Claude Desktop and send a message. The request will be intercepted and redirected to CC-Router. Requests carrying exactly one valid `X-Claude-Code-Session-Id` receive cache-aware sticky affinity; requests without one valid session header use load-aware **unscoped** routing and do not receive sticky affinity. Claude Desktop traffic normally follows the unscoped path.
-
-### Stopping / removing Desktop interception
-
-```bash
-cc-router client stop-desktop    # Stop the interceptor (keep configuration)
-cc-router client disconnect      # Stop + remove all client config
-```
-
-### How it works under the hood
-
-```
-Claude Desktop
-     │
-     │  tries to connect to api.anthropic.com:443
-     ▼
-mitmproxy (local mode)
-     │  addon.py rewrites scheme/host to CC-Router
-     ▼
-CC-Router :3456 ──► api.anthropic.com  (with OAuth Bearer token)
-```
-
-mitmproxy's local mode is *process-scoped* — it only intercepts traffic from the Claude process, not your browser, curl, or any other app. The OS-level interception uses:
-
-| Platform | Mechanism |
-|----------|-----------|
-| macOS    | Network Extension (App Proxy Provider API) |
-| Windows  | WinDivert (WFP kernel driver) |
-| Linux    | eBPF (kernel ≥ 6.8) |
-
-### Troubleshooting
-
-- **macOS: "provider rejected new flow"** — re-enable Mitmproxy Redirector in System Settings → General → Login Items & Extensions → Network Extensions, then restart mitmproxy.
-- **Windows: UAC prompt every start** — expected; mitmproxy's redirector needs admin at runtime.
-- **Linux: "eBPF program failed to load"** — check your kernel version with `uname -r`. You need ≥ 6.8.
-- **Chat shows "failed to connect"** — make sure CC-Router is reachable from the mitmproxy process. Run `curl http://localhost:3456/cc-router/health` to verify the proxy is up.
-
----
-
-## Reverting to normal Claude Code
-
-To stop using cc-router and go back to normal Claude Code authentication:
-
-```bash
-cc-router revert
-```
-
-This stops the proxy process, removes the auto-start service (if installed), and removes cc-router's settings from `~/.claude/settings.json`. Claude Code will use its own authentication on the next launch.
-
-For a gentler approach, `cc-router stop` interactively asks what you want to clean up.
-
----
-
-## Status dashboard
-
-```bash
-cc-router status
-```
-
-```text
- CC-Router  ·  standalone → api.anthropic.com  ·  up 2h 14m  ·  [q] quit
-
- OPERATIONS  base http://localhost:3456  ·  auth protected  ·  models dynamic
-  Claude 2/2 healthy  OpenAI 1/1 healthy  ·  cross-route ready
-  endpoints /v1/messages /v1/responses /v1/models /cc-router/accounts
-  routing claude=claude-sonnet-4-6 aliases[sonnet]  openai=gpt-5-codex aliases[codex]
-  models [m] list/select  change [c] Claude [o] OpenAI
-
- MODELS  [m/r] refresh  [↑/↓] select  [c] Claude default  [o] OpenAI default
-  current claude=claude-sonnet-4-6  openai=gpt-5-codex
-  ▶ anthropic/claude-sonnet-4-6 Claude
-    openai/gpt-5-codex OpenAI
-
- ACCOUNTS  2/2 healthy
-
-  ● max-account-1    ok      req   142  err   0  expires  6h 48m  last  2s ago
-  ● max-account-2    ok      req   139  err   0  expires  6h 51m  last  5s ago
-
- TOTALS  requests 281  ·  errors 0  ·  refreshes 2
-
- RECENT ACTIVITY
-  14:23:01  → max-account-1    route
-  14:22:58  → max-account-2    route
-  14:22:45  ↻ max-account-1    refresh
-```
-
-Press `q` to quit. Run with `--json` for non-interactive output; the JSON includes an `operational` block with capabilities, endpoints, provider readiness, auth status, and model routing. Secrets and account tokens are never included.
-
-The dashboard is also a control surface. In local mode it controls the local proxy; in client mode it controls the remote CC-Router configured by `cc-router client connect`. Authenticated account views include dynamic model-scoped allowance rows, their reset times, applicable global or requested-model cooldowns, paid-extra state, and whether the usage snapshot is fresh, stale, or unavailable. A stale row is shown as unknown rather than as authoritative available capacity.
-
-| Key | Action |
-|-----|--------|
-| `Tab` | Switch focus between logs, accounts, and models |
-| `n` | Add a Claude account |
-| `e` | Enable/disable selected Claude account |
-| `w` / `s` | Change selected Claude account weekly/session cap |
-| `d` | Delete selected Claude account |
-| `m` / `r` | Load or refresh discovered provider models |
-| `c` | Set selected `anthropic/*` model as Claude default |
-| `o` | Set selected `openai/*` model as OpenAI default |
-
-List and change models without waiting for a package update:
-
-```bash
-cc-router models list
-cc-router models set --claude-model anthropic/claude-sonnet-4-6
-cc-router models set --openai-model openai/gpt-5-codex
-```
-
-When the proxy is running, `models set` updates the live router and persists the new defaults. If the proxy is offline, it writes the configuration for the next start.
-
----
-
-## Security
-
-- Tokens are stored locally in `~/.cc-router/accounts.json`, **never in the repository**
-- The file is excluded by `.gitignore`
-- Writes are atomic (write to `.tmp`, then rename) — no corruption on crash
-- Keychain reads use `execFile` with a fixed argument array — no shell injection
-- Privacy-bounded telemetry through PostHog EU, enabled by default and fully
-  disableable (see [Telemetry](#telemetry) below)
-
-See [docs/security.md](docs/security.md) for details.
-
----
-
-## Telemetry
-
-CC-Router sends privacy-bounded traces, structured diagnostics, lifecycle
-events, and sanitized exceptions to PostHog's EU ingestion service. Telemetry
-is **on by default for fresh installations**. An existing persisted opt-out
-stays off after upgrade.
-
-Normal proxy traces are sampled at 10%; safe setup diagnostics, warnings,
-errors, lifecycle analytics, and sanitized exceptions are not sampled. A random
-install UUID stored in `~/.cc-router/telemetry.json` is used as the stable
-PostHog `distinctId` and OpenTelemetry `service.instance.id`. It is not derived
-from a user, account, hostname, IP address, or machine identifier. CC-Router
-does not create PostHog Person profiles and disables GeoIP enrichment.
-
-PostHog necessarily sees the connection's source IP while receiving HTTPS
-requests. CC-Router does not put that IP in the telemetry payload. Prompts,
-responses, request or response bodies, credentials, account/session/user IDs,
-raw errors, URLs, headers, hostnames, and absolute paths are forbidden from the
-payload. Existing console output and detailed local logs are never forwarded.
-
-See [docs/telemetry.md](docs/telemetry.md) for the complete closed inventory,
-privacy boundary, EU endpoints, sampling, bounded counters, setup diagnostic-ID
-reporting, and the guarded live-validation workflow. The contracts are
-implemented in [`src/telemetry/`](src/telemetry/).
-
-**Disable it** — three ways, any one works:
-
-```bash
-# 1. Persistent opt-out (recommended)
-cc-router telemetry off
-
-# 2. Respect the de-facto standard (honored by many OSS tools)
-export DO_NOT_TRACK=1
-
-# 3. Project-specific override
-export CC_ROUTER_TELEMETRY=0
-```
-
-Check status anytime: `cc-router telemetry status`.
-
-Turning telemetry off stops new capture immediately and queued records are
-discarded; an HTTPS request already in flight cannot be recalled. Turning it
-back on takes effect for future short-lived commands, but a daemon that started
-while telemetry was disabled must be restarted before its runtime telemetry
-stack is initialized.
-
----
+That's it. On first `start` you're asked how to run the router (background, foreground, or
+auto-start on boot) and the choice is remembered; `cc-router start --reconfigure` changes
+it later. Adding more accounts is `cc-router setup --add`, and `cc-router status` opens the
+dashboard.
+
+Per-platform token extraction, Codex CLI, Docker and everything else lives in
+[the docs](docs/).
+
+## Documentation
+
+| Guide | What's in it |
+|---|---|
+| [Installation & deployment](docs/installation.md) | Per-platform token setup, run modes, Docker |
+| [CLI reference](docs/cli-reference.md) | Every command and flag |
+| [Session routing](docs/session-routing.md) | How an account gets picked, failover, team operation |
+| [Architecture](docs/architecture.md) | Request path and components |
+| [Dashboard](docs/dashboard.md) | Live TUI, keybindings, model management |
+| [Codex CLI & OpenAI](docs/codex.md) | Responses endpoint, model prefixes, OpenAI accounts |
+| [Grok / xAI](docs/grok.md) | Adding Grok accounts, and why they're overview-only |
+| [Claude Desktop](docs/claude-desktop.md) | mitmproxy interception setup |
+| [Client mode](docs/client-mode.md) | Connecting your other devices |
+| [LiteLLM](docs/litellm-setup.md) | Optional logging and rate-limiting layer |
+| [OAuth tokens](docs/oauth-tokens.md) | How subscription tokens and refresh rotation work |
+| [Security](docs/security.md) | Token storage, proxy auth, threat model |
+| [Telemetry](docs/telemetry.md) | Privacy-bounded telemetry, on by default: exactly what is sent and how to turn it off |
+| [Troubleshooting](docs/troubleshooting.md) | When something doesn't connect |
 
 ## Disclaimer
 
-> CC-Router uses the OAuth tokens of your own Claude Max subscriptions.
+> CC-Router uses the OAuth tokens of **your own** Claude Max and ChatGPT subscriptions.
 >
-> **Read Anthropic's Terms of Service before using this tool.**  
-> Using multiple Max subscriptions to increase throughput may violate the ToS. Anthropic has been known to ban accounts for unusual OAuth usage patterns.
-> Do not share subscription accounts, OAuth credentials, or CC-Router proxy access with other people.
+> **Read Anthropic's and OpenAI's Terms of Service before using this tool.** Using multiple
+> subscriptions to increase throughput may violate them. Anthropic has been known to ban
+> accounts for unusual OAuth usage patterns.
 >
-> The authors are not responsible for any account bans, loss of access, or other consequences resulting from the use of this software. Use at your own risk.
-
----
+> Do not share subscription accounts, OAuth credentials, or CC-Router proxy access with
+> other people.
+>
+> The authors are not responsible for account bans, loss of access, or any other
+> consequence of using this software. Use at your own risk.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Bug reports → [GitHub Issues](https://github.com/Timo972/cc-router/issues)
-
----
+Bug reports and feature requests go to [GitHub Issues](https://github.com/Timo972/cc-router/issues).
+For development setup, code conventions and the PR process, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
@@ -663,5 +153,5 @@ Bug reports → [GitHub Issues](https://github.com/Timo972/cc-router/issues)
 
 This project began as a fork of [VictorMinemu/CC-Router](https://github.com/VictorMinemu/CC-Router)
 and is now maintained independently as [`@timo972/cc-router`](https://www.npmjs.com/package/@timo972/cc-router).
-It is not affiliated with the upstream project, and issues should be filed here rather than upstream.
+It is not affiliated with the upstream project — please file issues here rather than upstream.
 The original MIT copyright notice is retained in [LICENSE](LICENSE).

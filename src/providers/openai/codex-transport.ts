@@ -1,10 +1,6 @@
 import type { OpenAIResponsesRequest } from "../../protocol/openai-responses-types.js";
-import {
-  classifyExpectedRuntimeFailure,
-  recordSafeLog,
-  recordUnexpectedException,
-} from "../../telemetry/facade.js";
 import type { OpenAISubscriptionAccount } from "./token-refresher.js";
+import { createHeaderDeadline, withStreamIdleTimeout } from "../../proxy/transport-timing.js";
 
 const CODEX_RESPONSES_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_CODEX_INSTRUCTIONS = "You are a concise coding assistant.";
@@ -16,17 +12,18 @@ export interface ForwardOpenAICodexResponseOptions {
   /** Aborted when the client disconnects, so a request nobody is waiting for
    *  stops occupying an upstream slot on the account. */
   signal?: AbortSignal;
-  /** One-based router attempt for failover/retry correlation. */
-  attempt?: number;
+  /** Header deadline and reset-on-progress stream idle limit. */
+  timeoutMs?: number;
 }
 
 export async function forwardOpenAICodexResponse(
   opts: ForwardOpenAICodexResponseOptions,
 ): Promise<Response> {
-  const startedAt = Date.now();
+  const body = toCodexBackendRequest(opts.body);
+  const deadline = createHeaderDeadline(opts.timeoutMs, opts.signal);
+  let upstream: Response;
   try {
-    const body = toCodexBackendRequest(opts.body);
-    const upstream = await fetch(CODEX_RESPONSES_ENDPOINT, {
+    upstream = await fetch(CODEX_RESPONSES_ENDPOINT, {
       method: "POST",
       headers: {
         authorization: `Bearer ${opts.account.accessToken}`,
@@ -34,58 +31,19 @@ export async function forwardOpenAICodexResponse(
         accept: "text/event-stream",
       },
       body: JSON.stringify(body),
-      ...(opts.signal ? { signal: opts.signal } : {}),
+      ...(deadline.signal ? { signal: deadline.signal } : {}),
     });
-    const outcome = responseOutcome(upstream.status);
-    if (upstream.status === 401 || upstream.status === 403
-      || upstream.status === 429 || upstream.status >= 500) {
-      recordSafeLog({
-        operation: "provider.inference",
-        provider: "openai",
-        reason: responseReason(upstream.status),
-        outcome,
-        httpStatusCode: upstream.status,
-        attempt: opts.attempt,
-        operationDurationMs: Date.now() - startedAt,
-        severity: "warn",
-      });
-    }
-    return ensureEventStreamContentType(upstream);
-  } catch (error) {
-    const reason = classifyExpectedRuntimeFailure(error);
-    const outcome = reason === "timeout" ? "timeout" : "upstream_error";
-    if (reason) {
-      recordSafeLog({
-        operation: "provider.inference",
-        provider: "openai",
-        reason,
-        outcome,
-        attempt: opts.attempt,
-        operationDurationMs: Date.now() - startedAt,
-        severity: "error",
-      });
-    } else {
-      recordUnexpectedException(error, {
-        category: "runtime",
-        reason: "other",
-        operation: "provider.inference",
-        provider: "openai",
-      });
-    }
-    throw error;
+  } finally {
+    // The header deadline must not become an absolute generation deadline.
+    // Body progress and cancellation are owned by the stream wrapper below.
+    deadline.dispose();
   }
-}
-
-function responseOutcome(status: number): "complete" | "rate_limited" | "upstream_error" {
-  if (status >= 200 && status < 400) return "complete";
-  return status === 429 ? "rate_limited" : "upstream_error";
-}
-
-function responseReason(status: number): "unauthorized" | "forbidden" | "rate_limited" | "upstream_5xx" {
-  if (status === 401) return "unauthorized";
-  if (status === 403) return "forbidden";
-  if (status === 429) return "rate_limited";
-  return "upstream_5xx";
+  const timedBody = withStreamIdleTimeout(upstream.body, opts.timeoutMs, opts.signal);
+  return ensureEventStreamContentType(new Response(timedBody, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: upstream.headers,
+  }));
 }
 
 export function toCodexBackendRequest(body: OpenAIResponsesRequest): OpenAIResponsesRequest & {

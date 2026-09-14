@@ -4,7 +4,6 @@ import { readConfig, writeConfig } from "../config/manager.js";
 import { PROXY_PORT } from "../config/paths.js";
 import { buildModelRoutingUpdate } from "../protocol/model-routing-config.js";
 import { resolveStatusTarget } from "./cmd-status.js";
-import { exitCli } from "./errors.js";
 
 interface ModelEntry {
   id: string;
@@ -84,7 +83,7 @@ export function registerModels(program: Command): void {
     .action(async (opts: { port: string; claudeModel?: string; openaiModel?: string }) => {
       if (!opts.claudeModel && !opts.openaiModel) {
         console.error(chalk.red("Provide at least one model: --claude-model or --openai-model"));
-        exitCli(1);
+        process.exit(1);
       }
 
       const payload = buildModelSetPayload({

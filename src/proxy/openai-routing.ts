@@ -4,7 +4,8 @@ import type { NoEligibleAccountError } from "./account-pool.js";
 import { extractClaudeSessionId } from "./anthropic-routing.js";
 import { normalizeSessionId } from "./session-router.js";
 
-const CODEX_SESSION_HEADER = "session_id";
+const CODEX_SESSION_HEADER_DASHED = "session-id";
+const CODEX_SESSION_HEADER_UNDERSCORE = "session_id";
 
 /** Extract exactly one native HTTP header field without joined duplicates. */
 function extractSingleHeader(request: IncomingMessage, name: string): string | undefined {
@@ -25,13 +26,17 @@ function extractSingleHeader(request: IncomingMessage, name: string): string | u
 }
 
 /**
- * Resolve the OpenAI affinity key in priority order: Codex session_id header,
- * Claude Code session header, then the request body's prompt_cache_key
- * (Codex thread id). Returns undefined for unscoped requests.
+ * Resolve the OpenAI affinity key in priority order: Codex `session-id` header
+ * (current Codex CLI spelling), legacy `session_id` header, Claude Code session
+ * header, then the request body's prompt_cache_key (Codex thread id). Returns
+ * undefined for unscoped requests.
  */
 export function extractCodexSessionKey(request: IncomingMessage, body: unknown): string | undefined {
-  const codexSession = extractSingleHeader(request, CODEX_SESSION_HEADER);
-  if (codexSession !== undefined) return codexSession;
+  const codexSessionDashed = extractSingleHeader(request, CODEX_SESSION_HEADER_DASHED);
+  if (codexSessionDashed !== undefined) return codexSessionDashed;
+
+  const codexSessionUnderscore = extractSingleHeader(request, CODEX_SESSION_HEADER_UNDERSCORE);
+  if (codexSessionUnderscore !== undefined) return codexSessionUnderscore;
 
   const claudeSession = extractClaudeSessionId(request);
   if (claudeSession !== undefined) return claudeSession;

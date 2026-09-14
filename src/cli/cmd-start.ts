@@ -15,11 +15,6 @@ import { launchDaemon, waitForHealth } from "../daemon/launcher.js";
 import { isProxyRunning } from "../daemon/pid.js";
 import { installService } from "../daemon/service.js";
 import { getLocalIPs } from "../utils/network.js";
-import { startProxyTelemetry } from "../telemetry/runtime.js";
-import { handoffCliTelemetryToProxyWithin } from "../telemetry/facade.js";
-import { markCliTelemetryHandedOffToProxy } from "../telemetry/cli-runtime.js";
-import type { RuntimeMode } from "../telemetry/contracts.js";
-import { CliExitError, exitCli } from "./errors.js";
 
 /**
  * How long service-mode start waits for the proxy to answer after the
@@ -59,13 +54,12 @@ export function registerStart(program: Command): void {
           default: true,
         });
         if (runSetup) {
-          const { runSetupCommand } = await import("./cmd-setup.js");
-          await runSetupCommand({ addMode: false });
+          const { runSetupWizard } = await import("./cmd-setup.js");
+          await runSetupWizard({ addMode: false });
           // After setup, re-check
           if (!accountsFileExists()) {
             console.log(chalk.red("\n✗ Setup did not produce accounts. Cannot start.\n"));
-            process.exitCode = 1;
-            return;
+            process.exit(1);
           }
         } else {
           console.log(chalk.gray("  Run 'cc-router setup' when you're ready.\n"));
@@ -287,17 +281,14 @@ async function maybeUpdate(): Promise<void> {
         stdio: "inherit",
         env: process.env,
       });
-      const childExitCode = await new Promise<number>(resolve => {
-        child.once("exit", code => resolve(code ?? 0));
-        child.once("error", err => {
-          console.error(chalk.red(`  Failed to restart after update: ${err.message}`));
-          resolve(1);
-        });
+      child.on("exit", (code) => process.exit(code ?? 0));
+      child.on("error", (err) => {
+        console.error(chalk.red(`  Failed to restart after update: ${err.message}`));
+        process.exit(1);
       });
-      exitCli(childExitCode);
+      await new Promise(() => {});
     }
   } catch (err) {
-    if (err instanceof CliExitError) throw err;
     console.error(chalk.yellow(`  ⚠ Update failed: ${(err as Error).message}`));
     console.log(chalk.gray("  Continuing with current version.\n"));
   }
@@ -350,9 +341,9 @@ async function startForeground(opts: {
   litellm?: string | boolean;
   accounts: string;
 }): Promise<void> {
-  const litellmUrl = (opts.litellm
+  const litellmUrl = opts.litellm
     ? (typeof opts.litellm === "string" ? opts.litellm : `http://localhost:${LITELLM_PORT}`)
-    : undefined) ?? process.env["LITELLM_URL"];
+    : undefined;
 
   if (opts.litellm && typeof opts.litellm !== "string") {
     await ensureLiteLLMRunning();
@@ -364,22 +355,12 @@ async function startForeground(opts: {
     process.env["HOST"] = "0.0.0.0";
   }
 
-  const runtimeMode: RuntimeMode = process.env["CC_ROUTER_SERVICE"] === "1"
-    ? "service"
-    : process.env["CC_ROUTER_DAEMON"] === "1"
-      ? "daemon"
-      : "foreground";
-  await handoffCliTelemetryToProxyWithin(1_500);
-  startProxyTelemetry(runtimeMode, { trustedProviderTarget: litellmUrl });
   const { startServer } = await import("../proxy/server.js");
   await startServer({
     port: parseInt(opts.port, 10),
     litellmUrl,
     accountsPath: opts.accounts !== ACCOUNTS_PATH ? opts.accounts : undefined,
   });
-  // startServer has now installed the proxy's combined signal teardown. If
-  // import/initialization throws before here, bootstrap still owns cleanup.
-  markCliTelemetryHandedOffToProxy();
 }
 
 // ─── LiteLLM Docker helper ──────────────────────────────────────────────────
@@ -404,7 +385,7 @@ async function ensureLiteLLMRunning(): Promise<void> {
   } catch {
     console.error(chalk.red("✗ Docker is not running. Start Docker Desktop first."));
     console.error(chalk.gray("  Or pass a custom LiteLLM URL: cc-router start --litellm http://your-host:4000"));
-    exitCli(1);
+    process.exit(1);
   }
 
   try {
@@ -417,6 +398,6 @@ async function ensureLiteLLMRunning(): Promise<void> {
     console.log(chalk.green(`✓ LiteLLM starting at ${litellmUrl}/ui`));
   } catch (err) {
     console.error(chalk.red("✗ Failed to start LiteLLM:"), (err as Error).message);
-    exitCli(1);
+    process.exit(1);
   }
 }

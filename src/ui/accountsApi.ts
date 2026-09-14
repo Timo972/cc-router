@@ -1,3 +1,4 @@
+import type { CodexResetCode } from "../providers/openai/usage-reset.js";
 /**
  * Tiny authenticated HTTP client for /cc-router/accounts.
  *
@@ -7,6 +8,11 @@
  */
 
 const REQUEST_TIMEOUT_MS = 3_000;
+// Worst case is every account timing out: OpenAI token refreshes are
+// sequential with a 15s deadline each, usage fetches run two at a time with
+// 10s each. The server single-flights the pass, so a client that does give
+// up and presses again joins the running one rather than stacking another.
+const REFRESH_ALL_TIMEOUT_MS = 120_000;
 const MAX_PUBLIC_ROWS = 12;
 
 export interface AccountPatch {
@@ -20,7 +26,7 @@ type Severity = "" | "warning" | "critical" | "unknown";
 
 export interface AccountSafeView {
   id: string;
-  provider?: "anthropic_subscription" | "openai_subscription";
+  provider?: "anthropic_subscription" | "openai_subscription" | "xai_subscription";
   rateLimits?: {
     status: "allowed" | "rate_limited" | "unknown";
     fiveHourUtil: number;
@@ -51,19 +57,34 @@ export interface AccountSafeView {
   modelCooldowns?: Array<{ modelFamily: string; untilMs: number }>;
 }
 
+export interface RefreshAllResult {
+  accounts: number;
+  usageRefreshed: number;
+  usageFailed: number;
+  tokenRefreshFailed: number;
+  durationMs: number;
+}
+
+export interface UsageResetResult { code: CodexResetCode; usageRefreshed: boolean }
+
 export interface AccountsApi {
+  resetUsage(id: string, redeemRequestId: string): Promise<UsageResetResult>;
   /** Read the authenticated, disclosure-safe account status view. */
   list(): Promise<AccountSafeView[]>;
+  /** Ask the router to sweep cooldowns, re-try due tokens and re-fetch every
+   *  account's usage — a restart's worth of freshness without a restart. */
+  refreshAll(): Promise<RefreshAllResult>;
   /** Apply a partial update to an account. Throws on non-2xx or network error. */
   patch(id: string, patch: AccountPatch): Promise<void>;
   /** Enable or disable every configured account for a provider. */
-  setProviderEnabled(provider: "anthropic_subscription" | "openai_subscription", enabled: boolean): Promise<void>;
+  setProviderEnabled(provider: "anthropic_subscription" | "openai_subscription" | "xai_subscription", enabled: boolean): Promise<void>;
   /** Remove an account by id. Throws on non-2xx or network error. */
   remove(id: string): Promise<void>;
 }
 
 export function createAccountsApi(baseUrl: string, authToken?: string): AccountsApi {
-  const base = baseUrl.replace(/\/+$/, "") + "/cc-router/accounts";
+  const root = baseUrl.replace(/\/+$/, "");
+  const base = root + "/cc-router/accounts";
   const authHeaders: Record<string, string> = authToken ? { authorization: `Bearer ${authToken}` } : {};
 
   async function send(method: "PATCH" | "DELETE", path: string, body?: unknown): Promise<void> {
@@ -90,11 +111,50 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
     return Array.isArray(payload.accounts) ? payload.accounts.flatMap(publicAccountSafeView) : [];
   }
 
+  async function refreshAll(): Promise<RefreshAllResult> {
+    // Usage fetches for every account run behind this call, so it gets its
+    // own, longer budget than the account mutations above.
+    const res = await fetch(root + "/cc-router/refresh", {
+      method: "POST",
+      headers: authHeaders,
+      signal: AbortSignal.timeout(REFRESH_ALL_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await res.json() as { refresh?: unknown };
+    return publicRefreshResult(payload.refresh);
+  }
+
   return {
     list,
+    refreshAll,
+    async resetUsage(id, redeemRequestId) {
+      const response = await fetch(`${base}/${encodeURIComponent(id)}/reset-usage`, {
+        method: "POST",
+        headers: { ...authHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ redeemRequestId }),
+        signal: AbortSignal.timeout(REFRESH_ALL_TIMEOUT_MS),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const body: unknown = await response.json();
+      const reset = isRecord(body) ? body.reset : undefined;
+      if (!isRecord(reset) || typeof reset.code !== "string" || !["reset", "nothing_to_reset", "no_credit", "already_redeemed"].includes(reset.code)
+        || typeof reset.usageRefreshed !== "boolean") throw new Error("Invalid reset response");
+      return { code: reset.code as CodexResetCode, usageRefreshed: reset.usageRefreshed };
+    },
     patch(id, patch) { return send("PATCH", `/${encodeURIComponent(id)}`, patch); },
     setProviderEnabled(provider, enabled) { return send("PATCH", `/providers/${encodeURIComponent(provider)}`, { enabled }); },
     remove(id) { return send("DELETE", `/${encodeURIComponent(id)}`); },
+  };
+}
+
+function publicRefreshResult(value: unknown): RefreshAllResult {
+  const record = isRecord(value) ? value : {};
+  return {
+    accounts: publicInteger(record.accounts),
+    usageRefreshed: publicInteger(record.usageRefreshed),
+    usageFailed: publicInteger(record.usageFailed),
+    tokenRefreshFailed: publicInteger(record.tokenRefreshFailed),
+    durationMs: publicInteger(record.durationMs),
   };
 }
 
@@ -104,7 +164,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function publicAccountSafeView(value: unknown): AccountSafeView[] {
   if (!isRecord(value) || typeof value.id !== "string") return [];
-  const provider = value.provider === "anthropic_subscription" || value.provider === "openai_subscription"
+  const provider = value.provider === "anthropic_subscription"
+    || value.provider === "openai_subscription"
+    || value.provider === "xai_subscription"
     ? value.provider
     : undefined;
   const rateLimits = publicRateLimits(value.rateLimits);

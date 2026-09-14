@@ -3,6 +3,9 @@ import type { Request, RequestHandler } from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
 import type { Options } from "http-proxy-middleware";
 
+/** Inbound trace context is stripped rather than forwarded (see proxyReq). */
+const TRACE_CONTEXT_HEADERS = ["traceparent", "tracestate", "baggage"];
+
 export interface AnthropicProxyOptions {
   target: string;
   timeoutMs: number;
@@ -25,18 +28,14 @@ export function createAnthropicProxy(options: AnthropicProxyOptions): RequestHan
     on: {
       ...options.on,
       proxyReq: (proxyRequest, request, response, proxyOptions) => {
-        const stripPropagationHeaders = (): void => {
-          proxyRequest.removeHeader("traceparent");
-          proxyRequest.removeHeader("tracestate");
-          proxyRequest.removeHeader("baggage");
-        };
-        stripPropagationHeaders();
+        // Telemetry never joins a distributed trace: a client's context headers
+        // must not reach the upstream provider through this proxy.
+        for (const header of TRACE_CONTEXT_HEADERS) proxyRequest.removeHeader(header);
         proxyRequest.once("response", () => {
           proxyRequest.setTimeout(0);
           request.socket.setTimeout(0);
         });
         configuredProxyRequest?.(proxyRequest, request, response, proxyOptions);
-        if (!proxyRequest.headersSent) stripPropagationHeaders();
       },
     },
   });

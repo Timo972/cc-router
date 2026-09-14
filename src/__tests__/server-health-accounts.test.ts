@@ -7,7 +7,6 @@ import {
   createHealthAccountViews,
   createOpenAIPersister,
   createOperationalStatus,
-  shouldRecordAnthropicRuntimeFailure,
 } from "../proxy/server.js";
 import { applyOpenAIAccountPatch } from "../proxy/account-patch.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
@@ -51,14 +50,6 @@ function makeAnthropicAccount(): Account {
     weeklyLimitPercent: 90,
   };
 }
-
-describe("shouldRecordAnthropicRuntimeFailure", () => {
-  it("includes every upstream 5xx plus explicitly classified client failures", () => {
-    expect([401, 403, 429, 500, 502, 503, 504, 529].filter(shouldRecordAnthropicRuntimeFailure))
-      .toEqual([401, 403, 429, 500, 502, 503, 504, 529]);
-    expect([200, 400, 404].filter(shouldRecordAnthropicRuntimeFailure)).toEqual([]);
-  });
-});
 
 describe("createHealthAccountViews", () => {
   it("combines Anthropic pool stats with OpenAI subscription account status", () => {
@@ -420,10 +411,13 @@ describe("createOperationalStatus", () => {
       providers: {
         anthropic: { configured: true, accounts: 1, healthy: 1, enabled: 1 },
         openai: { configured: true, accounts: 1, healthy: 1, enabled: 1 },
+        xai: { configured: false, accounts: 0, healthy: 0, enabled: 0 },
       },
       endpoints: {
         health: "/cc-router/health",
         accounts: "/cc-router/accounts",
+        allowance: "/cc-router/allowance",
+        refresh: "/cc-router/refresh",
         messages: "/v1/messages",
         responses: "/v1/responses",
         models: "/v1/models",
@@ -445,5 +439,39 @@ describe("createOperationalStatus", () => {
 
     expect(JSON.stringify(status)).not.toContain("openai-access");
     expect(JSON.stringify(status)).not.toContain("ant-access");
+  });
+
+  it("surfaces a Grok CLI overview account without copying tokens", () => {
+    const views = createHealthAccountViews([], [], undefined, undefined, [{
+      id: "grok",
+      provider: "xai_subscription",
+      enabled: true,
+      healthy: true,
+      busy: true,
+      inFlightRequests: 0,
+      activeSessions: 2,
+      requestCount: 0,
+      errorCount: 0,
+      expiresInMs: 60_000,
+      lastUsedMs: 0,
+      lastRefreshMs: 0,
+      tier: 1,
+    }]);
+    expect(views).toEqual([{
+      id: "grok",
+      provider: "xai_subscription",
+      enabled: true,
+      healthy: true,
+      busy: true,
+      inFlightRequests: 0,
+      activeSessions: 2,
+      requestCount: 0,
+      errorCount: 0,
+      expiresInMs: 60_000,
+      lastUsedMs: 0,
+      lastRefreshMs: 0,
+      xai: { tier: 1 },
+    }]);
+    expect(JSON.stringify(views)).not.toContain("eyJ");
   });
 });

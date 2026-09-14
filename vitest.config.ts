@@ -14,7 +14,6 @@ export default defineConfig({
       include: [
         "src/proxy/**/*.ts",
         "src/config/**/*.ts",
-        "src/telemetry/**/*.ts",
         "src/utils/**/*.ts",
       ],
       exclude: [

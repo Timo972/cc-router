@@ -3,6 +3,11 @@ import { applyCodexRateLimits } from "./account-state.js";
 import { parseCodexUsagePayload, type CodexRateLimitsUpdate } from "./usage.js";
 import { UsageRefresher } from "../../proxy/usage-refresher.js";
 import type { RefreshableAccountPool } from "../../proxy/usage-refresher.js";
+import {
+  recordRuntimeError,
+  recordUpstreamStatus,
+  withTelemetrySpan,
+} from "../../telemetry/facade.js";
 
 /**
  * The endpoint the Codex CLI's own backend client reads rate limits from
@@ -14,17 +19,24 @@ export const CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage"
 
 export type CodexUsageFetchResult =
   | { ok: true; update: CodexRateLimitsUpdate }
-  | { ok: false; reason: "auth" | "http"; status: number }
-  | { ok: false; reason: "network" | "malformed" };
+  | { ok: false; reason: "auth" | "http" | "network" | "malformed" };
 
 export interface FetchCodexUsageOptions {
   fetch?: typeof globalThis.fetch;
   now?: () => number;
 }
 
-export async function fetchCodexUsage(
+export function fetchCodexUsage(
   account: Pick<OpenAIAccount, "accessToken">,
   options: FetchCodexUsageOptions = {},
+): Promise<CodexUsageFetchResult> {
+  return withTelemetrySpan("provider.usage_refresh", { provider: "openai" }, () =>
+    runCodexUsageFetch(account, options));
+}
+
+async function runCodexUsageFetch(
+  account: Pick<OpenAIAccount, "accessToken">,
+  options: FetchCodexUsageOptions,
 ): Promise<CodexUsageFetchResult> {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   const now = options.now ?? Date.now;
@@ -35,13 +47,15 @@ export async function fetchCodexUsage(
       headers: { authorization: `Bearer ${account.accessToken}` },
       signal: AbortSignal.timeout(10_000),
     });
-  } catch {
+  } catch (error) {
+    recordRuntimeError(error, { operation: "provider.usage_refresh", provider: "openai" });
     return { ok: false, reason: "network" };
   }
-  if (response.status === 401 || response.status === 403) {
-    return { ok: false, reason: "auth", status: response.status };
+  if (!response.ok) {
+    recordUpstreamStatus("provider.usage_refresh", "openai", response.status);
   }
-  if (!response.ok) return { ok: false, reason: "http", status: response.status };
+  if (response.status === 401 || response.status === 403) return { ok: false, reason: "auth" };
+  if (!response.ok) return { ok: false, reason: "http" };
 
   let body: unknown;
   try {
@@ -88,38 +102,24 @@ export class OpenAIUsageRefresher extends UsageRefresher<OpenAIAccount, CodexUsa
           } catch {
             ready = false;
           }
-          if (!ready) return { ok: false, reason: "auth", status: 401 };
+          if (!ready) return { ok: false, reason: "auth" };
         }
         return fetchUsage(account);
       },
       cancelledResult: () => ({ ok: false, reason: "network" }),
-      telemetry: {
-        provider: "openai",
-        classifyResult: result => {
-          if (result.ok) return { outcome: "complete" };
-          if (result.reason === "network") {
-            return { outcome: "upstream_error", reason: "network_failure" };
-          }
-          if (result.reason === "malformed") {
-            return { outcome: "upstream_error", reason: "unexpected_response_shape" };
-          }
-          if (!("status" in result)) {
-            return { outcome: "upstream_error", reason: "other" };
-          }
-          const reason = result.status === 401 ? "unauthorized"
-            : result.status === 403 ? "forbidden"
-            : result.status === 429 ? "rate_limited"
-            : result.status >= 500 ? "upstream_5xx"
-            : "upstream_4xx";
-          return {
-            outcome: result.status === 429 ? "rate_limited" : "upstream_error",
-            reason,
-            httpStatusCode: result.status,
-          };
-        },
-      },
       applyResult: (account, result) => {
-        if (result.ok) applyCodexRateLimits(account, result.update, now());
+        if (result.ok) {
+          applyCodexRateLimits(account, result.update, now());
+          // A successful authenticated poll clears only the advisory usage
+          // trouble state; permanent OAuth quarantine is owned by refresh.
+          if (account.authFailure === "transient") account.authFailure = undefined;
+        } else if (result.reason === "auth") {
+          // A usage endpoint 403 can be entitlement/scope related. Surface it
+          // as transient diagnostic state but never quarantine on this alone.
+          // Refresh owns permanent quarantine, so an advisory poll must not
+          // overwrite that stronger diagnosis.
+          if (account.authState !== "quarantined") account.authFailure = "transient";
+        }
       },
       ...(options.now !== undefined ? { now: options.now } : {}),
       ...(options.startupStaggerMs !== undefined ? { startupStaggerMs: options.startupStaggerMs } : {}),

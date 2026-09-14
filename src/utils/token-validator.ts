@@ -13,18 +13,12 @@ import {
 
 export type ValidationResult =
   | { valid: true }
+  /** Human-readable reason if invalid, plus its closed telemetry classification */
   | { valid: false; reason: string; diagnostic: SetupDiagnosticError };
 
-export interface TokenValidationOptions {
-  fetchImpl?: typeof fetch;
-}
-
-export async function validateToken(
-  accessToken: string,
-  options: TokenValidationOptions = {},
-): Promise<ValidationResult> {
+export async function validateToken(accessToken: string): Promise<ValidationResult> {
   try {
-    const res = await (options.fetchImpl ?? fetch)("https://api.anthropic.com/v1/models", {
+    const res = await fetch("https://api.anthropic.com/v1/models", {
       headers: {
         "Authorization": `Bearer ${accessToken}`,
         "anthropic-version": "2023-06-01",
@@ -39,6 +33,7 @@ export async function validateToken(
       ? "Token invalid or expired (401)"
       : res.status === 403
         ? "Token lacks required scopes (403) — needs user:inference"
+        // Any other non-ok status is unexpected but the token may still work
         : `Unexpected HTTP ${res.status}`;
     return {
       valid: false,
@@ -47,7 +42,7 @@ export async function validateToken(
     };
   } catch (err) {
     // Network error — can't validate, let user decide
-    const reason = `Network error: ${err instanceof Error ? err.message : String(err)}`;
+    const reason = `Network error: ${(err as Error).message}`;
     return {
       valid: false,
       reason,

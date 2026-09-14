@@ -12,11 +12,8 @@ import { OpenAITokenPool } from "../providers/openai/token-pool.js";
 import { applyCodexRateLimits, createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
 import { parseCodexRateLimits } from "../providers/openai/usage.js";
 import { stats, type LogEntry } from "../proxy/stats.js";
-import { MAX_CODEX_STREAM_EVENT_BYTES } from "../protocol/openai-responses-collect.js";
 
 type ForwardOpenAI = (opts: { account: OpenAIAccount; body: OpenAIResponsesRequest; stream: boolean; signal?: AbortSignal }) => Promise<Response>;
-
-const networkFetch = globalThis.fetch;
 
 async function withServer(
   app: ReturnType<typeof express>,
@@ -29,7 +26,6 @@ async function withServer(
     if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
     await fn(`http://127.0.0.1:${address.port}`);
   } finally {
-    server.closeAllConnections();
     await new Promise<void>((resolve, reject) => {
       server.close(err => err ? reject(err) : resolve());
     });
@@ -174,19 +170,17 @@ function makeRuntimeAccount(id: string): OpenAIAccount {
 
 function mountWithPool(
   accounts: OpenAIAccount[],
-  forwardOpenAI?: ForwardOpenAI,
+  forwardOpenAI: ForwardOpenAI,
   extra: Partial<ResponsesRoutesOptions> = {},
-  beforeMount?: (app: ReturnType<typeof express>) => void,
 ) {
   const app = express();
-  beforeMount?.(app);
   const openAIPool = new OpenAITokenPool(accounts);
   const openAIRouter = new SessionRouter<OpenAIAccount>(openAIPool);
   const activity: LogEntry[] = [];
   mountResponsesRoutes(app, {
     openAIRouter,
     openAIPool,
-    ...(forwardOpenAI ? { forwardOpenAI } : {}),
+    forwardOpenAI,
     recordActivity: entry => activity.push(entry),
     ...extra,
   });
@@ -195,129 +189,6 @@ function mountWithPool(
 
 describe("mountResponsesRoutes", () => {
   afterEach(() => vi.restoreAllMocks());
-
-  it.each([false, true])(
-    "preserves default-forwarder JSON errors and only forwards safe response headers (stream=%s)",
-    async stream => {
-      const privateBody = JSON.stringify({ error: { message: "private upstream detail" } });
-      vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-        const url = new URL(input instanceof Request ? input.url : input.toString());
-        if (url.hostname === "chatgpt.com") {
-          return new Response(privateBody, {
-            status: 429,
-            headers: {
-              "content-type": "application/json",
-              "retry-after": "17",
-              "set-cookie": "private_session=secret",
-              "x-upstream-secret": "do-not-forward",
-            },
-          });
-        }
-        return networkFetch(input, init);
-      });
-
-      const { app } = mountWithPool([makeRuntimeAccount("openai-victor")]);
-
-      await withServer(app, async baseUrl => {
-        const res = await networkFetch(`${baseUrl}/v1/responses`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream }),
-        });
-
-        expect(res.status).toBe(429);
-        expect(res.headers.get("content-type")).toContain("application/json");
-        expect(res.headers.get("retry-after")).toBe("17");
-        expect(res.headers.get("set-cookie")).toBeNull();
-        expect(res.headers.get("x-upstream-secret")).toBeNull();
-        expect(await res.text()).toBe(privateBody);
-      });
-    },
-  );
-
-  it("reports premature EOF without mutating bytes already relayed to the client", async () => {
-    const body = 'data: {"type":"response.created","response":{"id":"resp_cut_off"}}\n\n';
-    const { app, activity } = mountWithPool(
-      [makeRuntimeAccount("openai-victor")],
-      async () => new Response(
-        body,
-        { status: 200, headers: { "content-type": "text/event-stream" } },
-      ),
-    );
-
-    await withServer(app, async baseUrl => {
-      const res = await fetch(`${baseUrl}/v1/responses`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
-      });
-
-      expect(res.status).toBe(200);
-      expect(await res.text()).toBe(body);
-      await vi.waitFor(() => expect(activity).toHaveLength(1));
-      expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
-    });
-  });
-
-  it("relays an oversized frame byte-for-byte while the bounded observer recovers for a later terminal", async () => {
-    let upstreamCancelled = false;
-    const oversized = `data: ${"x".repeat(MAX_CODEX_STREAM_EVENT_BYTES + 1)}\n`;
-    const terminal = 'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n';
-    const { app, activity } = mountWithPool(
-      [makeRuntimeAccount("openai-victor")],
-      async () => new Response(new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(oversized));
-          controller.enqueue(new TextEncoder().encode(terminal));
-          controller.close();
-        },
-        cancel() {
-          upstreamCancelled = true;
-        },
-      }) as BodyInit, {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      }),
-    );
-
-    await withServer(app, async baseUrl => {
-      const res = await fetch(`${baseUrl}/v1/responses`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
-      });
-      expect(await res.text()).toBe(oversized + terminal);
-      expect(upstreamCancelled).toBe(false);
-      await vi.waitFor(() => expect(activity).toHaveLength(1));
-      expect(activity[0]).toEqual(expect.objectContaining({ type: "route", statusCode: 200 }));
-    });
-  });
-
-  it.each([
-    ["response.incomplete", { type: "response.incomplete", response: { id: "resp_1", status: "incomplete" } }],
-    ["response.failed", { type: "response.failed", response: { error: { message: "failed" } } }],
-    ["error", { type: "error", error: { message: "errored" } }],
-  ])("relays a %s terminal event exactly once before closing", async (_name, event) => {
-    const body = `data: ${JSON.stringify(event)}\n\n`;
-    const { app } = mountWithPool(
-      [makeRuntimeAccount("openai-victor")],
-      async () => new Response(body, {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      }),
-    );
-
-    await withServer(app, async baseUrl => {
-      const res = await fetch(`${baseUrl}/v1/responses`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
-      });
-
-      expect(res.status).toBe(200);
-      expect(await res.text()).toBe(body);
-    });
-  });
 
   it("rejects an explicit store:true with 400 and records exactly one warn entry", async () => {
     const forward = vi.fn();
@@ -346,7 +217,7 @@ describe("mountResponsesRoutes", () => {
   });
 
   it("bounds an oversized client model name in every retained activity entry", async () => {
-    // A 10mb body limit means the model string is a client-controlled lever on
+    // The request body limit means the model string is a client-controlled lever on
     // how much the 100-entry activity buffer retains, and on how much the
     // health response re-serializes each time it is read.
     const oversized = `openai/${"g".repeat(50_000)}`;
@@ -437,6 +308,40 @@ describe("mountResponsesRoutes", () => {
         },
       ]);
     });
+  });
+
+  it("accepts valid Codex Responses payloads larger than 10 MiB", async () => {
+    const toolOutput = "x".repeat(11 * 1024 * 1024);
+    let forwardedOutputLength = 0;
+    const forward: ForwardOpenAI = async ({ body }) => {
+      const output = body.input[0]?.content[0];
+      if (output?.type === "function_call_output") forwardedOutputLength = output.output.length;
+      return new Response(JSON.stringify({ id: "resp_large" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const { app } = mountWithPool([makeRuntimeAccount("openai-victor")], forward);
+
+    await withServer(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/gpt-5.5",
+          input: [{
+            role: "tool",
+            content: [{ type: "function_call_output", call_id: "call_large", output: toolOutput }],
+          }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ id: "resp_large" });
+    });
+
+    expect(forwardedOutputLength).toBe(toolOutput.length);
   });
 
   it("applies configured OpenAI model aliases before forwarding Responses requests", async () => {
@@ -537,124 +442,6 @@ describe("mountResponsesRoutes", () => {
       expect(new TextDecoder().decode(firstChunk.value)).toContain("response.created");
       await reader.cancel();
     });
-  });
-
-  it("pauses native Responses upstream reads while the client response is backpressured", async () => {
-    const encoder = new TextEncoder();
-    const chunks = [
-      encoder.encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'),
-      encoder.encode('data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n'),
-    ];
-    let nextChunk = 0;
-    const read = vi.fn(async () => nextChunk < chunks.length
-      ? { value: chunks[nextChunk++], done: false as const }
-      : { value: undefined, done: true as const });
-    const cancel = vi.fn(async () => undefined);
-    const upstream = {
-      ok: true,
-      status: 200,
-      headers: new Headers({ "content-type": "text/event-stream" }),
-      body: { getReader: () => ({ read, cancel }) },
-    } as unknown as Response;
-    const firstWrite = deferred<ExpressResponse>();
-    let writes = 0;
-    const { app } = mountWithPool(
-      [makeRuntimeAccount("openai-victor")],
-      async () => upstream,
-      {},
-      app => app.use((_req, res, next) => {
-        const originalWrite = res.write.bind(res);
-        res.write = ((...args: unknown[]) => {
-          writes++;
-          const accepted = Reflect.apply(originalWrite, res, args) as boolean;
-          if (writes === 1) {
-            firstWrite.resolve(res);
-            return false;
-          }
-          return accepted;
-        }) as ExpressResponse["write"];
-        next();
-      }),
-    );
-
-    await withServer(app, async baseUrl => {
-      const response = fetch(`${baseUrl}/v1/responses`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
-      });
-
-      const serverResponse = await firstWrite.promise;
-      await new Promise(resolve => setImmediate(resolve));
-      expect(read).toHaveBeenCalledTimes(1);
-      expect(writes).toBe(1);
-
-      serverResponse.emit("drain");
-      const body = await (await response).text();
-      expect(body).toBe(Buffer.concat(chunks.map(chunk => Buffer.from(chunk))).toString("utf8"));
-      expect(read).toHaveBeenCalledTimes(3);
-      expect(cancel).not.toHaveBeenCalled();
-    });
-  });
-
-  it("cancels the native Responses reader when the client closes during backpressure", async () => {
-    const encoder = new TextEncoder();
-    const neverRead = deferred<ReadableStreamReadResult<Uint8Array>>();
-    const read = vi.fn()
-      .mockResolvedValueOnce({
-        value: encoder.encode('data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'),
-        done: false,
-      })
-      .mockImplementationOnce(() => neverRead.promise);
-    const cancel = vi.fn(async () => undefined);
-    const upstream = {
-      ok: true,
-      status: 200,
-      headers: new Headers({ "content-type": "text/event-stream" }),
-      body: { getReader: () => ({ read, cancel }) },
-    } as unknown as Response;
-    const firstWrite = deferred<void>();
-    let writes = 0;
-    const { app } = mountWithPool(
-      [makeRuntimeAccount("openai-victor")],
-      async () => upstream,
-      {},
-      app => app.use((_req, res, next) => {
-        const originalWrite = res.write.bind(res);
-        res.write = ((...args: unknown[]) => {
-          writes++;
-          Reflect.apply(originalWrite, res, args);
-          if (writes === 1) {
-            firstWrite.resolve();
-            return false;
-          }
-          return true;
-        }) as ExpressResponse["write"];
-        next();
-      }),
-    );
-    const abort = new AbortController();
-    const response = withServer(app, async baseUrl => {
-      const pending = fetch(`${baseUrl}/v1/responses`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
-        signal: abort.signal,
-      }).then(res => res.text()).catch(() => undefined);
-      try {
-        await firstWrite.promise;
-        await new Promise(resolve => setImmediate(resolve));
-        expect(read).toHaveBeenCalledTimes(1);
-        abort.abort();
-        await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
-        expect(read).toHaveBeenCalledTimes(1);
-        expect(writes).toBe(1);
-      } finally {
-        neverRead.resolve({ value: undefined, done: true });
-        await pending;
-      }
-    });
-    await response;
   });
 
   it("warns on an explicit max_output_tokens, then forwards and reconciles", async () => {
@@ -1058,64 +845,6 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     }
   });
 
-  it.each([
-    ["streaming", true],
-    ["collected", false],
-  ])("keeps a bodyless successful-SSE %s response owned by upstream after client disconnect", async (_name, stream) => {
-    const account = makeRuntimeAccount("openai-victor");
-    const forwardStarted = deferred<void>();
-    const forward: ForwardOpenAI = async opts => {
-      forwardStarted.resolve();
-      // Make the server observe the disconnect before the bodyless successful
-      // SSE arrives. Upstream's invalid response must still own the outcome.
-      await new Promise<void>(resolve => {
-        if (opts.signal?.aborted) resolve();
-        else opts.signal?.addEventListener("abort", () => resolve(), { once: true });
-      });
-      return new Response(null, {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      });
-    };
-    const { app, activity, openAIPool } = mountWithPool([account], forward);
-    const server = createServer(app);
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    let client: ClientRequest | undefined;
-
-    try {
-      const port = (server.address() as AddressInfo).port;
-      const body = JSON.stringify({ model: "openai/gpt-5.5", input: [], stream });
-      const clientClosed = new Promise<void>(resolve => {
-        client = httpRequest({
-          host: "127.0.0.1",
-          port,
-          path: "/v1/responses",
-          method: "POST",
-          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
-        });
-        client.on("error", () => resolve());
-        client.on("close", () => resolve());
-        client.end(body);
-      });
-
-      await forwardStarted.promise;
-      client!.destroy();
-      await clientClosed;
-      await vi.waitFor(() => expect(activity).toHaveLength(1));
-
-      expect(activity[0]).toEqual(expect.objectContaining({ type: "error", statusCode: 502 }));
-      expect(activity[0]?.details).not.toContain("client-cancelled");
-      expect(account.errorCount).toBe(1);
-      expect(account.consecutiveErrors).toBe(1);
-      // A synthesized generic 502 counts against the account but is not an
-      // overload/rate-limit signal and must not invent a cooldown horizon.
-      expect(openAIPool.getGlobalCooldownUntil(account.id)).toBe(0);
-    } finally {
-      client?.destroy();
-      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
-    }
-  });
-
   it("still counts an explicit response.failed when the client disconnects after it", async () => {
     const account = makeRuntimeAccount("openai-victor");
     const failureSent = deferred<void>();
@@ -1263,7 +992,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     }
   });
 
-  it("does not forward after the client disconnects during token refresh (P2 disconnect)", async () => {
+  it.each([true, false])("does not charge a disconnect during token refresh (refresh succeeds: %s)", async (refreshSucceeds) => {
     const account = makeRuntimeAccount("openai-victor");
     const refreshStarted = deferred<void>();
     const refreshResult = deferred<boolean>();
@@ -1302,11 +1031,13 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
 
       // Resolve the refresh only after the disconnect was observed — the
       // handler must see the terminated response and stop before forwarding.
-      refreshResult.resolve(true);
+      refreshResult.resolve(refreshSucceeds);
       await new Promise(resolve => setImmediate(resolve));
 
       expect(forward).not.toHaveBeenCalled();
       expect(openAIPool.getInFlight(account.id)).toBe(0);
+      expect(account.errorCount).toBe(0);
+      if (!refreshSucceeds) expect(openAIPool.tryAcquire(account.id)).toBeNull();
     } finally {
       refreshResult.resolve(true);
       client?.destroy();
@@ -1393,7 +1124,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
   it("returns a local 502 when the relay throws before any bytes reach the client (F1d)", async () => {
     const forward: ForwardOpenAI = async () => new Response("data: x\n\n", {
       status: 200,
-      headers: { "content-type": "text/event-stream", "retry-after": "1" },
+      headers: { "content-type": "text/event-stream", "x-boom": "1" },
     });
     const app = express();
     // Force the relay's header-mirroring loop to throw for one specific
@@ -1402,7 +1133,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     app.use((_req, res: ExpressResponse, next) => {
       const original = res.setHeader.bind(res);
       res.setHeader = ((name: string, value: unknown) => {
-        if (String(name).toLowerCase() === "retry-after") throw new Error("setHeader boom");
+        if (String(name).toLowerCase() === "x-boom") throw new Error("setHeader boom");
         return original(name, value);
       }) as typeof res.setHeader;
       next();
@@ -1433,7 +1164,7 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
     expect(activity.some(entry => entry.type === "error" && entry.statusCode === 502)).toBe(true);
   });
 
-  it("tears down gracefully and still records an error entry when the relay throws after bytes were already flushed (F1e)", async () => {
+  it("destroys a partial response and records an error when the upstream body fails (F1e)", async () => {
     const forward: ForwardOpenAI = async () => {
       let calls = 0;
       const reader = {
@@ -1444,7 +1175,6 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
           }
           throw new Error("connection reset mid-stream");
         },
-        cancel: async () => undefined,
       };
       return {
         ok: true,
@@ -1463,17 +1193,18 @@ describe("mountResponsesRoutes crash safety and relay correctness (F1/F5/F6/F10)
         body: JSON.stringify({ model: "openai/gpt-5.5", input: [], stream: true }),
       });
 
-      // Status/headers were already committed before the failure — the best
-      // we can do is stop, not retract what was already sent.
+      // Status/headers were already committed before the failure. The client
+      // must observe a broken response rather than a normal EOF that makes a
+      // partial generation look complete.
       expect(res.status).toBe(200);
-      expect(await res.text()).toBe("data: partial\n\n");
+      await expect(res.text()).rejects.toThrow();
     });
 
-    expect(activity.some(entry => entry.type === "error")).toBe(true);
+    await vi.waitFor(() => expect(activity.some(entry => entry.type === "error")).toBe(true));
     // A REAL relay failure (no client disconnect) must still reach the log —
     // deferring the log line for the cancellation check must not swallow it.
     expect(
-      logSpy.mock.calls.map(call => String(call[0])).filter(line => line.includes("relay failed")),
+      logSpy.mock.calls.map(call => String(call[0])).filter(line => line.includes("operation=relay")),
     ).toHaveLength(1);
   });
 
@@ -1922,6 +1653,64 @@ describe("mountResponsesRoutes sticky routing", () => {
     expect(entry?.inputTokens).toBe(40);
     expect(entry?.outputTokens).toBe(25);
     expect(entry?.cacheReadTokens).toBe(60);
+  });
+
+  it("logs the routed request with its route reason on the success path", async () => {
+    const account = makeRuntimeAccount("openai-a");
+    const { app } = mountWithPool([account], vi.fn(async () => sseResponse()));
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await withServer(app, async baseUrl => {
+      const response = await post(baseUrl, {});
+      expect(await response.text()).toBe(SSE_BODY);
+    });
+
+    // Mirrors the Anthropic path's per-request route log (server.ts) —
+    // previously the OpenAI/Responses ingress logged nothing at all for a
+    // successful route, making routing decisions invisible on this path.
+    const routeLines = logSpy.mock.calls
+      .map(call => call.map(String).join(" "))
+      .filter(line => line.includes(account.id) && line.includes("req#"));
+    expect(routeLines.length).toBeGreaterThan(0);
+    // The reason segment must be EXACTLY one of the router's own
+    // (session-id-free) labels, with nothing appended beyond the known
+    // segments — account id / req# / exp= / reason. A prior version of this
+    // assertion only checked that one of these keywords appeared *anywhere*
+    // in the line, which would also pass for a leaked `sticky session=<id>`.
+    expect(routeLines[0]).toMatch(
+      new RegExp(`^\\[[^\\]]+\\] → ${account.id} req#\\d+ exp=\\d+min (sticky|new-session|unscoped|failover)(:fallback)?$`),
+    );
+  });
+
+  it("never logs the client-supplied session identifier, even for a sticky-routed second request", async () => {
+    // A distinct account id (not the "openai-a" reused by neighboring tests
+    // in this file) so a trailing async log tail from another test can never
+    // bleed into this test's route-line filter — see drainedErrorTotal()
+    // above for the same race in the error-count case.
+    const account = makeRuntimeAccount("openai-privacy-check");
+    const { app } = mountWithPool([account], vi.fn(async () => sseResponse()));
+    const sessionId = "session-privacy-check-do-not-leak";
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await withServer(app, async baseUrl => {
+      const first = await post(baseUrl, {}, { "session_id": sessionId });
+      await first.text();
+      const second = await post(baseUrl, {}, { "session_id": sessionId });
+      await second.text();
+    });
+
+    const routeLines = logSpy.mock.calls
+      .map(call => call.map(String).join(" "))
+      .filter(line => line.includes(account.id) && line.includes("req#"));
+    expect(routeLines.length).toBe(2);
+    // The second request on the same session must route "sticky" ...
+    expect(routeLines[1]).toMatch(
+      new RegExp(`^\\[[^\\]]+\\] → ${account.id} req#\\d+ exp=\\d+min (sticky)(:fallback)?$`),
+    );
+    // ... and the session identifier itself must never appear in any logged
+    // line — that is the privacy invariant this test exists to guard.
+    const allLoggedText = logSpy.mock.calls.map(call => call.map(String).join(" ")).join("\n");
+    expect(allLoggedText).not.toContain(sessionId);
   });
 
   it("streams a response.incomplete terminal event byte-for-byte and records it as a successful route with usage, not a 502", async () => {

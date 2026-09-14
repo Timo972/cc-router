@@ -4,7 +4,7 @@ import { existsSync } from "fs";
 import { input, confirm } from "@inquirer/prompts";
 import { readConfig, writeConfig, type ClientConfig } from "../config/manager.js";
 import { writeClaudeSettings, removeClaudeSettings, readClaudeProxySettings } from "../utils/claude-config.js";
-import { codexBaseUrlFromRouterUrl, writeCodexRouterConfigFromClient } from "../utils/codex-config.js";
+import { codexBaseUrlFromRouterUrl, writeCodexRouterConfigFromClient, removeCodexRouterConfig } from "../utils/codex-config.js";
 import { isMacos, isWindows } from "../utils/platform.js";
 import {
   checkMitmproxyInstalled,
@@ -23,7 +23,6 @@ import {
   isInterceptorServiceInstalled,
   removeCaCert,
 } from "../interceptor/mitmproxy-manager.js";
-import { exitCli } from "./errors.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -158,7 +157,7 @@ export function registerClient(program: Command): void {
         console.error(chalk.red(`\n✗ Cannot reach CC-Router at ${url}`));
         console.error(chalk.yellow(`  Error: ${test.error}`));
         console.error(chalk.gray("  Make sure the server is running and accessible.\n"));
-        exitCli(1);
+        process.exit(1);
       }
       console.log(chalk.green(`✓ Connected — ${test.data?.accounts?.length ?? "?"} accounts on server\n`));
 
@@ -222,7 +221,7 @@ export function registerClient(program: Command): void {
       const cfg = readConfig();
       if (!cfg.client?.remoteUrl) {
         console.error(chalk.red("✗ Client mode is not configured. Run: cc-router client connect <url>"));
-        exitCli(1);
+        process.exit(1);
       }
       writeClaudeSettings(0, cfg.client.remoteUrl, cfg.client.remoteSecret ?? "proxy-managed", opts.model);
       console.log(chalk.green("✓ Claude Code configured to route through CC-Router"));
@@ -247,7 +246,7 @@ export function registerClient(program: Command): void {
         printCodexTokenReminder(result.hasSecret);
       } catch (err) {
         console.error(chalk.red(`✗ ${(err as Error).message}`));
-        exitCli(1);
+        process.exit(1);
       }
     });
 
@@ -285,13 +284,14 @@ export function registerClient(program: Command): void {
       }
 
       removeClaudeSettings();
+      removeCodexRouterConfig();
 
       const current = readConfig();
       delete current.client;
       writeConfig(current);
 
       console.log(chalk.green("\n✓ Disconnected from CC-Router"));
-      console.log(chalk.gray("  Claude Code will use direct Anthropic connection on next restart.\n"));
+      console.log(chalk.gray("  Claude Code and Codex CLI will use their native auth on next restart.\n"));
     });
 
   // ── cc-router client status ─────────────────────────────────────────────────
@@ -422,14 +422,14 @@ export function registerClient(program: Command): void {
       const cfg = readConfig();
       if (!cfg.client) {
         console.error(chalk.red("Not connected. Run: cc-router client connect <url>"));
-        exitCli(1);
+        process.exit(1);
       }
 
       if (!(await checkMitmproxyInstalled())) {
         console.error(chalk.red("\n✗ mitmproxy not found. Install it first:"));
         console.error(chalk.cyan(isMacos() ? "    brew install mitmproxy" : "    pip install mitmproxy"));
         console.error();
-        exitCli(1);
+        process.exit(1);
       }
 
       if (!cfg.client.desktopEnabled) {
@@ -451,7 +451,7 @@ export function registerClient(program: Command): void {
           });
           if (openNow) await openNetworkExtensionSettings();
           console.error(chalk.yellow("\n  Re-run `cc-router client start-desktop` after approving.\n"));
-          exitCli(1);
+          process.exit(1);
         }
         if (status === "not_installed") {
           console.error(chalk.yellow("\n⚠  Mitmproxy Network Extension is not installed yet."));
@@ -472,7 +472,7 @@ export function registerClient(program: Command): void {
         console.error(chalk.red(`\n✗ Failed to start interceptor:\n`));
         console.error(chalk.yellow("  " + (e as Error).message.split("\n").join("\n  ")));
         console.error();
-        exitCli(1);
+        process.exit(1);
       }
 
       console.log(chalk.green("\n✓ Claude Desktop interceptor running"));

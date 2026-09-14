@@ -2,6 +2,7 @@ import type { Command } from "commander";
 import { confirm } from "@inquirer/prompts";
 import chalk from "chalk";
 import { removeClaudeSettings, readClaudeProxySettings } from "../utils/claude-config.js";
+import { removeCodexRouterConfig, readCodexRouterConfig } from "../utils/codex-config.js";
 import { PROXY_PORT } from "../config/paths.js";
 import { stopDaemon } from "../daemon/launcher.js";
 import { isProxyRunning } from "../daemon/pid.js";
@@ -90,6 +91,24 @@ async function stopProxy(opts: { keepConfig?: boolean; full?: boolean }): Promis
       removeClaudeSettings();
       console.log(chalk.green("✓ Removed proxy settings from ~/.claude/settings.json"));
       console.log(chalk.gray("  Claude Code will use its normal authentication on next launch."));
+      anythingDone = true;
+    }
+  }
+
+  // 4. Codex CLI config cleanup
+  const codex = readCodexRouterConfig();
+  if (codex.configured) {
+    let removeCodex = opts.full ?? false;
+    if (!opts.full) {
+      removeCodex = await confirm({
+        message: "Remove proxy settings from Codex CLI? (Codex will use native OpenAI auth)",
+        default: false,
+      });
+    }
+    if (removeCodex) {
+      removeCodexRouterConfig();
+      console.log(chalk.green(`✓ Removed proxy settings from ${codex.path}`));
+      console.log(chalk.gray("  Codex CLI will use its native OpenAI authentication on next launch."));
       anythingDone = true;
     }
   }

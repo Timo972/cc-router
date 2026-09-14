@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   hasPendingCredentialWrite,
   needsOpenAIRefresh,
+  OPENAI_REFRESH_TIMEOUT_MS,
   prepareOpenAIAccountForRequest,
   refreshOpenAISubscriptionToken,
   startOpenAIRefreshLoop,
@@ -18,6 +19,7 @@ function jwt(payload: Record<string, unknown>): string {
 
 describe("OpenAI subscription token refresher", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -134,6 +136,158 @@ describe("OpenAI subscription token refresher", () => {
     expect(save).not.toHaveBeenCalled();
   });
 
+  it("quarantines a permanently rejected refresh past ordinary cooldowns and restores it after reauth", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-revoked", provider: "openai_subscription", accessToken: "still-unexpired",
+      refreshToken: "revoked", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    const pool = new OpenAITokenPool([account]);
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 }));
+
+    expect(await prepareOpenAIAccountForRequest(account, [account], vi.fn())).toBe(false);
+    expect(account.authState).toBe("quarantined");
+    expect(() => pool.acquireBest(new Map())).toThrow(NoEligibleAccountError);
+
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({
+      access_token: "replacement", refresh_token: "replacement-refresh", expires_in: 3600,
+    }), { status: 200 }));
+    expect(await prepareOpenAIAccountForRequest(account, [account], vi.fn())).toBe(true);
+    expect(account.authState).toBe("ok");
+    expect(pool.acquireBest(new Map()).account.id).toBe("openai-revoked");
+  });
+
+  it("keeps transient refresh failures routable once their normal cooldown ends", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-temporary", provider: "openai_subscription", accessToken: "access",
+      refreshToken: "refresh", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("network unavailable"));
+    expect(await prepareOpenAIAccountForRequest(account, [account], vi.fn())).toBe(false);
+    expect(account.authState).toBe("ok");
+    expect(new OpenAITokenPool([account]).acquireBest(new Map()).account.id).toBe("openai-temporary");
+  });
+
+  it("recognizes a nested permanent OAuth rejection and preserves quarantine across transient failures", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-nested", provider: "openai_subscription", accessToken: "access",
+      refreshToken: "revoked", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(Response.json({ error: { type: "invalid_grant" } }, { status: 401 }))
+      .mockRejectedValueOnce(new Error("temporary network failure"));
+
+    expect(await refreshOpenAISubscriptionToken(account)).toBe(false);
+    expect(account.authState).toBe("quarantined");
+    expect(account.authFailure).toBe("permanent");
+
+    expect(await refreshOpenAISubscriptionToken(account)).toBe(false);
+    expect(account.authState).toBe("quarantined");
+    expect(account.authFailure).toBe("permanent");
+  });
+
+  it("sends the OAuth client_id so the token endpoint accepts the refresh", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({ access_token: "fresh", refresh_token: "fresh-refresh", expires_in: 3600 }, { status: 200 }),
+    );
+    const account = createOpenAIAccount({
+      id: "openai-clientid", provider: "openai_subscription", accessToken: "old",
+      refreshToken: "old-refresh", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+
+    expect(await refreshOpenAISubscriptionToken(account)).toBe(true);
+
+    const params = new URLSearchParams(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(params.get("client_id")).toBe("app_EMoamEEZ73f0CkXaXp7hrann");
+    expect(params.get("grant_type")).toBe("refresh_token");
+    expect(params.get("refresh_token")).toBe("old-refresh");
+  });
+
+  it("quarantines on the endpoint's real token_expired rejection code", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-expired", provider: "openai_subscription", accessToken: "access",
+      refreshToken: "expired", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      Response.json({ error: { type: "invalid_request_error", code: "token_expired" } }, { status: 401 }),
+    );
+
+    expect(await refreshOpenAISubscriptionToken(account)).toBe(false);
+    expect(account.authState).toBe("quarantined");
+    expect(account.authFailure).toBe("permanent");
+  });
+
+  it("bounds the whole OAuth response body and releases the shared refresh lock", async () => {
+    vi.useFakeTimers();
+    const account = createOpenAIAccount({
+      id: "openai-stalled-body", provider: "openai_subscription", accessToken: "access",
+      refreshToken: "refresh", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (_input, init) => ({
+      ok: true,
+      json: () => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      }),
+    }) as Response);
+
+    const first = refreshOpenAISubscriptionToken(account);
+    const concurrent = refreshOpenAISubscriptionToken(account);
+    await vi.advanceTimersByTimeAsync(OPENAI_REFRESH_TIMEOUT_MS);
+    await expect(first).resolves.toBe(false);
+    await expect(concurrent).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fetchMock.mockResolvedValueOnce(Response.json({
+      access_token: "recovered", refresh_token: "recovered-refresh", expires_in: 3600,
+    }));
+    await expect(refreshOpenAISubscriptionToken(account)).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keys refresh single-flight by account identity across rename and re-add", async () => {
+    let resolveOriginal!: (value: unknown) => void;
+    const originalBody = new Promise<unknown>(resolve => { resolveOriginal = resolve; });
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce({ ok: true, json: () => originalBody } as Response)
+      .mockResolvedValueOnce(Response.json({ access_token: "replacement-access", expires_in: 3600 }));
+    const original = createOpenAIAccount({
+      id: "openai-old", provider: "openai_subscription", accessToken: "old",
+      refreshToken: "refresh", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+
+    const first = refreshOpenAISubscriptionToken(original);
+    original.id = "openai-renamed";
+    const sameIdentity = refreshOpenAISubscriptionToken(original);
+    const replacement = createOpenAIAccount({
+      id: "openai-renamed", provider: "openai_subscription", accessToken: "replacement-old",
+      refreshToken: "replacement-refresh", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    await expect(refreshOpenAISubscriptionToken(replacement)).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    resolveOriginal({ access_token: "original-access", expires_in: 3600 });
+    await expect(first).resolves.toBe(true);
+    await expect(sameIdentity).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("logs only a safe refresh correlation and network cause code", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-redaction", provider: "openai_subscription", accessToken: "access-secret",
+      refreshToken: "refresh-secret", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    const error = new Error("fetch failed with refresh-secret", { cause: { code: "ECONNRESET" } });
+    vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(error);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    expect(await refreshOpenAISubscriptionToken(account)).toBe(false);
+    const line = logSpy.mock.calls.map(call => String(call[0])).join("\n");
+    expect(line).toContain("operation=refresh");
+    expect(line).toContain("cause=ECONNRESET");
+    expect(line).not.toContain("refresh-secret");
+    expect(line).not.toContain("access-secret");
+    expect(line).not.toContain("fetch failed");
+  });
+
   it("starts a background refresh loop and returns a stopper", async () => {
     vi.useFakeTimers();
     vi.spyOn(globalThis, "fetch").mockResolvedValue({
@@ -157,7 +311,7 @@ describe("OpenAI subscription token refresher", () => {
 
     const stop = startOpenAIRefreshLoop([account], save);
     await vi.runOnlyPendingTimersAsync();
-    await stop();
+    stop();
 
     expect(save).toHaveBeenCalled();
     expect(account.accessToken).toBe("new-access");
@@ -243,7 +397,7 @@ describe("OpenAI subscription token refresher", () => {
 
     const stop = startOpenAIRefreshLoop([first, second], save);
     await vi.runOnlyPendingTimersAsync();
-    await stop();
+    stop();
 
     expect(first.accessToken).toBe("new-access");
     expect(second.accessToken).toBe("new-access");
@@ -402,109 +556,5 @@ describe("OpenAI subscription token refresher", () => {
 
     expect(ok).toBe(true);
     expect(account.rateLimits.plan).toBe("pro");
-  });
-
-  it("drains and persists a deferred startup refresh before stopping", async () => {
-    let resolveJson!: (value: object) => void;
-    const json = new Promise<object>(resolve => { resolveJson = resolve; });
-    vi.spyOn(globalThis, "fetch").mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: () => json,
-    } as Response);
-    const account = {
-      id: "openai-deferred",
-      provider: "openai_subscription" as const,
-      accessToken: "old-access",
-      refreshToken: "old-refresh",
-      expiresAt: Date.now() + 60_000,
-      enabled: true,
-    };
-    const persistedRefreshTokens: string[] = [];
-    const stop = startOpenAIRefreshLoop([account], accounts => {
-      persistedRefreshTokens.push(accounts[0].refreshToken);
-    });
-    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1));
-
-    let stopped = false;
-    const stopping = stop(100).then(() => { stopped = true; });
-    await Promise.resolve();
-    expect(stopped).toBe(false);
-
-    resolveJson({
-      access_token: "new-access",
-      refresh_token: "new-refresh",
-      expires_in: 3600,
-      token_type: "Bearer",
-    });
-    await stopping;
-
-    expect(persistedRefreshTokens).toEqual(["new-refresh"]);
-  });
-
-  it("aborts a hung startup refresh within the stopper deadline", async () => {
-    let observedSignal: AbortSignal | undefined;
-    vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) => {
-      observedSignal = init?.signal ?? undefined;
-      return new Promise<Response>((_resolve, reject) => {
-        observedSignal?.addEventListener("abort", () => {
-          reject(Object.assign(new Error("PRIVATE_ABORT"), { name: "AbortError" }));
-        }, { once: true });
-      });
-    });
-    const account = {
-      id: "openai-hung",
-      provider: "openai_subscription" as const,
-      accessToken: "old-access",
-      refreshToken: "old-refresh",
-      expiresAt: Date.now() + 60_000,
-      enabled: true,
-    };
-    const stop = startOpenAIRefreshLoop([account], vi.fn());
-    await vi.waitFor(() => expect(observedSignal).toBeInstanceOf(AbortSignal));
-
-    const startedAt = Date.now();
-    await stop(10);
-
-    expect(Date.now() - startedAt).toBeLessThan(250);
-    expect(observedSignal?.aborted).toBe(true);
-  });
-
-  it("drains a request-triggered rotation and persists it before stopping", async () => {
-    let resolveJson!: (value: object) => void;
-    const json = new Promise<object>(resolve => { resolveJson = resolve; });
-    vi.spyOn(globalThis, "fetch").mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: () => json,
-    } as Response);
-    const account = {
-      id: "openai-request-refresh",
-      provider: "openai_subscription" as const,
-      accessToken: "old-access",
-      refreshToken: "old-refresh",
-      expiresAt: Date.now() + 60_000,
-      enabled: true,
-    };
-    const persistedRefreshTokens: string[] = [];
-    const save = (accounts: typeof account[]) => {
-      persistedRefreshTokens.push(accounts[0].refreshToken);
-    };
-    const stop = startOpenAIRefreshLoop([], save);
-    await Promise.resolve();
-    const preparing = prepareOpenAIAccountForRequest(account, [account], save);
-    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1));
-
-    const stopping = stop(100);
-    resolveJson({
-      access_token: "new-access",
-      refresh_token: "request-rotated-refresh",
-      expires_in: 3600,
-      token_type: "Bearer",
-    });
-
-    await expect(preparing).resolves.toBe(true);
-    await stopping;
-    expect(persistedRefreshTokens).toEqual(["request-rotated-refresh"]);
   });
 });

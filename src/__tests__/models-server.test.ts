@@ -22,6 +22,7 @@ describe("mountModelsRoute", () => {
       object: "list",
       data: [
         { id: "anthropic/claude-sonnet-4-6", object: "model", owned_by: "anthropic_subscription" },
+        { id: "gpt-5-codex", object: "model", owned_by: "openai_subscription" },
         { id: "openai/gpt-5-codex", object: "model", owned_by: "openai_subscription" },
       ],
     });
@@ -40,11 +41,42 @@ describe("mountModelsRoute", () => {
 
     expect(body.models).toEqual([
       expect.objectContaining({
+        slug: "gpt-5.4-mini",
+        display_name: "gpt-5.4-mini",
+        supported_reasoning_levels: expect.any(Array),
+        input_modalities: ["text"],
+        supported_in_api: true,
+        context_window: 272_000,
+        max_context_window: 1_050_000,
+      }),
+      expect.objectContaining({
         slug: "openai/gpt-5.4-mini",
         display_name: "openai/gpt-5.4-mini",
         supported_reasoning_levels: expect.any(Array),
         input_modalities: ["text"],
         supported_in_api: true,
+        context_window: 272_000,
+        max_context_window: 1_050_000,
+      }),
+    ]);
+  });
+
+  it("uses the standard Claude context window for Anthropic models", async () => {
+    const app = express();
+
+    mountModelsRoute(app, {
+      getAnthropicAccounts: () => [makeAnthropicAccount()],
+      getOpenAIAccounts: () => [],
+      fetchAnthropicModels: async () => ["claude-sonnet-4-6"],
+    });
+
+    const body = await getJson(app, "/v1/models");
+
+    expect(body.models).toEqual([
+      expect.objectContaining({
+        slug: "anthropic/claude-sonnet-4-6",
+        context_window: 200_000,
+        max_context_window: 200_000,
       }),
     ]);
   });
@@ -67,9 +99,62 @@ describe("mountModelsRoute", () => {
 
     expect(body.data.map((model: { id: string }) => model.id)).toEqual([
       "anthropic/claude-sonnet-4-6",
+      "gpt-5-codex",
       "openai/codex",
       "openai/gpt-5-codex",
       "sonnet",
+    ]);
+  });
+
+  it("adds a bare slug entry for OpenAI gpt- models, since routing already claims bare gpt- names", async () => {
+    const app = express();
+
+    mountModelsRoute(app, {
+      getAnthropicAccounts: () => [],
+      getOpenAIAccounts: () => [makeOpenAIAccount()],
+      fetchOpenAIModels: async () => ["gpt-5.6-sol"],
+    });
+
+    const body = await getJson(app, "/v1/models");
+
+    expect(body.data).toEqual([
+      { id: "gpt-5.6-sol", object: "model", owned_by: "openai_subscription" },
+      { id: "openai/gpt-5.6-sol", object: "model", owned_by: "openai_subscription" },
+    ]);
+    expect(body.models.map((model: { slug: string }) => model.slug)).toEqual(
+      expect.arrayContaining(["gpt-5.6-sol", "openai/gpt-5.6-sol"]),
+    );
+  });
+
+  it("does not add a bare entry for Anthropic models", async () => {
+    const app = express();
+
+    mountModelsRoute(app, {
+      getAnthropicAccounts: () => [makeAnthropicAccount()],
+      getOpenAIAccounts: () => [],
+      fetchAnthropicModels: async () => ["claude-sonnet-4-6"],
+    });
+
+    const body = await getJson(app, "/v1/models");
+
+    expect(body.data).toEqual([
+      { id: "anthropic/claude-sonnet-4-6", object: "model", owned_by: "anthropic_subscription" },
+    ]);
+  });
+
+  it("does not add a bare entry for OpenAI models that don't start with gpt-", async () => {
+    const app = express();
+
+    mountModelsRoute(app, {
+      getAnthropicAccounts: () => [],
+      getOpenAIAccounts: () => [makeOpenAIAccount()],
+      fetchOpenAIModels: async () => ["codex-auto-review"],
+    });
+
+    const body = await getJson(app, "/v1/models");
+
+    expect(body.data).toEqual([
+      { id: "openai/codex-auto-review", object: "model", owned_by: "openai_subscription" },
     ]);
   });
 
@@ -90,6 +175,7 @@ describe("mountModelsRoute", () => {
     const body = await getJson(app, "/v1/models");
 
     expect(body.data).toEqual([
+      { id: "gpt-5-codex", object: "model", owned_by: "openai_subscription" },
       { id: "openai/gpt-5-codex", object: "model", owned_by: "openai_subscription" },
     ]);
     expect(prepare).toHaveBeenCalledTimes(2);
@@ -138,6 +224,7 @@ describe("mountModelsRoute", () => {
       models: [
         { id: "anthropic/claude-sonnet-4-6", object: "model", owned_by: "anthropic_subscription" },
         { id: "claude/default", object: "model", owned_by: "anthropic_subscription" },
+        { id: "gpt-5-codex", object: "model", owned_by: "openai_subscription" },
         { id: "openai/default", object: "model", owned_by: "openai_subscription" },
         { id: "openai/gpt-5-codex", object: "model", owned_by: "openai_subscription" },
       ],

@@ -1,12 +1,7 @@
 import type { OpenAISubscriptionAccount } from "./openai/token-refresher.js";
 import type { Account } from "../proxy/types.js";
-import {
-  annotateActiveSpan,
-  classifyExpectedRuntimeFailure,
-  recordSafeLog,
-  recordUnexpectedException,
-  withTelemetrySpan,
-} from "../telemetry/facade.js";
+import { withTelemetrySpan } from "../telemetry/facade.js";
+import type { Provider } from "../telemetry/facade.js";
 
 export const ANTHROPIC_MODELS_ENDPOINT = "https://api.anthropic.com/v1/models";
 export const OPENAI_CODEX_MODELS_ENDPOINT = "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
@@ -55,88 +50,21 @@ export async function fetchOpenAICodexModels(
   }, fetchImpl);
 }
 
-async function fetchModels(
-  provider: "anthropic" | "openai",
+function fetchModels(
+  provider: Provider,
   url: string,
   init: RequestInit,
   fetchImpl: FetchLike,
 ): Promise<string[]> {
-  const startedAt = Date.now();
   return withTelemetrySpan("model.discovery", { provider }, async () => {
     try {
       const res = await fetchImpl(url, init);
-      const duration = Date.now() - startedAt;
-      const outcome = res.ok ? "complete" : res.status === 429 ? "rate_limited" : "upstream_error";
-      annotateActiveSpan("model.discovery", {
-        httpStatusCode: res.status,
-        outcome,
-        operationDurationMs: duration,
-      });
-      if (!res.ok) {
-        recordSafeLog({
-          operation: "model.discovery",
-          provider,
-          reason: discoveryHttpReason(res.status),
-          outcome,
-          httpStatusCode: res.status,
-          operationDurationMs: duration,
-          severity: "warn",
-        });
-        return [];
-      }
-      const payload: unknown = await res.json();
-      if (!isModelDiscoveryPayload(payload)) {
-        throw new TypeError("Unexpected model discovery response shape");
-      }
-      return normalizeModelIds(payload);
-    } catch (error) {
-      const expectedReason = init.signal?.aborted === true
-        ? "timeout"
-        : classifyExpectedRuntimeFailure(error);
-      const timeout = expectedReason === "timeout";
-      const network = expectedReason === "network_failure";
-      recordSafeLog({
-        operation: "model.discovery",
-        provider,
-        reason: timeout ? "timeout" : network ? "network_failure" : "unexpected_response_shape",
-        outcome: timeout ? "timeout" : "upstream_error",
-        operationDurationMs: Date.now() - startedAt,
-        severity: "warn",
-      });
-      annotateActiveSpan("model.discovery", {
-        outcome: timeout ? "timeout" : "upstream_error",
-        operationDurationMs: Date.now() - startedAt,
-      });
-      if (!timeout && !network) {
-        recordUnexpectedException(error, {
-          category: "runtime",
-          reason: "other",
-          operation: "model.discovery",
-          provider,
-        });
-      }
+      if (!res.ok) return [];
+      return normalizeModelIds(await res.json());
+    } catch {
       return [];
     }
   });
-}
-
-export function isModelDiscoveryPayload(payload: unknown): boolean {
-  if (Array.isArray(payload)) return payload.every(value => getModelId(value) !== undefined);
-  if (!payload || typeof payload !== "object") return false;
-  const record = payload as Record<string, unknown>;
-  const values = Array.isArray(record.data)
-    ? record.data
-    : Array.isArray(record.models)
-      ? record.models
-      : undefined;
-  return values !== undefined && values.every(value => getModelId(value) !== undefined);
-}
-
-function discoveryHttpReason(status: number): "unauthorized" | "forbidden" | "rate_limited" | "upstream_4xx" | "upstream_5xx" {
-  if (status === 401) return "unauthorized";
-  if (status === 403) return "forbidden";
-  if (status === 429) return "rate_limited";
-  return status >= 500 ? "upstream_5xx" : "upstream_4xx";
 }
 
 function getModelValues(payload: unknown): unknown[] {

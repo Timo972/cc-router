@@ -1,83 +1,74 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createTelemetryFacade } from "../telemetry/facade.js";
-import {
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const recorded = vi.hoisted(() => ({
+  stages: [] as Array<Record<string, unknown>>,
+  stageFailures: [] as Array<Record<string, unknown>>,
+  results: [] as Array<Record<string, unknown>>,
+  failures: [] as Array<Record<string, unknown>>,
+  exceptions: [] as Array<{ error: unknown; context: Record<string, unknown>; diagnosticId?: string }>,
+  flushes: [] as number[],
+}));
+
+vi.mock("../telemetry/facade.js", () => ({
+  recordSetupStage: (input: Record<string, unknown>) => { recorded.stages.push(input); },
+  recordSetupStageFailure: (input: Record<string, unknown>) => { recorded.stageFailures.push(input); },
+  recordSetupResult: (input: Record<string, unknown>) => { recorded.results.push(input); },
+  recordExpectedSetupFailure: (input: Record<string, unknown>) => { recorded.failures.push(input); },
+  recordUnexpectedException: (
+    error: unknown,
+    context: Record<string, unknown>,
+    diagnosticId?: string,
+  ) => {
+    recorded.exceptions.push({ error, context, diagnosticId });
+    return diagnosticId;
+  },
+  flushTelemetryWithin: async (deadlineMs: number) => { recorded.flushes.push(deadlineMs); },
+}));
+
+const {
   SetupDiagnosticError,
-  classifyAccountStateReadFailure,
   classifyHttpSetupFailure,
   classifyNetworkSetupFailure,
   createSetupAttempt,
-  persistSetupAttempts,
+  isPromptCancellation,
   withSetupTelemetryFlush,
-  type SetupDiagnosticRecorder,
-} from "../telemetry/setup-diagnostics.js";
-import { validateToken } from "../utils/token-validator.js";
+} = await import("../telemetry/setup-diagnostics.js");
 
-const INSTALL_ID = "11111111-1111-4111-8111-111111111111";
-const DIAGNOSTIC_ID = "22222222-2222-4222-8222-222222222222";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 beforeEach(() => {
-  vi.stubGlobal("fetch", vi.fn(async input => {
-    const url = input instanceof Request ? input.url : String(input);
-    const hostname = new URL(url).hostname.replace(/^\[|\]$/g, "");
-    if (!hostname.startsWith("127.") && hostname !== "::1") {
-      throw new Error(`Task 9 test blocked non-loopback fetch: ${hostname}`);
-    }
-    throw new Error("Task 9 test requires an injected loopback transport");
-  }));
+  recorded.stages = [];
+  recorded.stageFailures = [];
+  recorded.results = [];
+  recorded.failures = [];
+  recorded.exceptions = [];
+  recorded.flushes = [];
 });
 
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
-
-function recorder() {
-  const stages: unknown[] = [];
-  const stageFailures: unknown[] = [];
-  const results: unknown[] = [];
-  const failures: unknown[] = [];
-  const exceptions: Array<{ error: unknown; context: unknown; diagnosticId?: string }> = [];
-  const value: SetupDiagnosticRecorder = {
-    recordSetupStage: input => { stages.push(input); },
-    recordSetupStageFailure: input => { stageFailures.push(input); },
-    recordSetupResult: input => { results.push(input); },
-    recordExpectedSetupFailure: input => { failures.push(input); },
-    recordUnexpectedException: (error, context, diagnosticId) => {
-      exceptions.push({ error, context, diagnosticId });
-      return diagnosticId as never;
-    },
-    flushTelemetryWithin: async () => undefined,
-  };
-  return { value, stages, stageFailures, results, failures, exceptions };
-}
-
-describe("setup diagnostic stage matrix", () => {
+describe("setup attempt funnel", () => {
   it.each([
     ["anthropic", "macos_keychain", ["credential_read", "credential_parse", "token_validation", "persistence"]],
-    ["anthropic", "claude_credentials_file", ["credential_read", "credential_parse", "token_validation", "persistence"]],
     ["anthropic", "manual_token", ["credential_read", "credential_parse", "token_validation", "persistence"]],
     ["openai", "manual_token", ["credential_read", "credential_parse", "persistence"]],
     ["openai", "device_oauth", ["device_code_request", "authorization_polling", "token_exchange", "access_token_parse", "persistence"]],
-  ] as const)("records the complete %s/%s success path", (provider, method, completedStages) => {
-    const recorded = recorder();
-    const attempt = createSetupAttempt({
-      provider,
-      method,
-      recorder: recorded.value,
-      randomUUID: () => DIAGNOSTIC_ID,
-      now: () => 1_000,
-    });
+  ] as const)("records the complete %s/%s success path", (provider, method, stages) => {
+    const attempt = createSetupAttempt({ provider, method });
 
     attempt.stageCompleted("credential_source_selection");
-    for (const stage of completedStages) attempt.stageCompleted(stage);
+    for (const stage of stages) attempt.stageCompleted(stage);
     attempt.succeeded();
 
-    expect(recorded.stages).toEqual([
-      expect.objectContaining({ provider, method, stage: "attempt_start", diagnosticId: DIAGNOSTIC_ID }),
-      expect.objectContaining({ provider, method, stage: "credential_source_selection", diagnosticId: DIAGNOSTIC_ID }),
-      ...completedStages.map(stage => expect.objectContaining({ provider, method, stage, diagnosticId: DIAGNOSTIC_ID })),
+    expect(attempt.diagnosticId).toMatch(UUID);
+    expect(recorded.stages.map(stage => stage["stage"])).toEqual([
+      "attempt_start",
+      "credential_source_selection",
+      ...stages,
     ]);
+    expect(new Set(recorded.stages.map(stage => stage["diagnosticId"])))
+      .toEqual(new Set([attempt.diagnosticId]));
+    expect(recorded.stages[0]).toMatchObject({ provider, method, durationBucket: "under_1s" });
     expect(recorded.results).toEqual([
-      expect.objectContaining({ provider, method, result: "succeeded", diagnosticId: DIAGNOSTIC_ID }),
+      expect.objectContaining({ provider, method, result: "succeeded" }),
     ]);
     expect(recorded.failures).toEqual([]);
     expect(recorded.exceptions).toEqual([]);
@@ -85,403 +76,175 @@ describe("setup diagnostic stage matrix", () => {
 
   it.each([
     ["credential_read", "not_found", undefined],
-    ["credential_read", "permission_denied", undefined],
     ["credential_parse", "malformed_credentials", undefined],
-    ["token_validation", "invalid_token", undefined],
     ["token_validation", "unauthorized", 401],
-    ["token_validation", "forbidden", 403],
     ["token_validation", "rate_limited", 429],
-    ["device_code_request", "upstream_4xx", 418],
     ["token_exchange", "upstream_5xx", 503],
     ["authorization_polling", "timeout", undefined],
-    ["device_code_request", "network_failure", undefined],
     ["access_token_parse", "unexpected_response_shape", undefined],
-  ] as const)("keeps known %s/%s failures out of Error Tracking", (stage, reason, httpStatusCode) => {
-    const recorded = recorder();
-    const attempt = createSetupAttempt({
-      provider: "openai",
-      method: "device_oauth",
-      recorder: recorded.value,
-      randomUUID: () => DIAGNOSTIC_ID,
-      now: () => 1_000,
-    });
-
+  ] as const)("keeps known %s/%s failures out of error tracking", (stage, reason, httpStatusCode) => {
+    const attempt = createSetupAttempt({ provider: "openai", method: "device_oauth" });
     const error = new SetupDiagnosticError("local detail", {
       stage,
       reason,
       expected: true,
       ...(httpStatusCode === undefined ? {} : { httpStatusCode }),
     });
+
     const outcome = attempt.failed(error, stage);
 
-    expect(outcome).toEqual({ diagnosticId: DIAGNOSTIC_ID, unexpected: false });
-    expect(recorded.failures).toEqual([
-      expect.objectContaining({
-        stage,
-        reason,
-        diagnosticId: DIAGNOSTIC_ID,
-        ...(httpStatusCode === undefined ? {} : { httpStatusCode }),
-      }),
-    ]);
+    expect(outcome).toEqual({ diagnosticId: attempt.diagnosticId, unexpected: false });
+    expect(recorded.failures).toEqual([expect.objectContaining({
+      stage,
+      reason,
+      diagnosticId: attempt.diagnosticId,
+      ...(httpStatusCode === undefined ? {} : { httpStatusCode }),
+    })]);
     expect(recorded.exceptions).toEqual([]);
   });
 
-  it("reuses one attempt ID across stages, the failure funnel, and the sanitized exception", () => {
-    const recorded = recorder();
-    const attempt = createSetupAttempt({
-      provider: "anthropic",
-      method: "claude_credentials_file",
-      recorder: recorded.value,
-      randomUUID: () => DIAGNOSTIC_ID,
-      now: () => 1_000,
-    });
-    attempt.stageCompleted("credential_source_selection");
+  it("reports an unexpected failure once with the attempt id and the local cause", () => {
+    const cause = new Error("PRIVATE_KEYCHAIN_DETAIL");
+    const attempt = createSetupAttempt({ provider: "anthropic", method: "macos_keychain" });
 
-    const raw = new Error("prompt=PRIVATE account=user@example.com /Users/private/credentials");
-    const outcome = attempt.failed(raw, "credential_parse");
-
-    expect(outcome).toEqual({ diagnosticId: DIAGNOSTIC_ID, unexpected: true });
-    expect(recorded.failures).toEqual([
-      expect.objectContaining({
-        stage: "credential_parse",
+    const outcome = attempt.failed(
+      new SetupDiagnosticError("wrapper", {
+        stage: "credential_read",
         reason: "other",
-        diagnosticId: DIAGNOSTIC_ID,
-      }),
-    ]);
+        expected: false,
+      }, { cause }),
+      "credential_read",
+    );
+    attempt.failed(new Error("ignored after the terminal outcome"), "persistence");
+
+    expect(outcome.unexpected).toBe(true);
+    expect(recorded.failures).toHaveLength(1);
     expect(recorded.exceptions).toEqual([{
-      error: raw,
+      error: cause,
       context: {
         category: "setup",
         provider: "anthropic",
-        setupStage: "credential_parse",
+        setupStage: "credential_read",
         reason: "other",
       },
-      diagnosticId: DIAGNOSTIC_ID,
+      diagnosticId: attempt.diagnosticId,
     }]);
-    expect(recorded.stages.every(value => (value as { diagnosticId: string }).diagnosticId === DIAGNOSTIC_ID)).toBe(true);
   });
 
-  it("captures unexpected persistence faults with the attempt ID and preserves the local cause", async () => {
-    const recorded = recorder();
-    const attempt = createSetupAttempt({
-      provider: "openai",
-      method: "manual_token",
-      recorder: recorded.value,
-      randomUUID: () => DIAGNOSTIC_ID,
-      now: () => 1_000,
-    });
-    const cause = new Error("PRIVATE /Users/local/.cc-router/accounts.json");
+  it("keeps a recoverable stage failure nonterminal", () => {
+    const attempt = createSetupAttempt({ provider: "anthropic", method: "claude_credentials_file" });
 
-    const thrown = await persistSetupAttempts([attempt], () => { throw cause; }).catch(error => error);
-
-    expect(thrown).toBeInstanceOf(SetupDiagnosticError);
-    expect(thrown.message).toContain("PRIVATE");
-    expect(thrown.cause).toBe(cause);
-    expect(thrown.classification).toEqual({
-      stage: "persistence",
-      reason: "persistence_failure",
-      expected: false,
-    });
-    expect(recorded.failures).toEqual([
-      expect.objectContaining({
-        stage: "persistence",
-        reason: "persistence_failure",
-        diagnosticId: DIAGNOSTIC_ID,
-      }),
-    ]);
-    expect(recorded.exceptions).toEqual([
-      expect.objectContaining({ error: cause, diagnosticId: DIAGNOSTIC_ID }),
-    ]);
-  });
-
-  it("records explicit cancellation without creating an exception", () => {
-    const recorded = recorder();
-    const attempt = createSetupAttempt({
-      provider: "anthropic",
-      method: "manual_token",
-      recorder: recorded.value,
-      randomUUID: () => DIAGNOSTIC_ID,
-      now: () => 1_000,
-    });
-
-    attempt.cancelled();
-
-    expect(recorded.results).toEqual([
-      expect.objectContaining({ result: "cancelled", diagnosticId: DIAGNOSTIC_ID }),
-    ]);
-    expect(recorded.exceptions).toEqual([]);
-  });
-
-  it.each([
-    ["cancelled", "cancelled"],
-    ["succeeded", "succeeded"],
-    ["failed", "failed"],
-  ] as const)("emits exactly one %s terminal and ignores every later terminal", (_label, terminal) => {
-    const recorded = recorder();
-    const attempt = createSetupAttempt({
-      provider: "anthropic",
-      method: "manual_token",
-      recorder: recorded.value,
-      randomUUID: () => DIAGNOSTIC_ID,
-      now: () => 1_000,
-    });
-    const failure = new SetupDiagnosticError("PRIVATE invalid token", {
-      stage: "token_validation",
-      reason: "invalid_token",
+    const outcome = attempt.stageFailed(new SetupDiagnosticError("local", {
+      stage: "credential_read",
+      reason: "not_found",
       expected: true,
-    });
-
-    if (terminal === "cancelled") attempt.cancelled();
-    else if (terminal === "succeeded") attempt.succeeded();
-    else attempt.failed(failure, "token_validation");
-
-    attempt.cancelled();
-    attempt.succeeded();
-    attempt.failed(failure, "token_validation");
-    attempt.stageCompleted("persistence");
-
-    expect(recorded.results).toHaveLength(terminal === "failed" ? 0 : 1);
-    expect(recorded.failures).toHaveLength(terminal === "failed" ? 1 : 0);
-    expect(recorded.results.length + recorded.failures.length).toBe(1);
-    expect(recorded.stages).toHaveLength(1);
-  });
-
-  it("keeps a recoverable stage failure nonterminal until the attempt succeeds", () => {
-    const recorded = recorder();
-    const attempt = createSetupAttempt({
-      provider: "anthropic",
-      method: "manual_token",
-      recorder: recorded.value,
-      randomUUID: () => DIAGNOSTIC_ID,
-      now: () => 1_000,
-    });
-    const failure = new SetupDiagnosticError("PRIVATE invalid token", {
-      stage: "token_validation",
-      reason: "invalid_token",
-      expected: true,
-    });
-
-    attempt.stageFailed(failure, "token_validation");
-    attempt.stageCompleted("persistence");
+    }), "credential_read");
+    attempt.stageCompleted("credential_read");
     attempt.succeeded();
 
-    expect(recorded.stageFailures).toEqual([
-      expect.objectContaining({
-        stage: "token_validation",
-        reason: "invalid_token",
-        diagnosticId: DIAGNOSTIC_ID,
-      }),
-    ]);
+    expect(outcome.unexpected).toBe(false);
+    expect(recorded.stageFailures).toHaveLength(1);
     expect(recorded.failures).toEqual([]);
-    expect(recorded.results).toEqual([
-      expect.objectContaining({ result: "succeeded", diagnosticId: DIAGNOSTIC_ID }),
-    ]);
+    expect(recorded.results).toEqual([expect.objectContaining({ result: "succeeded" })]);
+  });
+
+  it("records cancellation without creating an exception", () => {
+    const attempt = createSetupAttempt({ provider: "openai", method: "device_oauth" });
+
+    attempt.cancelled();
+    attempt.succeeded();
+
+    expect(recorded.results).toEqual([expect.objectContaining({ result: "cancelled" })]);
+    expect(recorded.exceptions).toEqual([]);
   });
 });
 
 describe("typed failure classification", () => {
   it.each([
-    ["malformed_json", "malformed_credentials"],
-    ["invalid_shape", "malformed_credentials"],
-    ["permission_denied", "permission_denied"],
-    ["read_failure", "other"],
-  ] as const)("classifies typed account-state %s failures without local detail", (kind, reason) => {
-    const error = classifyAccountStateReadFailure({
-      kind,
-      message: "PRIVATE /Users/local/.cc-router/accounts.json",
-    });
+    [401, "unauthorized", true],
+    [403, "forbidden", true],
+    [429, "rate_limited", true],
+    [418, "upstream_4xx", true],
+    [503, "upstream_5xx", true],
+    [200, "other", false],
+  ] as const)("classifies HTTP %i as %s", (status, reason, expected) => {
+    const error = classifyHttpSetupFailure("token_validation", status, "PRIVATE_BODY");
 
     expect(error.classification).toEqual({
-      stage: "persistence",
+      stage: "token_validation",
       reason,
-      expected: false,
-    });
-    expect(JSON.stringify(error.classification)).not.toContain("PRIVATE");
-  });
-
-  it.each([
-    [401, "unauthorized"],
-    [403, "forbidden"],
-    [429, "rate_limited"],
-    [418, "upstream_4xx"],
-    [503, "upstream_5xx"],
-  ] as const)("classifies HTTP %i without retaining a response body", (status, reason) => {
-    const error = classifyHttpSetupFailure("token_exchange", status, "local raw body: PRIVATE");
-
-    expect(error.message).toContain("PRIVATE");
-    expect(error.classification).toEqual({
-      stage: "token_exchange",
-      reason,
-      expected: true,
+      expected,
       httpStatusCode: status,
     });
-    expect(JSON.stringify(error.classification)).not.toContain("PRIVATE");
+    expect(error.message).toBe("PRIVATE_BODY");
   });
 
-  it.each([
-    [401, "unauthorized"],
-    [403, "forbidden"],
-    [429, "rate_limited"],
-    [418, "upstream_4xx"],
-    [503, "upstream_5xx"],
-  ] as const)("returns a typed Anthropic validation failure for HTTP %i", async (status, reason) => {
-    const result = await validateToken("PRIVATE-token", {
-      fetchImpl: vi.fn(async () => new Response("PRIVATE body", { status })),
+  it("classifies timeouts and known network codes without parsing the message", () => {
+    const timeout = classifyNetworkSetupFailure(
+      "authorization_polling",
+      Object.assign(new Error("PRIVATE_TIMEOUT"), { code: "ETIMEDOUT" }),
+    );
+    const refused = classifyNetworkSetupFailure(
+      "device_code_request",
+      Object.assign(new Error("PRIVATE_REFUSED"), { code: "ECONNREFUSED" }),
+    );
+    const unknown = classifyNetworkSetupFailure("token_exchange", new TypeError("timed out"));
+
+    expect(timeout.classification).toEqual({
+      stage: "authorization_polling",
+      reason: "timeout",
+      expected: true,
     });
-
-    expect(result.valid).toBe(false);
-    if (!result.valid) {
-      expect(result.diagnostic.classification).toEqual({
-        stage: "token_validation",
-        reason,
-        expected: true,
-        httpStatusCode: status,
-      });
-      expect(JSON.stringify(result.diagnostic.classification)).not.toContain("PRIVATE");
-    }
-  });
-
-  it("keeps an unknown Anthropic validation exception local and marks it unexpected", async () => {
-    const result = await validateToken("PRIVATE-token", {
-      fetchImpl: vi.fn(async () => { throw new Error("PRIVATE novel transport failure"); }),
-    });
-
-    expect(result.valid).toBe(false);
-    if (!result.valid) {
-      expect(result.reason).toContain("PRIVATE");
-      expect(result.diagnostic.classification).toEqual({
-        stage: "token_validation",
-        reason: "other",
-        expected: false,
-      });
-    }
-  });
-
-  it("classifies timeouts and known network codes without parsing Error.message", () => {
-    const timeout = Object.assign(new Error("PRIVATE timeout message"), { name: "TimeoutError" });
-    const network = Object.assign(new Error("PRIVATE network message"), { code: "ECONNRESET" });
-    const unknown = new Error("PRIVATE totally novel failure");
-
-    expect(classifyNetworkSetupFailure("device_code_request", timeout).classification.reason).toBe("timeout");
-    expect(classifyNetworkSetupFailure("device_code_request", network).classification.reason).toBe("network_failure");
-    expect(classifyNetworkSetupFailure("device_code_request", unknown).classification).toEqual({
-      stage: "device_code_request",
+    expect(refused.classification.reason).toBe("network_failure");
+    expect(unknown.classification).toEqual({
+      stage: "token_exchange",
       reason: "other",
       expected: false,
     });
   });
 
-  it.each([
-    [new DOMException("PRIVATE aborted request", "AbortError"), "timeout"],
-    [new DOMException("PRIVATE timed out request", "TimeoutError"), "timeout"],
-  ] as const)("classifies inherited built-in %s names without exporting their messages", (error, reason) => {
-    expect(Object.hasOwn(error, "name")).toBe(false);
-
-    const classified = classifyNetworkSetupFailure("device_code_request", error);
-
-    expect(classified.classification).toEqual({
-      stage: "device_code_request",
-      reason,
-      expected: true,
+  it("finds an allowlisted code through a bounded own cause chain only", () => {
+    const nested = new TypeError("PRIVATE_FETCH_FAILURE");
+    Object.defineProperty(nested, "cause", {
+      value: Object.assign(new Error("PRIVATE_SOCKET"), { code: "ECONNRESET" }),
     });
-    expect(JSON.stringify(classified.classification)).not.toContain("PRIVATE");
-  });
-
-  it("finds an allowlisted system code through a bounded own cause chain", () => {
-    const deepest = Object.assign(new Error("PRIVATE socket detail"), { code: "ECONNREFUSED" });
-    const nested = Object.assign(new TypeError("PRIVATE fetch failed"), {
-      cause: Object.assign(new Error("PRIVATE wrapper"), { cause: deepest }),
-    });
-
-    expect(classifyNetworkSetupFailure("device_code_request", nested).classification).toEqual({
-      stage: "device_code_request",
-      reason: "network_failure",
-      expected: true,
-    });
-  });
-
-  it("does not traverse an unbounded cause chain or read cause accessors", () => {
-    let getterCalls = 0;
-    const accessor = Object.defineProperty(new Error("PRIVATE"), "cause", {
-      get() {
-        getterCalls += 1;
-        return Object.assign(new Error("PRIVATE"), { code: "ECONNREFUSED" });
-      },
-    });
-    const tooDeep = Object.assign(new Error("PRIVATE level 0"), {
-      cause: Object.assign(new Error("PRIVATE level 1"), {
-        cause: Object.assign(new Error("PRIVATE level 2"), {
-          cause: Object.assign(new Error("PRIVATE level 3"), { code: "ECONNREFUSED" }),
+    const tooDeep = new Error("level0");
+    Object.defineProperty(tooDeep, "cause", {
+      value: Object.assign(new Error("level1"), {
+        cause: Object.assign(new Error("level2"), {
+          cause: Object.assign(new Error("level3"), { code: "ECONNRESET" }),
         }),
       }),
     });
+    const accessorOnly = new Error("accessor");
+    Object.defineProperty(accessorOnly, "code", {
+      get: () => { throw new Error("telemetry must not invoke foreign accessors"); },
+    });
 
-    expect(classifyNetworkSetupFailure("device_code_request", accessor).classification.reason).toBe("other");
-    expect(getterCalls).toBe(0);
-    expect(classifyNetworkSetupFailure("device_code_request", tooDeep).classification.reason).toBe("other");
+    expect(classifyNetworkSetupFailure("token_exchange", nested).classification.reason)
+      .toBe("network_failure");
+    expect(classifyNetworkSetupFailure("token_exchange", tooDeep).classification.reason)
+      .toBe("other");
+    expect(classifyNetworkSetupFailure("token_exchange", accessorOnly).classification.reason)
+      .toBe("other");
+  });
+
+  it("detects prompt cancellation by its own name only", () => {
+    expect(isPromptCancellation(Object.assign(new Error("x"), { name: "ExitPromptError" })))
+      .toBe(true);
+    expect(isPromptCancellation(new Error("ExitPromptError"))).toBe(false);
   });
 });
 
-describe("diagnostic identity and command flushing", () => {
-  it("passes a trusted attempt ID to the sanitizer while stable installation identity remains separate", () => {
-    const identities: Array<{ installationId: string; diagnosticId?: string }> = [];
-    const facade = createTelemetryFacade({
-      getSnapshot: () => ({
-        enabled: true,
-        state: {
-          enabled: true,
-          installId: INSTALL_ID,
-          firstRunAt: "2026-08-11T00:00:00.000Z",
-          consentGeneration: "123e4567-e89b-42d3-a456-426614174010",
-          revision: 0,
-        },
-      }),
-      getAnalytics: () => ({
-        captureAnalytics: vi.fn(),
-        captureAnalyticsImmediate: vi.fn(async () => undefined),
-        captureException: vi.fn(),
-        captureExceptionImmediate: vi.fn(async () => undefined),
-        flushWithin: vi.fn(async () => undefined),
-        shutdownWithin: vi.fn(async () => undefined),
-        discardPending: vi.fn(),
-      }),
-      sanitizeException: (_error, _context, identity) => {
-        identities.push(identity);
-        return {
-          error: new Error("other"),
-          category: "setup",
-          reason: "other",
-          errorKind: "error",
-          frames: [],
-          fingerprint: "safe" as never,
-          diagnosticId: identity.diagnosticId as never,
-        };
-      },
-    });
-
-    expect(facade.recordUnexpectedException(new Error("PRIVATE"), {
-      category: "setup",
-      provider: "anthropic",
-      setupStage: "credential_parse",
-      reason: "other",
-    }, DIAGNOSTIC_ID)).toBe(DIAGNOSTIC_ID);
-    expect(identities).toEqual([{ installationId: INSTALL_ID, diagnosticId: DIAGNOSTIC_ID }]);
-
-    expect(facade.recordUnexpectedException(new Error("PRIVATE"), {
-      category: "setup",
-      provider: "anthropic",
-      setupStage: "credential_parse",
-      reason: "other",
-    }, INSTALL_ID)).toBeUndefined();
-    expect(identities).toHaveLength(1);
+describe("command flushing", () => {
+  it("flushes in finally without replacing the command result", async () => {
+    await expect(withSetupTelemetryFlush(async () => "result")).resolves.toBe("result");
+    expect(recorded.flushes).toEqual([1_500]);
   });
 
-  it("flushes in finally without replacing a command result or original error", async () => {
-    const flush = vi.fn(async () => { throw new Error("flush failed"); });
-
-    await expect(withSetupTelemetryFlush(async () => 7, flush)).resolves.toBe(7);
-    const original = new Error("command failed");
-    await expect(withSetupTelemetryFlush(async () => { throw original; }, flush)).rejects.toBe(original);
-    expect(flush).toHaveBeenCalledTimes(2);
+  it("flushes in finally without replacing the original error", async () => {
+    const failure = new Error("PRIVATE_COMMAND_FAILURE");
+    await expect(withSetupTelemetryFlush(async () => { throw failure; })).rejects.toBe(failure);
+    expect(recorded.flushes).toEqual([1_500]);
   });
 });

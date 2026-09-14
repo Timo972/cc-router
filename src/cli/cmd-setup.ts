@@ -7,21 +7,11 @@ import {
   extractFromCredentialsFileDetailed,
   formatExpiry,
   redactToken,
-  type CredentialExtractionResult,
 } from "../utils/token-extractor.js";
-import { validateToken, type ValidationResult } from "../utils/token-validator.js";
+import { validateToken } from "../utils/token-validator.js";
 import { writeClaudeSettings, readClaudeProxySettings } from "../utils/claude-config.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
-import {
-  loadAccounts,
-  accountsFileExists,
-  readAccountStateDetailed,
-  readConfig,
-  writeConfig,
-  generateProxySecret,
-  type AccountStateReadResult,
-  type ClientConfig,
-} from "../config/manager.js";
+import { loadAccounts, accountsFileExists, readConfig, writeConfig, generateProxySecret, type ClientConfig } from "../config/manager.js";
 import { PROXY_PORT } from "../config/paths.js";
 import type { Account, OAuthTokens } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS } from "../proxy/types.js";
@@ -37,39 +27,13 @@ import {
 } from "../interceptor/mitmproxy-manager.js";
 import { printDesktopSupportExplainer, printNetworkExtensionInstructions } from "./cmd-client.js";
 import {
-  SetupDiagnosticError,
-  classifyAccountStateReadFailure,
   createSetupAttempt,
-  isPromptCancellation,
-  persistSetupAttempts,
-  type CreateSetupAttemptInput,
-  type SetupAttempt,
   withSetupTelemetryFlush,
+  type SetupAttempt,
+  type SetupFailureOutcome,
 } from "../telemetry/setup-diagnostics.js";
-import { flushTelemetryWithin } from "../telemetry/facade.js";
 
 // ─── Public registration ──────────────────────────────────────────────────────
-
-export interface SetupCommandDependencies {
-  runWizard(options: { addMode: boolean }): Promise<number | undefined>;
-  flush(deadlineMs: number): Promise<void>;
-}
-
-const defaultSetupCommandDependencies: SetupCommandDependencies = {
-  runWizard: runSetupWizard,
-  flush: flushTelemetryWithin,
-};
-
-export async function runSetupCommand(
-  options: { addMode: boolean },
-  dependencies: SetupCommandDependencies = defaultSetupCommandDependencies,
-): Promise<void> {
-  const exitCode = await withSetupTelemetryFlush(
-    () => dependencies.runWizard(options),
-    dependencies.flush,
-  );
-  if (exitCode !== undefined && exitCode !== 0) process.exitCode = exitCode;
-}
 
 export function registerSetup(program: Command): void {
   program
@@ -77,203 +41,151 @@ export function registerSetup(program: Command): void {
     .description("Interactive wizard: extract tokens and configure Claude Code automatically")
     .option("--add", "Add a new account to an existing configuration (skip intro questions)")
     .action(async (opts: { add?: boolean }) => {
-      await runSetupCommand({ addMode: opts.add ?? false });
+      await withSetupTelemetryFlush(() => runSetupWizard({ addMode: opts.add ?? false }));
     });
+}
+
+/** Only an unexpected failure gets a diagnostic ID worth quoting in a bug report. */
+function printDiagnosticId(outcome: SetupFailureOutcome): void {
+  if (!outcome.unexpected) return;
+  console.log(chalk.gray(`  Diagnostic ID: ${outcome.diagnosticId}`));
 }
 
 // ─── Shared single-account setup (also used by `accounts add`) ───────────────
 
-type ExtractionMethod = "keychain" | "credentials" | "manual";
-
-export interface SetupSingleAccountDependencies {
-  chooseMethod(): Promise<ExtractionMethod>;
-  extractKeychain(): Promise<CredentialExtractionResult>;
-  extractCredentials(): CredentialExtractionResult;
-  promptManualTokens(): Promise<OAuthTokens | null>;
-  promptAccountId(defaultId: string): Promise<string>;
-  confirmRetry(kind: "keychain" | "credentials"): Promise<boolean>;
-  confirmSaveInvalid(result: Extract<ValidationResult, { valid: false }>): Promise<boolean>;
-  validateToken(accessToken: string): Promise<ValidationResult>;
-  readAccountState(): AccountStateReadResult;
-  createAttempt(input: Pick<CreateSetupAttemptInput, "provider" | "method">): SetupAttempt;
+export async function setupSingleAccount(index: number): Promise<Account | null> {
+  return (await setupSingleAccountWithAttempt(index)).account;
 }
 
-export interface SetupSingleAccountResult {
-  account: Account | null;
-  attempt: SetupAttempt;
-}
+/**
+ * Same step, but also hands back the setup attempt so the caller can mark the
+ * `persistence` stage and the final outcome once the account is written.
+ */
+export async function setupSingleAccountWithAttempt(
+  index: number,
+): Promise<{ account: Account | null; attempt: SetupAttempt }> {
+  type ExtractionMethod = "keychain" | "credentials" | "manual";
 
-async function chooseExtractionMethod(): Promise<ExtractionMethod> {
   const choices: { name: string; value: ExtractionMethod }[] = [];
   if (isMacos()) {
     choices.push({ name: "Extract automatically from macOS Keychain  (recommended)", value: "keychain" });
   }
   choices.push({ name: "Read from ~/.claude/.credentials.json", value: "credentials" });
   choices.push({ name: "Paste tokens manually", value: "manual" });
-  return select<ExtractionMethod>({
+
+  const method = await select<ExtractionMethod>({
     message: "How do you want to add the tokens?",
     choices,
   });
-}
 
-const defaultSetupSingleAccountDependencies: SetupSingleAccountDependencies = {
-  chooseMethod: chooseExtractionMethod,
-  extractKeychain: extractFromKeychainDetailed,
-  extractCredentials: extractFromCredentialsFileDetailed,
-  promptManualTokens,
-  promptAccountId: defaultId => input({
-    message: "Account ID (press Enter to accept default):",
-    default: defaultId,
-    validate: value => /^[a-zA-Z0-9_-]+$/.test(value) || "Only letters, numbers, _ and - allowed",
-  }),
-  confirmRetry: kind => confirm({
-    message: kind === "keychain" ? "Try another extraction method?" : "Paste tokens manually instead?",
-    default: true,
-  }),
-  confirmSaveInvalid: () => confirm({ message: "Save this account anyway?", default: false }),
-  validateToken,
-  readAccountState: readAccountStateDetailed,
-  createAttempt: createSetupAttempt,
-};
-
-function telemetryMethod(method: ExtractionMethod): "macos_keychain" | "claude_credentials_file" | "manual_token" {
-  switch (method) {
-    case "keychain": return "macos_keychain";
-    case "credentials": return "claude_credentials_file";
-    case "manual": return "manual_token";
-  }
-}
-
-function printUnexpectedSetupFailure(error: unknown, diagnosticId: string): void {
-  const detail = error instanceof Error ? error.message : String(error);
-  console.error(chalk.red(`  Unexpected setup failure: ${detail}`));
-  console.error(chalk.gray(`  Diagnostic ID: ${diagnosticId}`));
-}
-
-export async function setupSingleAccountDetailed(
-  index: number,
-  dependencies: SetupSingleAccountDependencies = defaultSetupSingleAccountDependencies,
-): Promise<SetupSingleAccountResult> {
-  const method = await dependencies.chooseMethod();
-  const attempt = dependencies.createAttempt({ provider: "anthropic", method: telemetryMethod(method) });
+  const attempt = createSetupAttempt({
+    provider: "anthropic",
+    method: method === "keychain"
+      ? "macos_keychain"
+      : method === "credentials" ? "claude_credentials_file" : "manual_token",
+  });
   attempt.stageCompleted("credential_source_selection");
+
   let tokens: OAuthTokens | null = null;
 
-  try {
-    const state = dependencies.readAccountState();
-    if (!state.ok) throw classifyAccountStateReadFailure(state.error);
-
-    if (method === "keychain") {
-      process.stdout.write(chalk.gray("  Extracting from Keychain... "));
-      const extraction = await dependencies.extractKeychain();
-      if (!extraction.ok) {
-        console.log(chalk.red("✗"));
-        console.log(chalk.yellow("  Could not read usable credentials from Keychain."));
-        console.log(chalk.yellow("  Run claude login, then retry."));
-        const retry = await dependencies.confirmRetry("keychain");
-        if (retry) {
-          const outcome = attempt.failed(extraction.error, extraction.error.classification.stage);
-          if (outcome.unexpected) printUnexpectedSetupFailure(extraction.error, outcome.diagnosticId);
-          return setupSingleAccountDetailed(index, dependencies);
-        }
-        const outcome = attempt.stageFailed(extraction.error, extraction.error.classification.stage);
-        if (outcome.unexpected) printUnexpectedSetupFailure(extraction.error, outcome.diagnosticId);
-        attempt.cancelled();
-        return { account: null, attempt };
-      }
+  if (method === "keychain") {
+    process.stdout.write(chalk.gray("  Extracting from Keychain... "));
+    const extraction = await extractFromKeychainDetailed();
+    if (extraction.ok) {
       tokens = extraction.tokens;
-      for (const stage of extraction.completedStages) attempt.stageCompleted(stage);
       console.log(chalk.green("✓"));
       console.log(chalk.gray(`  Token: ${redactToken(tokens.accessToken)}`));
       console.log(chalk.gray(`  Expiry: ${formatExpiry(tokens.expiresAt)}`));
-    } else if (method === "credentials") {
-      const extraction = dependencies.extractCredentials();
-      if (!extraction.ok) {
-        console.log(chalk.red("  ✗ ~/.claude/.credentials.json not found or unreadable."));
-        console.log(chalk.yellow("  Run claude login, then retry."));
-        const retry = await dependencies.confirmRetry("credentials");
-        if (retry) {
-          const outcome = attempt.failed(extraction.error, extraction.error.classification.stage);
-          if (outcome.unexpected) printUnexpectedSetupFailure(extraction.error, outcome.diagnosticId);
-          return setupSingleAccountDetailed(index, {
-            ...dependencies,
-            chooseMethod: async () => "manual",
-          });
-        }
-        const outcome = attempt.stageFailed(extraction.error, extraction.error.classification.stage);
-        if (outcome.unexpected) printUnexpectedSetupFailure(extraction.error, outcome.diagnosticId);
-        attempt.cancelled();
-        return { account: null, attempt };
-      }
+    } else {
+      console.log(chalk.red("✗"));
+      console.log(chalk.yellow("  Could not find credentials in Keychain."));
+      console.log(chalk.gray("  Make sure Claude Code is logged in: run `claude login` first."));
+      printDiagnosticId(attempt.stageFailed(extraction.error, "credential_read"));
+      const retry = await confirm({ message: "Try another extraction method?", default: true });
+      attempt.cancelled();
+      if (!retry) return { account: null, attempt };
+      return setupSingleAccountWithAttempt(index);
+    }
+  }
+
+  if (method === "credentials") {
+    const extraction = extractFromCredentialsFileDetailed();
+    if (extraction.ok) {
       tokens = extraction.tokens;
-      for (const stage of extraction.completedStages) attempt.stageCompleted(stage);
-      console.log(chalk.green("  ✓ Found Claude credentials"));
+      console.log(chalk.green(`  ✓ Found credentials in ~/.claude/.credentials.json`));
       console.log(chalk.gray(`    Token: ${redactToken(tokens.accessToken)}`));
       console.log(chalk.gray(`    Expiry: ${formatExpiry(tokens.expiresAt)}`));
     } else {
-      tokens = await dependencies.promptManualTokens();
-      if (!tokens) {
+      console.log(chalk.red("  ✗ ~/.claude/.credentials.json not found or unreadable."));
+      console.log(chalk.gray("  Make sure Claude Code is installed and you've run `claude login`."));
+      printDiagnosticId(attempt.stageFailed(extraction.error, "credential_read"));
+      const retry = await confirm({ message: "Paste tokens manually instead?", default: true });
+      if (!retry) {
         attempt.cancelled();
         return { account: null, attempt };
       }
-      attempt.stageCompleted("credential_read");
-      attempt.stageCompleted("credential_parse");
+      tokens = await promptManualTokens();
     }
+  }
 
-    const accountId = await dependencies.promptAccountId(`max-account-${index}`);
-    process.stdout.write(chalk.gray("  Validating tokens against Anthropic... "));
-    const validation = await dependencies.validateToken(tokens.accessToken);
+  if (method === "manual") {
+    tokens = await promptManualTokens();
+  }
 
-    if (validation.valid) {
-      attempt.stageCompleted("token_validation");
-      console.log(chalk.green("✓ Valid"));
-    } else {
-      console.log(chalk.red("✗ Invalid"));
-      console.log(chalk.yellow(`  Reason: ${validation.reason}`));
-      const outcome = attempt.stageFailed(validation.diagnostic, "token_validation");
-      if (outcome.unexpected) printUnexpectedSetupFailure(validation.diagnostic, outcome.diagnosticId);
-      console.log(chalk.gray("  The token will be saved but may not work until refreshed."));
-      const keepAnyway = await dependencies.confirmSaveInvalid(validation);
-      if (!keepAnyway) {
-        attempt.cancelled();
-        return { account: null, attempt };
-      }
-    }
+  if (!tokens) {
+    attempt.cancelled();
+    return { account: null, attempt };
+  }
 
-    return {
-      account: {
-        id: accountId,
-        tokens,
-        healthy: validation.valid,
-        busy: false,
-        requestCount: 0,
-        errorCount: 0,
-        lastUsed: 0,
-        lastRefresh: 0,
-        consecutiveErrors: 0,
-        rateLimits: { ...DEFAULT_RATE_LIMITS },
-        ...ACCOUNT_USER_DEFAULTS,
-      },
-      attempt,
-    };
-  } catch (error) {
-    if (isPromptCancellation(error)) {
+  attempt.stageCompleted("credential_read");
+  attempt.stageCompleted("credential_parse");
+
+  const defaultId = `max-account-${index}`;
+  const accountId = await input({
+    message: "Account ID (press Enter to accept default):",
+    default: defaultId,
+    validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
+  });
+
+  process.stdout.write(chalk.gray("  Validating tokens against Anthropic... "));
+  const validation = await validateToken(tokens.accessToken);
+
+  if (validation.valid) {
+    console.log(chalk.green("✓ Valid"));
+    attempt.stageCompleted("token_validation");
+  } else {
+    console.log(chalk.red("✗ Invalid"));
+    console.log(chalk.yellow(`  Reason: ${validation.reason}`));
+    printDiagnosticId(attempt.stageFailed(validation.diagnostic, "token_validation"));
+    console.log(chalk.gray("  The token will be saved but may not work until refreshed."));
+    const keepAnyway = await confirm({ message: "Save this account anyway?", default: false });
+    if (!keepAnyway) {
       attempt.cancelled();
       return { account: null, attempt };
     }
-    const outcome = attempt.failed(error, "failure");
-    if (outcome.unexpected) printUnexpectedSetupFailure(error, outcome.diagnosticId);
-    throw error;
   }
-}
 
-export async function setupSingleAccount(index: number): Promise<Account | null> {
-  return (await setupSingleAccountDetailed(index)).account;
+  return {
+    account: {
+      id: accountId,
+      tokens,
+      healthy: validation.valid,
+      busy: false,
+      requestCount: 0,
+      errorCount: 0,
+      lastUsed: 0,
+      lastRefresh: 0,
+      consecutiveErrors: 0,
+      rateLimits: { ...DEFAULT_RATE_LIMITS },
+      ...ACCOUNT_USER_DEFAULTS,
+    },
+    attempt,
+  };
 }
 
 // ─── Full wizard ──────────────────────────────────────────────────────────────
 
-export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise<number | undefined> {
+export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise<void> {
   const platform = detectPlatform();
   const hasExisting = accountsFileExists();
   const existingClient = readConfig().client;
@@ -301,7 +213,8 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
     });
 
     if (mode === "client") {
-      return runClientSetupFromWizard();
+      await runClientSetupFromWizard();
+      return;
     }
   }
 
@@ -347,7 +260,7 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
   }
 
   const newAccounts: Account[] = [];
-  const newAccountAttempts: SetupAttempt[] = [];
+  const savedAttempts: SetupAttempt[] = [];
 
   for (let i = 0; i < numAccounts; i++) {
     const label = numAccounts > 1 ? `${i + 1}/${numAccounts}` : "";
@@ -363,11 +276,10 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
     }
 
     const existingCount = hasExisting ? loadAccounts().length : 0;
-    const setup = await setupSingleAccountDetailed(i + 1 + existingCount);
-    const account = setup.account;
+    const { account, attempt } = await setupSingleAccountWithAttempt(i + 1 + existingCount);
     if (account) {
       newAccounts.push(account);
-      newAccountAttempts.push(setup.attempt);
+      savedAttempts.push(attempt);
       console.log(chalk.green(`\n  ✓ Account "${account.id}" ready.\n`));
     } else {
       console.log(chalk.yellow(`  ↷ Skipped account ${i + 1}.\n`));
@@ -388,13 +300,13 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
 
   console.log(chalk.bold(`\n${"━".repeat(40)}\n  Saving\n${"━".repeat(40)}\n`));
 
-  try {
-    await persistSetupAttempts(newAccountAttempts, () => saveAccounts(merged));
-  } catch (error) {
-    for (const attempt of newAccountAttempts) printUnexpectedSetupFailure(error, attempt.diagnosticId);
-    throw error;
-  }
+  saveAccounts(merged);
   console.log(chalk.green(`  ✓ ${merged.length} account(s) saved to ~/.cc-router/accounts.json`));
+
+  for (const attempt of savedAttempts) {
+    attempt.stageCompleted("persistence");
+    attempt.succeeded();
+  }
 
   // ─── Post-setup interactive flow ─────────────────────────────────────────
   await runPostSetupFlow(merged.length);
@@ -511,29 +423,11 @@ function printDone(accountCount: number): void {
 
 // ─── Manual token input ───────────────────────────────────────────────────────
 
-export function parseManualTokenExpiry(raw: string): number {
-  const value = raw.trim();
-  const expiresAt = /^\d+$/.test(value)
-    ? Number(value)
-    : /^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(value)
-      ? Date.parse(value)
-      : Number.NaN;
-  if (!Number.isFinite(expiresAt) || expiresAt <= 0 || Number.isNaN(new Date(expiresAt).getTime())) {
-    throw new SetupDiagnosticError("expiresAt must be a valid ISO date or positive Unix millisecond timestamp", {
-      stage: "credential_parse",
-      reason: "malformed_credentials",
-      expected: true,
-    });
-  }
-  return expiresAt;
-}
-
 async function promptManualTokens(): Promise<OAuthTokens | null> {
   console.log(chalk.gray(
     "\n  You can find your tokens by running:\n" +
     "    macOS:         security find-generic-password -s 'Claude Code-credentials' -w\n" +
-    "    Linux/Windows: cat ~/.claude/.credentials.json\n" +
-    "    Missing or stale credentials: claude login\n"
+    "    Linux/Windows: cat ~/.claude/.credentials.json\n"
   ));
 
   const accessToken = await password({
@@ -561,7 +455,7 @@ async function promptManualTokens(): Promise<OAuthTokens | null> {
 
   const expiresAt = useDefaultExpiry
     ? Date.now() + 8 * 60 * 60 * 1000
-    : parseManualTokenExpiry(await input({ message: "Paste expiresAt (ISO date or ms timestamp):" }));
+    : new Date(await input({ message: "Paste expiresAt (ISO date or ms timestamp):" })).getTime();
 
   return {
     accessToken,
@@ -573,33 +467,20 @@ async function promptManualTokens(): Promise<OAuthTokens | null> {
 
 // ─── Client-mode setup (from wizard) ─────────────────────────────────────────
 
-export interface ClientSetupDependencies {
-  promptServerUrl(): Promise<string>;
-  promptSecret(): Promise<string>;
-  fetchImpl: typeof fetch;
-}
-
-const defaultClientSetupDependencies: ClientSetupDependencies = {
-  promptServerUrl: () => input({
-    message: "CC-Router server URL (e.g. 192.168.1.50:3456):",
-  }),
-  promptSecret: () => input({
-    message: "Proxy secret (leave empty if none):",
-    transformer: (v) => (v ? "•".repeat(v.length) : ""),
-  }),
-  fetchImpl: (request, init) => fetch(request, init),
-};
-
-export async function runClientSetupFromWizard(
-  dependencies: ClientSetupDependencies = defaultClientSetupDependencies,
-): Promise<number | undefined> {
+async function runClientSetupFromWizard(): Promise<void> {
   console.log(chalk.bold("\n🔗 Client Mode — Connect to a CC-Router server\n"));
 
-  const rawUrl = await dependencies.promptServerUrl();
+  const rawUrl = await input({
+    message: "CC-Router server URL (e.g. 192.168.1.50:3456):",
+  });
   let url = rawUrl.trim().replace(/\/+$/, "");
   if (!url.startsWith("http://") && !url.startsWith("https://")) url = `http://${url}`;
 
-  const secret = (await dependencies.promptSecret()) || undefined;
+  const secret =
+    (await input({
+      message: "Proxy secret (leave empty if none):",
+      transformer: (v) => (v ? "•".repeat(v.length) : ""),
+    })) || undefined;
 
   // Test connection
   console.log(chalk.gray(`\nTesting connection to ${url}...`));
@@ -607,7 +488,7 @@ export async function runClientSetupFromWizard(
   try {
     const headers: Record<string, string> = {};
     if (secret) headers["authorization"] = `Bearer ${secret}`;
-    const res = await dependencies.fetchImpl(`${url}/cc-router/health`, {
+    const res = await fetch(`${url}/cc-router/health`, {
       headers,
       signal: AbortSignal.timeout(8_000),
     });
@@ -619,7 +500,7 @@ export async function runClientSetupFromWizard(
     console.error(chalk.red(`\n✗ Cannot reach CC-Router at ${url}`));
     console.error(chalk.yellow(`  Error: ${(e as Error).message}`));
     console.error(chalk.gray("  Make sure the server is running and the URL is correct.\n"));
-    return 1;
+    process.exit(1);
   }
 
   // Save config

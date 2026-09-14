@@ -57,6 +57,7 @@ function samplePayload(): unknown {
       approx_local_messages: null,
       approx_cloud_messages: null,
     },
+    rate_limit_reset_credits: { available_count: 2 },
   };
 }
 
@@ -75,6 +76,29 @@ describe("parseCodexUsagePayload", () => {
     });
     expect(bucket.secondary).toBeUndefined();
     expect(update!.credits).toEqual({ hasCredits: false, unlimited: false });
+    expect(update!.resetCredits).toEqual({ available: 2 });
+  });
+
+  it("parses rate_limit_reset_credits.available_count including zero", () => {
+    const payload = samplePayload() as Record<string, unknown>;
+    payload["rate_limit_reset_credits"] = { available_count: 0 };
+    expect(parseCodexUsagePayload(payload, NOW_MS)!.resetCredits).toEqual({ available: 0 });
+  });
+
+  it("omits resetCredits when the usage field is absent", () => {
+    const payload = samplePayload() as Record<string, unknown>;
+    delete payload["rate_limit_reset_credits"];
+    expect(parseCodexUsagePayload(payload, NOW_MS)!.resetCredits).toBeUndefined();
+  });
+
+  it("clamps reset credit counts to 0..99", () => {
+    const high = samplePayload() as Record<string, unknown>;
+    high["rate_limit_reset_credits"] = { available_count: 150 };
+    expect(parseCodexUsagePayload(high, NOW_MS)!.resetCredits).toEqual({ available: 99 });
+
+    const low = samplePayload() as Record<string, unknown>;
+    low["rate_limit_reset_credits"] = { available_count: -3 };
+    expect(parseCodexUsagePayload(low, NOW_MS)!.resetCredits).toEqual({ available: 0 });
   });
 
   it("maps named additional rate limits into their own buckets", () => {
@@ -177,12 +201,12 @@ describe("fetchCodexUsage", () => {
     const unauthorized = await fetchCodexUsage(account, {
       fetch: vi.fn(async () => new Response("denied", { status: 401 })),
     });
-    expect(unauthorized).toEqual({ ok: false, reason: "auth", status: 401 });
+    expect(unauthorized).toEqual({ ok: false, reason: "auth" });
 
     const overloaded = await fetchCodexUsage(account, {
       fetch: vi.fn(async () => new Response("busy", { status: 503 })),
     });
-    expect(overloaded).toEqual({ ok: false, reason: "http", status: 503 });
+    expect(overloaded).toEqual({ ok: false, reason: "http" });
 
     const offline = await fetchCodexUsage(account, {
       fetch: vi.fn(async () => { throw new Error("ECONNREFUSED"); }),
@@ -233,11 +257,31 @@ describe("OpenAIUsageRefresher", () => {
 
     const result = await refresher.refreshNow(account);
 
-    expect(result).toEqual({ ok: false, reason: "auth", status: 401 });
+    expect(result).toEqual({ ok: false, reason: "auth" });
     // A failed token refresh must not reach the endpoint with a dead token...
     expect(fetchUsage).not.toHaveBeenCalled();
     // ...and must not erase what the account already knew.
     expect(account.rateLimits.buckets.get(DEFAULT_CODEX_LIMIT_ID)?.primary?.utilization).toBe(0.5);
+    refresher.stop();
+  });
+
+  it("does not let advisory usage results overwrite permanent OAuth quarantine", async () => {
+    const account = makeAccount("quarantined");
+    account.authState = "quarantined";
+    account.authFailure = "permanent";
+    let result = { ok: false, reason: "auth" } as const;
+    const refresher = new OpenAIUsageRefresher(poolOf(account), {
+      fetchUsage: async () => result,
+    });
+
+    await refresher.refreshNow(account);
+    expect(account.authState).toBe("quarantined");
+    expect(account.authFailure).toBe("permanent");
+
+    result = { ok: true, update: { buckets: [] } } as const;
+    await refresher.refreshNow(account);
+    expect(account.authState).toBe("quarantined");
+    expect(account.authFailure).toBe("permanent");
     refresher.stop();
   });
 

@@ -37,7 +37,7 @@ function cleanModel(model: string | undefined): string | undefined {
  * costs the Anthropic path nothing. Everything else unprefixed still goes to
  * Anthropic, which is what existing setups rely on.
  */
-function isBareOpenAIModel(publicModel: string): boolean {
+export function isBareOpenAIModel(publicModel: string): boolean {
   return publicModel.toLowerCase().startsWith("gpt-");
 }
 

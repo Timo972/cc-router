@@ -21,29 +21,19 @@ import {
   mirrorUpstreamHeaders,
   type ForwardOpenAI,
   type OpenAIIngressEnvelope,
-  type OpenAIIngressTelemetry,
 } from "./openai-ingress.js";
-import { annotateActiveSpan } from "../telemetry/facade.js";
-import { writeResponseChunk } from "./response-write.js";
-
-function requestSource(req: Request): "cli" | "desktop" | "api" {
-  if (req.headers["x-claude-code-session-id"] !== undefined) return "cli";
-  if (req.headers["x-api-key"] !== undefined) return "desktop";
-  return "api";
-}
+import { waitForWritable } from "./transport-timing.js";
 
 export interface ResponsesRoutesOptions {
   openAIRouter: SessionRouter<OpenAIAccount>;
   openAIPool: OpenAITokenPool;
   prepareOpenAIAccount?: (account: OpenAIAccount) => Promise<boolean>;
-  prepareOpenAIAccountOwnsDiagnostics?: boolean;
   forwardOpenAI?: ForwardOpenAI;
   modelRouting?: ModelRoutingConfig;
   recordActivity?: (entry: LogEntry) => void;
   now?: () => number;
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
-  /** Injectable only for deterministic composition/privacy tests. */
-  telemetry?: OpenAIIngressTelemetry;
+  timeoutMs?: number;
   /** Upstream attempts per client request (default 3). `1` disables
    *  router-side failover/retry entirely — the `autoFailover: false`
    *  config opt-out is wired through here. */
@@ -59,6 +49,8 @@ const RESPONSES_ENVELOPE: OpenAIIngressEnvelope = {
   wrap: (type, message) => ({ error: { type, message } }),
   sendNoEligible: (error, res, nowMs) => sendOpenAINoEligibleResponse(error, res, nowMs),
 };
+
+const RESPONSES_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
 
 function isResponsesRequest(value: unknown): value is OpenAIResponsesRequest {
   return (
@@ -97,62 +89,51 @@ async function sendUpstreamResponse(
   // releases a stalled stream, so the account's upstream slot is not held for
   // a response nobody will receive.
   const DISCONNECTED = Symbol("client-disconnected");
+  let resolveDisconnected: ((value: typeof DISCONNECTED) => void) | undefined;
+  const onClose = () => resolveDisconnected?.(DISCONNECTED);
   const disconnected = new Promise<typeof DISCONNECTED>(resolve => {
+    resolveDisconnected = resolve;
     if (res.destroyed) resolve(DISCONNECTED);
-    else res.once("close", () => resolve(DISCONNECTED));
+    else res.once("close", onClose);
   });
-  let readerFinished = false;
-  let readerCancelled = false;
-  const cancelReader = async (): Promise<void> => {
-    if (readerFinished || readerCancelled) return;
-    readerCancelled = true;
-    await reader.cancel().catch(() => {});
-  };
+  let completed = false;
   try {
     while (true) {
       const next = await Promise.race([reader.read(), disconnected]);
       if (next === DISCONNECTED) {
-        await cancelReader();
-        break;
+        await reader.cancel().catch(() => {});
+        return;
       }
       const { value, done } = next;
-      if (done) {
-        readerFinished = true;
-        break;
-      }
+      if (done) break;
       if (value) {
         onChunk?.(value);
-        if (!await writeResponseChunk(res, Buffer.from(value))) {
-          await cancelReader();
-          break;
+        if (!res.write(Buffer.from(value))) {
+          // Backpressure is a contract: do not consume another upstream chunk
+          // until Node drains, or until the peer goes away.
+          const drained = await waitForWritable(res);
+          if (!drained) {
+            await reader.cancel().catch(() => {});
+            return;
+          }
         }
       }
     }
-  } catch (error) {
-    await cancelReader();
-    throw error;
+    completed = true;
   } finally {
-    if (!res.destroyed && !res.writableEnded) res.end();
+    res.removeListener("close", onClose);
+    if (completed && !res.destroyed && !res.writableEnded) res.end();
   }
 }
 
 export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions): void {
   const forwardOpenAI = opts.forwardOpenAI ?? forwardOpenAICodexResponse;
-  const forwardOpenAIOwnsDiagnostics = opts.forwardOpenAI === undefined;
   const prepareOpenAIAccount = opts.prepareOpenAIAccount ?? (async () => true);
   const recordActivity = opts.recordActivity ?? ((entry: LogEntry) => stats.addLog(entry));
   const now = opts.now ?? Date.now;
 
-  app.post("/v1/responses", express.json({ limit: "10mb" }), async (req: Request, res: Response) => {
+  app.post("/v1/responses", express.json({ limit: RESPONSES_BODY_LIMIT_BYTES }), async (req: Request, res: Response) => {
     if (!isResponsesRequest(req.body)) {
-      annotateActiveSpan("proxy.request", {
-        httpMethod: "POST",
-        provider: "openai",
-        route: "responses",
-        requestSource: requestSource(req),
-        httpStatusCode: 400,
-        outcome: "upstream_error",
-      });
       res.status(400).json({
         error: {
           type: "invalid_request_error",
@@ -163,16 +144,6 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
     }
 
     if (req.body.store === true) {
-      annotateActiveSpan("proxy.request", {
-        httpMethod: "POST",
-        provider: "openai",
-        route: "responses",
-        requestSource: requestSource(req),
-        modelFamily: "codex",
-        streaming: req.body.stream === true,
-        httpStatusCode: 400,
-        outcome: "upstream_error",
-      });
       recordActivity({
         ts: Date.now(),
         accountId: "-",
@@ -222,7 +193,6 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       sessionKey: extractCodexSessionKey(req, req.body),
       requestedModel: route.upstreamModel,
       path: "/v1/responses",
-      requestSource: requestSource(req),
       method: req.method,
       // Only the Codex CLI speaks the Responses API to this proxy.
       source: "codex",
@@ -235,9 +205,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       now,
       envelope: RESPONSES_ENVELOPE,
       onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
-      prepareOpenAIAccountOwnsDiagnostics: opts.prepareOpenAIAccountOwnsDiagnostics === true,
-      forwardOpenAIOwnsDiagnostics,
-      telemetry: opts.telemetry,
+      timeoutMs: opts.timeoutMs,
       ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
       ...(opts.sameAccountRetryDelayMs !== undefined
         ? { sameAccountRetryDelayMs: opts.sameAccountRetryDelayMs }
@@ -246,13 +214,6 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         ? { retryRefreshTimeoutMs: opts.retryRefreshTimeoutMs }
         : {}),
       relay: async (upstream, res, entry, report) => {
-        const successfulEventStream = upstream.ok
-          && (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
-        // A successful event stream with no body is already an upstream
-        // failure before either relay runs. Latch that ownership now so a
-        // concurrent client hangup cannot rewrite the collector's synthesized
-        // 502 into a benign cancellation and suppress account diagnostics.
-        if (successfulEventStream && !upstream.body) report.upstreamReportedFailure = true;
         if (body.stream === true) {
           const observer = createCodexUsageObserver();
           // Only an upstream that actually promised a successful event stream
@@ -262,11 +223,13 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
           // `sendUpstreamResponse` has already relayed the real status to the
           // client, so reporting 502 here would log a 502 for a client that
           // received a 429 and hide the actual failure from diagnostics.
-          const streamed = successfulEventStream;
+          const streamed = upstream.ok
+            && (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
           // Reported per chunk, not once at the end: this relay can throw
           // (or be cut short) after upstream has already announced a failure,
           // and the verdict has to survive that.
           await sendUpstreamResponse(upstream, res, chunk => {
+            if (entry.firstByteDurationMs === undefined) entry.firstByteDurationMs = now() - entry.ts;
             observer.push(chunk);
             if (observer.explicitFailure() !== undefined) report.upstreamReportedFailure = true;
           });

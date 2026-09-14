@@ -1,29 +1,25 @@
 import type { ProviderAccount } from "../types.js";
 import { decodeOpenAIPlan } from "./usage.js";
+import { createHeaderDeadline } from "../../proxy/transport-timing.js";
+import { logError } from "../../proxy/logger.js";
 import {
-  annotateActiveSpan,
-  classifyExpectedRuntimeFailure,
-  recordSafeLog,
-  recordUnexpectedException,
+  createCorrelationId,
+  formatTransportDiagnostic,
+  safeCauseCode,
+} from "../../proxy/transport-diagnostics.js";
+import { DEFAULT_CLIENT_ID } from "./device-oauth.js";
+import {
+  recordRuntimeError,
+  recordUpstreamStatus,
   withTelemetrySpan,
 } from "../../telemetry/facade.js";
 
 const TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
 const REFRESH_BUFFER_MS = 10 * 60 * 1000;
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
+export const OPENAI_REFRESH_TIMEOUT_MS = 15_000;
 
-const refreshLocks = new Map<string, Promise<boolean>>();
-const refreshControllers = new Map<string, AbortController>();
-const rawRefreshOwners = new Map<string, RefreshLifecycle | undefined>();
-const ownedRefreshLocks = new Set<Promise<boolean>>();
-const ownedRefreshOwners = new Map<Promise<boolean>, RefreshLifecycle | undefined>();
-
-interface RefreshLifecycle {
-  stopping: boolean;
-  settled: boolean;
-}
-
-let activeRefreshLifecycle: RefreshLifecycle | undefined;
+const refreshLocks = new WeakMap<OpenAISubscriptionAccount, Promise<boolean>>();
 
 /**
  * Accounts whose most recently rotated credentials have NOT been confirmed
@@ -118,45 +114,24 @@ type OpenAIRuntimeHealthFields = {
   consecutiveErrors?: number;
   lastRefresh?: number;
   rateLimits?: { plan?: string };
+  authState?: "ok" | "quarantined";
+  authFailure?: "permanent" | "transient";
 };
 
 export function needsOpenAIRefresh(account: Pick<OpenAISubscriptionAccount, "expiresAt">): boolean {
   return account.expiresAt - Date.now() < REFRESH_BUFFER_MS;
 }
 
-export async function refreshOpenAISubscriptionToken(
-  account: OpenAISubscriptionAccount,
-  signal?: AbortSignal,
-): Promise<boolean> {
-  if (activeRefreshLifecycle?.stopping) return false;
-  const existing = refreshLocks.get(account.id);
-  if (existing) {
-    const unlink = linkAbortSignal(signal, refreshControllers.get(account.id));
-    try {
-      return await existing;
-    } finally {
-      unlink();
-    }
-  }
+export async function refreshOpenAISubscriptionToken(account: OpenAISubscriptionAccount): Promise<boolean> {
+  const existing = refreshLocks.get(account);
+  if (existing) return existing;
 
-  const controller = new AbortController();
-  const owner = activeRefreshLifecycle;
-  const unlink = linkAbortSignal(signal, controller);
-  const promise = withTelemetrySpan(
-    "oauth.refresh",
-    { provider: "openai" },
-    () => doRefresh(account, controller.signal),
-  );
-  refreshLocks.set(account.id, promise);
-  refreshControllers.set(account.id, controller);
-  rawRefreshOwners.set(account.id, owner);
+  const promise = withTelemetrySpan("oauth.refresh", { provider: "openai" }, () => doRefresh(account));
+  refreshLocks.set(account, promise);
   try {
     return await promise;
   } finally {
-    if (refreshLocks.get(account.id) === promise) refreshLocks.delete(account.id);
-    if (refreshControllers.get(account.id) === controller) refreshControllers.delete(account.id);
-    if (rawRefreshOwners.get(account.id) === owner) rawRefreshOwners.delete(account.id);
-    unlink();
+    refreshLocks.delete(account);
   }
 }
 
@@ -165,7 +140,9 @@ export async function prepareOpenAIAccountForRequest(
   allAccounts: OpenAISubscriptionAccount[],
   saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
 ): Promise<boolean> {
-  if (!needsOpenAIRefresh(account)) {
+  const runtime = account as OpenAISubscriptionAccount & OpenAIRuntimeHealthFields;
+  // A revoked but unexpired access token must not bypass the refresh gate.
+  if (!needsOpenAIRefresh(account) && runtime.authState !== "quarantined") {
     // No refresh due, but a previous rotation from this account never made it
     // to disk (e.g. a transient disk-full). This is the retry path: piggyback
     // on this otherwise-idle request to flush the still-current in-memory
@@ -193,242 +170,200 @@ export async function refreshAndPersistOpenAIAccount(
   allAccounts: OpenAISubscriptionAccount[],
   saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
 ): Promise<boolean> {
-  if (activeRefreshLifecycle?.stopping) return false;
-  const owner = activeRefreshLifecycle;
-  let operation!: Promise<boolean>;
-  operation = (async () => {
+  const ok = await refreshOpenAISubscriptionToken(account);
+  if (ok) persistCredentials(account, allAccounts, saveAccounts);
+  return ok;
+}
+
+export interface RefreshOpenAIAccountsOnceOptions {
+  onError?: (error: unknown) => void;
+}
+
+/**
+ * One scheduled refresh pass over every OpenAI account: due tokens are
+ * refreshed, quarantined ones re-tried. Shared by the background loop and
+ * the manual reload endpoint so both isolate failures per account the same
+ * way. Returns how many accounts did not come out with usable credentials —
+ * an expected refresh rejection counts, not only a thrown error.
+ */
+export async function refreshOpenAIAccountsOnce(
+  accounts: OpenAISubscriptionAccount[],
+  saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
+  options: RefreshOpenAIAccountsOnceOptions = {},
+): Promise<{ failed: number }> {
+  let failed = 0;
+  for (const account of [...accounts]) {
+    // One account's refresh throwing must not skip every account after it
+    // in this tick — isolate failures per-account.
     try {
-      const ok = await refreshOpenAISubscriptionToken(account);
-      if (ok) persistCredentials(account, allAccounts, saveAccounts);
-      return ok;
-    } finally {
-      ownedRefreshLocks.delete(operation);
-      ownedRefreshOwners.delete(operation);
+      if (!await prepareOpenAIAccountForRequest(account, accounts, saveAccounts)) failed++;
+    } catch (error) {
+      failed++;
+      (options.onError ?? console.error)(error);
     }
-  })();
-  ownedRefreshLocks.add(operation);
-  ownedRefreshOwners.set(operation, owner);
-  return operation;
+  }
+  return { failed };
 }
 
 export function startOpenAIRefreshLoop(
   accounts: OpenAISubscriptionAccount[],
   saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
-): (deadlineMs?: number) => Promise<void> {
-  if (activeRefreshLifecycle && !activeRefreshLifecycle.settled) {
-    throw new Error("OpenAI refresh loop is already running");
-  }
-  const lifecycle: RefreshLifecycle = { stopping: false, settled: false };
-  activeRefreshLifecycle = lifecycle;
-  let stopped = false;
-  let activePass: Promise<void> | undefined;
-  let activeController: AbortController | undefined;
+): () => void {
+  const check = () => refreshOpenAIAccountsOnce(accounts, saveAccounts);
 
-  const check = async (signal: AbortSignal) => {
-    for (const account of accounts) {
-      if (stopped || signal.aborted || activeRefreshLifecycle !== lifecycle) return;
-      // One account's refresh throwing must not skip every account after it
-      // in this tick — isolate failures per-account.
-      try {
-        await prepareOpenAIAccountForRequest(account, accounts, saveAccounts);
-      } catch (error) {
-        console.error(error);
-      }
-    }
-  };
+  const timer = setInterval(() => { check().catch(console.error); }, CHECK_INTERVAL_MS);
+  queueMicrotask(() => { check().catch(console.error); });
 
-  const startPass = (): void => {
-    if (stopped || activePass || activeRefreshLifecycle !== lifecycle) return;
-    const controller = new AbortController();
-    activeController = controller;
-    let operation!: Promise<void>;
-    operation = check(controller.signal)
-      .catch(error => {
-        if (!controller.signal.aborted) console.error(error);
-      })
-      .finally(() => {
-        if (activePass === operation) activePass = undefined;
-        if (activeController === controller) activeController = undefined;
-      });
-    activePass = operation;
-  };
-
-  const timer = setInterval(startPass, CHECK_INTERVAL_MS);
-  queueMicrotask(startPass);
-
-  let stopPromise: Promise<void> | undefined;
-  return (deadlineMs = 500) => {
-    if (stopPromise) return stopPromise;
-    stopPromise = (async () => {
-      stopped = true;
-      lifecycle.stopping = true;
-      clearInterval(timer);
-      const active = Promise.allSettled([
-        ...(activePass ? [activePass] : []),
-        ...[...refreshLocks].filter(([id]) => rawRefreshOwners.get(id) === lifecycle).map(([, promise]) => promise),
-        ...[...ownedRefreshLocks].filter(promise => ownedRefreshOwners.get(promise) === lifecycle),
-      ]).then(() => undefined);
-      try {
-        await drainRefreshPassWithin(active, deadlineMs, () => {
-          activeController?.abort();
-          for (const [id, controller] of refreshControllers) {
-            if (rawRefreshOwners.get(id) !== lifecycle) continue;
-            controller.abort();
-            refreshLocks.delete(id);
-            refreshControllers.delete(id);
-            rawRefreshOwners.delete(id);
-          }
-          for (const operation of ownedRefreshLocks) {
-            if (ownedRefreshOwners.get(operation) !== lifecycle) continue;
-            ownedRefreshLocks.delete(operation);
-            ownedRefreshOwners.delete(operation);
-          }
-        });
-      } finally {
-        lifecycle.settled = true;
-        if (activeRefreshLifecycle === lifecycle) activeRefreshLifecycle = undefined;
-      }
-    })();
-    return stopPromise;
-  };
+  return () => clearInterval(timer);
 }
 
-async function doRefresh(account: OpenAISubscriptionAccount, signal?: AbortSignal): Promise<boolean> {
-  const startedAt = Date.now();
-  let receivedSuccessfulResponse = false;
+function refreshErrorCode(payload: unknown, depth = 0): string | undefined {
+  if (typeof payload === "string") return payload;
+  if (depth >= 3 || typeof payload !== "object" || payload === null) return undefined;
+
+  const record = payload as Record<string, unknown>;
+  for (const key of ["code", "type", "error"] as const) {
+    const code = refreshErrorCode(record[key], depth + 1);
+    if (code) return code;
+  }
+  return undefined;
+}
+
+function rejectIsPermanent(status: number, payload: unknown): boolean {
+  if (status !== 400 && status !== 401) return false;
+  const code = refreshErrorCode(payload);
+  // `token_expired` is the code the real endpoint returns for a refresh token it
+  // can no longer validate; like the OAuth2-standard codes it means re-auth, not
+  // a retriable blip, so it must quarantine rather than cooldown-loop forever.
+  return code === "invalid_grant" || code === "invalid_token" || code === "token_revoked" || code === "token_expired";
+}
+
+function markRefreshFailure(account: OpenAISubscriptionAccount, permanent: boolean): void {
+  const runtime = account as OpenAISubscriptionAccount & OpenAIRuntimeHealthFields;
+  if (permanent) {
+    runtime.authFailure = "permanent";
+    runtime.authState = "quarantined";
+  } else if (runtime.authState !== "quarantined") {
+    runtime.authFailure = "transient";
+  }
+}
+
+function logRefreshFailure(
+  account: OpenAISubscriptionAccount,
+  correlationId: string,
+  status: number | undefined,
+  error?: unknown,
+): void {
+  logError(account.id, status !== undefined && status >= 400 ? status : 0, formatTransportDiagnostic({
+    correlationId,
+    operation: "refresh",
+    ...(status !== undefined ? { status } : {}),
+    causeCode: safeCauseCode(error),
+  }));
+}
+
+async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: account.refreshToken,
+    // The token endpoint validates client_id before the grant; without it the
+    // refresh 400s as `missing_required_parameter` and never reaches token
+    // validation. Same public client the tokens were minted under (device-oauth).
+    client_id: DEFAULT_CLIENT_ID,
   });
 
+  let data: OpenAIRefreshResponse;
+  let responseStatus: number | undefined;
+  const correlationId = createCorrelationId();
+  const deadline = createHeaderDeadline(OPENAI_REFRESH_TIMEOUT_MS);
   try {
     const res = await fetch(TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
-      signal,
+      signal: deadline.signal,
     });
-    signal?.throwIfAborted();
+    responseStatus = res.status;
 
-    const outcome = res.ok ? "complete" : res.status === 429 ? "rate_limited" : "upstream_error";
-    annotateActiveSpan("oauth.refresh", {
-      httpStatusCode: res.status,
-      outcome,
-      operationDurationMs: Date.now() - startedAt,
-    });
     if (!res.ok) {
-      recordSafeLog({
-        operation: "oauth.refresh",
-        provider: "openai",
-        reason: refreshHttpReason(res.status),
-        outcome,
-        httpStatusCode: res.status,
-        operationDurationMs: Date.now() - startedAt,
-        severity: "warn",
-      });
+      let payload: unknown;
+      try { payload = await res.json(); } catch { /* intentionally do not retain response bodies */ }
+      markRefreshFailure(account, rejectIsPermanent(res.status, payload));
+      recordUpstreamStatus("oauth.refresh", "openai", res.status);
+      logRefreshFailure(account, correlationId, res.status);
       return false;
     }
 
-    receivedSuccessfulResponse = true;
-    const data = await res.json() as OpenAIRefreshResponse;
-    signal?.throwIfAborted();
-
-    // A 200 with an unusable payload is a failed refresh, not a successful one.
-    if (typeof data?.access_token !== "string" || data.access_token.length === 0) {
-      throw new TypeError("Unexpected OpenAI refresh response shape");
-    }
-    if (typeof data.expires_in !== "number" || !Number.isFinite(data.expires_in) || data.expires_in <= 0) {
-      throw new TypeError("Unexpected OpenAI refresh response shape");
-    }
-    const expiresAt = Date.now() + data.expires_in * 1000;
-    if (!Number.isFinite(expiresAt)) throw new TypeError("Unexpected OpenAI refresh response shape");
-
-    account.accessToken = data.access_token;
-    account.refreshToken = data.refresh_token ?? account.refreshToken;
-    account.expiresAt = expiresAt;
-
-    // A successful refresh recovers an account the pool previously excluded.
-    const runtime = account as OpenAISubscriptionAccount & OpenAIRuntimeHealthFields;
-    if (runtime.healthy !== undefined) runtime.healthy = true;
-    if (runtime.consecutiveErrors !== undefined) runtime.consecutiveErrors = 0;
-    if (runtime.lastRefresh !== undefined) runtime.lastRefresh = Date.now();
-
-    if (runtime.rateLimits) {
-      const plan = decodeOpenAIPlan(account.accessToken);
-      if (plan) runtime.rateLimits.plan = plan;
-    }
-
-    return true;
+    data = await res.json() as OpenAIRefreshResponse;
   } catch (error) {
     // Network failure (or malformed response body) must resolve to `false`,
     // exactly like a non-ok HTTP response — never propagate as a rejection.
-    if (signal?.aborted) return false;
-    const expectedReason = classifyExpectedRuntimeFailure(error);
-    const reason = expectedReason ?? (receivedSuccessfulResponse ? "unexpected_response_shape" : "other");
-    const outcome = reason === "timeout" ? "timeout" : "upstream_error";
-    annotateActiveSpan("oauth.refresh", {
-      outcome,
-      operationDurationMs: Date.now() - startedAt,
-    });
-    recordSafeLog({
-      operation: "oauth.refresh",
-      provider: "openai",
-      reason,
-      outcome,
-      operationDurationMs: Date.now() - startedAt,
-      severity: "error",
-    });
-    if (!expectedReason) {
-      recordUnexpectedException(error, {
-        category: "runtime",
-        reason: "other",
-        operation: "oauth.refresh",
-        provider: "openai",
-      });
-    }
+    markRefreshFailure(account, false);
+    recordRuntimeError(error, { operation: "oauth.refresh", provider: "openai" });
+    logRefreshFailure(account, correlationId, responseStatus, error);
+    return false;
+  } finally {
+    // OAuth is a small JSON exchange: unlike inference, the deadline covers
+    // both headers and body parsing so a stalled body cannot retain the lock.
+    deadline.dispose();
+  }
+
+  // A 200 with an unusable payload is a failed refresh, not a successful one.
+  // Writing it through would leave `expiresAt` as NaN, which then reads as
+  // "never needs refreshing" in `needsOpenAIRefresh` and permanently strands
+  // the account on a broken token.
+  if (typeof data?.access_token !== "string" || data.access_token.length === 0) {
+    markRefreshFailure(account, false);
+    logRefreshFailure(account, correlationId, 200);
     return false;
   }
-}
-
-function linkAbortSignal(
-  signal: AbortSignal | undefined,
-  controller: AbortController | undefined,
-): () => void {
-  if (!signal || !controller) return () => undefined;
-  if (signal.aborted) {
-    controller.abort();
-    return () => undefined;
+  // The lifetime has to be positive and has to still name a finite instant
+  // once converted. A zero or negative `expires_in` would report success on a
+  // token that is already due for another refresh, so every request re-enters
+  // the refresh path; a value big enough to overflow the multiplication would
+  // set `expiresAt` to Infinity, which `needsOpenAIRefresh` can never reach —
+  // the same permanent strand as NaN, from the opposite direction.
+  if (typeof data.expires_in !== "number" || !Number.isFinite(data.expires_in)) {
+    markRefreshFailure(account, false);
+    logRefreshFailure(account, correlationId, 200);
+    return false;
   }
-  const abort = () => controller.abort();
-  signal.addEventListener("abort", abort, { once: true });
-  return () => signal.removeEventListener("abort", abort);
-}
-
-async function drainRefreshPassWithin(
-  active: Promise<void>,
-  deadlineMs: number,
-  abort: () => void,
-): Promise<void> {
-  const bounded = Number.isFinite(deadlineMs) ? Math.max(0, Math.min(10_000, Math.floor(deadlineMs))) : 0;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = await Promise.race([
-    active.then(() => false, () => false),
-    new Promise<true>(resolve => { timer = setTimeout(() => resolve(true), bounded); }),
-  ]);
-  if (!timedOut) {
-    clearTimeout(timer);
-    return;
+  if (data.expires_in <= 0) {
+    markRefreshFailure(account, false);
+    logRefreshFailure(account, correlationId, 200);
+    return false;
   }
-  abort();
-  await Promise.race([
-    active.then(() => undefined, () => undefined),
-    new Promise<void>(resolve => setTimeout(resolve, Math.min(25, bounded))),
-  ]);
-}
+  const expiresAt = Date.now() + data.expires_in * 1000;
+  if (!Number.isFinite(expiresAt)) {
+    markRefreshFailure(account, false);
+    logRefreshFailure(account, correlationId, 200);
+    return false;
+  }
 
-function refreshHttpReason(status: number): "unauthorized" | "forbidden" | "rate_limited" | "upstream_4xx" | "upstream_5xx" {
-  if (status === 401) return "unauthorized";
-  if (status === 403) return "forbidden";
-  if (status === 429) return "rate_limited";
-  return status >= 500 ? "upstream_5xx" : "upstream_4xx";
+  account.accessToken = data.access_token;
+  account.refreshToken = data.refresh_token ?? account.refreshToken;
+  account.expiresAt = expiresAt;
+
+  // A successful refresh recovers an account the pool previously excluded for
+  // being unhealthy (e.g. after a prior failed refresh). Without this, the pool's
+  // hard `!healthy` block means the account never gets acquired again — and thus
+  // never gets another chance to refresh — so it stays excluded until restart.
+  const runtime = account as OpenAISubscriptionAccount & OpenAIRuntimeHealthFields;
+  if (runtime.healthy !== undefined) runtime.healthy = true;
+  if (runtime.consecutiveErrors !== undefined) runtime.consecutiveErrors = 0;
+  if (runtime.lastRefresh !== undefined) runtime.lastRefresh = Date.now();
+  runtime.authState = "ok";
+  runtime.authFailure = undefined;
+
+  // The rotated access token can carry a different plan than the one decoded
+  // at account creation (e.g. a Plus->Pro upgrade). Mirrors createOpenAIAccount's
+  // semantics: only overwrite when the new token actually decodes a plan claim —
+  // an undecodable token leaves the previously known plan in place rather than
+  // erasing it, since a missing claim means "unknown", not "no plan".
+  if (runtime.rateLimits) {
+    const plan = decodeOpenAIPlan(account.accessToken);
+    if (plan) runtime.rateLimits.plan = plan;
+  }
+
+  return true;
 }

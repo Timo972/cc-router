@@ -7,7 +7,7 @@ import {
 
 describe("isValidAccountId", () => {
   it("accepts the shapes existing account ids use", () => {
-    expect(isValidAccountId("max-developer-droidrun")).toBe(true);
+    expect(isValidAccountId("max-developer-team")).toBe(true);
     expect(isValidAccountId("pro.timo_personal")).toBe(true);
     expect(isValidAccountId("a")).toBe(true);
   });

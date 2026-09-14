@@ -15,6 +15,7 @@ const TEST_STATE = vi.hoisted(() => {
 
 vi.mock("../config/paths.js", () => ({
   CLAUDE_SETTINGS_PATH: `${TEST_STATE.dir}/settings.json`,
+  CODEX_CONFIG_PATH: `${TEST_STATE.dir}/codex-config.toml`,
   CONFIG_DIR: TEST_STATE.dir,
   ACCOUNTS_PATH: `${TEST_STATE.dir}/accounts.json`,
   CONFIG_PATH: `${TEST_STATE.dir}/config.json`,

@@ -1,6 +1,11 @@
 import type { Account, AccountUsageSnapshot } from "../../proxy/types.js";
 import { UsageRefresher } from "../../proxy/usage-refresher.js";
 import { fetchAnthropicUsage, type UsageFetchResult } from "./usage.js";
+import {
+  recordRuntimeError,
+  recordUpstreamStatus,
+  withTelemetrySpan,
+} from "../../telemetry/facade.js";
 
 export interface UsageAccountPool {
   getAll(): Account[];
@@ -23,19 +28,23 @@ export interface AnthropicUsageRefresherOptions {
 export class AnthropicUsageRefresher extends UsageRefresher<Account, UsageFetchResult> {
   constructor(pool: UsageAccountPool, options: AnthropicUsageRefresherOptions = {}) {
     const now = options.now ?? Date.now;
+    const fetchUsage = options.fetchUsage ?? fetchAnthropicUsage;
     super(pool, {
-      fetchUsage: options.fetchUsage ?? fetchAnthropicUsage,
-      cancelledResult: () => ({ ok: false, reason: "network" }),
-      telemetry: {
-        provider: "anthropic",
-        classifyResult: result => ({
-          outcome: usageOutcome(result),
-          ...(!result.ok ? {
-            reason: usageReason(result),
-            ...(result.status !== undefined ? { httpStatusCode: result.status } : {}),
-          } : {}),
+      fetchUsage: account => withTelemetrySpan("provider.usage_refresh", { provider: "anthropic" },
+        async () => {
+          let result: UsageFetchResult;
+          try {
+            result = await fetchUsage(account);
+          } catch (error) {
+            recordRuntimeError(error, { operation: "provider.usage_refresh", provider: "anthropic" });
+            throw error;
+          }
+          if (!result.ok && result.status !== undefined) {
+            recordUpstreamStatus("provider.usage_refresh", "anthropic", result.status);
+          }
+          return result;
         }),
-      },
+      cancelledResult: () => ({ ok: false, reason: "network" }),
       applyResult: (account, result) => {
         if (result.ok) {
           account.rateLimits = { ...account.rateLimits, usage: result.snapshot };
@@ -52,23 +61,4 @@ export class AnthropicUsageRefresher extends UsageRefresher<Account, UsageFetchR
       ...(options.maxConcurrent !== undefined ? { maxConcurrent: options.maxConcurrent } : {}),
     });
   }
-}
-
-function usageOutcome(result: UsageFetchResult): "complete" | "rate_limited" | "timeout" | "upstream_error" {
-  if (result.ok) return "complete";
-  if (result.reason === "timeout") return "timeout";
-  if (result.reason === "http" && result.status === 429) return "rate_limited";
-  return "upstream_error";
-}
-
-function usageReason(result: Exclude<UsageFetchResult, { ok: true }>): "unauthorized" | "forbidden" | "rate_limited" | "upstream_4xx" | "upstream_5xx" | "timeout" | "network_failure" | "unexpected_response_shape" {
-  if (result.reason === "timeout") return "timeout";
-  if (result.reason === "network") return "network_failure";
-  if (result.reason === "invalid_json" || result.reason === "invalid_schema") {
-    return "unexpected_response_shape";
-  }
-  if (result.status === 401) return "unauthorized";
-  if (result.status === 403) return "forbidden";
-  if (result.status === 429) return "rate_limited";
-  return (result.status ?? 500) >= 500 ? "upstream_5xx" : "upstream_4xx";
 }

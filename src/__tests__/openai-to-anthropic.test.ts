@@ -27,47 +27,28 @@ describe("openAIResponsesToAnthropic", () => {
     });
   });
 
-  it("maps function calls and outputs to Anthropic tool blocks", () => {
+  it("maps top-level function call items to adjacent Anthropic messages", () => {
     const result = openAIResponsesToAnthropic({
       model: "anthropic/claude-opus-4-1",
       input: [
-        {
-          role: "assistant",
-          content: [
-            { type: "function_call", call_id: "call_1", name: "read_file", arguments: "{\"path\":\"README.md\"}" },
-          ],
-        },
-        {
-          role: "tool",
-          content: [
-            { type: "function_call_output", call_id: "call_1", output: "CC-Router" },
-          ],
-        },
+        { role: "user", content: [{ type: "input_text", text: "Read it." }] },
+        { role: "assistant", content: [{ type: "output_text", text: "Reading." }] },
+        { type: "function_call", call_id: "call_1", name: "read_file", arguments: "{\"path\":\"README.md\"}" },
+        { type: "function_call_output", call_id: "call_1", output: "CC-Router" },
       ],
-      tools: [
-        {
-          type: "function",
-          name: "read_file",
-          parameters: { type: "object", properties: { path: { type: "string" } } },
-        },
-      ],
+      tools: [{ type: "function", name: "read_file", parameters: { type: "object" } }],
     });
 
     expect(result.messages).toEqual([
+      { role: "user", content: "Read it." },
       {
         role: "assistant",
-        content: [{ type: "tool_use", id: "call_1", name: "read_file", input: { path: "README.md" } }],
+        content: [
+          { type: "text", text: "Reading." },
+          { type: "tool_use", id: "call_1", name: "read_file", input: { path: "README.md" } },
+        ],
       },
-      {
-        role: "user",
-        content: [{ type: "tool_result", tool_use_id: "call_1", content: "CC-Router" }],
-      },
-    ]);
-    expect(result.tools).toEqual([
-      {
-        name: "read_file",
-        input_schema: { type: "object", properties: { path: { type: "string" } } },
-      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "CC-Router" }] },
     ]);
   });
 });

@@ -3,16 +3,17 @@ import type { Express, NextFunction, Request, Response } from "express";
 import { selectRoute } from "../providers/route-selector.js";
 import { anthropicToOpenAIResponses } from "../protocol/anthropic-to-openai.js";
 import { openAIResponseToAnthropicMessage } from "../protocol/openai-response-to-anthropic.js";
+import { OpenAIProtocolError } from "../protocol/openai-function-call.js";
 import { createOpenAIStreamToAnthropicNormalizer } from "../protocol/openai-stream-to-anthropic.js";
-import { createBoundedSseLineParser, encodeSseEvent } from "../protocol/sse.js";
+import { encodeSseEvent, parseSseLines } from "../protocol/sse.js";
 import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.js";
 import type { AnthropicMessagesRequest } from "../protocol/anthropic-types.js";
-import type { OpenAIResponseCompleted, OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
+import type {
+  OpenAIFunctionCall,
+  OpenAIResponseCompleted,
+  OpenAIResponseOutputItem,
+} from "../protocol/openai-responses-types.js";
 import {
-  MAX_CODEX_COLLECTED_RESPONSE_BYTES,
-  MAX_CODEX_STREAM_EVENT_BYTES,
-  RESPONSE_SIZE_ERROR,
-  readBodyWithinLimit,
   terminalResponsePayload,
   usageFromTerminalEvent,
   usageFromResponseBody,
@@ -34,17 +35,14 @@ import {
   type ForwardOpenAI,
   type OpenAIIngressEnvelope,
   type OpenAIIngressRelayResult,
-  type OpenAIIngressTelemetry,
   type OpenAIRelayReport,
 } from "./openai-ingress.js";
-import { annotateActiveSpan, recordUnexpectedException } from "../telemetry/facade.js";
-import { writeResponseChunk } from "./response-write.js";
+import { waitForWritable } from "./transport-timing.js";
 
 declare module "express-serve-static-core" {
   interface Request {
     _ccRawBody?: Buffer;
     _ccRouteContext?: RouteContext;
-    _ccTelemetryStreaming?: boolean;
   }
 }
 
@@ -52,14 +50,12 @@ export interface MessagesCrossProviderRouteOptions {
   openAIRouter: SessionRouter<OpenAIAccount>;
   openAIPool: OpenAITokenPool;
   prepareOpenAIAccount?: (account: OpenAIAccount) => Promise<boolean>;
-  prepareOpenAIAccountOwnsDiagnostics?: boolean;
   forwardOpenAI?: ForwardOpenAI;
   modelRouting?: ModelRoutingConfig;
   recordActivity?: (entry: LogEntry) => void;
   now?: () => number;
   onUpstreamAuthFailure?: (account: OpenAIAccount) => void;
-  /** Injectable only for deterministic composition/privacy tests. */
-  telemetry?: OpenAIIngressTelemetry;
+  timeoutMs?: number;
   /** Upstream attempts per client request (default 3). `1` disables
    *  router-side failover/retry entirely — the `autoFailover: false`
    *  config opt-out is wired through here. */
@@ -82,12 +78,6 @@ function isAnthropicMessagesRequest(value: unknown): value is AnthropicMessagesR
     value !== null &&
     Array.isArray((value as { messages?: unknown }).messages)
   );
-}
-
-function requestSource(req: Request): "cli" | "desktop" | "api" {
-  if (req.headers["x-claude-code-session-id"] !== undefined) return "cli";
-  if (req.headers["x-api-key"] !== undefined) return "desktop";
-  return "api";
 }
 
 /** Longest upstream error snippet echoed back when the body isn't JSON. */
@@ -122,19 +112,6 @@ function extractUpstreamErrorMessage(bodyText: string, status: number): string {
   return `Upstream request failed with status ${status}`;
 }
 
-function sendBoundedUpstreamFailure(
-  res: Response,
-  report: OpenAIRelayReport,
-  message: string,
-): OpenAIIngressRelayResult {
-  report.upstreamReportedFailure = true;
-  res.status(502).json({
-    type: "error",
-    error: { type: "upstream_error", message },
-  });
-  return { statusCode: 502 };
-}
-
 /**
  * Relay an upstream Codex response in Anthropic Messages shape and report the
  * status the client actually received — which is not always `upstream.status`:
@@ -147,18 +124,17 @@ async function sendOpenAIAsAnthropic(
   requestedStream: boolean,
   entry: LogEntry,
   report: OpenAIRelayReport,
-  signal: AbortSignal,
+  now: () => number,
 ): Promise<OpenAIIngressRelayResult> {
   const onUsage = (usage: CodexUsageTotals | undefined) => applyCodexUsage(entry, usage);
 
   // A non-OK response is never a Responses payload, whatever its content-type
   // — parsing it as an event stream or a completed response would translate a
   // real upstream failure (401/429/5xx) into an empty "success". Handle it
-  // before any content-type dispatch and relay the upstream status verbatim
-  // when its body is readable within the shared bound. A body overflow/read
-  // failure is itself synthesized as the same safe 502 used by Responses.
+  // before any content-type dispatch and relay the upstream status verbatim,
+  // never a synthesized 502.
   if (!upstream.ok) {
-    const read = await readBodyWithinLimit(upstream, MAX_CODEX_COLLECTED_RESPONSE_BYTES, signal);
+    const bodyText = await upstream.text();
     // Mirror the safe upstream headers so a client can honor the server's
     // backoff: without Retry-After a 429 tells the caller to slow down but not
     // for how long. content-type is skipped for the same reason as the
@@ -168,14 +144,11 @@ async function sendOpenAIAsAnthropic(
       if (key.toLowerCase() === "content-type") return;
       res.setHeader(key, value);
     });
-    if (read.kind === "overflow") return sendBoundedUpstreamFailure(res, report, RESPONSE_SIZE_ERROR);
-    if (read.kind === "cancelled") return { statusCode: upstream.status };
-    if (read.kind === "error") return sendBoundedUpstreamFailure(res, report, "Malformed upstream stream");
     res.status(upstream.status).json({
       type: "error",
       error: {
         type: anthropicErrorTypeForStatus(upstream.status),
-        message: extractUpstreamErrorMessage(read.body, upstream.status),
+        message: extractUpstreamErrorMessage(bodyText, upstream.status),
       },
     });
     report.upstreamReportedFailure = true;
@@ -188,12 +161,11 @@ async function sendOpenAIAsAnthropic(
       // Headers are already flushed by the time a mid-stream failure surfaces,
       // so the client keeps the partial stream; reporting 502 here keeps the
       // activity log and error totals honest about what happened.
-      const failure = await sendOpenAIStreamAsAnthropic(upstream, res, onUsage, report);
+      const failure = await sendOpenAIStreamAsAnthropic(upstream, res, entry, onUsage, report, now);
       return { statusCode: failure === undefined ? upstream.status : 502 };
     }
 
-    const collected = await collectOpenAIStreamAsAnthropicMessage(upstream, report, signal);
-    if (collected.cancelled) return { statusCode: upstream.status };
+    const collected = await collectOpenAIStreamAsAnthropicMessage(upstream, report);
     onUsage(collected.usage);
     if (collected.failure !== undefined) {
       // Mirrors collectCodexResponseStream on the /v1/responses path: a stream
@@ -209,34 +181,13 @@ async function sendOpenAIAsAnthropic(
   }
 
   if (!contentType.includes("application/json")) {
-    const read = await readBodyWithinLimit(upstream, MAX_CODEX_COLLECTED_RESPONSE_BYTES, signal);
-    if (read.kind === "overflow") return sendBoundedUpstreamFailure(res, report, RESPONSE_SIZE_ERROR);
-    if (read.kind === "cancelled") return { statusCode: upstream.status };
-    if (read.kind === "error") return sendBoundedUpstreamFailure(res, report, "Malformed upstream stream");
     res.status(upstream.status);
     res.setHeader("content-type", contentType || "text/plain");
-    res.send(read.body);
+    res.send(await upstream.text());
     return { statusCode: upstream.status };
   }
 
-  // A successful JSON response with no body is intrinsically malformed. The
-  // generic bounded reader treats a bodyless response observed after abort as
-  // cancellation so bodyless text keeps its existing passthrough ownership;
-  // classify the stricter JSON contract here before that transport-neutral
-  // result can hide the upstream protocol failure.
-  if (!upstream.body) {
-    return sendBoundedUpstreamFailure(res, report, "Malformed upstream JSON body");
-  }
-  const read = await readBodyWithinLimit(upstream, MAX_CODEX_COLLECTED_RESPONSE_BYTES, signal);
-  if (read.kind === "overflow") return sendBoundedUpstreamFailure(res, report, RESPONSE_SIZE_ERROR);
-  if (read.kind === "cancelled") return { statusCode: upstream.status };
-  if (read.kind === "error") return sendBoundedUpstreamFailure(res, report, "Malformed upstream stream");
-  let json: OpenAIResponseCompleted;
-  try {
-    json = JSON.parse(read.body) as OpenAIResponseCompleted;
-  } catch {
-    return sendBoundedUpstreamFailure(res, report, "Malformed upstream JSON body");
-  }
+  const json = await upstream.json() as OpenAIResponseCompleted;
   onUsage(usageFromResponseBody(json));
   res.status(upstream.status).json(openAIResponseToAnthropicMessage(json));
   return { statusCode: upstream.status };
@@ -245,12 +196,10 @@ async function sendOpenAIAsAnthropic(
 async function collectOpenAIStreamAsAnthropicMessage(
   upstream: globalThis.Response,
   report: OpenAIRelayReport,
-  signal: AbortSignal,
 ): Promise<{
   message: ReturnType<typeof openAIResponseToAnthropicMessage>;
   usage: CodexUsageTotals | undefined;
   failure: string | undefined;
-  cancelled?: boolean;
 }> {
   const reader = upstream.body?.getReader();
   if (!reader) {
@@ -267,62 +216,30 @@ async function collectOpenAIStreamAsAnthropicMessage(
     };
   }
 
-  let cancelPromise: Promise<void> | undefined;
-  const cancelReader = (): Promise<void> => {
-    cancelPromise ??= reader.cancel().catch(() => undefined);
-    return cancelPromise;
-  };
-  const onAbort = (): void => {
-    void cancelReader();
-  };
-  const emptyMessage = () => openAIResponseToAnthropicMessage({
-    id: "",
-    model: "",
-    output: [],
-    usage: {},
-  });
-  const failCollection = async (message: string) => {
-    report.upstreamReportedFailure = true;
-    await cancelReader();
-    return {
-      message: emptyMessage(),
-      usage: undefined,
-      failure: message,
-    };
-  };
-  const cancelCollection = async () => {
-    await cancelReader();
-    return {
-      message: emptyMessage(),
-      usage: undefined,
-      failure: undefined,
-      cancelled: true,
-    };
-  };
-
-  if (signal.aborted) return cancelCollection();
-  signal.addEventListener("abort", onAbort, { once: true });
-
-  const parser = createBoundedSseLineParser(MAX_CODEX_STREAM_EVENT_BYTES, { tolerant: true });
+  const decoder = new TextDecoder();
+  let remainder = "";
   let id = "";
   let model = "";
-  let text = "";
   let failure: string | undefined;
   let completed = false;
   let usage: OpenAIResponseCompleted["usage"] = {};
   let status: string | undefined;
   let incompleteDetails: { reason?: string } | undefined;
-  let totalBytes = 0;
-  let outputBytes = 0;
-  let overflowed = false;
-  let malformed = false;
+  const textByIndex = new Map<number, string>();
+  const refusalByIndex = new Map<number, string>();
+  const argumentsByIndex = new Map<number, string>();
+  const pendingCallsByIndex = new Map<number, OpenAIFunctionCall>();
+  const callsByIndex = new Map<number, OpenAIFunctionCall>();
 
   const applyEvent = (event: unknown) => {
     if (typeof event !== "object" || event === null) return;
     const openAIEvent = event as {
       type?: string;
-      delta?: unknown;
+      delta?: string;
+      arguments?: string;
+      output_index?: number;
       error?: { message?: string };
+      item?: { type?: string; call_id?: string; name?: string; arguments?: string };
       response?: {
         id?: string;
         model?: string;
@@ -332,6 +249,7 @@ async function collectOpenAIStreamAsAnthropicMessage(
         usage?: OpenAIResponseCompleted["usage"];
       };
     };
+    const outputIndex = openAIEvent.output_index ?? 0;
 
     // Reported the moment it is seen, not when this function returns: the
     // read after it can be cut short by a client disconnect, and losing the
@@ -355,17 +273,61 @@ async function collectOpenAIStreamAsAnthropicMessage(
     }
 
     if (openAIEvent.type === "response.output_text.delta") {
-      const delta = openAIEvent.delta;
-      if (typeof delta !== "string") {
-        malformed = true;
-        return;
+      textByIndex.set(outputIndex, (textByIndex.get(outputIndex) ?? "") + (openAIEvent.delta ?? ""));
+      return;
+    }
+
+    if (openAIEvent.type === "response.refusal.delta") {
+      refusalByIndex.set(outputIndex, (refusalByIndex.get(outputIndex) ?? "") + (openAIEvent.delta ?? ""));
+      return;
+    }
+
+    if (openAIEvent.type === "response.output_item.added") {
+      const item = openAIEvent.item;
+      if (item?.type === "function_call") {
+        if (!item.call_id?.trim() || !item.name?.trim()) {
+          throw new OpenAIProtocolError("Invalid OpenAI function call metadata");
+        }
+        pendingCallsByIndex.set(outputIndex, {
+          type: "function_call",
+          call_id: item.call_id,
+          name: item.name,
+          arguments: item.arguments ?? "",
+        });
       }
-      outputBytes += Buffer.byteLength(delta);
-      if (outputBytes > MAX_CODEX_COLLECTED_RESPONSE_BYTES) {
-        overflowed = true;
-        return;
+      return;
+    }
+
+    if (openAIEvent.type === "response.function_call_arguments.delta") {
+      if (!pendingCallsByIndex.has(outputIndex)) return;
+      argumentsByIndex.set(outputIndex, (argumentsByIndex.get(outputIndex) ?? "") + (openAIEvent.delta ?? ""));
+      return;
+    }
+
+    if (openAIEvent.type === "response.function_call_arguments.done") {
+      if (pendingCallsByIndex.has(outputIndex) && !argumentsByIndex.has(outputIndex) && openAIEvent.arguments) {
+        argumentsByIndex.set(outputIndex, openAIEvent.arguments);
       }
-      text += delta;
+      return;
+    }
+
+    if (openAIEvent.type === "response.output_item.done") {
+      const item = openAIEvent.item;
+      const pending = pendingCallsByIndex.get(outputIndex);
+      if (item?.type === "function_call" || pending) {
+        const callId = item?.call_id || pending?.call_id;
+        const name = item?.name || pending?.name;
+        if (!callId?.trim() || !name?.trim()) {
+          throw new OpenAIProtocolError("Invalid OpenAI function call metadata");
+        }
+        callsByIndex.set(outputIndex, {
+          type: "function_call",
+          call_id: callId,
+          name,
+          arguments: item?.arguments || argumentsByIndex.get(outputIndex) || pending?.arguments || "",
+        });
+        pendingCallsByIndex.delete(outputIndex);
+      }
       return;
     }
 
@@ -382,73 +344,76 @@ async function collectOpenAIStreamAsAnthropicMessage(
     }
   };
 
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      totalBytes += value.byteLength;
-      if (totalBytes > MAX_CODEX_COLLECTED_RESPONSE_BYTES) {
-        return await failCollection(RESPONSE_SIZE_ERROR);
-      }
-      const result = await parser.push(value, event => {
-        applyEvent(event);
-        return !overflowed && !malformed;
-      });
-      if (malformed) return await failCollection("Malformed upstream stream");
-      if (result === "overflow" || overflowed) {
-        return await failCollection(RESPONSE_SIZE_ERROR);
-      }
-    }
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
 
-    const finished = await parser.finish(event => {
-      applyEvent(event);
-      return !overflowed && !malformed;
-    });
-    if (malformed) return await failCollection("Malformed upstream stream");
-    if (finished === "overflow" || overflowed) {
-      return await failCollection(RESPONSE_SIZE_ERROR);
-    }
-
-    return {
-      message: openAIResponseToAnthropicMessage({
-        id,
-        model,
-        output: text ? [{
-          type: "message",
-          role: "assistant",
-          content: [{ type: "output_text", text }],
-        }] : [],
-        usage,
-        ...(status ? { status } : {}),
-        ...(incompleteDetails ? { incomplete_details: incompleteDetails } : {}),
-      }),
-      usage: usageFromResponseBody({ usage }),
-      // Tolerant parsing skips a malformed frame rather than aborting the read,
-      // which keeps a bad nonterminal frame from truncating the stream — but it
-      // also means a malformed *terminal* frame (`response.completed` or
-      // `response.incomplete`) would silently vanish. Without an observed
-      // terminal event there is no answer to return, so a stream that ends
-      // without one (dropped terminal frame, or an upstream that simply stopped
-      // mid-flight) is a failure rather than an empty success. An explicit
-      // `response.failed`/`error` message wins, since it says more about what
-      // went wrong.
-      failure: failure ?? (completed ? undefined : "Upstream stream ended without a terminal response event"),
-    };
-  } catch {
-    if (signal.aborted && !report.upstreamReportedFailure) return await cancelCollection();
-    return await failCollection(failure ?? "Malformed upstream stream");
-  } finally {
-    signal.removeEventListener("abort", onAbort);
+    const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }), { tolerant: true });
+    remainder = parsed.remainder;
+    parsed.events.forEach(applyEvent);
   }
+
+  const tail = decoder.decode();
+  if (tail || remainder) {
+    parseSseLines(remainder + tail + "\n", { tolerant: true }).events.forEach(applyEvent);
+  }
+
+  const output: OpenAIResponseOutputItem[] = [...new Set([
+    ...textByIndex.keys(),
+    ...refusalByIndex.keys(),
+    ...callsByIndex.keys(),
+  ])]
+    .sort((a, b) => a - b)
+    .flatMap((index): OpenAIResponseOutputItem[] => {
+      const call = callsByIndex.get(index);
+      if (call) return [{ ...call, arguments: call.arguments || argumentsByIndex.get(index) || "" }];
+      const text = textByIndex.get(index);
+      const refusal = refusalByIndex.get(index);
+      const content = [
+        ...(text ? [{ type: "output_text" as const, text }] : []),
+        ...(refusal ? [{ type: "refusal" as const, refusal }] : []),
+      ];
+      return content.length > 0 ? [{ type: "message", role: "assistant", content }] : [];
+    });
+
+  const protocolFailure = pendingCallsByIndex.size > 0
+    ? "OpenAI function call ended before completion"
+    : undefined;
+  if (protocolFailure) report.upstreamReportedFailure = true;
+
+  return {
+    message: openAIResponseToAnthropicMessage({
+      id,
+      model,
+      output,
+      usage,
+      ...(status ? { status } : {}),
+      ...(incompleteDetails ? { incomplete_details: incompleteDetails } : {}),
+    }),
+    usage: usageFromResponseBody({ usage }),
+    // Tolerant parsing skips a malformed frame rather than aborting the read,
+    // which keeps a bad nonterminal frame from truncating the stream — but it
+    // also means a malformed *terminal* frame (`response.completed` or
+    // `response.incomplete`) would silently vanish. Without an observed
+    // terminal event there is no answer to return, so a stream that ends
+    // without one (dropped terminal frame, or an upstream that simply stopped
+    // mid-flight) is a failure rather than an empty success. An explicit
+    // `response.failed`/`error` message wins, since it says more about what
+    // went wrong.
+    failure: failure
+      ?? protocolFailure
+      ?? (completed ? undefined : "Upstream stream ended without a terminal response event"),
+  };
 }
 
 /** Returns the upstream failure message when the stream ended in one. */
 async function sendOpenAIStreamAsAnthropic(
   upstream: globalThis.Response,
   res: Response,
+  entry: LogEntry,
   onUsage: ((usage: CodexUsageTotals | undefined) => void) | undefined,
   report: OpenAIRelayReport,
+  now: () => number,
 ): Promise<string | undefined> {
   res.status(upstream.status);
   res.setHeader("content-type", "text/event-stream");
@@ -466,7 +431,8 @@ async function sendOpenAIStreamAsAnthropic(
     return "Upstream response had no body";
   }
 
-  const parser = createBoundedSseLineParser(MAX_CODEX_STREAM_EVENT_BYTES, { tolerant: true });
+  const decoder = new TextDecoder();
+  let remainder = "";
   // Usage is applied once, after the stream ends: `applyCodexUsage`
   // accumulates into the process-wide totals, so calling it per terminal event
   // would double-count a stream that carried more than one. Mirrors
@@ -474,11 +440,29 @@ async function sendOpenAIStreamAsAnthropic(
   let totals: CodexUsageTotals | undefined;
   let failure: string | undefined;
   let completed = false;
+  let cleanEof = false;
+  const pendingToolCalls = new Set<number>();
+
+  const writeProtocolError = () => {
+    res.write(encodeSseEvent({
+      type: "error",
+      error: {
+        type: "api_error",
+        message: "Invalid or incomplete response from OpenAI",
+      },
+    }));
+  };
 
   const inspect = (event: unknown): void => {
     totals = usageFromTerminalEvent(event) ?? totals;
     if (typeof event !== "object" || event === null) return;
-    const typed = event as { type?: unknown; error?: { message?: string }; response?: { error?: { message?: string } } };
+    const typed = event as {
+      type?: unknown;
+      output_index?: number;
+      item?: { type?: string };
+      error?: { message?: string };
+      response?: { error?: { message?: string } };
+    };
     // Recorded as observed — an aborted read can reject on the very next
     // chunk, and this verdict has to outlive that.
     if (typed.type === "response.failed") {
@@ -490,22 +474,27 @@ async function sendOpenAIStreamAsAnthropic(
     } else if (terminalResponsePayload(event) !== undefined) {
       completed = true;
     }
+    if (typed.type === "response.output_item.added" && typed.item?.type === "function_call") {
+      pendingToolCalls.add(typed.output_index ?? 0);
+    } else if (typed.type === "response.output_item.done") {
+      pendingToolCalls.delete(typed.output_index ?? 0);
+    }
   };
 
-  let readerFinished = false;
-  let readerCancelled = false;
-  const cancelReader = async (): Promise<void> => {
-    if (readerFinished || readerCancelled) return;
-    readerCancelled = true;
-    await reader.cancel().catch(() => undefined);
-  };
-
-  const relayEvent = async (event: unknown): Promise<boolean> => {
-    inspect(event);
-    for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
-      if (!await writeResponseChunk(res, encodeSseEvent(mapped))) {
-        await cancelReader();
-        return false;
+  const relayEvents = async (events: unknown[]): Promise<boolean> => {
+    for (const event of events) {
+      inspect(event);
+      for (const mapped of normalizer.convert(event as Parameters<typeof normalizer.convert>[0])) {
+        if (!res.write(encodeSseEvent(mapped))) {
+          // Do not consume another translated event or upstream chunk while
+          // Node is buffering for a slow client. A close/error while waiting
+          // ends the relay and explicitly releases the upstream reader.
+          const drained = await waitForWritable(res);
+          if (!drained) {
+            await reader.cancel().catch(() => {});
+            return false;
+          }
+        }
       }
     }
     return true;
@@ -520,35 +509,37 @@ async function sendOpenAIStreamAsAnthropic(
       // not honour the signal.
       const { value, done } = await reader.read();
       if (done) break;
+      if (entry.firstByteDurationMs === undefined) entry.firstByteDurationMs = now() - entry.ts;
 
-      if (!value) continue;
       // Tolerant: one malformed frame must not abort the relay (which would
       // silently truncate the client's stream) nor discard the valid events
-      // decoded from the same chunk. Oversized framing is different: retaining
-      // it would be unbounded, so cancel the source and report a closed failure.
-      const parsed = await parser.push(value, relayEvent);
-      if (parsed === "overflow") {
-        failure = RESPONSE_SIZE_ERROR;
-        report.upstreamReportedFailure = true;
-        await cancelReader();
-        break;
-      }
-      if (parsed === "stopped") break;
+      // decoded from the same chunk.
+      const parsed = parseSseLines(remainder + decoder.decode(value, { stream: true }), { tolerant: true });
+      remainder = parsed.remainder;
+      if (!await relayEvents(parsed.events)) return undefined;
     }
 
-    if (!readerCancelled) {
-      readerFinished = true;
-      const parsed = await parser.finish(relayEvent);
-      if (parsed === "overflow") {
-        failure = RESPONSE_SIZE_ERROR;
-        report.upstreamReportedFailure = true;
+    const tail = decoder.decode();
+    if (tail || remainder) {
+      if (!await relayEvents(parseSseLines(remainder + tail + "\n", { tolerant: true }).events)) {
+        return undefined;
       }
     }
+    cleanEof = true;
+    if (!completed && pendingToolCalls.size > 0 && failure === undefined) {
+      failure = "OpenAI function call ended before completion";
+      report.upstreamReportedFailure = true;
+      writeProtocolError();
+    }
   } catch (error) {
-    await cancelReader();
-    throw error;
+    if (!(error instanceof OpenAIProtocolError)) throw error;
+    failure = error.message;
+    report.upstreamReportedFailure = true;
+    writeProtocolError();
+    cleanEof = true;
+    await reader.cancel().catch(() => {});
   } finally {
-    if (!res.destroyed && !res.writableEnded) res.end();
+    if (cleanEof && !res.destroyed && !res.writableEnded) res.end();
     onUsage?.(totals);
   }
   // Mirrors collectOpenAIStreamAsAnthropicMessage: tolerant parsing skips a
@@ -567,7 +558,6 @@ export function mountMessagesCrossProviderRoute(
   opts: MessagesCrossProviderRouteOptions,
 ): void {
   const forwardOpenAI = opts.forwardOpenAI ?? forwardOpenAICodexResponse;
-  const forwardOpenAIOwnsDiagnostics = opts.forwardOpenAI === undefined;
   const prepareOpenAIAccount = opts.prepareOpenAIAccount ?? (async () => true);
   const recordActivity = opts.recordActivity ?? ((entry: LogEntry) => stats.addLog(entry));
   const now = opts.now ?? Date.now;
@@ -582,14 +572,6 @@ export function mountMessagesCrossProviderRoute(
     }),
     async (req: Request, res: Response, next: NextFunction) => {
       if (!isAnthropicMessagesRequest(req.body)) {
-        annotateActiveSpan("proxy.request", {
-          httpMethod: "POST",
-          provider: "other",
-          route: "messages",
-          requestSource: requestSource(req),
-          httpStatusCode: 400,
-          outcome: "upstream_error",
-        });
         res.status(400).json({
           type: "error",
           error: {
@@ -601,7 +583,6 @@ export function mountMessagesCrossProviderRoute(
       }
 
       const requestedModel = typeof req.body.model === "string" ? req.body.model : undefined;
-      req._ccTelemetryStreaming = req.body.stream === true;
       const route = selectRoute(requestedModel, opts.modelRouting);
       if (route.provider !== "openai_subscription") {
         req._ccRouteContext = extractAnthropicRouteContext(requestedModel, opts.modelRouting);
@@ -609,19 +590,7 @@ export function mountMessagesCrossProviderRoute(
         return;
       }
 
-      let body: OpenAIResponsesRequest;
-      try {
-        body = anthropicToOpenAIResponses(req.body, opts.modelRouting);
-      } catch (error) {
-        recordUnexpectedException(error, {
-          category: "runtime",
-          reason: "other",
-          operation: "proxy.request",
-          provider: "openai",
-        });
-        next(error);
-        return;
-      }
+      const body = anthropicToOpenAIResponses(req.body, opts.modelRouting);
       const requestedStream = req.body.stream === true;
 
       await runOpenAIIngress({
@@ -629,7 +598,6 @@ export function mountMessagesCrossProviderRoute(
         sessionKey: extractCodexSessionKey(req, req.body),
         requestedModel: route.upstreamModel,
         path: "/v1/messages",
-        requestSource: requestSource(req),
         method: req.method,
         // A Claude-shaped client that happens to route to an OpenAI backend is
         // still that client — classify it the way the Claude path does.
@@ -643,9 +611,7 @@ export function mountMessagesCrossProviderRoute(
         now,
         envelope: MESSAGES_ENVELOPE,
         onUpstreamAuthFailure: opts.onUpstreamAuthFailure,
-        prepareOpenAIAccountOwnsDiagnostics: opts.prepareOpenAIAccountOwnsDiagnostics === true,
-        forwardOpenAIOwnsDiagnostics,
-        telemetry: opts.telemetry,
+        timeoutMs: opts.timeoutMs,
         ...(opts.maxAttempts !== undefined ? { maxAttempts: opts.maxAttempts } : {}),
         ...(opts.sameAccountRetryDelayMs !== undefined
           ? { sameAccountRetryDelayMs: opts.sameAccountRetryDelayMs }
@@ -653,8 +619,8 @@ export function mountMessagesCrossProviderRoute(
         ...(opts.retryRefreshTimeoutMs !== undefined
           ? { retryRefreshTimeoutMs: opts.retryRefreshTimeoutMs }
           : {}),
-        relay: (upstream, res, entry, report, signal) =>
-          sendOpenAIAsAnthropic(upstream, res, requestedStream, entry, report, signal),
+        relay: (upstream, res, entry, report) =>
+          sendOpenAIAsAnthropic(upstream, res, requestedStream, entry, report, now),
       });
     },
   );

@@ -1,5 +1,4 @@
 import type { AccountRecord } from "../../proxy/types.js";
-import { SetupDiagnosticError } from "../../telemetry/setup-diagnostics.js";
 
 export type OpenAIAccountRecord = AccountRecord & {
   provider: "openai_subscription";
@@ -18,11 +17,7 @@ export interface CreateOpenAIAccountRecordInput {
 function parseExpiresAt(value: string | number): number {
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new SetupDiagnosticError("expiresAt must be a positive Unix timestamp in milliseconds", {
-      stage: "credential_parse",
-      reason: "malformed_credentials",
-      expected: true,
-    });
+    throw new Error("expiresAt must be a positive Unix timestamp in milliseconds");
   }
   return parsed;
 }
@@ -36,26 +31,10 @@ function parseScopes(value: string[] | string | undefined): string[] {
 export function createOpenAIAccountRecord(input: CreateOpenAIAccountRecordInput): OpenAIAccountRecord {
   const id = input.id.trim();
   if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
-    throw new SetupDiagnosticError("Only letters, numbers, _ and - allowed in account ID", {
-      stage: "credential_parse",
-      reason: "malformed_credentials",
-      expected: true,
-    });
+    throw new Error("Only letters, numbers, _ and - allowed in account ID");
   }
-  if (!input.accessToken.trim()) {
-    throw new SetupDiagnosticError("Access token is required", {
-      stage: "credential_parse",
-      reason: "invalid_token",
-      expected: true,
-    });
-  }
-  if (!input.refreshToken.trim()) {
-    throw new SetupDiagnosticError("Refresh token is required", {
-      stage: "credential_parse",
-      reason: "invalid_token",
-      expected: true,
-    });
-  }
+  if (!input.accessToken.trim()) throw new Error("Access token is required");
+  if (!input.refreshToken.trim()) throw new Error("Refresh token is required");
 
   return {
     id,

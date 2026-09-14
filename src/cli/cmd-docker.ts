@@ -7,7 +7,6 @@ import { fileURLToPath } from "url";
 import { dirname } from "path";
 import chalk from "chalk";
 import { ACCOUNTS_PATH, LITELLM_PORT, PROXY_PORT } from "../config/paths.js";
-import { exitCli } from "./errors.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,7 +38,7 @@ export function registerDocker(program: Command): void {
       } catch (err) {
         console.error(chalk.red("\n✗ docker compose up failed:"), (err as Error).message);
         console.error(chalk.gray("  Check logs with: cc-router docker logs"));
-        exitCli(1);
+        process.exit(1);
       }
     });
 
@@ -92,7 +91,7 @@ async function ensureDockerAvailable(): Promise<void> {
   } catch {
     console.error(chalk.red("✗ Docker is not running or not installed."));
     console.error(chalk.gray("  Install Docker Desktop: https://docs.docker.com/get-docker/"));
-    exitCli(1);
+    process.exit(1);
   }
 }
 
@@ -100,7 +99,7 @@ async function ensureAccountsExist(): Promise<void> {
   if (!existsSync(ACCOUNTS_PATH)) {
     console.error(chalk.red(`✗ accounts.json not found at ${ACCOUNTS_PATH}`));
     console.error(chalk.yellow("  Run: cc-router setup"));
-    exitCli(1);
+    process.exit(1);
   }
 }
 

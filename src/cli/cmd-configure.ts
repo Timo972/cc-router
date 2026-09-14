@@ -1,8 +1,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { writeClaudeSettings, removeClaudeSettings, readClaudeProxySettings } from "../utils/claude-config.js";
-import { exitCli } from "./errors.js";
-import { writeCodexRouterConfig } from "../utils/codex-config.js";
+import { writeCodexRouterConfig, removeCodexRouterConfig } from "../utils/codex-config.js";
 import { readConfig, writeConfig, generateProxySecret } from "../config/manager.js";
 import { PROXY_PORT, CLAUDE_SETTINGS_PATH } from "../config/paths.js";
 import { buildModelRoutingUpdate } from "../protocol/model-routing-config.js";
@@ -12,7 +11,7 @@ export function registerConfigure(program: Command): void {
     .command("configure")
     .description("Configure Claude Code or Codex to point to the proxy")
     .argument("[target]", "Optional target to configure: codex, models")
-    .option("--remove", "Remove cc-router settings from ~/.claude/settings.json")
+    .option("--remove", "Remove cc-router settings from Claude Code or Codex")
     .option("--port <port>", "Proxy port to configure", String(PROXY_PORT))
     .option("--model <model>", "Default model for the configured target")
     .option("--claude-model <model>", "Default Claude/Anthropic model for router aliases")
@@ -37,10 +36,22 @@ export function registerConfigure(program: Command): void {
       disableAutoUpdate?: boolean;
     }) => {
       if (target === "codex") {
+        if (opts.remove) {
+          const result = removeCodexRouterConfig();
+          if (result.removed) {
+            console.log(chalk.green(`✓ Removed cc-router settings from ${result.path}`));
+            console.log(chalk.gray("  Codex CLI will use its native OpenAI auth on next launch."));
+          } else {
+            console.log(chalk.gray(`  No cc-router block in ${result.path}`));
+          }
+          return;
+        }
         const port = parseInt(opts.port, 10);
+        // Local routing has no auth in front of the proxy, so no env_key is
+        // written — Codex would otherwise hard-abort on startup if that env
+        // var isn't set.
         const result = writeCodexRouterConfig({
           baseUrl: `http://localhost:${port}/v1`,
-          tokenEnvKey: "CC_ROUTER_TOKEN",
           defaultModel: opts.model,
         });
         console.log(chalk.green(`✓ Updated ${result.path}`));
@@ -48,14 +59,14 @@ export function registerConfigure(program: Command): void {
         if (opts.model) console.log(chalk.gray(`    model          = ${opts.model}`));
         console.log(chalk.gray("    model_provider = cc-router"));
         console.log(chalk.gray(`    base_url       = http://localhost:${port}/v1`));
-        console.log(chalk.gray("    env_key        = CC_ROUTER_TOKEN"));
+        if (result.tokenEnvKey) console.log(chalk.gray(`    env_key        = ${result.tokenEnvKey}`));
         return;
       }
 
       if (target === "models") {
         if (!opts.claudeModel && !opts.openaiModel) {
           console.error(chalk.red("Provide at least one model: --claude-model or --openai-model"));
-          exitCli(1);
+          process.exit(1);
         }
         const cfg = readConfig();
         const modelRouting = buildModelRoutingUpdate(cfg.modelRouting, {
@@ -72,7 +83,7 @@ export function registerConfigure(program: Command): void {
 
       if (target !== undefined) {
         console.error(chalk.red(`Unknown configure target: ${target}`));
-        exitCli(1);
+        process.exit(1);
       }
 
       if (opts.show) {
@@ -133,7 +144,7 @@ export function registerConfigure(program: Command): void {
         const secret = opts.setPassword.trim();
         if (!secret) {
           console.error(chalk.red("Secret cannot be empty."));
-          exitCli(1);
+          process.exit(1);
         }
         writeConfig({ ...readConfig(), proxySecret: secret });
         const { baseUrl } = readClaudeProxySettings();

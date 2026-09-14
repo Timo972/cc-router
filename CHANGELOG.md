@@ -10,13 +10,130 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Privacy-safe OpenTelemetry and PostHog EU telemetry: sampled proxy
-  waterfalls, closed-schema setup/runtime diagnostics, lifecycle analytics,
-  and sanitized Error Tracking with diagnostic IDs. Fresh installs default
-  on; persisted and environment opt-outs gate every signal. Usage polling and
-  retrying provider requests retain provider and attempt-level visibility
-  without exporting prompts, bodies, headers, URLs, account IDs, or raw errors.
-  See [docs/telemetry.md](docs/telemetry.md) for the exhaustive inventory.
+- Privacy-bounded OpenTelemetry and PostHog EU telemetry: 10%-sampled proxy
+  traces, closed-schema setup and runtime diagnostics, lifecycle events, and
+  sanitized exceptions with diagnostic IDs. Every outbound record is rebuilt
+  from an allowlist immediately before export; prompts, bodies, headers,
+  URLs, account identifiers, tokens, and raw error messages are never sent.
+  Fresh installations default on; `cc-router telemetry off`, `DO_NOT_TRACK=1`,
+  and `CC_ROUTER_TELEMETRY=0` disable every signal, and a running daemon stops
+  exporting as soon as it observes an explicit opt-out. See
+  [docs/telemetry.md](docs/telemetry.md) for the complete inventory.
+
+### Changed
+
+- Aptabase telemetry has been removed. An existing persisted opt-out remains
+  off after upgrade; no PostHog Person profiles are created and GeoIP
+  enrichment is disabled.
+
+---
+
+## [0.12.1] — 2026-09-14
+
+### Added
+
+- Dashboard `Ctrl+R` confirms redemption of one banked usage-limit reset for
+  the focused ChatGPT account, with duplicate-submission protection and stable
+  retry IDs for uncertain outcomes. No custom Meta key mapping is needed.
+  Account usage is refreshed after redemption.
+- Dashboard `[R]` reloads account usage and due tokens without restarting the
+  router or dropping active requests and sticky sessions. It also refreshes
+  Grok snapshots, CLI routing state, and an already-loaded model list, with
+  progress and partial-failure summaries.
+- `POST /cc-router/refresh` runs a shared Claude/OpenAI refresh pass, sweeps
+  expired cooldowns, and returns per-provider results. Concurrent reloads
+  join the same pass instead of starting duplicate work.
+- OpenAI transport diagnostics include correlation IDs and refresh, response
+  header, and first-byte timings. Failure logs use bounded diagnostic fields
+  rather than raw upstream error messages.
+
+### Changed
+
+- Streamlined the README and split detailed setup and reference material into
+  dedicated guides, including the full dashboard UI and keybindings, first-class
+  Codex CLI setup, and Grok/xAI account monitoring (overview-only, not proxied).
+  Updated the dashboard screenshot with anonymized account names.
+- The configured proxy request timeout now bounds Codex response headers and
+  upstream stream inactivity on both `/v1/responses` and OpenAI-routed
+  `/v1/messages`, including failover attempts. Progressing streams can outlive
+  that interval; time spent waiting for a slow client does not count as
+  upstream inactivity.
+- Permanently rejected OpenAI refresh credentials are quarantined from
+  inference routing without changing the account's saved `enabled` setting.
+  Health reports expose the authentication state and failure category.
+  Successful refresh or credential replacement restores eligibility;
+  quarantine is runtime-only and does not survive a router restart.
+
+### Fixed
+
+- OpenAI OAuth refresh sends the required public `client_id` and has a
+  15-second deadline covering response headers and JSON body parsing, so a
+  stalled refresh cannot retain its lock indefinitely.
+- Refresh deduplication is scoped to the account object, preventing a deleted
+  and re-added account from sharing an old account's in-flight refresh.
+- OpenAI usage authentication failures remain advisory rather than disabling
+  an account or overriding permanent credential quarantine. Background and
+  manual token refreshes continue to check quarantined accounts for recovery.
+- OpenAI response relays honor downstream backpressure and cancel upstream
+  reads when the client disconnects. Failed partial streams close the
+  connection instead of appearing complete, and router-side stream failures
+  are no longer misclassified as client cancellations.
+- Codex header timeouts return a safe HTTP 504 response, including after
+  account failover, while preserving the existing retry budget and shared
+  request correlation.
+
+---
+
+## [0.12.0] — 2026-09-11
+
+### Added
+
+- `cc-router cli claude` and `cc-router cli codex` toggle Claude Code / Codex
+  CLI routing without stopping the proxy: `start`, `stop`, `resume` (same as
+  start), and `status`. `cc-router cli` shows both. Short aliases
+  `cc-router claude` / `cc-router codex` still work. `configure --remove` now
+  also works with `configure codex --remove`. `stop --full` / `revert` and
+  `client disconnect` strip the Codex managed block as well as Claude Code
+  settings.
+- Dashboard `[c]` / `[x]` toggle Claude Code / Codex CLI routing without
+  stopping the proxy (`[c]` still sets the Claude model default while MODELS
+  is focused).
+- Status dashboard `rst` column shows Codex banked usage-limit reset count
+  (`0` = none available); Claude cells are `—`.
+- Grok subscriptions are first-class accounts: device login and token import,
+  persisted account records, live plan/usage refresh, CLI account management,
+  allowance reporting, and grouped dashboard rows with credits and reset data.
+
+### Changed
+
+- Codex configuration rewrites now use TOML-aware parsing and validation rather
+  than line-oriented edits, including safe CLI start/stop toggles for the
+  managed block.
+- The status dashboard has been redesigned with a more compact layout,
+  allowing even more accounts to be displayed at once. Compact provider
+  groups keep account headers visible in short terminals, and the dashboard
+  exposes the fleet-wide weekly-full count.
+
+### Fixed
+
+- OpenAI Responses function calls and their outputs remain top-level input
+  items across the Anthropic Messages bridge. JSON and SSE responses now
+  preserve call IDs, streamed or atomic arguments, refusal text, and
+  `tool_use` stop reasons. Invalid metadata, malformed arguments, and tool
+  streams that end before completion fail closed instead of fabricating a
+  successful assistant turn.
+- `/v1/models` reports real context windows and includes bare `gpt-*` slugs used
+  by the Codex CLI.
+- Codex routing accepts both dashed session-header spellings, logs route
+  reasons, and includes calendar dates in proxy log timestamps.
+- Grok overview fixtures resolve portably across local and CI working
+  directories.
+
+---
+
+## [0.11.0] — 2026-08-30
+
+### Added
 
 - Automatic upstream failover and retry on both providers. A 429 or 5xx
   received before any response byte is relayed no longer passes straight
@@ -40,10 +157,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Aptabase telemetry has been replaced by a reconstructive, closed-schema
-  PostHog EU boundary with no Person profiles, disabled GeoIP enrichment, and
-  immediate late opt-out checks. Existing persisted opt-outs remain disabled.
-
 - Claude-bound POST `/v1/messages` moved from the generic proxy middleware
   to a dedicated transport (same byte-transparent relay contract: verbatim
   status/headers, raw body bytes, no synthesized events) so the router can
@@ -52,10 +165,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   model and the full `/v1/messages` path.
 
 ### Fixed
-
-- Shared Anthropic and OpenAI usage polling now exports its allowlisted
-  `provider.usage_refresh` spans with terminal status and duration, while
-  telemetry classification failures remain isolated from refresh behavior.
 
 - An account whose quota refills early — upgrading a Claude plan being the
   common case — is returned to rotation as soon as the usage endpoint says
@@ -129,6 +238,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   during an idle stretch with nothing routing or polling in the meantime. A
   model-scoped limit never emits one, since the account kept serving every
   other family and so never left the rotation to rejoin.
+- Codex cache accounting separates cached and uncached input before updating
+  shared activity and aggregate totals, preventing cached tokens from being
+  counted twice in cache-hit percentages and token totals.
+- `/v1/responses` accepts JSON request bodies up to 32 MiB, so long-running
+  Codex sessions with large retained tool outputs are not rejected locally by
+  Express's former 10 MiB parser limit.
 
 ---
 
@@ -624,6 +739,9 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
+[0.12.1]: https://github.com/Timo972/cc-router/releases/tag/v0.12.1
+[0.12.0]: https://github.com/Timo972/cc-router/releases/tag/v0.12.0
+[0.11.0]: https://github.com/Timo972/cc-router/releases/tag/v0.11.0
 [0.9.0]: https://github.com/Timo972/cc-router/releases/tag/v0.9.0
 [0.8.3]: https://github.com/Timo972/cc-router/releases/tag/v0.8.3
 [0.8.2]: https://github.com/Timo972/cc-router/releases/tag/v0.8.2

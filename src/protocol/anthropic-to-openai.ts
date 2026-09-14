@@ -1,5 +1,5 @@
 import type { AnthropicContent, AnthropicMessagesRequest } from "./anthropic-types.js";
-import type { OpenAIInputContent, OpenAIResponsesRequest } from "./openai-responses-types.js";
+import type { OpenAIInputItem, OpenAIInputRole, OpenAIResponsesRequest } from "./openai-responses-types.js";
 import { parseModelRef } from "./model-ref.js";
 import type { ModelRoutingConfig } from "./model-ref.js";
 
@@ -9,28 +9,48 @@ function stringifySystem(system: AnthropicMessagesRequest["system"]): string | u
   return system.map(block => block.text).join("\n");
 }
 
-function contentToOpenAI(content: AnthropicContent): OpenAIInputContent[] {
-  if (typeof content === "string") return [{ type: "input_text", text: content }];
+function messageToOpenAIItems(role: OpenAIInputRole, content: AnthropicContent): OpenAIInputItem[] {
+  const textType = role === "assistant" ? "output_text" as const : "input_text" as const;
+  if (typeof content === "string") {
+    return [{ role, content: [{ type: textType, text: content }] }];
+  }
 
-  return content.map(block => {
-    if (block.type === "text") return { type: "input_text", text: block.text };
+  const items: OpenAIInputItem[] = [];
+  let pendingText: Array<{ type: typeof textType; text: string }> = [];
+  const flushText = () => {
+    if (pendingText.length === 0) return;
+    items.push({ role, content: pendingText });
+    pendingText = [];
+  };
+
+  for (const block of content) {
+    if (block.type === "text") {
+      pendingText.push({ type: textType, text: block.text });
+      continue;
+    }
+
+    flushText();
     if (block.type === "tool_use") {
-      return {
+      items.push({
         type: "function_call",
         call_id: block.id,
         name: block.name,
         arguments: JSON.stringify(block.input ?? {}),
-      };
+      });
+      continue;
     }
-    const output = typeof block.content === "string"
-      ? block.content
-      : block.content.map(item => item.text).join("\n");
-    return {
+
+    items.push({
       type: "function_call_output",
       call_id: block.tool_use_id,
-      output,
-    };
-  });
+      output: typeof block.content === "string"
+        ? block.content
+        : block.content.map(item => item.text).join("\n"),
+    });
+  }
+
+  flushText();
+  return items;
 }
 
 export function anthropicToOpenAIResponses(
@@ -41,10 +61,7 @@ export function anthropicToOpenAIResponses(
   return {
     model: parsed.upstreamModel,
     instructions: stringifySystem(req.system),
-    input: req.messages.map(message => ({
-      role: message.role,
-      content: contentToOpenAI(message.content),
-    })),
+    input: req.messages.flatMap(message => messageToOpenAIItems(message.role, message.content)),
     tools: req.tools?.map(tool => ({
       type: "function",
       name: tool.name,

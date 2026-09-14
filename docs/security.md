@@ -78,35 +78,30 @@ cc-router only makes outbound connections to:
 | `auth.openai.com` | OpenAI subscription OAuth token refresh |
 | `localhost:4000` | LiteLLM (full mode only) |
 | `registry.npmjs.org` | Update **check** (version lookup only; installs are manual by default) |
-| `eu.i.posthog.com` | PostHog EU analytics and sanitized exceptions (`/batch/`) plus OTLP traces and logs (`/i/v1/traces`, `/i/v1/logs`) when telemetry is enabled |
+| `eu.i.posthog.com` | Telemetry when enabled: analytics and sanitized exceptions (`/batch/`), OTLP traces and logs (`/i/v1/traces`, `/i/v1/logs`) |
 
 ## Telemetry
 
-Telemetry is **on by default for fresh installations**. Existing persisted
-opt-outs remain off. Persistently disable it with `cc-router telemetry off`, or
-disable a process with `DO_NOT_TRACK=1` or `CC_ROUTER_TELEMETRY=0`. Environment
-variables cannot force a persisted opt-out on. Turning telemetry off stops new
-capture immediately and discards queued records; a request already in flight
-cannot be recalled. After `cc-router telemetry on`, restart a daemon that
-started disabled so it can initialize its runtime telemetry stack.
+Telemetry is **on by default for fresh installations**; an existing persisted
+opt-out stays off after upgrade. Disable it persistently with
+`cc-router telemetry off`, or for one process with `DO_NOT_TRACK=1` or
+`CC_ROUTER_TELEMETRY=0`. Environment variables can only turn it off. Turning it
+off stops new capture immediately and discards queued records; a request already
+in flight cannot be recalled. The endpoint is hardcoded and cannot be
+redirected.
 
-Enabled telemetry sends only reconstructed closed-schema records to the
-hardcoded PostHog EU ingestion host shown above. A random installation UUID is
-the stable pseudonym used as PostHog `distinctId` and OpenTelemetry
-`service.instance.id`; it is not derived from user, account, host, network, or
-machine identity. Analytics and sanitized exceptions disable GeoIP processing
-and Person profiles are never created. The receiving HTTPS service necessarily
-sees the connection's source IP at the transport layer, but CC-Router does not
-include it in the application payload.
+**What is sent:** closed-schema records rebuilt from an allowlist immediately
+before export — sampled proxy spans, setup/runtime diagnostics, a few lifecycle
+events, and sanitized exceptions whose message is a fixed reason code. A random
+installation UUID is the only stable identifier; it is not derived from any
+user, account, host, or machine identity. No PostHog Person profile is created
+and GeoIP enrichment is disabled. Your IP is visible to the endpoint at the
+network layer, as with any HTTPS request, but is not part of the payload.
 
-The final exporters reconstruct new allowlisted objects and reject unknown
-fields and instrumentation scopes. Prompts, content, bodies, credentials,
-account/session/user identifiers, raw errors, URLs, headers, hostnames, and
-absolute paths are forbidden. Existing console output and detailed local logs
-are not bridged to telemetry. PostHog Logs ingestion PII scrubbing should also
-be enabled as defense-in-depth; correctness does not depend on that backend
-filter. See [telemetry.md](telemetry.md) for the exhaustive outbound inventory
-and privacy contract.
+**What is never sent:** prompts, request/response bodies, headers, URLs, OAuth
+tokens, account or session identifiers, email addresses, hostnames, absolute
+paths, raw error messages. Console output and local logs are not forwarded.
+See [telemetry.md](telemetry.md) for the exhaustive inventory.
 
 ---
 

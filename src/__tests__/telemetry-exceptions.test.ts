@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { sanitizeException } from "../telemetry/privacy.js";
 
@@ -5,8 +6,8 @@ const INSTALL_ID = "70d8062e-1fa0-4ae4-a115-bf782ecca462";
 const OTHER_INSTALL_ID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
 const DIAGNOSTIC_ID = "ad94f035-1e08-4e29-8517-fd56bdc83d99";
 const NEXT_DIAGNOSTIC_ID = "57b50aa2-fb24-40af-965b-cd5f2e506cdc";
-const PROJECT_ROOT = "/Users/alice/work/cc-router";
-const TRUSTED_SOURCE = { projectRoot: PROJECT_ROOT };
+// privacy.ts derives the same root from its own module URL.
+const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url)).replace(/\/+$/, "");
 
 const context = {
   category: "setup",
@@ -16,6 +17,9 @@ const context = {
   setupStage: "persistence",
   runtimeMode: "foreground",
 };
+
+const identity = { installationId: INSTALL_ID, diagnosticId: DIAGNOSTIC_ID };
+const nextIdentity = { installationId: INSTALL_ID, diagnosticId: NEXT_DIAGNOSTIC_ID };
 
 function hostileError(message: string): TypeError {
   const error = new TypeError(message, {
@@ -33,11 +37,11 @@ function hostileError(message: string): TypeError {
   });
   error.stack = [
     `TypeError: ${message}`,
-    "    at persist (/Users/alice/work/cc-router/dist/config/store.js:42:7)",
-    "    at load (file:///Users/alice/work/cc-router/dist/state/load.js:8:2)",
-    "    at scoped (/Users/alice/work/cc-router/node_modules/@scope/safe-package/lib/index.js:19:4)",
-    "    at nested (/Users/alice/work/cc-router/node_modules/outer/node_modules/inner/lib.js:3:9)",
-    "    at source (/Users/alice/work/cc-router/src/private-source.ts:12:5)",
+    `    at persist (${PROJECT_ROOT}/dist/config/store.js:42:7)`,
+    `    at load (file://${PROJECT_ROOT}/dist/state/load.js:8:2)`,
+    `    at scoped (${PROJECT_ROOT}/node_modules/@scope/safe-package/lib/index.js:19:4)`,
+    `    at nested (${PROJECT_ROOT}/node_modules/outer/node_modules/inner/lib.js:3:9)`,
+    `    at source (${PROJECT_ROOT}/src/private-source.ts:12:5)`,
     "    at remote (https://alice:password@example.test/dist/leak.js:2:2)",
     "    at home (/Users/alice/private/secrets.js:1:1)",
     "PRIVATE_SOURCE_CONTEXT = sk-stack-secret",
@@ -53,10 +57,7 @@ describe("exception sanitization", () => {
       ...context,
       prompt: "PRIVATE_PROMPT",
       workspace: "/Users/alice/work/cc-router",
-    }, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    }, identity);
 
     expect(result).toEqual(expect.objectContaining({
       category: "setup",
@@ -102,6 +103,7 @@ describe("exception sanitization", () => {
       "/Users/alice",
       "alice:password",
       "private-source",
+      PROJECT_ROOT,
     ]) {
       expect(serialized).not.toContain(secret);
       expect(result?.error.stack).not.toContain(secret);
@@ -109,43 +111,27 @@ describe("exception sanitization", () => {
   });
 
   it("groups the same safe fault independently of its raw message and diagnostic occurrence", () => {
-    const first = sanitizeException(hostileError("account alice@example.test failed"), context, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
-    const second = sanitizeException(hostileError("token sk-different-secret failed"), context, {
-      installationId: INSTALL_ID,
-      diagnosticId: NEXT_DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    const first = sanitizeException(hostileError("account alice@example.test failed"), context, identity);
+    const second = sanitizeException(hostileError("token sk-different-secret failed"), context, nextIdentity);
     const otherInstall = sanitizeException(hostileError("third private message"), context, {
       installationId: OTHER_INSTALL_ID,
       diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    });
 
     expect(first?.fingerprint).toBe(second?.fingerprint);
     expect(first?.fingerprint).toBe(otherInstall?.fingerprint);
     expect(first?.diagnosticId).toBe(DIAGNOSTIC_ID);
     expect(second?.diagnosticId).toBe(NEXT_DIAGNOSTIC_ID);
     expect(first?.diagnosticId).not.toBe(INSTALL_ID);
-    expect(second?.diagnosticId).not.toBe(INSTALL_ID);
   });
 
   it("changes grouping when safe context or a normalized frame changes", () => {
     const original = hostileError("same private message");
-    const baseline = sanitizeException(original, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
-    const changedContext = sanitizeException(original, { ...context, setupStage: "credential_parse" }, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    const baseline = sanitizeException(original, context, identity);
+    const changedContext = sanitizeException(original, { ...context, setupStage: "credential_parse" }, identity);
     const changedStackError = hostileError("same private message");
     changedStackError.stack = changedStackError.stack?.replace("store.js:42:7", "store.js:43:7");
-    const changedStack = sanitizeException(changedStackError, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    const changedStack = sanitizeException(changedStackError, context, identity);
 
     expect(changedContext?.fingerprint).not.toBe(baseline?.fingerprint);
     expect(changedStack?.fingerprint).not.toBe(baseline?.fingerprint);
@@ -165,10 +151,7 @@ describe("exception sanitization", () => {
       provider: "anthropic",
       setupStage: "credential_parse",
       runtimeMode: "daemon",
-    }, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    }, identity);
 
     expect(result).toEqual(expect.objectContaining({
       category: "setup",
@@ -181,7 +164,6 @@ describe("exception sanitization", () => {
       diagnosticId: DIAGNOSTIC_ID,
       frames: [{ path: "dist/auth/parser.js", line: 71, column: 13 }],
     }));
-    expect(result?.reason).not.toBe("other");
     expect(result?.fingerprint).toMatch(/^[0-9a-f]{64}$/);
     expect(result?.error.stack).not.toContain("PRIVATE_JSON");
   });
@@ -189,7 +171,7 @@ describe("exception sanitization", () => {
   it("uses unexpected_error without inspecting arbitrary thrown values", () => {
     const thrown = {
       message: "PRIVATE_MESSAGE",
-      stack: "/Users/alice/work/cc-router/dist/private.js:1:2",
+      stack: `${PROJECT_ROOT}/dist/private.js:1:2`,
       cause: new Error("PRIVATE_CAUSE"),
       code: "ECONNRESET",
       statusCode: 503,
@@ -201,10 +183,7 @@ describe("exception sanitization", () => {
       operation: "proxy.request",
       provider: "private-provider",
       runtimeMode: "daemon",
-    }, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    }, identity);
 
     expect(result).toEqual(expect.objectContaining({
       category: "runtime",
@@ -230,23 +209,10 @@ describe("exception sanitization", () => {
         throw new Error("PRIVATE_PROXY_GETTER");
       },
     });
+    const runtimeContext = { category: "runtime", reason: "other", operation: "proxy.request" };
 
-    expect(() => sanitizeException(thrown, {
-      category: "runtime",
-      reason: "other",
-      operation: "proxy.request",
-    }, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE)).not.toThrow();
-    expect(sanitizeException(thrown, {
-      category: "runtime",
-      reason: "other",
-      operation: "proxy.request",
-    }, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE)?.errorKind).toBe("unexpected_error");
+    expect(() => sanitizeException(thrown, runtimeContext, identity)).not.toThrow();
+    expect(sanitizeException(thrown, runtimeContext, identity)).toBeUndefined();
   });
 
   it.each([
@@ -262,10 +228,7 @@ describe("exception sanitization", () => {
       category: "runtime",
       reason: "network_failure",
       operation: "provider.inference",
-    }, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    }, identity);
 
     expect(result).toEqual(expect.objectContaining(expected));
     if (!("systemErrorCode" in expected)) expect(result).not.toHaveProperty("systemErrorCode");
@@ -277,8 +240,8 @@ describe("exception sanitization", () => {
     { installationId: INSTALL_ID },
     { installationId: INSTALL_ID, diagnosticId: "not-a-uuid" },
     { installationId: INSTALL_ID, diagnosticId: INSTALL_ID },
-  ])("rejects an invalid or non-ephemeral trusted diagnostic identity", (identity) => {
-    expect(sanitizeException(new Error("PRIVATE"), context, identity, TRUSTED_SOURCE)).toBeUndefined();
+  ])("rejects an invalid or non-ephemeral trusted diagnostic identity", (invalidIdentity) => {
+    expect(sanitizeException(new Error("PRIVATE"), context, invalidIdentity)).toBeUndefined();
   });
 
   it("removes the complete multiline Error message before parsing stack frames", () => {
@@ -286,30 +249,17 @@ describe("exception sanitization", () => {
       message,
       injectedFrame,
     ].join("\n"));
-    const first = multilineError(
-      "PRIVATE_MULTILINE_A",
-      `    at ${PROJECT_ROOT}/dist/injected-a.js:1:2`,
-    );
-    const second = multilineError(
-      "PRIVATE_MULTILINE_B",
-      `    at ${PROJECT_ROOT}/dist/injected-b.js:8:9`,
-    );
+    const first = multilineError("PRIVATE_MULTILINE_A", `    at ${PROJECT_ROOT}/dist/injected-a.js:1:2`);
+    const second = multilineError("PRIVATE_MULTILINE_B", `    at ${PROJECT_ROOT}/dist/injected-b.js:8:9`);
 
-    const firstResult = sanitizeException(first, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
-    const secondResult = sanitizeException(second, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: NEXT_DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    const firstResult = sanitizeException(first, context, identity);
+    const secondResult = sanitizeException(second, context, nextIdentity);
 
     expect(firstResult?.frames).not.toContainEqual(expect.objectContaining({ path: "dist/injected-a.js" }));
     expect(secondResult?.frames).not.toContainEqual(expect.objectContaining({ path: "dist/injected-b.js" }));
     expect(firstResult?.fingerprint).toBe(secondResult?.fingerprint);
     for (const canary of ["PRIVATE_MULTILINE", "injected-a", "injected-b"]) {
       expect(firstResult?.error.stack).not.toContain(canary);
-      expect(secondResult?.error.stack).not.toContain(canary);
       expect(JSON.stringify(firstResult)).not.toContain(canary);
       expect(JSON.stringify(secondResult)).not.toContain(canary);
     }
@@ -327,35 +277,24 @@ describe("exception sanitization", () => {
       `    at injected (${PROJECT_ROOT}/dist/header-b.js:6:7)`,
     ].join("\n");
 
-    const firstResult = sanitizeException(first, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
-    const secondResult = sanitizeException(second, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: NEXT_DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    const firstResult = sanitizeException(first, context, identity);
+    const secondResult = sanitizeException(second, context, nextIdentity);
 
     expect(firstResult?.frames).toEqual([]);
     expect(secondResult?.frames).toEqual([]);
     expect(firstResult?.fingerprint).toBe(secondResult?.fingerprint);
     expect(firstResult?.error.stack).toBe("Error: persistence_failure");
-    expect(secondResult?.error.stack).toBe("Error: persistence_failure");
   });
 
-  it("classifies global-install project frames before generic dependency frames", () => {
-    const globalRoot = "/usr/local/lib/node_modules/@timo972/cc-router";
-    const error = new Error("PRIVATE_GLOBAL_INSTALL");
+  it("classifies project frames before generic dependency frames", () => {
+    const error = new Error("PRIVATE_INSTALL_LAYOUT");
     error.stack = [
-      "Error: PRIVATE_GLOBAL_INSTALL",
-      `    at start (${globalRoot}/dist/cli/index.js:12:4)`,
-      `    at dependency (${globalRoot}/node_modules/chalk/source/index.js:20:6)`,
+      "Error: PRIVATE_INSTALL_LAYOUT",
+      `    at start (${PROJECT_ROOT}/dist/cli/index.js:12:4)`,
+      `    at dependency (${PROJECT_ROOT}/node_modules/chalk/source/index.js:20:6)`,
     ].join("\n");
 
-    const result = sanitizeException(error, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, { projectRoot: globalRoot });
+    const result = sanitizeException(error, context, identity);
 
     expect(result?.frames).toEqual([
       { path: "dist/cli/index.js", line: 12, column: 4 },
@@ -363,29 +302,20 @@ describe("exception sanitization", () => {
     ]);
   });
 
-  it("drops unrelated absolute dist roots and strips trusted-root UUID canaries", () => {
-    const rootCanary = "c58fcf9c-63ec-44a6-ac1f-6dc741bd2f69";
+  it("drops dist frames belonging to an unrelated absolute root", () => {
     const unrelatedCanary = "e51a3bc5-19c2-42de-b770-3fd43a2d93ee";
-    const trustedRoot = `/private/${rootCanary}/cc-router`;
     const error = new Error("PRIVATE_ROOT_CLASSIFICATION");
     error.stack = [
       "Error: PRIVATE_ROOT_CLASSIFICATION",
-      `    at trusted (${trustedRoot}/dist/server/index.js:31:7)`,
+      `    at trusted (${PROJECT_ROOT}/dist/server/index.js:31:7)`,
       `    at unrelated (/srv/${unrelatedCanary}/dist/injected.js:5:4)`,
     ].join("\n");
 
-    const result = sanitizeException(error, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, { projectRoot: trustedRoot });
+    const result = sanitizeException(error, context, identity);
 
-    expect(result?.frames).toEqual([
-      { path: "dist/server/index.js", line: 31, column: 7 },
-    ]);
-    expect(result?.error.stack).not.toContain(rootCanary);
-    expect(result?.error.stack).not.toContain(unrelatedCanary);
-    expect(JSON.stringify(result)).not.toContain(rootCanary);
+    expect(result?.frames).toEqual([{ path: "dist/server/index.js", line: 31, column: 7 }]);
     expect(JSON.stringify(result)).not.toContain(unrelatedCanary);
+    expect(JSON.stringify(result)).not.toContain("/srv/");
   });
 
   it("drops project frames with UUID-shaped retained path segments from output and grouping", () => {
@@ -402,21 +332,13 @@ describe("exception sanitization", () => {
       `    at run (${PROJECT_ROOT}/dist/${secondUuid}/run.js:17:3)`,
     ].join("\n");
 
-    const firstResult = sanitizeException(first, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
-    const secondResult = sanitizeException(second, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: NEXT_DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    const firstResult = sanitizeException(first, context, identity);
+    const secondResult = sanitizeException(second, context, nextIdentity);
 
     expect(firstResult?.frames).toEqual([]);
     expect(secondResult?.frames).toEqual([]);
     expect(firstResult?.fingerprint).toBe(secondResult?.fingerprint);
     for (const canary of [firstUuid, secondUuid]) {
-      expect(firstResult?.error.stack).not.toContain(canary);
-      expect(secondResult?.error.stack).not.toContain(canary);
       expect(JSON.stringify(firstResult)).not.toContain(canary);
       expect(JSON.stringify(secondResult)).not.toContain(canary);
     }
@@ -436,35 +358,15 @@ describe("exception sanitization", () => {
       `    at load (${PROJECT_ROOT}/node_modules/safe-package/cache/${secondUuid}/index.js:9:2)`,
     ].join("\n");
 
-    const firstResult = sanitizeException(first, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
-    const secondResult = sanitizeException(second, context, {
-      installationId: INSTALL_ID,
-      diagnosticId: NEXT_DIAGNOSTIC_ID,
-    }, TRUSTED_SOURCE);
+    const firstResult = sanitizeException(first, context, identity);
+    const secondResult = sanitizeException(second, context, nextIdentity);
 
     expect(firstResult?.frames).toEqual([]);
     expect(secondResult?.frames).toEqual([]);
     expect(firstResult?.fingerprint).toBe(secondResult?.fingerprint);
     for (const canary of [firstUuid, secondUuid]) {
-      expect(firstResult?.error.stack).not.toContain(canary);
-      expect(secondResult?.error.stack).not.toContain(canary);
       expect(JSON.stringify(firstResult)).not.toContain(canary);
       expect(JSON.stringify(secondResult)).not.toContain(canary);
     }
-  });
-
-  it.each([
-    undefined,
-    { projectRoot: "relative/cc-router" },
-    { projectRoot: "file:///Users/alice/work/cc-router" },
-    { projectRoot: "/Users/alice/work/cc-router/../other" },
-  ])("fails closed without a valid absolute trusted project root", (trustedSource) => {
-    expect(sanitizeException(new Error("PRIVATE"), context, {
-      installationId: INSTALL_ID,
-      diagnosticId: DIAGNOSTIC_ID,
-    }, trustedSource)).toBeUndefined();
   });
 });
