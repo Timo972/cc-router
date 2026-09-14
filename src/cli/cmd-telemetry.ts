@@ -1,11 +1,11 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { loadTelemetryState, writeTelemetryState, isTelemetryEnabled } from "../config/telemetry.js";
+import { getTelemetrySnapshot, updateTelemetryConsent } from "../config/telemetry.js";
 
 export function registerTelemetry(program: Command): void {
   program
     .command("telemetry [action]")
-    .description("Manage anonymous usage analytics: on, off, status (default: status)")
+    .description("Manage privacy-safe telemetry: on, off, status (default: status; fresh installs: on)")
     .action(async (action?: string) => {
       const resolved = action ?? "status";
 
@@ -15,20 +15,17 @@ export function registerTelemetry(program: Command): void {
       }
 
       if (resolved === "on") {
-        const state = loadTelemetryState();
-        state.enabled = true;
-        writeTelemetryState(state);
-        console.log(chalk.green("Telemetry enabled."));
+        const state = updateTelemetryConsent(true);
+        console.log(chalk.green("Telemetry enabled for future daemon starts."));
+        console.log(chalk.dim("Restart a daemon that started with telemetry disabled to begin sending telemetry."));
         console.log(chalk.dim(`Install ID: ${state.installId}`));
         return;
       }
 
       if (resolved === "off") {
         // Do not beacon on opt-out: an explicit "turn it off" must not send data.
-        const state = loadTelemetryState();
-        state.enabled = false;
-        writeTelemetryState(state);
-        console.log(chalk.yellow("Telemetry disabled. No data will be sent."));
+        updateTelemetryConsent(false);
+        console.log(chalk.yellow("Telemetry disabled. New outbound telemetry stops immediately."));
         console.log(chalk.dim("Re-enable anytime with: cc-router telemetry on"));
         return;
       }
@@ -39,28 +36,30 @@ export function registerTelemetry(program: Command): void {
 }
 
 function showStatus(): void {
-  const state = loadTelemetryState();
-  const envDisabled =
-    process.env["DO_NOT_TRACK"] === "1" || process.env["CC_ROUTER_TELEMETRY"] === "0";
+  const { state, environmentDisabled, enabled } = getTelemetrySnapshot();
 
   console.log(chalk.bold("Telemetry"));
   console.log();
 
-  if (envDisabled) {
+  if (environmentDisabled) {
     console.log(`  Status:     ${chalk.yellow("disabled")} (by environment variable)`);
   } else if (state.enabled) {
-    console.log(`  Status:     ${chalk.green("enabled")}`);
+    console.log(`  Status:     ${chalk.green("enabled")} (persisted)`);
   } else {
-    console.log(`  Status:     ${chalk.yellow("disabled")}`);
+    console.log(`  Status:     ${chalk.yellow("disabled")} (persisted)`);
   }
 
-  console.log(`  Active:     ${isTelemetryEnabled() ? chalk.green("yes") : chalk.yellow("no")}`);
+  console.log(`  Active:     ${enabled ? chalk.green("yes") : chalk.yellow("no")}`);
   console.log(`  Install ID: ${chalk.dim(state.installId)}`);
   console.log(`  Since:      ${chalk.dim(state.firstRunAt)}`);
   console.log();
-  console.log(chalk.dim("  What we send:  version, OS, locale, lifecycle events (start, heartbeat)"));
-  console.log(chalk.dim("  What we DON'T: IPs, tokens, prompts, request content, account names"));
-  console.log(chalk.dim("  Source code:   src/utils/telemetry.ts"));
+  console.log(chalk.dim("  What we send:  sampled traces, safe diagnostics, lifecycle events, sanitized exceptions"));
+  console.log(chalk.dim("  What we DON'T: tokens, prompts/content, account/session IDs, raw errors, URLs, headers"));
+  console.log(chalk.dim("  Network note:   PostHog EU sees the HTTPS source IP; it is not added to the payload"));
+  console.log(chalk.dim("  Identity:       random install pseudonym; no Person profile or GeoIP enrichment"));
+  console.log(chalk.dim("  Source code:   src/telemetry/"));
+  console.log(chalk.dim("  Inventory:     docs/telemetry.md"));
+  console.log(chalk.dim("  Default:       on for new installs"));
   console.log();
   console.log(chalk.dim("  Disable:  cc-router telemetry off"));
   console.log(chalk.dim("  Or set:   DO_NOT_TRACK=1  |  CC_ROUTER_TELEMETRY=0"));
