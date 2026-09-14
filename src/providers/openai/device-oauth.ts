@@ -1,4 +1,16 @@
 import { createOpenAIAccountRecord, type OpenAIAccountRecord } from "./account-record.js";
+import type { SetupStage } from "../../telemetry/contracts.js";
+import {
+  SetupDiagnosticError,
+  classifyHttpSetupFailure,
+  classifyNetworkSetupFailure,
+} from "../../telemetry/setup-diagnostics.js";
+
+/** Stages the device-code login can report to a setup attempt as it progresses. */
+export type OpenAIDeviceSetupStage = Extract<
+  SetupStage,
+  "device_code_request" | "authorization_polling" | "token_exchange" | "access_token_parse"
+>;
 
 const DEFAULT_ISSUER = "https://auth.openai.com";
 export const DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -51,6 +63,7 @@ export interface ExchangeOpenAIDeviceCodeOptions extends OpenAIDeviceOAuthOption
   sleep?: (ms: number) => Promise<void>;
   timeoutMs?: number;
   now?: () => number;
+  onStageCompleted?: (stage: OpenAIDeviceSetupStage) => void;
 }
 
 export interface LoginOpenAIWithDeviceCodeOptions extends OpenAIDeviceOAuthOptions {
@@ -59,6 +72,7 @@ export interface LoginOpenAIWithDeviceCodeOptions extends OpenAIDeviceOAuthOptio
   sleep?: (ms: number) => Promise<void>;
   timeoutMs?: number;
   now?: () => number;
+  onStageCompleted?: (stage: OpenAIDeviceSetupStage) => void;
 }
 
 function issuerOf(opts: OpenAIDeviceOAuthOptions): string {
@@ -73,12 +87,44 @@ function fetchOf(opts: OpenAIDeviceOAuthOptions): FetchImpl {
   return opts.fetchImpl ?? fetch;
 }
 
+/** A malformed body is attributed to the stage that received it; the message is unchanged. */
+async function parseJsonAt<T>(stage: OpenAIDeviceSetupStage, res: Response): Promise<T> {
+  try {
+    return await res.json() as T;
+  } catch (error) {
+    throw new SetupDiagnosticError(
+      error instanceof Error ? error.message : String(error),
+      { stage, reason: "unexpected_response_shape", expected: true, httpStatusCode: res.status },
+      { cause: error },
+    );
+  }
+}
+
 function parseAccessTokenExpiry(accessToken: string): number {
   const [, payload] = accessToken.split(".");
-  if (!payload) throw new Error("OpenAI access token is not a JWT");
-  const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8")) as { exp?: unknown };
+  if (!payload) {
+    throw new SetupDiagnosticError("OpenAI access token is not a JWT", {
+      stage: "access_token_parse",
+      reason: "unexpected_response_shape",
+      expected: false,
+    });
+  }
+  let claims: { exp?: unknown };
+  try {
+    claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8")) as { exp?: unknown };
+  } catch (error) {
+    throw new SetupDiagnosticError(
+      error instanceof Error ? error.message : String(error),
+      { stage: "access_token_parse", reason: "unexpected_response_shape", expected: true },
+      { cause: error },
+    );
+  }
   if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp)) {
-    throw new Error("OpenAI access token JWT does not contain a numeric exp claim");
+    throw new SetupDiagnosticError("OpenAI access token JWT does not contain a numeric exp claim", {
+      stage: "access_token_parse",
+      reason: "unexpected_response_shape",
+      expected: true,
+    });
   }
   return claims.exp * 1000;
 }
@@ -93,20 +139,34 @@ async function readError(res: Response): Promise<string> {
 
 export async function requestOpenAIDeviceCode(opts: OpenAIDeviceOAuthOptions = {}): Promise<OpenAIDeviceCode> {
   const issuer = issuerOf(opts);
-  const res = await fetchOf(opts)(`${issuer}/api/accounts/deviceauth/usercode`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ client_id: clientIdOf(opts) }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`OpenAI device code request failed (${res.status}): ${await readError(res)}`);
+  let res: Response;
+  try {
+    res = await fetchOf(opts)(`${issuer}/api/accounts/deviceauth/usercode`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_id: clientIdOf(opts) }),
+    });
+  } catch (error) {
+    throw classifyNetworkSetupFailure("device_code_request", error);
   }
 
-  const body = await res.json() as RequestDeviceCodeResponse;
+  if (!res.ok) {
+    throw classifyHttpSetupFailure(
+      "device_code_request",
+      res.status,
+      `OpenAI device code request failed (${res.status}): ${await readError(res)}`,
+    );
+  }
+
+  const body = await parseJsonAt<RequestDeviceCodeResponse>("device_code_request", res);
   const userCode = body.user_code ?? body.usercode;
   if (!body.device_auth_id || !userCode) {
-    throw new Error("OpenAI device code response is missing device_auth_id or user_code");
+    throw new SetupDiagnosticError("OpenAI device code response is missing device_auth_id or user_code", {
+      stage: "device_code_request",
+      reason: "unexpected_response_shape",
+      expected: true,
+      httpStatusCode: res.status,
+    });
   }
 
   return {
@@ -125,24 +185,37 @@ async function pollAuthorizationCode(opts: ExchangeOpenAIDeviceCodeOptions): Pro
   const started = now();
 
   while (now() - started <= timeoutMs) {
-    const res = await fetchOf(opts)(`${issuer}/api/accounts/deviceauth/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        device_auth_id: opts.deviceCode.deviceAuthId,
-        user_code: opts.deviceCode.userCode,
-      }),
-    });
+    let res: Response;
+    try {
+      res = await fetchOf(opts)(`${issuer}/api/accounts/deviceauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          device_auth_id: opts.deviceCode.deviceAuthId,
+          user_code: opts.deviceCode.userCode,
+        }),
+      });
+    } catch (error) {
+      throw classifyNetworkSetupFailure("authorization_polling", error);
+    }
 
-    if (res.ok) return await res.json() as PollDeviceCodeResponse;
+    if (res.ok) return await parseJsonAt<PollDeviceCodeResponse>("authorization_polling", res);
     if (res.status !== 403 && res.status !== 404) {
-      throw new Error(`OpenAI device authorization failed (${res.status}): ${await readError(res)}`);
+      throw classifyHttpSetupFailure(
+        "authorization_polling",
+        res.status,
+        `OpenAI device authorization failed (${res.status}): ${await readError(res)}`,
+      );
     }
 
     await sleep(Math.max(1, opts.deviceCode.intervalSeconds) * 1000);
   }
 
-  throw new Error("OpenAI device authorization timed out");
+  throw new SetupDiagnosticError("OpenAI device authorization timed out", {
+    stage: "authorization_polling",
+    reason: "timeout",
+    expected: true,
+  });
 }
 
 export async function exchangeOpenAIDeviceCodeForTokens(
@@ -150,6 +223,7 @@ export async function exchangeOpenAIDeviceCodeForTokens(
 ): Promise<OpenAIDeviceTokens> {
   const issuer = issuerOf(opts);
   const code = await pollAuthorizationCode(opts);
+  opts.onStageCompleted?.("authorization_polling");
   const form = new URLSearchParams({
     grant_type: "authorization_code",
     code: code.authorization_code,
@@ -158,22 +232,34 @@ export async function exchangeOpenAIDeviceCodeForTokens(
     code_verifier: code.code_verifier,
   });
 
-  const res = await fetchOf(opts)(`${issuer}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: form.toString(),
-  });
-
-  if (!res.ok) {
-    throw new Error(`OpenAI token exchange failed (${res.status}): ${await readError(res)}`);
+  let res: Response;
+  try {
+    res = await fetchOf(opts)(`${issuer}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+    });
+  } catch (error) {
+    throw classifyNetworkSetupFailure("token_exchange", error);
   }
 
-  const tokens = await res.json() as TokenResponse;
+  if (!res.ok) {
+    throw classifyHttpSetupFailure(
+      "token_exchange",
+      res.status,
+      `OpenAI token exchange failed (${res.status}): ${await readError(res)}`,
+    );
+  }
+
+  const tokens = await parseJsonAt<TokenResponse>("token_exchange", res);
+  opts.onStageCompleted?.("token_exchange");
+  const expiresAt = parseAccessTokenExpiry(tokens.access_token);
+  opts.onStageCompleted?.("access_token_parse");
   return {
     idToken: tokens.id_token,
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
-    expiresAt: parseAccessTokenExpiry(tokens.access_token),
+    expiresAt,
   };
 }
 
@@ -181,6 +267,7 @@ export async function loginOpenAIWithDeviceCode(
   opts: LoginOpenAIWithDeviceCodeOptions,
 ): Promise<OpenAIAccountRecord> {
   const deviceCode = await requestOpenAIDeviceCode(opts);
+  opts.onStageCompleted?.("device_code_request");
   opts.onDeviceCode?.(deviceCode);
   const tokens = await exchangeOpenAIDeviceCodeForTokens({ ...opts, deviceCode });
   return createOpenAIAccountRecord({

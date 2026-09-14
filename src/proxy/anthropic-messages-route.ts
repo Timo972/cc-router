@@ -18,9 +18,23 @@ import { EmptyPoolError, NoEligibleAccountError, type TokenPool } from "./token-
 import type { Account } from "./types.js";
 import { applyRateLimitHeaders } from "../providers/anthropic/rate-limit-headers.js";
 import { attachAnthropicResponseCapture } from "./anthropic-response-capture.js";
+import { TRACE_CONTEXT_HEADERS } from "./anthropic-proxy.js";
 import { boundModelId, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { logError, logRoute } from "./logger.js";
+import {
+  annotateActiveSpan,
+  classifyExpectedRuntimeFailure,
+  modelFamilyOf,
+  recordRuntimeError,
+  recordUpstreamStatus,
+  settleProxyRequestSpan,
+  startTelemetrySpan,
+} from "../telemetry/facade.js";
+import type { Outcome, SafeSpanAttributes, StreamOutcome } from "../telemetry/facade.js";
+
+/** How long a provider span may wait for a compressed body's usage after the response closed. */
+const USAGE_SETTLE_GRACE_MS = 1_000;
 import {
   MAX_UPSTREAM_ATTEMPTS,
   RETRY_REFRESH_TIMEOUT_MS,
@@ -106,6 +120,7 @@ function buildUpstreamHeaders(
   delete headers["content-length"];
   delete headers["transfer-encoding"];
   delete headers["x-api-key"];
+  for (const header of TRACE_CONTEXT_HEADERS) delete headers[header];
   headers["connection"] = "close";
   headers["host"] = target.host;
   headers["authorization"] = `Bearer ${account.tokens.accessToken}`;
@@ -166,7 +181,12 @@ function forwardAttempt(opts: {
     });
     upstreamRequest.on("error", reject);
     upstreamRequest.on("timeout", () => {
-      upstreamRequest.destroy(new Error(`Upstream request timed out after ${opts.timeoutMs}ms`));
+      // The `code` lets telemetry classify this as an expected timeout; the
+      // message and the client-facing response are unchanged.
+      upstreamRequest.destroy(Object.assign(
+        new Error(`Upstream request timed out after ${opts.timeoutMs}ms`),
+        { code: "ETIMEDOUT" },
+      ));
     });
   });
   upstreamRequest.end(opts.body);
@@ -180,7 +200,12 @@ function forwardAttempt(opts: {
  * its HTTP/1.0 accommodations, so moving /v1/messages off the generic proxy
  * changes nothing about what a client receives.
  */
-function relayUpstreamResponse(upstream: IncomingMessage, req: Request, res: Response): void {
+function relayUpstreamResponse(
+  upstream: IncomingMessage,
+  req: Request,
+  res: Response,
+  onUpstreamFailure?: () => void,
+): void {
   if (req.httpVersion === "1.0") {
     delete upstream.headers["transfer-encoding"];
     upstream.headers["connection"] = (req.headers["connection"] as string | undefined) ?? "close";
@@ -197,6 +222,9 @@ function relayUpstreamResponse(upstream: IncomingMessage, req: Request, res: Res
   // tear the client connection down rather than ending it cleanly, so the
   // client sees a broken transfer instead of a silently truncated body.
   upstream.once("error", () => {
+    // Recorded before the downstream teardown, which would otherwise look
+    // like a client hang-up to the response's own close listener.
+    onUpstreamFailure?.();
     if (!res.writableEnded) res.destroy();
   });
   upstream.pipe(res);
@@ -247,8 +275,22 @@ export function mountAnthropicMessagesRoute(
       ? "desktop" as const
       : "api" as const;
     const model = boundModelId(context?.requestedModel ?? "-");
+    const modelFamily = modelFamilyOf(model);
+    const streaming = (req.body as { stream?: unknown } | undefined)?.stream === true;
     const startedAt = now();
     stats.totalRequests++;
+    annotateActiveSpan("proxy.request", {
+      provider: "anthropic",
+      route: "messages",
+      modelFamily,
+      requestSource: source,
+      streaming,
+      accountPoolSize: opts.pool.getAll().length,
+    });
+    /** The request span's final verdict; the middleware ends the span from it. */
+    const settleRequest = (outcome: Outcome, extra: SafeSpanAttributes = {}): void => {
+      settleProxyRequestSpan(res, { ...extra, outcome, operationDurationMs: now() - startedAt });
+    };
 
     // A client that hangs up takes the in-flight upstream attempt (and any
     // pending retry) with it. `writableEnded` guards the normal-completion
@@ -270,6 +312,23 @@ export function mountAnthropicMessagesRoute(
     for (let attempt = 1; ; attempt++) {
       const account = route.account;
       const attemptStartedAt = now();
+      const attemptSpan = startTelemetrySpan("provider.inference", {
+        provider: "anthropic",
+        route: "messages",
+        modelFamily,
+        streaming,
+        attempt,
+      });
+      /** Close this attempt's span exactly once, on the outcome it ended with. */
+      const endAttempt = (outcome: Outcome, extra: SafeSpanAttributes = {}): void => {
+        attemptSpan.annotate({
+          ...extra,
+          outcome,
+          attempt,
+          operationDurationMs: now() - attemptStartedAt,
+        });
+        attemptSpan.end(outcome === "complete" ? "ok" : "error");
+      };
       req._ccAccount = account;
       logRoute(
         account.id,
@@ -296,9 +355,20 @@ export function mountAnthropicMessagesRoute(
         // is a cancellation, not an upstream failure — there is no client
         // left to receive a 502, and the generic proxy does not log client
         // resets either.
-        if (clientGone.signal.aborted || res.writableEnded) return;
+        if (clientGone.signal.aborted || res.writableEnded) {
+          endAttempt("cancelled", { streamOutcome: "cancelled" });
+          settleRequest("cancelled", { streamOutcome: "cancelled", attempt });
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         stats.totalErrors++;
+        recordRuntimeError(error, { operation: "provider.inference", provider: "anthropic" }, {
+          attempt,
+          durationMs: now() - attemptStartedAt,
+        });
+        const forwardOutcome: Outcome = classifyExpectedRuntimeFailure(error) === "timeout"
+          ? "timeout"
+          : "upstream_error";
         logError("proxy", 0, message);
         recordActivity({
           ts: attemptStartedAt,
@@ -320,11 +390,19 @@ export function mountAnthropicMessagesRoute(
             error: { type: "proxy_error", message },
           });
         }
+        endAttempt(forwardOutcome, { httpStatusCode: 502, streamOutcome: forwardOutcome });
+        settleRequest(forwardOutcome, { httpStatusCode: 502, attempt });
         return;
       }
       req.socket.setTimeout(0);
 
       const status = upstream.statusCode ?? 0;
+      if (status === 401 || status === 403 || status === 429 || status >= 500) {
+        recordUpstreamStatus("provider.inference", "anthropic", status, {
+          attempt,
+          durationMs: now() - attemptStartedAt,
+        });
+      }
       // Routing state changes implied by the failure — cooldowns and sticky
       // binding invalidation — run before any retry decision, so the
       // re-acquisition below already sees the failed account excluded.
@@ -463,10 +541,16 @@ export function mountAnthropicMessagesRoute(
           next?.release();
           release();
           upstream.destroy();
+          endAttempt("cancelled", { httpStatusCode: status, streamOutcome: "cancelled" });
+          settleRequest("cancelled", { httpStatusCode: status, streamOutcome: "cancelled", attempt });
           return;
         }
         if (next) {
           // Committed: record the failed attempt and abandon its response.
+          endAttempt(status === 429 ? "rate_limited" : "upstream_error", {
+            httpStatusCode: status,
+            streamOutcome: "upstream_error",
+          });
           entry.details = `${entry.details}:will-retry`;
           recordActivity(entry);
           upstream.destroy();
@@ -511,6 +595,8 @@ export function mountAnthropicMessagesRoute(
         recordActivity(entry);
         upstream.destroy();
         release();
+        endAttempt("cancelled", { httpStatusCode: status, streamOutcome: "cancelled" });
+        settleRequest("cancelled", { httpStatusCode: status, streamOutcome: "cancelled", attempt });
         return;
       }
 
@@ -528,6 +614,8 @@ export function mountAnthropicMessagesRoute(
         entry.details = `${entry.details}:held-response-lost`;
         recordActivity(entry);
         release();
+        endAttempt("upstream_error", { httpStatusCode: 502, streamOutcome: "upstream_error" });
+        settleRequest("upstream_error", { httpStatusCode: 502, attempt });
         logError(account.id, 502, `upstream ${status} response was lost before it could be relayed`);
         res.status(502).json({
           type: "error",
@@ -544,8 +632,74 @@ export function mountAnthropicMessagesRoute(
       // usage capture; the dashboard picks the values up on its next poll —
       // same contract as the generic proxy path.
       recordActivity(entry);
-      attachAnthropicResponseCapture(upstream, res, entry, startedAt);
-      relayUpstreamResponse(upstream, req, res);
+      const outcome: Outcome = status === 429 ? "rate_limited"
+        : status >= 400 ? "upstream_error"
+        : "complete";
+      annotateActiveSpan("proxy.request", {
+        httpStatusCode: status,
+        outcome,
+        attempt,
+        operationDurationMs: now() - startedAt,
+      });
+      // Tokens and the stream verdict are only known once the relayed body
+      // settles. The span waits for both the response's close and the passive
+      // usage capture (a compressed body decodes after close), bounded so a
+      // decoder that never finishes cannot keep the span open.
+      const contentType = String(upstream.headers["content-type"] ?? "");
+      const encoding = String(upstream.headers["content-encoding"] ?? "");
+      const isSse = contentType.includes("text/event-stream");
+      // Set by the relay when the provider connection failed first; a client
+      // hang-up also destroys the upstream, so the order of events matters.
+      let upstreamFailedFirst = false;
+      // The lifecycle tracker only reads uncompressed SSE; the usage capture's
+      // decoded copy reports the terminal event for compressed streams.
+      let decodedMessageStop = false;
+      let responseClosed = false;
+      let usageSettled = false;
+      let usageDeadline: ReturnType<typeof setTimeout> | undefined;
+      const finishAttempt = (): void => {
+        if (usageDeadline !== undefined) clearTimeout(usageDeadline);
+        const lifecycle = entry.streamLifecycle;
+        // A client hang-up destroys the upstream request too, so the client's
+        // own signal must win over the resulting upstream abort.
+        const streamOutcome: StreamOutcome = status >= 400 ? "upstream_error"
+          : upstreamFailedFirst ? "upstream_error"
+          : clientGone.signal.aborted ? "cancelled"
+          : lifecycle?.upstreamAborted ? "upstream_error"
+          : !res.writableEnded ? "cancelled"
+          : isSse && !lifecycle?.sawMessageStop && !decodedMessageStop ? "upstream_error"
+          : "complete";
+        const attemptOutcome: Outcome = status >= 400 ? outcome
+          : streamOutcome === "complete" ? outcome
+          : streamOutcome;
+        const tokens = {
+          ...(entry.inputTokens !== undefined ? { inputTokens: entry.inputTokens } : {}),
+          ...(entry.outputTokens !== undefined ? { outputTokens: entry.outputTokens } : {}),
+        };
+        endAttempt(attemptOutcome, { httpStatusCode: status, streamOutcome, ...tokens });
+        settleRequest(attemptOutcome, { httpStatusCode: status, streamOutcome, attempt, ...tokens });
+      };
+      const maybeFinishAttempt = (): void => {
+        if (responseClosed && usageSettled) finishAttempt();
+      };
+      res.once("close", () => {
+        responseClosed = true;
+        if (!usageSettled) {
+          usageDeadline = setTimeout(finishAttempt, USAGE_SETTLE_GRACE_MS);
+          usageDeadline.unref?.();
+        }
+        maybeFinishAttempt();
+      });
+      attachAnthropicResponseCapture(upstream, res, entry, startedAt, {
+        onMessageStop: () => { decodedMessageStop = true; },
+        onUsageSettled: () => {
+          usageSettled = true;
+          maybeFinishAttempt();
+        },
+      });
+      relayUpstreamResponse(upstream, req, res, () => {
+        if (!clientGone.signal.aborted) upstreamFailedFirst = true;
+      });
       return;
     }
   };

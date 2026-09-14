@@ -4,6 +4,7 @@ import {
   loginOpenAIWithDeviceCode,
   requestOpenAIDeviceCode,
 } from "../providers/openai/device-oauth.js";
+import { SetupDiagnosticError } from "../telemetry/setup-diagnostics.js";
 
 function jwtWithExp(exp: number): string {
   const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");
@@ -131,6 +132,30 @@ describe("OpenAI device OAuth", () => {
       expiresAt: 2_000_000_000_000,
       scopes: ["openid", "profile", "email", "offline_access"],
       enabled: true,
+    });
+  });
+
+  it("attributes a malformed token-exchange body to the token_exchange stage", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ authorization_code: "code", code_verifier: "v" }) } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => { throw new SyntaxError("Unexpected token < in JSON"); },
+      } as unknown as Response);
+
+    const failure = await exchangeOpenAIDeviceCodeForTokens({
+      fetchImpl,
+      deviceCode: { verificationUrl: "u", userCode: "c", deviceAuthId: "d", intervalSeconds: 0 },
+      sleep: async () => undefined,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(SetupDiagnosticError);
+    expect((failure as SetupDiagnosticError).message).toBe("Unexpected token < in JSON");
+    expect((failure as SetupDiagnosticError).classification).toMatchObject({
+      stage: "token_exchange",
+      reason: "unexpected_response_shape",
+      expected: true,
     });
   });
 });

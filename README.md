@@ -125,7 +125,7 @@ Per-platform token extraction, Codex CLI, Docker and everything else lives in
 | [LiteLLM](docs/litellm-setup.md) | Optional logging and rate-limiting layer |
 | [OAuth tokens](docs/oauth-tokens.md) | How subscription tokens and refresh rotation work |
 | [Security](docs/security.md) | Token storage, proxy auth, threat model |
-| [Telemetry](docs/telemetry.md) | Opt-in analytics: what's sent if you enable it |
+| [Telemetry](docs/telemetry.md) | Privacy-bounded telemetry, on by default: exactly what is sent and how to turn it off |
 | [Troubleshooting](docs/troubleshooting.md) | When something doesn't connect |
 
 ## Disclaimer

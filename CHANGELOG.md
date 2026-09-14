@@ -8,6 +8,24 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Privacy-bounded OpenTelemetry and PostHog EU telemetry: 10%-sampled proxy
+  traces, closed-schema setup and runtime diagnostics, lifecycle events, and
+  sanitized exceptions with diagnostic IDs. Every outbound record is rebuilt
+  from an allowlist immediately before export; prompts, bodies, headers,
+  URLs, account identifiers, tokens, and raw error messages are never sent.
+  Fresh installations default on; `cc-router telemetry off`, `DO_NOT_TRACK=1`,
+  and `CC_ROUTER_TELEMETRY=0` disable every signal, and a running daemon stops
+  exporting as soon as it observes an explicit opt-out. See
+  [docs/telemetry.md](docs/telemetry.md) for the complete inventory.
+
+### Changed
+
+- Aptabase telemetry has been removed. An existing persisted opt-out remains
+  off after upgrade; no PostHog Person profiles are created and GeoIP
+  enrichment is disabled.
+
 ---
 
 ## [0.12.1] — 2026-09-14

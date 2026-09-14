@@ -1,4 +1,5 @@
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
+import { MAX_RETAINED_SSE_LINE_BYTES } from "./stream-lifecycle.js";
 import type { Transform } from "node:stream";
 
 /**
@@ -25,6 +26,15 @@ export interface AnthropicUsageCaptureOptions {
   /** message_delta usage (output tokens), or the sole usage object of a
    *  non-streaming JSON body. */
   onOutputUsage(usage: Record<string, number>): void;
+  /** Fired once when the capture has seen everything it will see (end,
+   *  size cap, or decoder error). Compressed bodies decode asynchronously,
+   *  so this can trail the relayed response's own close event. */
+  onSettled?(): void;
+  /** Fired when the decoded SSE copy carries the `message_stop` terminal event.
+   *  Providing it keeps the passive decoder running to the end of the stream
+   *  (instead of stopping after both usage events) so a compressed stream's
+   *  completion can be verified without touching the forwarded bytes. */
+  onMessageStop?(): void;
 }
 
 export interface AnthropicUsageCapture {
@@ -63,17 +73,42 @@ export function createAnthropicUsageCapture(
     if (dead) return;
     dead = true;
     decoder?.destroy();
+    options.onSettled?.();
   };
 
   // ── SSE: incremental line parsing, stop once both events were seen ────────
   let lineBuf = "";
+  let discardingOversizedLine = false;
   let gotInput = false;
   let gotOutput = false;
   const parseSSEChunk = (text: string): void => {
-    lineBuf += text;
-    const lines = lineBuf.split("\n");
+    let rest = text;
+    if (discardingOversizedLine) {
+      const newline = rest.indexOf("\n");
+      if (newline === -1) return; // still inside the oversized line
+      rest = rest.slice(newline + 1);
+      discardingOversizedLine = false;
+    }
+    if (!rest.includes("\n")) {
+      // No line boundary yet: retain a bounded partial line and never re-split
+      // the accumulated tail (an unterminated tail would otherwise cost
+      // quadratic work and unbounded memory).
+      if (lineBuf.length + rest.length > MAX_RETAINED_SSE_LINE_BYTES) {
+        lineBuf = "";
+        discardingOversizedLine = true;
+      } else {
+        lineBuf += rest;
+      }
+      return;
+    }
+    const lines = (lineBuf + rest).split("\n");
     lineBuf = lines.pop() ?? ""; // keep incomplete last line
+    if (lineBuf.length > MAX_RETAINED_SSE_LINE_BYTES) {
+      lineBuf = "";
+      discardingOversizedLine = true;
+    }
     for (const line of lines) {
+      if (dead) return;
       if (!line.startsWith("data: ")) continue;
       try {
         const evt = JSON.parse(line.slice(6)) as {
@@ -89,9 +124,16 @@ export function createAnthropicUsageCapture(
           options.onOutputUsage(evt.usage);
           gotOutput = true;
         }
+        if (evt.type === "message_stop") {
+          // The terminal event is the last thing of interest on the stream.
+          options.onMessageStop?.();
+          die();
+          return;
+        }
         // Everything of interest has been seen — stop paying for the rest of
-        // the stream (and free the decompressor's zlib state).
-        if (gotInput && gotOutput) die();
+        // the stream (and free the decompressor's zlib state), unless the
+        // caller also wants the terminal event.
+        if (gotInput && gotOutput && !options.onMessageStop) die();
       } catch { /* partial JSON across chunk boundary — next chunk completes it */ }
     }
   };
@@ -124,6 +166,7 @@ export function createAnthropicUsageCapture(
     if (dead) return;
     if (isJSON) parseJSONBody();
     dead = true;
+    options.onSettled?.();
   };
 
   if (!decoder) {

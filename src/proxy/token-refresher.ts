@@ -2,6 +2,14 @@ import type { Account, RefreshResponse } from "./types.js";
 import { writeAnthropicAccountsPreservingOtherProviders, serialize } from "../config/manager.js";
 import { logRefresh } from "./logger.js";
 import { stats } from "./stats.js";
+import {
+  classifyExpectedRuntimeFailure,
+  httpOutcome,
+  recordRuntimeError,
+  recordUpstreamStatus,
+  withTelemetrySpan,
+  type ActiveTelemetrySpan,
+} from "../telemetry/facade.js";
 
 /**
  * Official Claude Code CLI client_id for the OAuth PKCE flow.
@@ -76,7 +84,11 @@ export async function refreshAccountToken(account: Account): Promise<boolean> {
   const existing = rawRefreshLocks.get(account);
   if (existing) return existing;
 
-  const promise = _doRefresh(account);
+  const promise = withTelemetrySpan("oauth.refresh", { provider: "anthropic" }, async span => {
+    const refreshed = await _doRefresh(account, span);
+    if (!refreshed) span.fail();
+    return refreshed;
+  });
   rawRefreshLocks.set(account, promise);
   try {
     return await promise;
@@ -183,7 +195,7 @@ export function refreshAccountIfCurrent(
   return operation;
 }
 
-async function _doRefresh(account: Account): Promise<boolean> {
+async function _doRefresh(account: Account, span: ActiveTelemetrySpan): Promise<boolean> {
   try {
     const body = new URLSearchParams({
       grant_type: "refresh_token",
@@ -199,6 +211,8 @@ async function _doRefresh(account: Account): Promise<boolean> {
 
     if (!res.ok) {
       const body = await res.text();
+      recordUpstreamStatus("oauth.refresh", "anthropic", res.status);
+      span.fail({ httpStatusCode: res.status, outcome: httpOutcome(res.status) });
       logRefresh(account.id, false);
       console.error(`  Status: ${res.status} — ${body}`);
       account.consecutiveErrors++;
@@ -234,6 +248,8 @@ async function _doRefresh(account: Account): Promise<boolean> {
     logRefresh(account.id, true, expiresInMin);
     return true;
   } catch (err) {
+    recordRuntimeError(err, { operation: "oauth.refresh", provider: "anthropic" });
+    span.fail({ outcome: classifyExpectedRuntimeFailure(err) === "timeout" ? "timeout" : "upstream_error" });
     logRefresh(account.id, false);
     console.error(`  Error:`, err);
     account.consecutiveErrors++;

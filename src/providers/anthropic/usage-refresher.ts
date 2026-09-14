@@ -1,6 +1,13 @@
 import type { Account, AccountUsageSnapshot } from "../../proxy/types.js";
 import { UsageRefresher } from "../../proxy/usage-refresher.js";
 import { fetchAnthropicUsage, type UsageFetchResult } from "./usage.js";
+import {
+  httpOutcome,
+  recordRuntimeError,
+  recordSafeLog,
+  recordUpstreamStatus,
+  withTelemetrySpan,
+} from "../../telemetry/facade.js";
 
 export interface UsageAccountPool {
   getAll(): Account[];
@@ -23,8 +30,40 @@ export interface AnthropicUsageRefresherOptions {
 export class AnthropicUsageRefresher extends UsageRefresher<Account, UsageFetchResult> {
   constructor(pool: UsageAccountPool, options: AnthropicUsageRefresherOptions = {}) {
     const now = options.now ?? Date.now;
+    const fetchUsage = options.fetchUsage ?? fetchAnthropicUsage;
     super(pool, {
-      fetchUsage: options.fetchUsage ?? fetchAnthropicUsage,
+      fetchUsage: account => withTelemetrySpan("provider.usage_refresh", { provider: "anthropic" },
+        async span => {
+          let result: UsageFetchResult;
+          try {
+            result = await fetchUsage(account);
+          } catch (error) {
+            recordRuntimeError(error, { operation: "provider.usage_refresh", provider: "anthropic" });
+            throw error;
+          }
+          if (!result.ok) {
+            if (result.status !== undefined) {
+              recordUpstreamStatus("provider.usage_refresh", "anthropic", result.status);
+              span.fail({ httpStatusCode: result.status, outcome: httpOutcome(result.status) });
+            } else {
+              // fetchAnthropicUsage resolves transport failures instead of
+              // throwing, so the unsampled failure log is emitted here.
+              const reason = result.reason === "timeout" ? "timeout"
+                : result.reason === "network" ? "network_failure"
+                : "other";
+              const outcome = reason === "timeout" ? "timeout" : "upstream_error";
+              recordSafeLog({
+                operation: "provider.usage_refresh",
+                provider: "anthropic",
+                severity: "error",
+                reason,
+                outcome,
+              });
+              span.fail({ outcome });
+            }
+          }
+          return result;
+        }),
       cancelledResult: () => ({ ok: false, reason: "network" }),
       applyResult: (account, result) => {
         if (result.ok) {

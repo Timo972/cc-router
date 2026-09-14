@@ -106,4 +106,31 @@ describe("createAnthropicUsageCapture", () => {
     expect(onInputUsage).not.toHaveBeenCalled();
     expect(onOutputUsage).not.toHaveBeenCalled();
   });
+
+  it("bounds an unterminated SSE tail and still observes the terminal event", () => {
+    const onInputUsage = vi.fn();
+    const onOutputUsage = vi.fn();
+    const onMessageStop = vi.fn();
+    const capture = createAnthropicUsageCapture({
+      contentType: "text/event-stream",
+      contentEncoding: "",
+      onInputUsage,
+      onOutputUsage,
+      onMessageStop,
+    });
+    if (!capture) throw new Error("expected an SSE capture");
+
+    capture.write(Buffer.from(`data: ${JSON.stringify({ type: "message_start", message: { usage: INPUT_USAGE } })}\n`));
+    capture.write(Buffer.from(`data: ${JSON.stringify({ type: "message_delta", usage: OUTPUT_USAGE })}\n`));
+    // A pathological unterminated line, delivered in many chunks.
+    for (let index = 0; index < 64; index += 1) capture.write(Buffer.alloc(16 * 1024, "x"));
+    capture.write(Buffer.from(`\ndata: ${JSON.stringify({ type: "message_stop" })}\n`));
+    capture.write(Buffer.from(`data: ${JSON.stringify({ type: "message_stop" })}\n`));
+    capture.end();
+
+    expect(onInputUsage).toHaveBeenCalledWith(INPUT_USAGE);
+    expect(onOutputUsage).toHaveBeenCalledWith(OUTPUT_USAGE);
+    // Observed once: the capture stops at the terminal event.
+    expect(onMessageStop).toHaveBeenCalledTimes(1);
+  });
 });

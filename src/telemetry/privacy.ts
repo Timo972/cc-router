@@ -1,0 +1,674 @@
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import {
+  ANALYTICS_EVENT_NAMES,
+  CPU_ARCHITECTURES,
+  DURATION_BUCKETS,
+  HTTP_METHODS,
+  INSTRUMENTATION_SCOPES,
+  LOG_EVENT_CODES,
+  MAX_ACCOUNT_POOL_SIZE,
+  MAX_ATTEMPT,
+  MAX_CONCURRENCY,
+  MAX_DURATION_MS,
+  ERROR_KINDS,
+  MAX_STACK_FRAMES,
+  MAX_STACK_FRAME_PATH_LENGTH,
+  MAX_TIMESTAMP_MS,
+  MAX_TOKEN_COUNT,
+  MAX_VERSION_LENGTH,
+  MODEL_FAMILIES,
+  OPERATIONS,
+  OS_FAMILIES,
+  OUTCOMES,
+  PROVIDERS,
+  REQUEST_SOURCES,
+  ROUTES,
+  RUNTIME_MODES,
+  SETUP_METHODS,
+  SETUP_REASONS,
+  SETUP_STAGES,
+  SEVERITIES,
+  SPAN_KINDS,
+  SPAN_STATUS_CODES,
+  STREAM_OUTCOMES,
+  SYSTEM_ERROR_CODES,
+} from "./contracts.js";
+import type {
+  AnalyticsEventName,
+  ErrorKind,
+  HttpMethod,
+  InstrumentationScope,
+  ModelFamily,
+  Operation,
+  OsFamily,
+  Outcome,
+  Provider,
+  RequestSource,
+  Route,
+  RuntimeMode,
+  SafeAnalyticsEvent,
+  SafeExceptionContext,
+  SafeExceptionContract,
+  SafeLog,
+  SafeResource,
+  SafeRuntimeEventProperties,
+  SafeRuntimeFailureAttributes,
+  SafeSetupDiagnosticAttributes,
+  SafeSetupEventProperties,
+  SafeSpan,
+  SafeSpanAttributes,
+  SafeStackFrame,
+  SetupMethod,
+  SetupReason,
+  SetupStage,
+  Severity,
+  SpanKind,
+  SpanStatusCode,
+  StreamOutcome,
+  SystemErrorCode,
+  TrustedTelemetryIdentity,
+} from "./contracts.js";
+
+type UnknownRecord = Record<string, unknown>;
+
+// Only frames under this package's own dist/ or node_modules/ survive, so the
+// user's home directory and workspace layout never reach a stack trace.
+const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url))
+  .replace(/\\/g, "/")
+  .replace(/\/+$/, "");
+const CASE_INSENSITIVE_ROOT = process.platform === "win32";
+const COMPARISON_ROOT = CASE_INSENSITIVE_ROOT ? PROJECT_ROOT.toLowerCase() : PROJECT_ROOT;
+
+/** OTel attribute name for every field of the closed span schema. */
+export const SPAN_ATTRIBUTE_KEYS: Record<keyof SafeSpanAttributes, string> = {
+  httpMethod: "http.request.method",
+  httpStatusCode: "http.response.status_code",
+  provider: "cc_router.provider",
+  route: "cc_router.route",
+  modelFamily: "cc_router.model_family",
+  requestSource: "cc_router.request_source",
+  runtimeMode: "cc_router.runtime_mode",
+  streaming: "cc_router.streaming",
+  streamOutcome: "cc_router.stream_outcome",
+  outcome: "cc_router.outcome",
+  attempt: "cc_router.attempt",
+  accountPoolSize: "cc_router.account_pool_size",
+  concurrency: "cc_router.concurrency",
+  inputTokens: "cc_router.input_tokens",
+  outputTokens: "cc_router.output_tokens",
+  operationDurationMs: "cc_router.operation_duration_ms",
+};
+
+/** OTel attribute name for every field of both closed log schemas. */
+export const LOG_ATTRIBUTE_KEYS: Record<string, string> = {
+  operation: "cc_router.operation",
+  provider: "cc_router.provider",
+  method: "cc_router.method",
+  stage: "cc_router.stage",
+  reason: "cc_router.reason",
+  outcome: "cc_router.outcome",
+  httpStatusCode: "http.response.status_code",
+  durationBucket: "cc_router.duration_bucket",
+  attempt: "cc_router.attempt",
+  accountPoolSize: "cc_router.account_pool_size",
+  concurrency: "cc_router.concurrency",
+  operationDurationMs: "cc_router.operation_duration_ms",
+  serviceVersion: "service.version",
+  osFamily: "os.type",
+  runtimeMode: "cc_router.runtime_mode",
+  diagnosticId: "cc_router.diagnostic_id",
+};
+
+/** OTel attribute name for every field of the closed resource schema. */
+export const RESOURCE_ATTRIBUTE_KEYS: Record<string, string> = {
+  serviceName: "service.name",
+  serviceVersion: "service.version",
+  serviceInstanceId: "service.instance.id",
+  nodeVersion: "process.runtime.version",
+  osFamily: "os.type",
+  cpuArchitecture: "host.arch",
+  runtimeMode: "cc_router.runtime_mode",
+};
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function own(input: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(input, key);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+}
+
+function member<const T extends readonly string[]>(values: T, value: unknown): T[number] | undefined {
+  return typeof value === "string" && (values as readonly string[]).includes(value)
+    ? value as T[number]
+    : undefined;
+}
+
+function otherEnum<const T extends readonly string[]>(values: T, value: unknown): T[number] | undefined {
+  if (value === undefined) return undefined;
+  return member(values, value) ?? member(values, "other");
+}
+
+function boundedInteger(value: unknown, maximum: number, minimum = 0): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum && value <= maximum
+    ? value
+    : undefined;
+}
+
+function boundedNumber(value: unknown, maximum: number, minimum = 0): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum && value <= maximum
+    ? value
+    : undefined;
+}
+
+function version(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > MAX_VERSION_LENGTH) return undefined;
+  return /^\d+\.\d+\.\d+(?:-[0-9a-z.-]+)?$/.test(value) ? value : undefined;
+}
+
+function uuid(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.toLowerCase();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+function installationId(identity: TrustedTelemetryIdentity): string | undefined {
+  return uuid(identity?.installationId);
+}
+
+/** A per-occurrence diagnostic id must never collapse onto the stable install id. */
+function diagnosticId(identity: TrustedTelemetryIdentity, trustedInstallationId: string): string | undefined {
+  if (identity?.diagnosticId === undefined) return undefined;
+  const value = uuid(identity.diagnosticId);
+  return value && value !== trustedInstallationId ? value : undefined;
+}
+
+function hexId(value: unknown, length: 16 | 32): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.toLowerCase();
+  return new RegExp(`^[0-9a-f]{${length}}$`).test(normalized) && !/^0+$/.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+function httpStatusCode(value: unknown): number | undefined {
+  return boundedInteger(value, 599, 100);
+}
+
+function setupMethodForProvider(provider: "anthropic" | "openai", value: unknown): SetupMethod | undefined {
+  const method = member(SETUP_METHODS, value);
+  if (provider === "anthropic") {
+    return method === "macos_keychain" || method === "claude_credentials_file" || method === "manual_token"
+      ? method
+      : undefined;
+  }
+  return method === "manual_token" || method === "device_oauth" ? method : undefined;
+}
+
+function assignIfDefined<T extends object, K extends string, V>(target: T, key: K, value: V | undefined): void {
+  if (value !== undefined) Object.assign(target, { [key]: value });
+}
+
+/** Project a reconstructed record onto its OTel attribute names. */
+export function toOtelAttributes(
+  keys: Record<string, string>,
+  safe: object,
+): Record<string, string | number | boolean> {
+  const output: Record<string, string | number | boolean> = {};
+  for (const [field, attribute] of Object.entries(keys)) {
+    const value = own(safe, field);
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      output[attribute] = value;
+    }
+  }
+  return output;
+}
+
+/** Read an untrusted OTel attribute bag back into candidate record fields. */
+export function fromOtelAttributes(
+  keys: Record<string, string>,
+  attributes: object,
+): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  for (const [field, attribute] of Object.entries(keys)) {
+    output[field] = own(attributes, attribute);
+  }
+  return output;
+}
+
+function errorKind(input: Error): ErrorKind {
+  if (typeof AggregateError !== "undefined" && input instanceof AggregateError) return "aggregate_error";
+  if (input instanceof TypeError) return "type_error";
+  if (input instanceof RangeError) return "range_error";
+  if (input instanceof ReferenceError) return "reference_error";
+  if (input instanceof SyntaxError) return "syntax_error";
+  if (input instanceof URIError) return "uri_error";
+  if (input instanceof EvalError) return "eval_error";
+  return "error";
+}
+
+// UUID-shaped segments are stripped: a temp/cache directory name can identify
+// an install as reliably as a home directory does.
+function safePathSegments(path: string): boolean {
+  return path.split("/").every((segment) => segment.length > 0
+    && segment !== "."
+    && segment !== ".."
+    && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment)
+    && /^[0-9A-Za-z@._+~-]+$/.test(segment));
+}
+
+function normalizedFramePath(rawPath: string): SafeStackFrame["path"] | undefined {
+  let path = rawPath.trim().replace(/\\/g, "/");
+  const openingParenthesis = path.lastIndexOf("(");
+  if (openingParenthesis >= 0) path = path.slice(openingParenthesis + 1);
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(path) && !path.startsWith("file://")) return undefined;
+  if (path.startsWith("file://")) path = path.slice("file://".length);
+  if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+
+  const comparisonPath = CASE_INSENSITIVE_ROOT ? path.toLowerCase() : path;
+  const projectDistPrefix = `${COMPARISON_ROOT}/dist/`;
+  if (comparisonPath.startsWith(projectDistPrefix)) {
+    const relative = `dist/${path.slice(projectDistPrefix.length)}`;
+    return relative.length <= MAX_STACK_FRAME_PATH_LENGTH && safePathSegments(relative)
+      ? relative as SafeStackFrame["path"]
+      : undefined;
+  }
+
+  const dependencyIndex = path.lastIndexOf("/node_modules/");
+  if (dependencyIndex >= 0) {
+    const relative = path.slice(dependencyIndex + 1);
+    const segments = relative.split("/");
+    const packageSegmentCount = segments[1]?.startsWith("@") ? 2 : 1;
+    if (segments.length < packageSegmentCount + 2 || !safePathSegments(relative)) return undefined;
+    return relative.length <= MAX_STACK_FRAME_PATH_LENGTH
+      ? relative as SafeStackFrame["path"]
+      : undefined;
+  }
+
+  return undefined;
+}
+
+function stackHeaderName(kind: ErrorKind): string {
+  switch (kind) {
+    case "type_error": return "TypeError";
+    case "range_error": return "RangeError";
+    case "reference_error": return "ReferenceError";
+    case "syntax_error": return "SyntaxError";
+    case "uri_error": return "URIError";
+    case "eval_error": return "EvalError";
+    case "aggregate_error": return "AggregateError";
+    default: return "Error";
+  }
+}
+
+function normalizedFrames(input: Error, kind: ErrorKind): readonly SafeStackFrame[] {
+  const stack = input.stack;
+  if (typeof stack !== "string") return [];
+
+  // The header carries the raw message. Parse frames only after removing it
+  // verbatim, so a multiline message can never inject a frame.
+  const rawMessage = own(input, "message");
+  if (rawMessage !== undefined && typeof rawMessage !== "string") return [];
+  const header = `${stackHeaderName(kind)}${rawMessage ? `: ${rawMessage}` : ""}`;
+  if (!stack.startsWith(`${header}\n`)) return [];
+
+  const frames: SafeStackFrame[] = [];
+  for (const line of stack.slice(header.length + 1).split("\n")) {
+    if (frames.length >= MAX_STACK_FRAMES) break;
+    const match = line.match(/(?:\(|\bat\s+)(.+):(\d+):(\d+)\)?\s*$/);
+    if (!match) continue;
+    const path = normalizedFramePath(match[1]);
+    const frameLine = boundedInteger(Number(match[2]), Number.MAX_SAFE_INTEGER, 1);
+    const column = boundedInteger(Number(match[3]), Number.MAX_SAFE_INTEGER, 1);
+    if (!path || frameLine === undefined || column === undefined) continue;
+    frames.push({ path, line: frameLine, column });
+  }
+  return frames;
+}
+
+function sanitizedError(reason: SetupReason, frames: readonly SafeStackFrame[]): Error {
+  const error = new Error(reason);
+  error.stack = [
+    `Error: ${reason}`,
+    ...frames.map(frame => `    at ${frame.path}:${frame.line}:${frame.column}`),
+  ].join("\n");
+  return error;
+}
+
+function fingerprint(
+  kind: ErrorKind,
+  context: SafeExceptionContext,
+  systemErrorCode: SystemErrorCode | undefined,
+  status: number | undefined,
+  frames: readonly SafeStackFrame[],
+): string {
+  return createHash("sha256").update(JSON.stringify({
+    errorKind: kind,
+    category: context.category,
+    reason: context.reason,
+    operation: context.operation,
+    provider: context.provider,
+    setupStage: context.setupStage,
+    runtimeMode: context.runtimeMode,
+    systemErrorCode,
+    httpStatusCode: status,
+    frames,
+  })).digest("hex");
+}
+
+function exceptionContext(input: unknown): SafeExceptionContext | undefined {
+  if (!isRecord(input)) return undefined;
+  const category = input.category === "setup" || input.category === "runtime" ? input.category : undefined;
+  const reason = otherEnum(SETUP_REASONS, input.reason) as SetupReason | undefined;
+  if (!category || !reason) return undefined;
+
+  const output: SafeExceptionContext = { category, reason };
+  assignIfDefined(output, "operation", member(OPERATIONS, input.operation) as Operation | undefined);
+  assignIfDefined(output, "provider", otherEnum(PROVIDERS, input.provider) as Provider | undefined);
+  assignIfDefined(output, "setupStage", member(SETUP_STAGES, input.setupStage) as SetupStage | undefined);
+  assignIfDefined(output, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode) as RuntimeMode | undefined);
+  return output;
+}
+
+/**
+ * Reconstruct an exception from closed safe values. No original Error object,
+ * message, cause, or arbitrary thrown-value property escapes this boundary;
+ * a hostile thrown value can only cause the occurrence to be dropped.
+ */
+export function sanitizeException(
+  input: unknown,
+  candidateContext: unknown,
+  identity: TrustedTelemetryIdentity,
+): SafeExceptionContract | undefined {
+  try {
+    const trustedInstallationId = installationId(identity);
+    if (!trustedInstallationId) return undefined;
+    const trustedDiagnosticId = diagnosticId(identity, trustedInstallationId);
+    const context = exceptionContext(candidateContext);
+    if (!trustedDiagnosticId || !context) return undefined;
+
+    const isError = input instanceof Error;
+    const kind: ErrorKind = isError ? errorKind(input) : "unexpected_error";
+    const frames = isError ? normalizedFrames(input, kind) : [];
+    const code = isError
+      ? member(SYSTEM_ERROR_CODES, own(input, "code")) as SystemErrorCode | undefined
+      : undefined;
+    const status = isError
+      ? httpStatusCode(own(input, "statusCode")) ?? httpStatusCode(own(input, "status"))
+      : undefined;
+    const output: SafeExceptionContract = {
+      error: sanitizedError(context.reason, frames),
+      ...context,
+      errorKind: kind,
+      frames,
+      fingerprint: fingerprint(kind, context, code, status, frames),
+      diagnosticId: trustedDiagnosticId,
+    };
+    assignIfDefined(output, "systemErrorCode", code);
+    assignIfDefined(output, "httpStatusCode", status);
+    return output;
+  } catch {
+    return undefined;
+  }
+}
+
+export function reconstructResource(
+  input: unknown,
+  identity: TrustedTelemetryIdentity,
+): SafeResource | undefined {
+  if (!isRecord(input) || input.serviceName !== "cc-router") return undefined;
+
+  const serviceVersion = version(input.serviceVersion);
+  const nodeVersion = version(input.nodeVersion);
+  const serviceInstanceId = installationId(identity);
+  const runtimeMode = member(RUNTIME_MODES, input.runtimeMode);
+  const osFamily = otherEnum(OS_FAMILIES, input.osFamily);
+  const cpuArchitecture = otherEnum(CPU_ARCHITECTURES, input.cpuArchitecture);
+  if (!serviceVersion || !nodeVersion || !serviceInstanceId || !runtimeMode || !osFamily || !cpuArchitecture) {
+    return undefined;
+  }
+
+  return {
+    "service.name": "cc-router",
+    "service.version": serviceVersion,
+    "service.instance.id": serviceInstanceId,
+    "process.runtime.version": nodeVersion,
+    "os.type": osFamily,
+    "host.arch": cpuArchitecture,
+    "cc_router.runtime_mode": runtimeMode,
+  };
+}
+
+function reconstructSpanAttributes(input: unknown): SafeSpanAttributes {
+  if (!isRecord(input)) return {};
+  const output: SafeSpanAttributes = {};
+  assignIfDefined(output, "httpMethod", member(HTTP_METHODS, input.httpMethod) as HttpMethod | undefined);
+  assignIfDefined(output, "httpStatusCode", httpStatusCode(input.httpStatusCode));
+  assignIfDefined(output, "provider", otherEnum(PROVIDERS, input.provider) as Provider | undefined);
+  assignIfDefined(output, "route", otherEnum(ROUTES, input.route) as Route | undefined);
+  assignIfDefined(output, "modelFamily", otherEnum(MODEL_FAMILIES, input.modelFamily) as ModelFamily | undefined);
+  assignIfDefined(output, "requestSource", otherEnum(REQUEST_SOURCES, input.requestSource) as RequestSource | undefined);
+  assignIfDefined(output, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode) as RuntimeMode | undefined);
+  assignIfDefined(output, "streaming", typeof input.streaming === "boolean" ? input.streaming : undefined);
+  assignIfDefined(output, "streamOutcome", otherEnum(STREAM_OUTCOMES, input.streamOutcome) as StreamOutcome | undefined);
+  assignIfDefined(output, "outcome", otherEnum(OUTCOMES, input.outcome) as Outcome | undefined);
+  assignIfDefined(output, "attempt", boundedInteger(input.attempt, MAX_ATTEMPT));
+  assignIfDefined(output, "accountPoolSize", boundedInteger(input.accountPoolSize, MAX_ACCOUNT_POOL_SIZE));
+  assignIfDefined(output, "concurrency", boundedInteger(input.concurrency, MAX_CONCURRENCY));
+  assignIfDefined(output, "inputTokens", boundedInteger(input.inputTokens, MAX_TOKEN_COUNT));
+  assignIfDefined(output, "outputTokens", boundedInteger(input.outputTokens, MAX_TOKEN_COUNT));
+  assignIfDefined(output, "operationDurationMs", boundedNumber(input.operationDurationMs, MAX_DURATION_MS));
+  return output;
+}
+
+export function reconstructSpan(input: unknown): SafeSpan | undefined {
+  if (!isRecord(input)) return undefined;
+  const scope = member(INSTRUMENTATION_SCOPES, input.scope) as InstrumentationScope | undefined;
+  const operation = member(OPERATIONS, input.operation) as Operation | undefined;
+  const traceId = hexId(input.traceId, 32);
+  const spanId = hexId(input.spanId, 16);
+  const kind = member(SPAN_KINDS, input.kind) as SpanKind | undefined;
+  const startTimeMs = boundedNumber(input.startTimeMs, MAX_TIMESTAMP_MS);
+  const durationMs = boundedNumber(input.durationMs, MAX_DURATION_MS);
+  const statusCode = member(SPAN_STATUS_CODES, input.statusCode) as SpanStatusCode | undefined;
+  if (!scope || !operation || !traceId || !spanId || !kind || startTimeMs === undefined
+    || durationMs === undefined || !statusCode) {
+    return undefined;
+  }
+
+  const output: SafeSpan = {
+    scope,
+    name: operation,
+    traceId,
+    spanId,
+    kind,
+    startTimeMs,
+    durationMs,
+    statusCode,
+    attributes: reconstructSpanAttributes(input.attributes),
+  };
+  assignIfDefined(output, "parentSpanId", hexId(input.parentSpanId, 16));
+  return output;
+}
+
+function setupAttributes(
+  input: unknown,
+  trustedDiagnosticId: string,
+): SafeSetupDiagnosticAttributes | undefined {
+  if (!isRecord(input)) return undefined;
+  const provider = member(PROVIDERS, input.provider);
+  if (provider !== "anthropic" && provider !== "openai") return undefined;
+  const method = setupMethodForProvider(provider, input.method);
+  const stage = member(SETUP_STAGES, input.stage) as SetupStage | undefined;
+  if (!method || !stage) return undefined;
+
+  const output: SafeSetupDiagnosticAttributes = { provider, method, stage, diagnosticId: trustedDiagnosticId };
+  assignIfDefined(output, "reason", otherEnum(SETUP_REASONS, input.reason) as SetupReason | undefined);
+  assignIfDefined(output, "outcome", otherEnum(OUTCOMES, input.outcome) as Outcome | undefined);
+  assignIfDefined(output, "httpStatusCode", httpStatusCode(input.httpStatusCode));
+  assignIfDefined(output, "durationBucket", member(DURATION_BUCKETS, input.durationBucket));
+  assignIfDefined(output, "serviceVersion", version(input.serviceVersion));
+  assignIfDefined(output, "osFamily", otherEnum(OS_FAMILIES, input.osFamily) as OsFamily | undefined);
+  assignIfDefined(output, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode) as RuntimeMode | undefined);
+  return output;
+}
+
+function runtimeFailureAttributes(
+  input: unknown,
+  trustedDiagnosticId: string | undefined,
+): SafeRuntimeFailureAttributes | undefined {
+  if (!isRecord(input)) return undefined;
+  const operation = member(OPERATIONS, input.operation) as Operation | undefined;
+  const reason = otherEnum(SETUP_REASONS, input.reason) as SetupReason | undefined;
+  if (!operation || !reason) return undefined;
+
+  const output: SafeRuntimeFailureAttributes = { operation, reason };
+  assignIfDefined(output, "provider", otherEnum(PROVIDERS, input.provider) as Provider | undefined);
+  assignIfDefined(output, "outcome", otherEnum(OUTCOMES, input.outcome) as Outcome | undefined);
+  assignIfDefined(output, "httpStatusCode", httpStatusCode(input.httpStatusCode));
+  assignIfDefined(output, "attempt", boundedInteger(input.attempt, MAX_ATTEMPT));
+  assignIfDefined(output, "accountPoolSize", boundedInteger(input.accountPoolSize, MAX_ACCOUNT_POOL_SIZE));
+  assignIfDefined(output, "concurrency", boundedInteger(input.concurrency, MAX_CONCURRENCY));
+  assignIfDefined(output, "operationDurationMs", boundedNumber(input.operationDurationMs, MAX_DURATION_MS));
+  assignIfDefined(output, "serviceVersion", version(input.serviceVersion));
+  assignIfDefined(output, "osFamily", otherEnum(OS_FAMILIES, input.osFamily) as OsFamily | undefined);
+  assignIfDefined(output, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode) as RuntimeMode | undefined);
+  assignIfDefined(output, "diagnosticId", trustedDiagnosticId);
+  return output;
+}
+
+export function reconstructLog(input: unknown, identity: TrustedTelemetryIdentity): SafeLog | undefined {
+  if (!isRecord(input)) return undefined;
+  const scope = member(INSTRUMENTATION_SCOPES, input.scope) as InstrumentationScope | undefined;
+  const body = member(LOG_EVENT_CODES, input.body);
+  const severity = member(SEVERITIES, input.severity) as Severity | undefined;
+  const timestampMs = boundedNumber(input.timestampMs, MAX_TIMESTAMP_MS);
+  const trustedInstallationId = installationId(identity);
+  if (!scope || !body || !severity || timestampMs === undefined || !trustedInstallationId) return undefined;
+
+  const trustedDiagnosticId = diagnosticId(identity, trustedInstallationId);
+  if (identity.diagnosticId !== undefined && !trustedDiagnosticId) return undefined;
+  if (body === "account.setup.diagnostic" && !trustedDiagnosticId) return undefined;
+
+  const attributes = body === "account.setup.diagnostic"
+    ? setupAttributes(input.attributes, trustedDiagnosticId as string)
+    : runtimeFailureAttributes(input.attributes, trustedDiagnosticId);
+  if (!attributes) return undefined;
+
+  const context: { traceId?: string; spanId?: string } = {};
+  assignIfDefined(context, "traceId", hexId(input.traceId, 32));
+  assignIfDefined(context, "spanId", hexId(input.spanId, 16));
+  return body === "account.setup.diagnostic"
+    ? { scope, body, severity, timestampMs, ...context, attributes: attributes as SafeSetupDiagnosticAttributes }
+    : { scope, body, severity, timestampMs, ...context, attributes: attributes as SafeRuntimeFailureAttributes };
+}
+
+function runtimeEventProperties(input: unknown): SafeRuntimeEventProperties | undefined {
+  if (!isRecord(input)) return undefined;
+  const output: SafeRuntimeEventProperties = {};
+  assignIfDefined(output, "serviceVersion", version(input.serviceVersion));
+  assignIfDefined(output, "osFamily", otherEnum(OS_FAMILIES, input.osFamily) as OsFamily | undefined);
+  assignIfDefined(output, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode) as RuntimeMode | undefined);
+  assignIfDefined(output, "accountPoolSize", boundedInteger(input.accountPoolSize, MAX_ACCOUNT_POOL_SIZE));
+  return output;
+}
+
+function setupEventProperties(
+  input: unknown,
+  trustedDiagnosticId: string,
+): SafeSetupEventProperties | undefined {
+  const attributes = setupAttributes(input, trustedDiagnosticId);
+  if (!attributes) return undefined;
+  const output: SafeSetupEventProperties = {
+    provider: attributes.provider,
+    method: attributes.method,
+    stage: attributes.stage,
+    diagnosticId: trustedDiagnosticId,
+  };
+  assignIfDefined(output, "reason", attributes.reason);
+  assignIfDefined(output, "durationBucket", attributes.durationBucket);
+  assignIfDefined(output, "serviceVersion", attributes.serviceVersion);
+  assignIfDefined(output, "osFamily", attributes.osFamily);
+  assignIfDefined(output, "runtimeMode", attributes.runtimeMode);
+  return output;
+}
+
+export function reconstructAnalyticsEvent(
+  input: unknown,
+  identity: TrustedTelemetryIdentity,
+): SafeAnalyticsEvent | undefined {
+  if (!isRecord(input)) return undefined;
+  const event = member(ANALYTICS_EVENT_NAMES, input.event) as AnalyticsEventName | undefined;
+  const trustedInstallationId = installationId(identity);
+  if (!event || !trustedInstallationId) return undefined;
+
+  const isSetupEvent = event.startsWith("account_setup.");
+  const trustedDiagnosticId = diagnosticId(identity, trustedInstallationId);
+  if (identity.diagnosticId !== undefined && !trustedDiagnosticId) return undefined;
+  if (isSetupEvent && !trustedDiagnosticId) return undefined;
+
+  const properties = isSetupEvent
+    ? setupEventProperties(input.properties, trustedDiagnosticId as string)
+    : runtimeEventProperties(input.properties);
+  if (!properties) return undefined;
+
+  const output: SafeAnalyticsEvent = { event, properties, installationId: trustedInstallationId };
+  assignIfDefined(output, "diagnosticId", trustedDiagnosticId);
+  return output;
+}
+
+/**
+ * Rebuild a sanitized exception that was persisted for crash-safe delivery.
+ * The record is re-validated against the same closed schema as a live
+ * sanitization; anything outside it (including an edited file) is dropped.
+ */
+export function rebuildSanitizedException(input: unknown): SafeExceptionContract | undefined {
+  if (!isRecord(input)) return undefined;
+  const category = input.category === "setup" || input.category === "runtime" ? input.category : undefined;
+  const reason = member(SETUP_REASONS, input.reason);
+  const errorKind = member(ERROR_KINDS, input.errorKind);
+  const fingerprint = typeof input.fingerprint === "string" && /^[0-9a-f]{64}$/.test(input.fingerprint)
+    ? input.fingerprint
+    : undefined;
+  const diagnosticId = uuid(input.diagnosticId);
+  if (!category || !reason || !errorKind || !fingerprint || !diagnosticId || !Array.isArray(input.frames)) {
+    return undefined;
+  }
+  const frames: SafeStackFrame[] = [];
+  for (const frame of input.frames.slice(0, MAX_STACK_FRAMES)) {
+    if (!isRecord(frame) || typeof frame.path !== "string") return undefined;
+    const path = frame.path;
+    if (!/^(dist|node_modules)\//.test(path) || path.length > MAX_STACK_FRAME_PATH_LENGTH || !safePathSegments(path)) {
+      return undefined;
+    }
+    const line = frame.line === undefined ? undefined : boundedInteger(frame.line, Number.MAX_SAFE_INTEGER, 1);
+    const column = frame.column === undefined ? undefined : boundedInteger(frame.column, Number.MAX_SAFE_INTEGER, 1);
+    if ((frame.line !== undefined && line === undefined) || (frame.column !== undefined && column === undefined)) {
+      return undefined;
+    }
+    const safeFrame: SafeStackFrame = { path: path as SafeStackFrame["path"] };
+    assignIfDefined(safeFrame, "line", line);
+    assignIfDefined(safeFrame, "column", column);
+    frames.push(safeFrame);
+  }
+  const contract: SafeExceptionContract = {
+    error: sanitizedError(reason, frames),
+    category,
+    reason,
+    errorKind,
+    frames,
+    fingerprint,
+    diagnosticId,
+  };
+  assignIfDefined(contract, "systemErrorCode", member(SYSTEM_ERROR_CODES, input.systemErrorCode));
+  assignIfDefined(contract, "httpStatusCode", httpStatusCode(input.httpStatusCode));
+  assignIfDefined(contract, "operation", member(OPERATIONS, input.operation));
+  assignIfDefined(contract, "provider", member(PROVIDERS, input.provider));
+  assignIfDefined(contract, "setupStage", member(SETUP_STAGES, input.setupStage));
+  assignIfDefined(contract, "runtimeMode", member(RUNTIME_MODES, input.runtimeMode));
+  return contract;
+}
