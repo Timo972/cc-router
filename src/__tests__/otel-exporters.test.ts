@@ -3,14 +3,10 @@ import { SeverityNumber } from "@opentelemetry/api-logs";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import type { LogRecordExporter, ReadableLogRecord } from "@opentelemetry/sdk-logs";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { TelemetrySnapshot } from "../config/telemetry.js";
-import { startTransportCaptureServer, TELEMETRY_CANARY } from "./telemetry-test-helpers.js";
-import {
-  createPostHogOtlpExporters,
-  createPrivacySafeLogExporter,
-  createPrivacySafeSpanExporter,
-} from "../telemetry/otel-exporters.js";
+import { createPostHogOtlpExporters } from "../telemetry/otel-exporters.js";
+import { startTransportCaptureServer, TELEMETRY_CANARY, type TransportCaptureServer } from "./telemetry-test-helpers.js";
 
 const INSTALL_ID = "70d8062e-1fa0-4ae4-a115-bf782ecca462";
 const CANDIDATE_ID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
@@ -20,20 +16,14 @@ const SPAN_ID = "0123456789abcdef";
 const PARENT_SPAN_ID = "fedcba9876543210";
 const PRIVATE_CANARY = "PRIVATE prompt token@example.test /Users/alice ?secret=true";
 const CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174010";
-const NEXT_CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174011";
 
-function snapshot(
-  enabled = true,
-  consentGeneration = CONSENT_GENERATION,
-  revision = 0,
-): TelemetrySnapshot {
+function snapshot(enabled = true): TelemetrySnapshot {
   return {
     state: {
       enabled,
       installId: INSTALL_ID,
       firstRunAt: "2026-08-03T00:00:00.000Z",
-      consentGeneration,
-      revision,
+      consentGeneration: CONSENT_GENERATION,
     },
     environmentDisabled: false,
     enabled,
@@ -87,8 +77,16 @@ function unsafeSpan(overrides: Partial<ReadableSpan> = {}): ReadableSpan {
       prompt: PRIVATE_CANARY,
       "private.canaries": Object.values(TELEMETRY_CANARY),
     },
-    links: [{ context: { traceId: TRACE_ID, spanId: PARENT_SPAN_ID, traceFlags: 1 }, attributes: { prompt: PRIVATE_CANARY } }],
-    events: [{ name: PRIVATE_CANARY, time: [1_800_000_000, 0], attributes: { prompt: PRIVATE_CANARY }, droppedAttributesCount: 0 }],
+    links: [{
+      context: { traceId: TRACE_ID, spanId: PARENT_SPAN_ID, traceFlags: 1 },
+      attributes: { prompt: PRIVATE_CANARY },
+    }],
+    events: [{
+      name: PRIVATE_CANARY,
+      time: [1_800_000_000, 0],
+      attributes: { prompt: PRIVATE_CANARY },
+      droppedAttributesCount: 0,
+    }],
     ended: true,
     resource: unsafeResource(),
     instrumentationScope: { name: "cc-router", version: PRIVATE_CANARY },
@@ -97,10 +95,6 @@ function unsafeSpan(overrides: Partial<ReadableSpan> = {}): ReadableSpan {
     droppedLinksCount: 7,
   };
   return { ...candidate, ...overrides };
-}
-
-function exportSpans(exporter: SpanExporter, spans: ReadableSpan[]): Promise<{ code: number; error?: Error }> {
-  return new Promise(resolve => exporter.export(spans, resolve));
 }
 
 function unsafeLog(overrides: Partial<ReadableLogRecord> = {}): ReadableLogRecord {
@@ -130,7 +124,7 @@ function unsafeLog(overrides: Partial<ReadableLogRecord> = {}): ReadableLogRecor
       "service.version": "0.8.2",
       "os.type": "macos",
       "cc_router.runtime_mode": "foreground",
-      "cc_router.diagnostic_id": CANDIDATE_ID,
+      "cc_router.diagnostic_id": DIAGNOSTIC_ID,
       prompt: PRIVATE_CANARY,
       error: PRIVATE_CANARY,
       "private.canaries": Object.values(TELEMETRY_CANARY),
@@ -140,596 +134,179 @@ function unsafeLog(overrides: Partial<ReadableLogRecord> = {}): ReadableLogRecor
   return { ...candidate, ...overrides };
 }
 
-function exportLogs(
-  exporter: LogRecordExporter,
-  logs: ReadableLogRecord[],
-): Promise<{ code: number; error?: Error }> {
+function exportSpans(exporter: SpanExporter, spans: ReadableSpan[]): Promise<{ code: number }> {
+  return new Promise(resolve => exporter.export(spans, resolve));
+}
+
+function exportLogs(exporter: LogRecordExporter, logs: ReadableLogRecord[]): Promise<{ code: number }> {
   return new Promise(resolve => exporter.export(logs, resolve));
 }
 
-describe("privacy-safe span exporter", () => {
-  it("rebuilds a span from only the closed trace and resource schema", async () => {
-    const delegated: ReadableSpan[][] = [];
-    const delegate: SpanExporter = {
-      export(spans, callback) {
-        delegated.push(spans);
-        callback({ code: 0 });
-      },
-      forceFlush: async () => undefined,
-      shutdown: async () => undefined,
-    };
-    const candidate = unsafeSpan();
-    const exporter = createPrivacySafeSpanExporter({
-      delegate,
-      getSnapshot: () => snapshot(),
-    });
+const openServers: TransportCaptureServer[] = [];
 
-    await expect(exportSpans(exporter, [candidate])).resolves.toEqual({ code: 0 });
+async function capture(options?: Parameters<typeof startTransportCaptureServer>[0]) {
+  const server = await startTransportCaptureServer(options);
+  openServers.push(server);
+  return server;
+}
 
-    expect(delegated).toHaveLength(1);
-    const safe = delegated[0]![0]!;
-    expect(safe).not.toBe(candidate);
-    expect(safe.name).toBe("proxy.request");
-    expect(safe.kind).toBe(SpanKind.SERVER);
-    expect(safe.spanContext()).toEqual({ traceId: TRACE_ID, spanId: SPAN_ID, traceFlags: TraceFlags.SAMPLED });
-    expect(safe.parentSpanContext).toEqual({ traceId: TRACE_ID, spanId: PARENT_SPAN_ID, traceFlags: TraceFlags.SAMPLED });
-    expect(safe.startTime).toEqual([1_800_000_000, 250_000_000]);
-    expect(safe.duration).toEqual([1, 250_000_000]);
-    expect(safe.endTime).toEqual([1_800_000_001, 500_000_000]);
-    expect(safe.status).toEqual({ code: SpanStatusCode.OK });
-    expect(safe.attributes).toEqual({
-      "http.request.method": "POST",
-      "http.response.status_code": 200,
-      "cc_router.provider": "anthropic",
-      "cc_router.route": "messages",
-      "cc_router.model_family": "sonnet",
-      "cc_router.request_source": "cli",
-      "cc_router.runtime_mode": "daemon",
-      "cc_router.streaming": true,
-      "cc_router.stream_outcome": "complete",
-      "cc_router.outcome": "complete",
-      "cc_router.attempt": 2,
-      "cc_router.account_pool_size": 3,
-      "cc_router.concurrency": 1,
-      "cc_router.input_tokens": 100,
-      "cc_router.output_tokens": 20,
-      "cc_router.operation_duration_ms": 1_200,
-    });
-    expect(safe.resource.attributes).toEqual({
-      "service.name": "cc-router",
-      "service.version": "0.8.2",
-      "service.instance.id": INSTALL_ID,
-      "process.runtime.version": "22.18.0",
-      "os.type": "macos",
-      "host.arch": "arm64",
-      "cc_router.runtime_mode": "daemon",
-    });
-    expect(safe.instrumentationScope).toEqual({ name: "cc-router" });
-    expect(safe.events).toEqual([]);
-    expect(safe.links).toEqual([]);
-    expect(safe.droppedAttributesCount).toBe(0);
-    expect(safe.droppedEventsCount).toBe(0);
-    expect(safe.droppedLinksCount).toBe(0);
-    expect(JSON.stringify(safe)).not.toContain(PRIVATE_CANARY);
-    expect(JSON.stringify(safe)).not.toContain(CANDIDATE_ID);
-  });
+async function exporters(getSnapshot: () => TelemetrySnapshot | undefined, options?: {
+  responseMode?: "success" | "reset";
+}) {
+  const traces = await capture(options);
+  const logs = await capture(options);
+  return {
+    traces,
+    logs,
+    ...createPostHogOtlpExporters({
+      getSnapshot,
+      traceUrl: traces.endpoint("/i/v1/traces"),
+      logUrl: logs.endpoint("/i/v1/logs"),
+    }),
+  };
+}
 
-  it("bounds force-flush and shutdown even when the delegate never settles", async () => {
-    vi.useFakeTimers();
-    try {
-      const delegate: SpanExporter = {
-        export: () => undefined,
-        forceFlush: () => new Promise<void>(() => undefined),
-        shutdown: () => new Promise<void>(() => undefined),
-      };
-      const exporter = createPrivacySafeSpanExporter({
-        delegate,
-        getSnapshot: () => snapshot(),
-        lifecycleTimeoutMillis: 10,
-      });
+/** OTLP http/json log payloads stay readable, so assert on their records. */
+function exportedLogRecords(body: unknown): Record<string, unknown>[] {
+  const resourceLogs = (body as { resourceLogs?: { scopeLogs?: { logRecords?: unknown[] }[] }[] }).resourceLogs ?? [];
+  return resourceLogs.flatMap(resource => (resource.scopeLogs ?? [])
+    .flatMap(scope => (scope.logRecords ?? []) as Record<string, unknown>[]));
+}
 
-      const flush = exporter.forceFlush?.();
-      await vi.advanceTimersByTimeAsync(11);
-      await expect(flush).resolves.toBeUndefined();
+afterEach(async () => {
+  const servers = openServers.splice(0, openServers.length);
+  await Promise.all(servers.map(server => server.close()));
+});
 
-      const shutdown = exporter.shutdown();
-      await vi.advanceTimersByTimeAsync(11);
-      await expect(shutdown).resolves.toBeUndefined();
-    } finally {
-      vi.useRealTimers();
+describe("consent-gated PostHog OTLP exporters", () => {
+  it("sends spans rebuilt from the closed schema to the EU trace endpoint", async () => {
+    const { traces, spanExporter } = await exporters(() => snapshot());
+
+    await expect(exportSpans(spanExporter, [unsafeSpan()])).resolves.toEqual({ code: 0 });
+
+    expect(traces.requests).toHaveLength(1);
+    const request = traces.requests[0]!;
+    expect(request.method).toBe("POST");
+    expect(request.url).toBe("/i/v1/traces");
+    expect(request.headers["content-type"]).toBe("application/x-protobuf");
+    expect(request.headers.authorization).toMatch(/^Bearer phc_[0-9A-Za-z]+$/);
+
+    const wire = request.rawBody.toString("utf8");
+    expect(wire).toContain("proxy.request");
+    expect(wire).toContain(INSTALL_ID);
+    expect(wire).toContain("cc_router.model_family");
+    for (const forbidden of [PRIVATE_CANARY, CANDIDATE_ID, "url.full", "prompt", ...Object.values(TELEMETRY_CANARY)]) {
+      expect(wire).not.toContain(forbidden);
     }
   });
 
-  it("caps every delegated batch at the configured safe maximum", async () => {
-    const delegated: ReadableSpan[][] = [];
-    const delegate: SpanExporter = {
-      export(spans, callback) {
-        delegated.push(spans);
-        callback({ code: 0 });
-      },
-      shutdown: async () => undefined,
-    };
-    const exporter = createPrivacySafeSpanExporter({
-      delegate,
-      getSnapshot: () => snapshot(),
-      maxBatchSize: 2,
-    });
+  it("sends logs rebuilt from the fixed body and allowlisted attributes only", async () => {
+    const { logs, logExporter } = await exporters(() => snapshot());
 
-    await exportSpans(exporter, [unsafeSpan(), unsafeSpan(), unsafeSpan()]);
+    await expect(exportLogs(logExporter, [unsafeLog()])).resolves.toEqual({ code: 0 });
 
-    expect(delegated).toHaveLength(1);
-    expect(delegated[0]).toHaveLength(2);
+    expect(logs.requests).toHaveLength(1);
+    const request = logs.requests[0]!;
+    expect(request.url).toBe("/i/v1/logs");
+    expect(request.headers["content-type"]).toBe("application/json");
+    expect(request.headers.authorization).toMatch(/^Bearer phc_[0-9A-Za-z]+$/);
+
+    const records = exportedLogRecords(request.json);
+    expect(records).toHaveLength(1);
+    const record = records[0]!;
+    expect(record.body).toEqual({ stringValue: "account.setup.diagnostic" });
+    expect(record.severityText).toBe("WARN");
+    expect(record.traceId).toBe(TRACE_ID);
+    expect(record.spanId).toBe(SPAN_ID);
+    const attributeKeys = (record.attributes as { key: string }[]).map(attribute => attribute.key).sort();
+    expect(attributeKeys).toEqual([
+      "cc_router.diagnostic_id",
+      "cc_router.duration_bucket",
+      "cc_router.method",
+      "cc_router.outcome",
+      "cc_router.provider",
+      "cc_router.reason",
+      "cc_router.runtime_mode",
+      "cc_router.stage",
+      "http.response.status_code",
+      "os.type",
+      "service.version",
+    ]);
+
+    const wire = request.rawBody.toString("utf8");
+    expect(wire).toContain(INSTALL_ID);
+    expect(wire).toContain(DIAGNOSTIC_ID);
+    for (const forbidden of [PRIVATE_CANARY, CANDIDATE_ID, ...Object.values(TELEMETRY_CANARY)]) {
+      expect(wire).not.toContain(JSON.stringify(forbidden).slice(1, -1));
+    }
   });
 
-  it("does not flush a delegate after telemetry is disabled", async () => {
-    let flushes = 0;
-    const delegate: SpanExporter = {
-      export: (_spans, callback) => callback({ code: 0 }),
-      forceFlush: async () => {
-        flushes += 1;
-      },
-      shutdown: async () => undefined,
-    };
-    const exporter = createPrivacySafeSpanExporter({
-      delegate,
-      getSnapshot: () => snapshot(false),
-    });
+  it("drops every record without contacting the network while consent is withdrawn", async () => {
+    const { traces, logs, spanExporter, logExporter } = await exporters(() => undefined);
 
-    await exporter.forceFlush?.();
+    await expect(exportSpans(spanExporter, [unsafeSpan()])).resolves.toEqual({ code: 0 });
+    await expect(exportLogs(logExporter, [unsafeLog()])).resolves.toEqual({ code: 0 });
+    await spanExporter.forceFlush?.();
+    await logExporter.forceFlush();
 
-    expect(flushes).toBe(0);
+    expect(traces.requests).toHaveLength(0);
+    expect(logs.requests).toHaveLength(0);
   });
 
-  it("drops unknown scopes and malformed records without calling the delegate", async () => {
-    let delegateCalls = 0;
-    const delegate: SpanExporter = {
-      export: (_spans, callback) => {
-        delegateCalls += 1;
-        callback({ code: 0 });
-      },
-      shutdown: async () => undefined,
-    };
-    const exporter = createPrivacySafeSpanExporter({
-      delegate,
-      getSnapshot: () => snapshot(),
+  it("drops a rebuilt batch when consent disappears during reconstruction", async () => {
+    let reads = 0;
+    const { traces, spanExporter } = await exporters(() => {
+      reads += 1;
+      return reads === 1 ? snapshot() : undefined;
     });
 
-    await expect(exportSpans(exporter, [
+    await expect(exportSpans(spanExporter, [unsafeSpan()])).resolves.toEqual({ code: 0 });
+
+    expect(reads).toBe(2);
+    expect(traces.requests).toHaveLength(0);
+  });
+
+  it("drops unknown scopes and malformed records without contacting the network", async () => {
+    const { traces, logs, spanExporter, logExporter } = await exporters(() => snapshot());
+
+    await expect(exportSpans(spanExporter, [
       unsafeSpan({ instrumentationScope: { name: "unknown-library" } }),
       unsafeSpan({ resource: resourceFromAttributes({ "service.name": "wrong-service" }) }),
+      unsafeSpan({ attributes: { "cc_router.operation": "/v1/messages/private" } }),
     ])).resolves.toEqual({ code: 0 });
-
-    expect(delegateCalls).toBe(0);
-  });
-
-  it("drops a reconstructed queued batch when telemetry turns off before delegation", async () => {
-    let delegateCalls = 0;
-    let reads = 0;
-    const delegate: SpanExporter = {
-      export: (_spans, callback) => {
-        delegateCalls += 1;
-        callback({ code: 0 });
-      },
-      shutdown: async () => undefined,
-    };
-    const exporter = createPrivacySafeSpanExporter({
-      delegate,
-      getSnapshot: () => {
-        reads += 1;
-        return snapshot(reads === 1);
-      },
-    });
-
-    await expect(exportSpans(exporter, [unsafeSpan()])).resolves.toEqual({ code: 0 });
-
-    expect(reads).toBe(2);
-    expect(delegateCalls).toBe(0);
-  });
-
-  it("latches an old automatic-span exporter off across choices and lets a new exporter adopt the generation", async () => {
-    let current = snapshot(true, CONSENT_GENERATION, 30);
-    let delegateCalls = 0;
-    const delegate: SpanExporter = {
-      export: (_spans, callback) => { delegateCalls += 1; callback({ code: 0 }); },
-      shutdown: async () => undefined,
-    };
-    const oldExporter = createPrivacySafeSpanExporter({ delegate, getSnapshot: () => current });
-
-    current = snapshot(true, NEXT_CONSENT_GENERATION, 30);
-    await exportSpans(oldExporter, [unsafeSpan()]);
-    current = snapshot(true, CONSENT_GENERATION, 30);
-    await exportSpans(oldExporter, [unsafeSpan()]);
-    expect(delegateCalls).toBe(0);
-
-    current = snapshot(true, NEXT_CONSENT_GENERATION, 30);
-    const newExporter = createPrivacySafeSpanExporter({ delegate, getSnapshot: () => current });
-    await exportSpans(newExporter, [unsafeSpan()]);
-    expect(delegateCalls).toBe(1);
-  });
-
-  it("contains synchronous and callback delegate failures without forwarding raw errors", async () => {
-    const thrown = createPrivacySafeSpanExporter({
-      delegate: {
-        export() {
-          throw new Error(PRIVATE_CANARY);
-        },
-        shutdown: async () => undefined,
-      },
-      getSnapshot: () => snapshot(),
-    });
-    const callbackFailure = createPrivacySafeSpanExporter({
-      delegate: {
-        export(_spans, callback) {
-          callback({ code: 1, error: new Error(PRIVATE_CANARY) });
-        },
-        shutdown: async () => undefined,
-      },
-      getSnapshot: () => snapshot(),
-    });
-
-    await expect(exportSpans(thrown, [unsafeSpan()])).resolves.toEqual({ code: 1 });
-    await expect(exportSpans(callbackFailure, [unsafeSpan()])).resolves.toEqual({ code: 1 });
-  });
-
-  it("fails closed within a deadline when a delegate never invokes its callback", async () => {
-    vi.useFakeTimers();
-    try {
-      const exporter = createPrivacySafeSpanExporter({
-        delegate: {
-          export: () => undefined,
-          shutdown: async () => undefined,
-        },
-        getSnapshot: () => snapshot(),
-        exportTimeoutMillis: 10,
-      });
-
-      const result = exportSpans(exporter, [unsafeSpan()]);
-      await vi.advanceTimersByTimeAsync(11);
-
-      await expect(result).resolves.toEqual({ code: 1 });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-});
-
-describe("privacy-safe log exporter", () => {
-  it("rebuilds a log from a fixed body and separately trusted diagnostic identity", async () => {
-    const delegated: ReadableLogRecord[][] = [];
-    const delegate: LogRecordExporter = {
-      export(logs, callback) {
-        delegated.push(logs);
-        callback({ code: 0 });
-      },
-      forceFlush: async () => undefined,
-      shutdown: async () => undefined,
-    };
-    const candidate = unsafeLog();
-    const exporter = createPrivacySafeLogExporter({
-      delegate,
-      getSnapshot: () => snapshot(),
-      getDiagnosticId: record => record === candidate ? DIAGNOSTIC_ID : undefined,
-    });
-
-    await expect(exportLogs(exporter, [candidate])).resolves.toEqual({ code: 0 });
-
-    expect(delegated).toHaveLength(1);
-    const safe = delegated[0]![0]!;
-    expect(safe).not.toBe(candidate);
-    expect(safe.hrTime).toEqual([1_800_000_000, 250_000_000]);
-    expect(safe.hrTimeObserved).toEqual([1_800_000_000, 250_000_000]);
-    expect(safe.spanContext).toEqual({ traceId: TRACE_ID, spanId: SPAN_ID, traceFlags: TraceFlags.SAMPLED });
-    expect(safe.severityText).toBe("WARN");
-    expect(safe.severityNumber).toBe(SeverityNumber.WARN);
-    expect(safe.body).toBe("account.setup.diagnostic");
-    expect(safe.eventName).toBeUndefined();
-    expect(safe.resource.attributes).toEqual({
-      "service.name": "cc-router",
-      "service.version": "0.8.2",
-      "service.instance.id": INSTALL_ID,
-      "process.runtime.version": "22.18.0",
-      "os.type": "macos",
-      "host.arch": "arm64",
-      "cc_router.runtime_mode": "daemon",
-    });
-    expect(safe.instrumentationScope).toEqual({ name: "cc-router" });
-    expect(safe.attributes).toEqual({
-      "cc_router.provider": "openai",
-      "cc_router.method": "device_oauth",
-      "cc_router.stage": "token_exchange",
-      "cc_router.reason": "unauthorized",
-      "cc_router.outcome": "upstream_error",
-      "http.response.status_code": 401,
-      "cc_router.duration_bucket": "5s_to_30s",
-      "service.version": "0.8.2",
-      "os.type": "macos",
-      "cc_router.runtime_mode": "foreground",
-      "cc_router.diagnostic_id": DIAGNOSTIC_ID,
-    });
-    expect(safe.droppedAttributesCount).toBe(0);
-    expect(JSON.stringify(safe)).not.toContain(PRIVATE_CANARY);
-    expect(JSON.stringify(safe)).not.toContain(CANDIDATE_ID);
-  });
-
-  it("drops setup logs whose scope or diagnostic identity is not independently trusted", async () => {
-    let delegateCalls = 0;
-    const delegate: LogRecordExporter = {
-      export: (_logs, callback) => {
-        delegateCalls += 1;
-        callback({ code: 0 });
-      },
-      forceFlush: async () => undefined,
-      shutdown: async () => undefined,
-    };
-    const exporter = createPrivacySafeLogExporter({
-      delegate,
-      getSnapshot: () => snapshot(),
-      getDiagnosticId: () => undefined,
-    });
-
-    await expect(exportLogs(exporter, [
+    await expect(exportLogs(logExporter, [
       unsafeLog({ instrumentationScope: { name: "unknown-library" } }),
-      unsafeLog(),
+      unsafeLog({ body: "raw user message" }),
+      unsafeLog({ attributes: { ...unsafeLog().attributes, "cc_router.diagnostic_id": INSTALL_ID } }),
     ])).resolves.toEqual({ code: 0 });
 
-    expect(delegateCalls).toBe(0);
+    expect(traces.requests).toHaveLength(0);
+    expect(logs.requests).toHaveLength(0);
   });
 
-  it("caps every delegated log batch at the configured safe maximum", async () => {
-    const delegated: ReadableLogRecord[][] = [];
-    const delegate: LogRecordExporter = {
-      export(logs, callback) {
-        delegated.push(logs);
-        callback({ code: 0 });
-      },
-      forceFlush: async () => undefined,
-      shutdown: async () => undefined,
-    };
-    const exporter = createPrivacySafeLogExporter({
-      delegate,
-      getSnapshot: () => snapshot(),
-      getDiagnosticId: () => DIAGNOSTIC_ID,
-      maxBatchSize: 2,
-    });
+  it("caps every delegated batch at the fixed safe maximum", async () => {
+    const { logs, logExporter } = await exporters(() => snapshot());
 
-    await exportLogs(exporter, [unsafeLog(), unsafeLog(), unsafeLog()]);
+    await exportLogs(logExporter, Array.from({ length: 150 }, () => unsafeLog()));
 
-    expect(delegated).toHaveLength(1);
-    expect(delegated[0]).toHaveLength(2);
+    expect(logs.requests).toHaveLength(1);
+    expect(exportedLogRecords(logs.requests[0]!.json)).toHaveLength(100);
   });
 
-  it("does not flush a log delegate after telemetry is disabled", async () => {
-    let flushes = 0;
-    const delegate: LogRecordExporter = {
-      export: (_logs, callback) => callback({ code: 0 }),
-      forceFlush: async () => {
-        flushes += 1;
-      },
-      shutdown: async () => undefined,
-    };
-    const exporter = createPrivacySafeLogExporter({
-      delegate,
-      getSnapshot: () => snapshot(false),
-      getDiagnosticId: () => DIAGNOSTIC_ID,
-    });
+  it("fails closed without forwarding raw delegate errors", async () => {
+    const { spanExporter, logExporter } = await exporters(() => snapshot(), { responseMode: "reset" });
 
-    await exporter.forceFlush();
-
-    expect(flushes).toBe(0);
+    await expect(exportSpans(spanExporter, [unsafeSpan()])).resolves.toEqual({ code: 1 });
+    await expect(exportLogs(logExporter, [unsafeLog()])).resolves.toEqual({ code: 1 });
   });
 
-  it("drops a reconstructed queued log batch when telemetry turns off before delegation", async () => {
-    let delegateCalls = 0;
-    let reads = 0;
-    const delegate: LogRecordExporter = {
-      export: (_logs, callback) => {
-        delegateCalls += 1;
-        callback({ code: 0 });
-      },
-      forceFlush: async () => undefined,
-      shutdown: async () => undefined,
-    };
-    const exporter = createPrivacySafeLogExporter({
-      delegate,
-      getSnapshot: () => {
-        reads += 1;
-        return snapshot(reads === 1);
-      },
-      getDiagnosticId: () => DIAGNOSTIC_ID,
-    });
+  it("settles shutdown even after the endpoint is gone", async () => {
+    const { traces, logs, spanExporter, logExporter } = await exporters(() => snapshot());
+    await traces.close();
+    await logs.close();
+    openServers.splice(0, openServers.length);
 
-    await expect(exportLogs(exporter, [unsafeLog()])).resolves.toEqual({ code: 0 });
-
-    expect(reads).toBe(2);
-    expect(delegateCalls).toBe(0);
-  });
-
-  it("latches an old log exporter off across choices and lets a new exporter adopt the generation", async () => {
-    let current = snapshot(true, CONSENT_GENERATION, 40);
-    let delegateCalls = 0;
-    const delegate: LogRecordExporter = {
-      export: (_logs, callback) => { delegateCalls += 1; callback({ code: 0 }); },
-      forceFlush: async () => undefined,
-      shutdown: async () => undefined,
-    };
-    const oldExporter = createPrivacySafeLogExporter({
-      delegate,
-      getSnapshot: () => current,
-      getDiagnosticId: () => DIAGNOSTIC_ID,
-    });
-
-    current = snapshot(true, NEXT_CONSENT_GENERATION, 40);
-    await exportLogs(oldExporter, [unsafeLog()]);
-    current = snapshot(true, CONSENT_GENERATION, 40);
-    await exportLogs(oldExporter, [unsafeLog()]);
-    expect(delegateCalls).toBe(0);
-
-    current = snapshot(true, NEXT_CONSENT_GENERATION, 40);
-    const newExporter = createPrivacySafeLogExporter({
-      delegate,
-      getSnapshot: () => current,
-      getDiagnosticId: () => DIAGNOSTIC_ID,
-    });
-    await exportLogs(newExporter, [unsafeLog()]);
-    expect(delegateCalls).toBe(1);
-  });
-
-  it("contains synchronous and callback log delegate failures without forwarding raw errors", async () => {
-    const thrown = createPrivacySafeLogExporter({
-      delegate: {
-        export() {
-          throw new Error(PRIVATE_CANARY);
-        },
-        forceFlush: async () => undefined,
-        shutdown: async () => undefined,
-      },
-      getSnapshot: () => snapshot(),
-      getDiagnosticId: () => DIAGNOSTIC_ID,
-    });
-    const callbackFailure = createPrivacySafeLogExporter({
-      delegate: {
-        export(_logs, callback) {
-          callback({ code: 1, error: new Error(PRIVATE_CANARY) });
-        },
-        forceFlush: async () => undefined,
-        shutdown: async () => undefined,
-      },
-      getSnapshot: () => snapshot(),
-      getDiagnosticId: () => DIAGNOSTIC_ID,
-    });
-
-    await expect(exportLogs(thrown, [unsafeLog()])).resolves.toEqual({ code: 1 });
-    await expect(exportLogs(callbackFailure, [unsafeLog()])).resolves.toEqual({ code: 1 });
-  });
-
-  it("bounds log force-flush and shutdown when the delegate never settles", async () => {
-    vi.useFakeTimers();
-    try {
-      const delegate: LogRecordExporter = {
-        export: () => undefined,
-        forceFlush: () => new Promise<void>(() => undefined),
-        shutdown: () => new Promise<void>(() => undefined),
-      };
-      const exporter = createPrivacySafeLogExporter({
-        delegate,
-        getSnapshot: () => snapshot(),
-        getDiagnosticId: () => DIAGNOSTIC_ID,
-        lifecycleTimeoutMillis: 10,
-      });
-
-      let flushSettled = false;
-      const flush = exporter.forceFlush().then(() => {
-        flushSettled = true;
-      });
-      await vi.advanceTimersByTimeAsync(9);
-      expect(flushSettled).toBe(false);
-      await vi.advanceTimersByTimeAsync(2);
-      expect(flushSettled).toBe(true);
-      await expect(flush).resolves.toBeUndefined();
-
-      let shutdownSettled = false;
-      const shutdown = exporter.shutdown().then(() => {
-        shutdownSettled = true;
-      });
-      await vi.advanceTimersByTimeAsync(9);
-      expect(shutdownSettled).toBe(false);
-      await vi.advanceTimersByTimeAsync(2);
-      expect(shutdownSettled).toBe(true);
-      await expect(shutdown).resolves.toBeUndefined();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("fails closed within a deadline when a log delegate never invokes its callback", async () => {
-    vi.useFakeTimers();
-    try {
-      const exporter = createPrivacySafeLogExporter({
-        delegate: {
-          export: () => undefined,
-          forceFlush: async () => undefined,
-          shutdown: async () => undefined,
-        },
-        getSnapshot: () => snapshot(),
-        getDiagnosticId: () => DIAGNOSTIC_ID,
-        exportTimeoutMillis: 10,
-      });
-
-      let resultCode: number | undefined;
-      const result = exportLogs(exporter, [unsafeLog()]).then(value => {
-        resultCode = value.code;
-        return value;
-      });
-      await vi.advanceTimersByTimeAsync(9);
-      expect(resultCode).toBeUndefined();
-      await vi.advanceTimersByTimeAsync(2);
-      expect(resultCode).toBe(1);
-
-      await expect(result).resolves.toEqual({ code: 1 });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-});
-
-describe("official PostHog EU OTLP delegates", () => {
-  it("serializes safe protobuf traces and documented JSON logs through loopback endpoints", async () => {
-    const traceCapture = await startTransportCaptureServer();
-    const logCapture = await startTransportCaptureServer();
-    const log = unsafeLog();
-    const span = unsafeSpan();
-    const exporters = createPostHogOtlpExporters({
-      traceUrl: traceCapture.endpoint("/i/v1/traces"),
-      logUrl: logCapture.endpoint("/i/v1/logs"),
-      getSnapshot: () => snapshot(),
-      getDiagnosticId: record => record === log ? DIAGNOSTIC_ID : undefined,
-      requestTimeoutMillis: 500,
-    });
-
-    try {
-      const spanCanaries = span.attributes["private.canaries"];
-      const logCanaries = log.attributes["private.canaries"];
-      for (const canary of Object.values(TELEMETRY_CANARY)) {
-        expect(spanCanaries).toContain(canary);
-        expect(logCanaries).toContain(canary);
-      }
-
-      await expect(exportSpans(exporters.spanExporter, [span])).resolves.toEqual({ code: 0 });
-      await expect(exportLogs(exporters.logExporter, [log])).resolves.toEqual({ code: 0 });
-
-      expect(traceCapture.requests).toHaveLength(1);
-      expect(logCapture.requests).toHaveLength(1);
-      const traceRequest = traceCapture.requests[0]!;
-      const logRequest = logCapture.requests[0]!;
-      expect(traceRequest.method).toBe("POST");
-      expect(traceRequest.url).toBe("/i/v1/traces");
-      expect(traceRequest.headers["content-type"]).toBe("application/x-protobuf");
-      expect(traceRequest.headers.authorization).toMatch(/^Bearer phc_[0-9A-Za-z]+$/);
-      expect(logRequest.method).toBe("POST");
-      expect(logRequest.url).toBe("/i/v1/logs");
-      expect(logRequest.headers["content-type"]).toBe("application/json");
-      expect(logRequest.headers.authorization).toMatch(/^Bearer phc_[0-9A-Za-z]+$/);
-
-      const traceBytes = traceRequest.rawBody.toString("utf8");
-      const logBytes = logRequest.rawBody.toString("utf8");
-      expect(traceBytes).toContain("proxy.request");
-      expect(traceBytes).toContain(INSTALL_ID);
-      expect(logBytes).toContain("account.setup.diagnostic");
-      expect(logBytes).toContain(INSTALL_ID);
-      expect(logBytes).toContain(DIAGNOSTIC_ID);
-      for (const forbidden of [
-        PRIVATE_CANARY,
-        ...Object.values(TELEMETRY_CANARY),
-        CANDIDATE_ID,
-      ]) {
-        expect(traceBytes).not.toContain(forbidden);
-        expect(logBytes).not.toContain(JSON.stringify(forbidden).slice(1, -1));
-      }
-    } finally {
-      await exporters.spanExporter.shutdown();
-      await exporters.logExporter.shutdown();
-      await traceCapture.close();
-      await logCapture.close();
-    }
+    await expect(spanExporter.shutdown()).resolves.toBeUndefined();
+    await expect(logExporter.shutdown()).resolves.toBeUndefined();
   });
 });
