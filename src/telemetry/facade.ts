@@ -1,70 +1,162 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID as nodeRandomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
   context,
   ROOT_CONTEXT,
+  SpanKind,
   SpanStatusCode,
   TraceFlags,
   trace,
   type Attributes,
   type Span,
 } from "@opentelemetry/api";
-import { logs, SeverityNumber, type LogAttributes } from "@opentelemetry/api-logs";
+import { logs, SeverityNumber } from "@opentelemetry/api-logs";
+import type { RequestHandler } from "express";
 import {
   claimTelemetryFirstStart,
   createTelemetryConsentGate,
   getTelemetrySnapshot,
+  type TelemetryConsentGate,
   type TelemetrySnapshot,
 } from "../config/telemetry.js";
 import { getCurrentVersion } from "../utils/self-update.js";
-import { MAX_ACCOUNT_POOL_SIZE } from "./constants.js";
+import { MAX_ACCOUNT_POOL_SIZE } from "./contracts.js";
 import type {
-  DiagnosticId,
   DurationBucket,
+  LogEventCode,
+  ModelFamily,
   Operation,
   OsFamily,
   Outcome,
   Provider,
   RuntimeMode,
-  SafeAnalyticsEvent,
   SafeExceptionContext,
   SafeExceptionContract,
-  SafeLog,
-  SafeRuntimeFailureAttributes,
-  SafeSetupDiagnosticAttributes,
   SafeSpanAttributes,
   SetupMethod,
   SetupReason,
   SetupStage,
   Severity,
-  TrustedExceptionSource,
   TrustedTelemetryIdentity,
 } from "./contracts.js";
 import { createPostHogTelemetryClient, type PostHogTelemetryClient } from "./posthog-client.js";
-import { reportRuntimeExceptionLocally } from "./local-diagnostics.js";
+import { reconstructAnalyticsEvent, sanitizeException } from "./privacy.js";
 import {
-  reconstructAnalyticsEvent,
-  reconstructLog,
-  reconstructSpan,
-  sanitizeException,
-} from "./privacy.js";
-import { flushProxyTelemetryWithin, shutdownProxyTelemetryWithin } from "./runtime.js";
-import { flushCliTelemetryWithin, shutdownCliTelemetryWithin } from "./cli-runtime.js";
+  flushTelemetryRuntimeWithin,
+  isTelemetryRuntimeActive,
+  shutdownTelemetryRuntimeWithin,
+  startTelemetryRuntime,
+} from "./runtime.js";
+
+export type {
+  DurationBucket,
+  ModelFamily,
+  Operation,
+  Outcome,
+  Provider,
+  RequestSource,
+  Route,
+  RuntimeMode,
+  SafeExceptionContext,
+  SafeSpanAttributes,
+  SetupMethod,
+  SetupReason,
+  SetupStage,
+  Severity,
+  StreamOutcome,
+} from "./contracts.js";
 
 const HEARTBEAT_INTERVAL_MS = 60 * 60 * 1_000;
+const SCOPE = "cc-router";
+const PROXY_REQUEST_PATHS = new Set(["/v1/messages", "/v1/responses"]);
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
-export interface RuntimeTelemetryMetadata {
-  serviceVersion: string;
-  osFamily: OsFamily;
-  runtimeMode: RuntimeMode;
+// TEMP(A2): move to privacy.ts (SPAN_ATTRIBUTE_KEYS / LOG_ATTRIBUTE_KEYS /
+// toOtelAttributes). The key map is the facade's only attribute filter: a value
+// whose key is absent here can never reach an exporter.
+const SPAN_ATTRIBUTE_KEYS: Readonly<Record<keyof SafeSpanAttributes, string>> = {
+  httpMethod: "http.request.method",
+  httpStatusCode: "http.response.status_code",
+  provider: "cc_router.provider",
+  route: "cc_router.route",
+  modelFamily: "cc_router.model_family",
+  requestSource: "cc_router.request_source",
+  runtimeMode: "cc_router.runtime_mode",
+  streaming: "cc_router.streaming",
+  streamOutcome: "cc_router.stream_outcome",
+  outcome: "cc_router.outcome",
+  attempt: "cc_router.attempt",
+  accountPoolSize: "cc_router.account_pool_size",
+  concurrency: "cc_router.concurrency",
+  inputTokens: "cc_router.input_tokens",
+  outputTokens: "cc_router.output_tokens",
+  operationDurationMs: "cc_router.operation_duration_ms",
+};
+
+// TEMP(A2): move to privacy.ts.
+const LOG_ATTRIBUTE_KEYS: Readonly<Record<string, string>> = {
+  operation: "cc_router.operation",
+  provider: "cc_router.provider",
+  method: "cc_router.method",
+  stage: "cc_router.stage",
+  reason: "cc_router.reason",
+  outcome: "cc_router.outcome",
+  httpStatusCode: "http.response.status_code",
+  durationBucket: "cc_router.duration_bucket",
+  attempt: "cc_router.attempt",
+  accountPoolSize: "cc_router.account_pool_size",
+  concurrency: "cc_router.concurrency",
+  operationDurationMs: "cc_router.operation_duration_ms",
+  serviceVersion: "service.version",
+  osFamily: "os.type",
+  runtimeMode: "cc_router.runtime_mode",
+  diagnosticId: "cc_router.diagnostic_id",
+};
+
+// TEMP(A2): move to privacy.ts.
+function toOtelAttributes(map: Readonly<Record<string, string>>, safe: object): Attributes {
+  const output: Attributes = {};
+  for (const [key, value] of Object.entries(safe)) {
+    const name = map[key];
+    if (name === undefined) continue;
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      output[name] = value;
+    }
+  }
+  return output;
 }
 
-export type TelemetrySpanStatus = "ok" | "error";
+// TEMP(A2): the plan's privacy.ts takes three arguments; the donor still
+// requires the trusted filesystem root as a fourth.
+type DonorSanitizeException = (
+  error: unknown,
+  exceptionContext: SafeExceptionContext,
+  identity: TrustedTelemetryIdentity,
+  source: { projectRoot: string },
+) => SafeExceptionContract | undefined;
+
+function sanitize(
+  error: unknown,
+  exceptionContext: SafeExceptionContext,
+  identity: TrustedTelemetryIdentity,
+): SafeExceptionContract | undefined {
+  return (sanitizeException as DonorSanitizeException)(error, exceptionContext, identity, {
+    projectRoot: PROJECT_ROOT,
+  });
+}
+
+// TEMP(A2): the plan's consent gate takes (getSnapshot, onLatch); the donor
+// still threads an initial snapshot between them.
+function consentGate(
+  getSnapshot: () => TelemetrySnapshot,
+  onLatch: () => void,
+): TelemetryConsentGate {
+  return createTelemetryConsentGate(getSnapshot, undefined, onLatch);
+}
 
 export interface TelemetrySpanHandle {
   annotate(attributes: SafeSpanAttributes): void;
-  end(status: TelemetrySpanStatus): void;
+  end(status: "ok" | "error"): void;
 }
 
 export interface SafeRuntimeLogInput {
@@ -79,37 +171,6 @@ export interface SafeRuntimeLogInput {
   concurrency?: number;
   operationDurationMs?: number;
   diagnosticId?: string;
-}
-
-function runtimeErrorProperty(error: unknown, key: "cause" | "code"): unknown {
-  if (typeof error !== "object" || error === null) return undefined;
-  try {
-    return Object.getOwnPropertyDescriptor(error, key)?.value;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Classify only explicit, allowlisted transport failures without parsing text. */
-export function classifyExpectedRuntimeFailure(
-  error: unknown,
-): "timeout" | "network_failure" | undefined {
-  const directCode = runtimeErrorProperty(error, "code");
-  const causeCode = runtimeErrorProperty(runtimeErrorProperty(error, "cause"), "code");
-  const code = typeof directCode === "string" ? directCode : causeCode;
-  if (code === "ETIMEDOUT") return "timeout";
-  if (["EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ENETUNREACH", "ENOTFOUND", "EPIPE"]
-    .includes(String(code))) {
-    return "network_failure";
-  }
-  try {
-    if (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) {
-      return "timeout";
-    }
-  } catch {
-    // Exotic thrown values remain unexpected.
-  }
-  return undefined;
 }
 
 interface SetupOperationBase {
@@ -133,51 +194,29 @@ export interface ExpectedSetupFailureInput extends SetupOperationBase {
   httpStatusCode?: number;
 }
 
-export interface FacadeTimer {
-  unref?(): void;
+export interface RuntimeErrorContext {
+  operation: Operation;
+  provider?: Provider;
+}
+
+export interface RuntimeFailureExtras {
+  attempt?: number;
+  durationMs?: number;
 }
 
 export interface TelemetryFacadeDependencies {
-  getSnapshot: () => TelemetrySnapshot;
-  claimFirstStart: () => TelemetrySnapshot | undefined;
-  getAnalytics: () => PostHogTelemetryClient;
-  emitLog: (log: SafeLog) => void;
-  annotateSpan: (operation: Operation, attributes: SafeSpanAttributes) => void;
-  sanitizeException: (
-    error: unknown,
-    context: SafeExceptionContext,
-    identity: TrustedTelemetryIdentity,
-    source: TrustedExceptionSource,
-  ) => SafeExceptionContract | undefined;
-  flushRuntime: (deadlineMs: number) => Promise<void>;
-  handoffRuntime: (deadlineMs: number) => Promise<void>;
-  shutdownRuntime: (deadlineMs: number) => Promise<void>;
-  runtimeMetadata: () => RuntimeTelemetryMetadata;
-  now: () => number;
-  randomUUID: () => string;
-  reportRuntimeException: (error: unknown, diagnosticId: string) => void;
-  projectRoot: string;
-  setInterval: (callback: () => void, delayMs: number) => FacadeTimer;
+  getSnapshot?: () => TelemetrySnapshot;
+  now?: () => number;
+  randomUUID?: () => string;
+  analytics?: PostHogTelemetryClient;
 }
 
-export interface TelemetryFacade {
-  recordApplicationStart(): void;
-  recordProxyStarted(accountCount: number): void;
-  startProxyHeartbeat(getAccountCount: () => number): void;
-  recordSafeLog(input: SafeRuntimeLogInput): void;
-  recordSetupStage(input: SetupStageInput): void;
-  recordSetupStageFailure(input: ExpectedSetupFailureInput): void;
-  recordSetupResult(input: SetupResultInput): void;
-  recordExpectedSetupFailure(input: ExpectedSetupFailureInput): void;
-  recordUnexpectedException(
-    error: unknown,
-    context: SafeExceptionContext,
-    diagnosticId?: string,
-  ): DiagnosticId | undefined;
-  annotateActiveSpan(operation: Operation, attributes: SafeSpanAttributes): void;
-  flushTelemetryWithin(deadlineMs: number): Promise<void>;
-  handoffCliTelemetryToProxyWithin(deadlineMs: number): Promise<void>;
-  shutdownTelemetryWithin(deadlineMs: number): Promise<void>;
+export type TelemetryFacade = ReturnType<typeof createTelemetryFacade>;
+
+export function runtimeMode(): RuntimeMode {
+  if (process.env["CC_ROUTER_SERVICE"] === "1") return "service";
+  if (process.env["CC_ROUTER_DAEMON"] === "1") return "daemon";
+  return "foreground";
 }
 
 function osFamily(): OsFamily {
@@ -189,18 +228,59 @@ function osFamily(): OsFamily {
   }
 }
 
-function runtimeMode(): RuntimeMode {
-  if (process.env["CC_ROUTER_SERVICE"] === "1") return "service";
-  if (process.env["CC_ROUTER_DAEMON"] === "1") return "daemon";
-  return "foreground";
+export function modelFamilyOf(model: string): ModelFamily {
+  const value = model.toLowerCase();
+  if (value.includes("fable")) return "fable";
+  if (value.includes("sonnet")) return "sonnet";
+  if (value.includes("opus")) return "opus";
+  if (value.includes("haiku")) return "haiku";
+  if (value.includes("codex") || value.startsWith("gpt-")) return "codex";
+  return "other";
 }
 
-function runtimeMetadata(): RuntimeTelemetryMetadata {
-  return {
-    serviceVersion: getCurrentVersion(),
-    osFamily: osFamily(),
-    runtimeMode: runtimeMode(),
-  };
+export function httpFailureReason(status: number): SetupReason {
+  if (status === 401) return "unauthorized";
+  if (status === 403) return "forbidden";
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "upstream_5xx";
+  return "upstream_4xx";
+}
+
+export function httpOutcome(status: number): Outcome {
+  if (status === 429) return "rate_limited";
+  if (status >= 400) return "upstream_error";
+  return "complete";
+}
+
+function errorProperty(error: unknown, key: "cause" | "code"): unknown {
+  if (typeof error !== "object" || error === null) return undefined;
+  try {
+    return Object.getOwnPropertyDescriptor(error, key)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Classify only explicit, allowlisted transport failures without parsing text. */
+export function classifyExpectedRuntimeFailure(
+  error: unknown,
+): "timeout" | "network_failure" | undefined {
+  const directCode = errorProperty(error, "code");
+  const causeCode = errorProperty(errorProperty(error, "cause"), "code");
+  const code = typeof directCode === "string" ? directCode : causeCode;
+  if (code === "ETIMEDOUT") return "timeout";
+  if (["EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ENETUNREACH", "ENOTFOUND", "EPIPE"]
+    .includes(String(code))) {
+    return "network_failure";
+  }
+  try {
+    if (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) {
+      return "timeout";
+    }
+  } catch {
+    // Exotic thrown values remain unexpected.
+  }
+  return undefined;
 }
 
 function severityNumber(severity: Severity): SeverityNumber {
@@ -212,254 +292,13 @@ function severityNumber(severity: Severity): SeverityNumber {
   }
 }
 
-function logAttributes(
-  attributes: SafeRuntimeFailureAttributes | SafeSetupDiagnosticAttributes,
-): LogAttributes {
-  const output: LogAttributes = {};
-  const assign = (key: string, value: string | number | undefined): void => {
-    if (value !== undefined) output[key] = value;
-  };
-  if ("operation" in attributes) assign("cc_router.operation", attributes.operation);
-  assign("cc_router.provider", attributes.provider);
-  if ("method" in attributes) assign("cc_router.method", attributes.method);
-  if ("stage" in attributes) assign("cc_router.stage", attributes.stage);
-  assign("cc_router.reason", attributes.reason);
-  assign("cc_router.outcome", attributes.outcome);
-  assign("http.response.status_code", attributes.httpStatusCode);
-  if ("durationBucket" in attributes) assign("cc_router.duration_bucket", attributes.durationBucket);
-  if ("attempt" in attributes) assign("cc_router.attempt", attributes.attempt);
-  if ("accountPoolSize" in attributes) assign("cc_router.account_pool_size", attributes.accountPoolSize);
-  if ("concurrency" in attributes) assign("cc_router.concurrency", attributes.concurrency);
-  if ("operationDurationMs" in attributes) {
-    assign("cc_router.operation_duration_ms", attributes.operationDurationMs);
-  }
-  assign("service.version", attributes.serviceVersion);
-  assign("os.type", attributes.osFamily);
-  assign("cc_router.runtime_mode", attributes.runtimeMode);
-  assign("cc_router.diagnostic_id", attributes.diagnosticId);
-  return output;
-}
-
-function defaultEmitLog(log: SafeLog): void {
-  const emit = (): void => {
-    logs.getLogger("cc-router").emit({
-      body: log.body,
-      severityNumber: severityNumber(log.severity),
-      severityText: log.severity.toUpperCase(),
-      timestamp: log.timestampMs,
-      attributes: logAttributes(log.attributes),
-    });
-  };
-  const active = trace.getActiveSpan()?.spanContext();
-  if (active && (active.traceFlags & TraceFlags.SAMPLED) !== 0) emit();
-  else context.with(ROOT_CONTEXT, emit);
-}
-
-const SPAN_ATTRIBUTE_NAMES: Readonly<Record<keyof SafeSpanAttributes, string>> = {
-  httpMethod: "http.request.method",
-  httpStatusCode: "http.response.status_code",
-  provider: "cc_router.provider",
-  route: "cc_router.route",
-  modelFamily: "cc_router.model_family",
-  requestSource: "cc_router.request_source",
-  runtimeMode: "cc_router.runtime_mode",
-  streaming: "cc_router.streaming",
-  streamOutcome: "cc_router.stream_outcome",
-  outcome: "cc_router.outcome",
-  attempt: "cc_router.attempt",
-  accountPoolSize: "cc_router.account_pool_size",
-  concurrency: "cc_router.concurrency",
-  inputTokens: "cc_router.input_tokens",
-  outputTokens: "cc_router.output_tokens",
-  operationDurationMs: "cc_router.operation_duration_ms",
-};
-
-function defaultAnnotateSpan(operation: Operation, attributes: SafeSpanAttributes): void {
-  const span = trace.getActiveSpan();
-  if (!span) return;
-  span.setAttribute("cc_router.operation", operation);
-  span.setAttributes(otelSpanAttributes(attributes));
-}
-
-function otelSpanAttributes(attributes: SafeSpanAttributes): Attributes {
-  const safeAttributes: Attributes = {};
-  for (const [key, value] of Object.entries(attributes) as Array<[keyof SafeSpanAttributes, unknown]>) {
-    if (value !== undefined) safeAttributes[SPAN_ATTRIBUTE_NAMES[key]] = value as string | number | boolean;
-  }
-  return safeAttributes;
-}
-
-function reconstructedSpan(
-  operation: Operation,
-  attributes: SafeSpanAttributes,
-): { operation: Operation; attributes: SafeSpanAttributes } | undefined {
-  const safe = reconstructSpan({
-    scope: "cc-router",
-    operation,
-    traceId: "1".repeat(32),
-    spanId: "2".repeat(16),
-    kind: "internal",
-    startTimeMs: 0,
-    durationMs: 0,
-    statusCode: "unset",
-    attributes,
-  });
-  return safe ? { operation: safe.name, attributes: safe.attributes } : undefined;
-}
-
-const automaticSpanConsent = createTelemetryConsentGate();
-const NOOP_TELEMETRY_SPAN: TelemetrySpanHandle = {
-  annotate: () => undefined,
-  end: () => undefined,
-};
-
-/**
- * Start a closed-schema span whose lifetime is owned by an event-driven body.
- * The returned handle never exposes the underlying OTel span or accepts
- * arbitrary attributes.
- */
-export function startTelemetrySpan(
-  operation: Operation,
-  attributes: SafeSpanAttributes,
-): TelemetrySpanHandle {
-  try {
-    if (!automaticSpanConsent.getSnapshot()) return NOOP_TELEMETRY_SPAN;
-    const safe = reconstructedSpan(operation, attributes);
-    if (!safe) return NOOP_TELEMETRY_SPAN;
-    const span = trace.getTracer("cc-router").startSpan(safe.operation, {
-      attributes: {
-        "cc_router.operation": safe.operation,
-        ...otelSpanAttributes(safe.attributes),
-      },
-    });
-    let ended = false;
-    return {
-      annotate(nextAttributes): void {
-        if (ended) return;
-        try {
-          const next = reconstructedSpan(operation, nextAttributes);
-          if (next) span.setAttributes(otelSpanAttributes(next.attributes));
-        } catch {
-          // Body telemetry never changes response handling.
-        }
-      },
-      end(status): void {
-        if (ended) return;
-        ended = true;
-        finalizeSpanBestEffort(
-          span,
-          status === "error" ? SpanStatusCode.ERROR : SpanStatusCode.OK,
-        );
-      },
-    };
-  } catch {
-    return NOOP_TELEMETRY_SPAN;
-  }
-}
-
-/**
- * Run one closed runtime operation in the active OTel context. The callback is
- * invoked exactly once even if telemetry is disabled or the OTel API fails.
- */
-export function withTelemetrySpan<T>(
-  operation: Operation,
-  attributes: SafeSpanAttributes,
-  callback: () => T,
-): T {
-  let callbackStarted = false;
-  try {
-    if (!automaticSpanConsent.getSnapshot()) return callback();
-    const safe = reconstructedSpan(operation, attributes);
-    if (!safe) return callback();
-
-    return trace.getTracer("cc-router").startActiveSpan(
-      safe.operation,
-      {
-        attributes: {
-          "cc_router.operation": safe.operation,
-          ...otelSpanAttributes(safe.attributes),
-        },
-      },
-      span => {
-        callbackStarted = true;
-        try {
-          const result = callback();
-          if (result !== null
-            && (typeof result === "object" || typeof result === "function")
-            && typeof (result as unknown as PromiseLike<unknown>).then === "function") {
-            return Promise.resolve(result).then(value => {
-              finalizeSpanBestEffort(span, SpanStatusCode.OK);
-              return value;
-            }, error => {
-              finalizeSpanBestEffort(span, SpanStatusCode.ERROR);
-              throw error;
-            }) as T;
-          }
-          finalizeSpanBestEffort(span, SpanStatusCode.OK);
-          return result;
-        } catch (error) {
-          finalizeSpanBestEffort(span, SpanStatusCode.ERROR);
-          throw error;
-        }
-      },
-    );
-  } catch (error) {
-    if (callbackStarted) throw error;
-    return callback();
-  }
-}
-
-function finalizeSpanBestEffort(span: Span, status: SpanStatusCode): void {
-  try {
-    span.setStatus({ code: status });
-  } catch {
-    // Telemetry finalization never changes application behavior.
-  }
-  try {
-    span.end();
-  } catch {
-    // A broken tracer must not replace the callback value or error identity.
-  }
-}
-
-function defaultDependencies(): TelemetryFacadeDependencies {
-  let analytics: PostHogTelemetryClient | undefined;
-  return {
-    getSnapshot: getTelemetrySnapshot,
-    claimFirstStart: claimTelemetryFirstStart,
-    getAnalytics: () => analytics ??= createPostHogTelemetryClient(),
-    emitLog: defaultEmitLog,
-    annotateSpan: defaultAnnotateSpan,
-    sanitizeException,
-    flushRuntime: async deadlineMs => {
-      await Promise.all([
-        flushProxyTelemetryWithin(deadlineMs),
-        flushCliTelemetryWithin(deadlineMs),
-      ]);
-    },
-    handoffRuntime: shutdownCliTelemetryWithin,
-    shutdownRuntime: async deadlineMs => {
-      await Promise.all([
-        shutdownProxyTelemetryWithin(deadlineMs),
-        shutdownCliTelemetryWithin(deadlineMs),
-      ]);
-    },
-    runtimeMetadata,
-    now: Date.now,
-    randomUUID,
-    reportRuntimeException: reportRuntimeExceptionLocally,
-    projectRoot: PROJECT_ROOT,
-    setInterval: (callback, delayMs) => setInterval(callback, delayMs),
-  };
+function isRandomUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function clampedAccountCount(value: number): number | undefined {
   if (!Number.isFinite(value)) return undefined;
   return Math.max(0, Math.min(MAX_ACCOUNT_POOL_SIZE, Math.floor(value)));
-}
-
-function isRandomUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function expectedSetupFailureOutcome(reason: SetupReason): Outcome | undefined {
@@ -470,33 +309,217 @@ function expectedSetupFailureOutcome(reason: SetupReason): Outcome | undefined {
     case "upstream_5xx":
     case "unexpected_response_shape":
       return "upstream_error";
-    case "rate_limited":
-      return "rate_limited";
-    case "timeout":
-      return "timeout";
-    case "user_cancelled":
-      return "cancelled";
-    case "other":
-      return "other";
-    case "not_found":
-    case "permission_denied":
-    case "malformed_credentials":
-    case "invalid_token":
-    case "network_failure":
-    case "persistence_failure":
-      return undefined;
+    case "rate_limited": return "rate_limited";
+    case "timeout": return "timeout";
+    case "user_cancelled": return "cancelled";
+    case "other": return "other";
+    default: return undefined;
   }
 }
 
-export function createTelemetryFacade(
-  overrides: Partial<TelemetryFacadeDependencies> = {},
-): TelemetryFacade {
-  const dependencies = { ...defaultDependencies(), ...overrides };
-  let activeAnalytics: PostHogTelemetryClient | undefined;
-  const immediateOperations = new Set<Promise<void>>();
-  const consent = createTelemetryConsentGate(dependencies.getSnapshot, undefined, () => {
-    try { activeAnalytics?.discardPending(); } catch { /* isolated */ }
+let sharedGate: TelemetryConsentGate | undefined;
+let sharedAnalytics: PostHogTelemetryClient | undefined;
+
+function sharedConsentGate(): TelemetryConsentGate {
+  return sharedGate ??= consentGate(getTelemetrySnapshot, () => {
+    try { sharedAnalytics?.discardPending(); } catch { /* isolated */ }
   });
+}
+
+/** Logs and analytics work without the proxy's tracing runtime. */
+function ensureRuntime(): void {
+  try {
+    if (isTelemetryRuntimeActive()) return;
+    startTelemetryRuntime({ tracing: false, runtimeMode: runtimeMode() });
+  } catch {
+    // Telemetry transport failures never reach application code.
+  }
+}
+
+function spanAttributes(operation: Operation, attributes: SafeSpanAttributes): Attributes {
+  return {
+    "cc_router.operation": operation,
+    ...toOtelAttributes(SPAN_ATTRIBUTE_KEYS, attributes),
+  };
+}
+
+function finalizeSpan(span: Span, status: "ok" | "error"): void {
+  try {
+    span.setStatus({ code: status === "error" ? SpanStatusCode.ERROR : SpanStatusCode.OK });
+  } catch {
+    // Telemetry finalization never changes application behavior.
+  }
+  try {
+    span.end();
+  } catch {
+    // A broken tracer must not replace the callback value or error identity.
+  }
+}
+
+const NOOP_SPAN_HANDLE: TelemetrySpanHandle = {
+  annotate: () => undefined,
+  end: () => undefined,
+};
+
+/**
+ * Start a closed-schema span whose lifetime is owned by an event-driven body.
+ * The handle never exposes the OTel span or accepts arbitrary attributes.
+ */
+export function startTelemetrySpan(
+  operation: Operation,
+  attributes: SafeSpanAttributes,
+): TelemetrySpanHandle {
+  try {
+    if (!sharedConsentGate().getSnapshot()) return NOOP_SPAN_HANDLE;
+    const span = trace.getTracer(SCOPE).startSpan(operation, {
+      attributes: spanAttributes(operation, attributes),
+    });
+    let ended = false;
+    return {
+      annotate(next): void {
+        if (ended) return;
+        try {
+          span.setAttributes(toOtelAttributes(SPAN_ATTRIBUTE_KEYS, next));
+        } catch {
+          // Body telemetry never changes response handling.
+        }
+      },
+      end(status): void {
+        if (ended) return;
+        ended = true;
+        finalizeSpan(span, status);
+      },
+    };
+  } catch {
+    return NOOP_SPAN_HANDLE;
+  }
+}
+
+/** Run one closed runtime operation as the active span. The callback runs exactly once. */
+export function withTelemetrySpan<T>(
+  operation: Operation,
+  attributes: SafeSpanAttributes,
+  callback: () => Promise<T>,
+): Promise<T> {
+  let started = false;
+  try {
+    if (!sharedConsentGate().getSnapshot()) return callback();
+    return trace.getTracer(SCOPE).startActiveSpan(
+      operation,
+      { attributes: spanAttributes(operation, attributes) },
+      async span => {
+        started = true;
+        try {
+          const value = await callback();
+          finalizeSpan(span, "ok");
+          return value;
+        } catch (error) {
+          finalizeSpan(span, "error");
+          throw error;
+        }
+      },
+    );
+  } catch (error) {
+    if (started) return Promise.reject(error);
+    return callback();
+  }
+}
+
+export function annotateActiveSpan(operation: Operation, attributes: SafeSpanAttributes): void {
+  try {
+    if (!sharedConsentGate().getSnapshot()) return;
+    trace.getActiveSpan()?.setAttributes(spanAttributes(operation, attributes));
+  } catch {
+    // Span enrichment is optional.
+  }
+}
+
+/** Wrap the two inference routes in a server span; every other route passes through. */
+export function telemetryRequestMiddleware(): RequestHandler {
+  return (request, response, next) => {
+    let continued = false;
+    const proceed = (): void => {
+      if (continued) return;
+      continued = true;
+      next();
+    };
+    try {
+      if (!PROXY_REQUEST_PATHS.has(request.path) || !sharedConsentGate().getSnapshot()) {
+        proceed();
+        return;
+      }
+      const attributes: SafeSpanAttributes = {
+        ...(request.method === "GET" || request.method === "POST"
+          ? { httpMethod: request.method }
+          : {}),
+        route: request.path === "/v1/messages" ? "messages" : "responses",
+      };
+      trace.getTracer(SCOPE).startActiveSpan(
+        "proxy.request",
+        { kind: SpanKind.SERVER, attributes: spanAttributes("proxy.request", attributes) },
+        span => {
+          let ended = false;
+          const end = (): void => {
+            if (ended) return;
+            ended = true;
+            try {
+              span.setAttributes(toOtelAttributes(SPAN_ATTRIBUTE_KEYS, {
+                httpStatusCode: response.statusCode,
+              }));
+            } catch {
+              // Response telemetry never changes the response itself.
+            }
+            finalizeSpan(span, response.statusCode >= 500 ? "error" : "ok");
+          };
+          response.once("finish", end);
+          response.once("close", end);
+          proceed();
+        },
+      );
+    } catch {
+      proceed();
+    }
+  };
+}
+
+export function createTelemetryFacade(dependencies: TelemetryFacadeDependencies = {}) {
+  const now = dependencies.now ?? Date.now;
+  const uuid = dependencies.randomUUID ?? nodeRandomUUID;
+  const getSnapshot = dependencies.getSnapshot;
+  let gate: TelemetryConsentGate | undefined;
+  // Lazy: binding the consent generation must not read the state file at import.
+  const consent = (): TelemetryConsentGate => gate ??= getSnapshot
+    ? consentGate(getSnapshot, () => {
+      try { dependencies.analytics?.discardPending(); } catch { /* isolated */ }
+    })
+    : sharedConsentGate();
+  const immediate = new Set<Promise<void>>();
+
+  const analytics = (): PostHogTelemetryClient | undefined => {
+    if (dependencies.analytics) return dependencies.analytics;
+    try {
+      return sharedAnalytics ??= createPostHogTelemetryClient({
+        getSnapshot: getSnapshot ?? getTelemetrySnapshot,
+      });
+    } catch {
+      return undefined;
+    }
+  };
+
+  const activeAnalytics = (): PostHogTelemetryClient | undefined =>
+    dependencies.analytics ?? sharedAnalytics;
+
+  const metadata = (): { serviceVersion: string; osFamily: OsFamily; runtimeMode: RuntimeMode } => ({
+    serviceVersion: getCurrentVersion(),
+    osFamily: osFamily(),
+    runtimeMode: runtimeMode(),
+  });
+
+  const trackImmediate = (operation: Promise<void>): void => {
+    const contained = Promise.resolve(operation).catch(() => undefined);
+    immediate.add(contained);
+    void contained.then(() => { immediate.delete(contained); });
+  };
 
   const boundedDeadline = (deadlineMs: number): number => Number.isFinite(deadlineMs)
     ? Math.max(0, Math.min(10_000, Math.floor(deadlineMs)))
@@ -504,141 +527,166 @@ export function createTelemetryFacade(
 
   const settleWithin = async (operations: readonly Promise<unknown>[], deadlineMs: number): Promise<void> => {
     if (operations.length === 0) return;
-    const bounded = boundedDeadline(deadlineMs);
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([
       Promise.allSettled(operations).then(() => undefined),
       new Promise<void>(resolve => {
-        timer = setTimeout(resolve, bounded);
+        timer = setTimeout(resolve, boundedDeadline(deadlineMs));
         timer.unref?.();
       }),
     ]).catch(() => undefined).finally(() => clearTimeout(timer));
   };
 
-  const trackImmediate = (operation: Promise<void>): void => {
-    const contained = Promise.resolve(operation).catch(() => undefined);
-    immediateOperations.add(contained);
-    void contained.then(() => { immediateOperations.delete(contained); });
-  };
-
-  const enabledSnapshot = (): TelemetrySnapshot | undefined => {
-    return consent.getSnapshot();
-  };
-
-  const analytics = (): PostHogTelemetryClient | undefined => {
+  const emitLog = (
+    body: LogEventCode,
+    severity: Severity,
+    attributes: object,
+  ): void => {
     try {
-      return activeAnalytics ??= dependencies.getAnalytics();
+      ensureRuntime();
+      const emit = (): void => {
+        logs.getLogger(SCOPE).emit({
+          body,
+          severityNumber: severityNumber(severity),
+          severityText: severity.toUpperCase(),
+          timestamp: now(),
+          attributes: toOtelAttributes(LOG_ATTRIBUTE_KEYS, attributes),
+        });
+      };
+      const active = trace.getActiveSpan()?.spanContext();
+      // Trace correlation would drop this record when the active span is
+      // unsampled, so an unsampled parent is detached instead.
+      if (active && (active.traceFlags & TraceFlags.SAMPLED) !== 0) emit();
+      else context.with(ROOT_CONTEXT, emit);
     } catch {
-      return undefined;
-    }
-  };
-
-  const metadata = (): RuntimeTelemetryMetadata | undefined => {
-    try {
-      return dependencies.runtimeMetadata();
-    } catch {
-      return undefined;
+      // Remote logging is best effort only.
     }
   };
 
   const captureAnalytics = (
     snapshot: TelemetrySnapshot,
-    event: SafeAnalyticsEvent["event"],
+    event: string,
     properties: object,
     diagnosticId?: string,
-    immediate = false,
   ): void => {
     try {
-      if (!snapshot.enabled) return;
+      ensureRuntime();
       const safe = reconstructAnalyticsEvent({ event, properties }, {
         installationId: snapshot.state.installId,
         ...(diagnosticId === undefined ? {} : { diagnosticId }),
       });
       const client = safe && analytics();
-      if (!safe || !client) return;
-      if (immediate) {
-        trackImmediate(client.captureAnalyticsImmediate(safe, snapshot.state.consentGeneration));
-      } else {
-        client.captureAnalytics(safe, snapshot.state.consentGeneration);
-      }
+      if (safe && client) client.captureAnalytics(safe, snapshot.state.consentGeneration);
     } catch {
       // Application behavior never depends on telemetry capture.
     }
   };
 
-  const emitLog = (
-    snapshot: TelemetrySnapshot,
-    body: SafeLog["body"],
-    severity: Severity,
-    attributes: object,
+  const recordSafeLog = (input: SafeRuntimeLogInput): void => {
+    const snapshot = consent().getSnapshot();
+    if (!snapshot) return;
+    const { severity, diagnosticId, ...attributes } = input;
+    emitLog("runtime.failure", severity, {
+      ...attributes,
+      ...metadata(),
+      diagnosticId: diagnosticId !== undefined && isRandomUuid(diagnosticId) ? diagnosticId : undefined,
+    });
+  };
+
+  const recordUnexpectedException = (
+    error: unknown,
+    exceptionContext: SafeExceptionContext,
     diagnosticId?: string,
-  ): void => {
+  ): string | undefined => {
+    const snapshot = consent().getSnapshot();
+    if (!snapshot) return undefined;
     try {
-      if (!snapshot.enabled) return;
-      const safe = reconstructLog({
-        scope: "cc-router",
-        body,
-        severity,
-        timestampMs: dependencies.now(),
-        attributes,
-      }, {
+      const candidate = diagnosticId ?? uuid();
+      if (!isRandomUuid(candidate) || candidate === snapshot.state.installId) return undefined;
+      const exception = sanitize(error, exceptionContext, {
         installationId: snapshot.state.installId,
-        ...(diagnosticId === undefined ? {} : { diagnosticId }),
+        diagnosticId: candidate,
       });
-      if (safe) dependencies.emitLog(safe);
+      if (!exception) return undefined;
+      if (exceptionContext.category === "runtime") {
+        // Raw detail stays local; only the correlation key is exported.
+        console.error(
+          `[cc-router] Unexpected runtime failure (diagnostic ID: ${exception.diagnosticId})`,
+          error,
+        );
+      }
+      const client = analytics();
+      if (client) {
+        if (exceptionContext.category === "setup") {
+          trackImmediate(client.captureExceptionImmediate(exception, snapshot.state.consentGeneration));
+        } else {
+          client.captureException(exception, snapshot.state.consentGeneration);
+        }
+      }
+      return exception.diagnosticId;
     } catch {
-      // Remote logging is best effort only.
+      return undefined;
+    }
+  };
+
+  /** Neither flush nor shutdown may outlive its deadline or reject. */
+  const settleTelemetry = async (kind: "flush" | "shutdown", deadlineMs: number): Promise<void> => {
+    try {
+      if (!consent().getSnapshot()) {
+        try { activeAnalytics()?.discardPending(); } catch { /* isolated */ }
+      } else {
+        await settleWithin([...immediate], deadlineMs);
+      }
+      const client = activeAnalytics();
+      await Promise.all([
+        (kind === "flush" ? client?.flushWithin(deadlineMs) : client?.shutdownWithin(deadlineMs))
+          ?.catch(() => undefined),
+        (kind === "flush"
+          ? flushTelemetryRuntimeWithin(deadlineMs)
+          : shutdownTelemetryRuntimeWithin(deadlineMs)).catch(() => undefined),
+      ]);
+    } catch {
+      // Telemetry lifecycle failures never change application behavior.
     }
   };
 
   const setupProperties = (
     input: SetupOperationBase & { stage: SetupStage; reason?: SetupReason },
     extra: object = {},
-  ): object | undefined => {
-    const common = metadata();
-    if (!common) return undefined;
-    return { ...input, ...extra, ...common };
-  };
+  ): object => ({ ...input, ...extra, ...metadata() });
 
   return {
     recordApplicationStart(): void {
       try {
-        const current = enabledSnapshot();
-        const snapshot = dependencies.claimFirstStart();
-        const properties = current
-          && snapshot?.enabled
-          && current.state.installId === snapshot.state.installId
-          && current.state.consentGeneration === snapshot.state.consentGeneration
-          ? metadata()
-          : undefined;
-        if (snapshot && properties) {
-          captureAnalytics(snapshot, "app.first_start", properties, undefined, true);
-        }
+        const current = consent().getSnapshot();
+        const claimed = claimTelemetryFirstStart();
+        if (!current || !claimed?.enabled) return;
+        if (current.state.installId !== claimed.state.installId) return;
+        if (current.state.consentGeneration !== claimed.state.consentGeneration) return;
+        captureAnalytics(claimed, "app.first_start", metadata());
       } catch {
-        // First-start attribution is optional and never affects CLI startup.
+        // First-start attribution never affects CLI startup.
       }
     },
 
-    recordProxyStarted(accountCount): void {
-      const snapshot = enabledSnapshot();
-      const common = snapshot && metadata();
-      if (!snapshot || !common) return;
+    recordProxyStarted(accountCount: number): void {
+      const snapshot = consent().getSnapshot();
+      if (!snapshot) return;
       captureAnalytics(snapshot, "proxy.started", {
-        ...common,
+        ...metadata(),
         accountPoolSize: clampedAccountCount(accountCount),
       });
     },
 
-    startProxyHeartbeat(getAccountCount): void {
-      if (!enabledSnapshot()) return;
+    startProxyHeartbeat(getAccountCount: () => number): void {
+      if (!consent().getSnapshot()) return;
       try {
-        const timer = dependencies.setInterval(() => {
+        const timer = setInterval(() => {
           try {
-            const snapshot = enabledSnapshot();
-            const common = snapshot && metadata();
-            if (!snapshot || !common) return;
+            const snapshot = consent().getSnapshot();
+            if (!snapshot) return;
             captureAnalytics(snapshot, "proxy.heartbeat", {
-              ...common,
+              ...metadata(),
               accountPoolSize: clampedAccountCount(getAccountCount()),
             });
           } catch {
@@ -651,178 +699,107 @@ export function createTelemetryFacade(
       }
     },
 
-    recordSafeLog(input): void {
-      const snapshot = enabledSnapshot();
-      const common = snapshot && metadata();
-      if (!snapshot || !common) return;
-      emitLog(snapshot, "runtime.failure", input.severity, { ...input, ...common }, input.diagnosticId);
+    recordSafeLog,
+
+    recordUpstreamStatus(
+      operation: Operation,
+      provider: Provider,
+      httpStatusCode: number,
+      extra?: RuntimeFailureExtras,
+    ): void {
+      recordSafeLog({
+        operation,
+        provider,
+        severity: "warn",
+        reason: httpFailureReason(httpStatusCode),
+        outcome: httpOutcome(httpStatusCode),
+        httpStatusCode,
+        attempt: extra?.attempt,
+        operationDurationMs: extra?.durationMs,
+      });
     },
 
-    recordSetupStage(input): void {
-      const snapshot = enabledSnapshot();
-      const properties = snapshot && setupProperties(input);
-      if (!snapshot || !properties) return;
-      emitLog(snapshot, "account.setup.diagnostic", "info", properties, input.diagnosticId);
+    recordRuntimeError(
+      error: unknown,
+      errorContext: RuntimeErrorContext,
+      extra?: RuntimeFailureExtras,
+    ): void {
+      const expected = classifyExpectedRuntimeFailure(error);
+      if (!expected) {
+        recordUnexpectedException(error, {
+          category: "runtime",
+          reason: "other",
+          operation: errorContext.operation,
+          provider: errorContext.provider,
+          runtimeMode: runtimeMode(),
+        });
+        return;
+      }
+      recordSafeLog({
+        operation: errorContext.operation,
+        provider: errorContext.provider,
+        severity: "error",
+        reason: expected,
+        outcome: expected === "timeout" ? "timeout" : "other",
+        attempt: extra?.attempt,
+        operationDurationMs: extra?.durationMs,
+      });
+    },
+
+    recordUnexpectedException,
+
+    recordSetupStage(input: SetupStageInput): void {
+      const snapshot = consent().getSnapshot();
+      if (!snapshot) return;
+      const properties = setupProperties(input);
+      emitLog("account.setup.diagnostic", "info", properties);
       captureAnalytics(
         snapshot,
         input.stage === "attempt_start" ? "account_setup.started" : "account_setup.stage_completed",
         properties,
         input.diagnosticId,
-        true,
       );
     },
 
-    recordSetupStageFailure(input): void {
-      const snapshot = enabledSnapshot();
+    recordSetupStageFailure(input: ExpectedSetupFailureInput): void {
+      if (!consent().getSnapshot()) return;
       const outcome = expectedSetupFailureOutcome(input.reason);
-      const properties = snapshot && setupProperties(
+      emitLog("account.setup.diagnostic", "warn", setupProperties(
         input,
         outcome === undefined ? {} : { outcome },
-      );
-      if (!snapshot || !properties) return;
-      emitLog(snapshot, "account.setup.diagnostic", "warn", properties, input.diagnosticId);
+      ));
     },
 
-    recordSetupResult(input): void {
-      if (input.result !== "succeeded" && input.result !== "cancelled") return;
-      const snapshot = enabledSnapshot();
+    recordSetupResult(input: SetupResultInput): void {
+      const snapshot = consent().getSnapshot();
       if (!snapshot) return;
+      if (input.result !== "succeeded" && input.result !== "cancelled") return;
       const cancelled = input.result === "cancelled";
-      const stage: SetupStage = cancelled ? "cancellation" : "success";
-      const reason: SetupReason | undefined = cancelled ? "user_cancelled" : undefined;
-      const outcome: Outcome = cancelled ? "cancelled" : "complete";
-      const properties = setupProperties({ ...input, stage, reason }, { outcome });
-      if (!properties) return;
-      emitLog(snapshot, "account.setup.diagnostic", "info", properties, input.diagnosticId);
+      const properties = setupProperties({
+        ...input,
+        stage: cancelled ? "cancellation" : "success",
+        reason: cancelled ? "user_cancelled" : undefined,
+      }, { outcome: cancelled ? "cancelled" : "complete" });
+      emitLog("account.setup.diagnostic", "info", properties);
       captureAnalytics(
         snapshot,
         cancelled ? "account_setup.cancelled" : "account_setup.succeeded",
         properties,
         input.diagnosticId,
-        true,
       );
     },
 
-    recordExpectedSetupFailure(input): void {
-      const snapshot = enabledSnapshot();
+    recordExpectedSetupFailure(input: ExpectedSetupFailureInput): void {
+      const snapshot = consent().getSnapshot();
+      if (!snapshot) return;
       const outcome = expectedSetupFailureOutcome(input.reason);
-      const properties = snapshot && setupProperties(
-        input,
-        outcome === undefined ? {} : { outcome },
-      );
-      if (!snapshot || !properties) return;
-      emitLog(snapshot, "account.setup.diagnostic", "warn", properties, input.diagnosticId);
-      captureAnalytics(snapshot, "account_setup.failed", properties, input.diagnosticId, true);
+      const properties = setupProperties(input, outcome === undefined ? {} : { outcome });
+      emitLog("account.setup.diagnostic", "warn", properties);
+      captureAnalytics(snapshot, "account_setup.failed", properties, input.diagnosticId);
     },
 
-    recordUnexpectedException(error, context, diagnosticId): DiagnosticId | undefined {
-      const snapshot = enabledSnapshot();
-      if (!snapshot) return undefined;
-      try {
-        let candidate = diagnosticId ?? dependencies.randomUUID();
-        if (!isRandomUuid(candidate)) return undefined;
-        if (candidate === snapshot.state.installId && diagnosticId === undefined) {
-          candidate = dependencies.randomUUID();
-        }
-        if (!isRandomUuid(candidate) || candidate === snapshot.state.installId) return undefined;
-        const exception = dependencies.sanitizeException(error, context, {
-          installationId: snapshot.state.installId,
-          diagnosticId: candidate,
-        }, {
-          projectRoot: dependencies.projectRoot,
-        });
-        if (exception) {
-          if (context.category === "runtime") {
-            dependencies.reportRuntimeException(error, exception.diagnosticId);
-          }
-          const client = analytics();
-          if (client) {
-            if (context.category === "setup") {
-              trackImmediate(client.captureExceptionImmediate(
-                exception,
-                snapshot.state.consentGeneration,
-              ));
-            } else {
-              client.captureException(exception, snapshot.state.consentGeneration);
-            }
-          }
-        }
-        return exception?.diagnosticId;
-      } catch {
-        return undefined;
-      }
-    },
-
-    annotateActiveSpan(operation, attributes): void {
-      if (!enabledSnapshot()) return;
-      try {
-        const safe = reconstructedSpan(operation, attributes);
-        if (safe) dependencies.annotateSpan(safe.operation, safe.attributes);
-      } catch {
-        // Span enrichment is optional.
-      }
-    },
-
-    async flushTelemetryWithin(deadlineMs): Promise<void> {
-      try {
-        const startedAt = dependencies.now();
-        const remaining = (): number => Math.max(0, boundedDeadline(deadlineMs)
-          - Math.max(0, dependencies.now() - startedAt));
-        const snapshot = enabledSnapshot();
-        if (!snapshot) {
-          try { activeAnalytics?.discardPending(); } catch { /* isolated */ }
-          await dependencies.flushRuntime(remaining()).catch(() => undefined);
-          return;
-        }
-        await settleWithin([...immediateOperations], remaining());
-        await Promise.all([
-          activeAnalytics?.flushWithin(remaining()).catch(() => undefined),
-          dependencies.flushRuntime(remaining()).catch(() => undefined),
-        ]);
-      } catch {
-        // A flush failure never changes the command result.
-      }
-    },
-
-    async handoffCliTelemetryToProxyWithin(deadlineMs): Promise<void> {
-      try {
-        const startedAt = dependencies.now();
-        const remaining = (): number => Math.max(0, boundedDeadline(deadlineMs)
-          - Math.max(0, dependencies.now() - startedAt));
-        const snapshot = enabledSnapshot();
-        if (!snapshot) {
-          try { activeAnalytics?.discardPending(); } catch { /* isolated */ }
-        } else {
-          await settleWithin([...immediateOperations], remaining());
-        }
-        await Promise.all([
-          snapshot ? activeAnalytics?.flushWithin(remaining()).catch(() => undefined) : undefined,
-          dependencies.handoffRuntime(remaining()).catch(() => undefined),
-        ]);
-      } catch {
-        // A handoff failure never prevents the proxy boundary from starting.
-      }
-    },
-
-    async shutdownTelemetryWithin(deadlineMs): Promise<void> {
-      try {
-        const startedAt = dependencies.now();
-        const remaining = (): number => Math.max(0, boundedDeadline(deadlineMs)
-          - Math.max(0, dependencies.now() - startedAt));
-        const snapshot = enabledSnapshot();
-        if (!snapshot) {
-          try { activeAnalytics?.discardPending(); } catch { /* isolated */ }
-        } else {
-          await settleWithin([...immediateOperations], remaining());
-        }
-        await Promise.all([
-          activeAnalytics?.shutdownWithin(remaining()).catch(() => undefined),
-          dependencies.shutdownRuntime(remaining()).catch(() => undefined),
-        ]);
-      } catch {
-        // A shutdown failure never changes proxy lifecycle behavior.
-      }
-    },
+    flushTelemetryWithin: (deadlineMs: number) => settleTelemetry("flush", deadlineMs),
+    shutdownTelemetryWithin: (deadlineMs: number) => settleTelemetry("shutdown", deadlineMs),
   };
 }
 
@@ -832,12 +809,12 @@ export const recordApplicationStart = telemetry.recordApplicationStart;
 export const recordProxyStarted = telemetry.recordProxyStarted;
 export const startProxyHeartbeat = telemetry.startProxyHeartbeat;
 export const recordSafeLog = telemetry.recordSafeLog;
+export const recordUpstreamStatus = telemetry.recordUpstreamStatus;
+export const recordRuntimeError = telemetry.recordRuntimeError;
+export const recordUnexpectedException = telemetry.recordUnexpectedException;
 export const recordSetupStage = telemetry.recordSetupStage;
 export const recordSetupStageFailure = telemetry.recordSetupStageFailure;
 export const recordSetupResult = telemetry.recordSetupResult;
 export const recordExpectedSetupFailure = telemetry.recordExpectedSetupFailure;
-export const recordUnexpectedException = telemetry.recordUnexpectedException;
-export const annotateActiveSpan = telemetry.annotateActiveSpan;
 export const flushTelemetryWithin = telemetry.flushTelemetryWithin;
-export const handoffCliTelemetryToProxyWithin = telemetry.handoffCliTelemetryToProxyWithin;
 export const shutdownTelemetryWithin = telemetry.shutdownTelemetryWithin;

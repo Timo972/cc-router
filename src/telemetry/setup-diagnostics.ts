@@ -1,11 +1,5 @@
-import { randomUUID as nodeRandomUUID } from "node:crypto";
-import type {
-  DiagnosticId,
-  SafeExceptionContext,
-  SetupMethod,
-  SetupReason,
-  SetupStage,
-} from "./contracts.js";
+import { randomUUID } from "node:crypto";
+import type { SetupMethod, SetupReason, SetupStage } from "./contracts.js";
 import {
   flushTelemetryWithin,
   recordExpectedSetupFailure,
@@ -14,33 +8,10 @@ import {
   recordSetupStageFailure,
   recordUnexpectedException,
   type ExpectedSetupFailureInput,
-  type SetupResultInput,
   type SetupStageInput,
 } from "./facade.js";
 
 export type SetupDiagnosticProvider = "anthropic" | "openai";
-
-/** Exact stages that production can complete for each successful setup path. */
-export const SETUP_SUCCESS_STAGE_SEQUENCES = {
-  anthropic: {
-    macos_keychain: [
-      "credential_source_selection", "credential_read", "credential_parse", "token_validation", "persistence",
-    ],
-    claude_credentials_file: [
-      "credential_source_selection", "credential_read", "credential_parse", "token_validation", "persistence",
-    ],
-    manual_token: [
-      "credential_source_selection", "credential_read", "credential_parse", "token_validation", "persistence",
-    ],
-  },
-  openai: {
-    manual_token: ["credential_source_selection", "credential_read", "credential_parse", "persistence"],
-    device_oauth: [
-      "credential_source_selection", "device_code_request", "authorization_polling", "token_exchange",
-      "access_token_parse", "persistence",
-    ],
-  },
-} as const satisfies Record<SetupDiagnosticProvider, Partial<Record<SetupMethod, readonly SetupStage[]>>>;
 
 export interface SetupFailureClassification {
   stage: SetupStage;
@@ -172,49 +143,9 @@ export function classifyNetworkSetupFailure(
   }, { cause });
 }
 
-export function classifyAccountStateReadFailure(
-  error: { kind: "malformed_json" | "invalid_shape" | "permission_denied" | "read_failure"; message: string },
-): SetupDiagnosticError {
-  const reason: SetupReason = error.kind === "malformed_json" || error.kind === "invalid_shape"
-    ? "malformed_credentials"
-    : error.kind === "permission_denied"
-      ? "permission_denied"
-      : "other";
-  return new SetupDiagnosticError(error.message, {
-    stage: "persistence",
-    reason,
-    expected: false,
-  }, { cause: error });
-}
-
-export interface SetupDiagnosticRecorder {
-  recordSetupStage(input: SetupStageInput): void;
-  recordSetupStageFailure(input: ExpectedSetupFailureInput): void;
-  recordSetupResult(input: SetupResultInput): void;
-  recordExpectedSetupFailure(input: ExpectedSetupFailureInput): void;
-  recordUnexpectedException(
-    error: unknown,
-    context: SafeExceptionContext,
-    diagnosticId?: string,
-  ): DiagnosticId | undefined;
-  flushTelemetryWithin(deadlineMs: number): Promise<void>;
-}
-
-const defaultRecorder: SetupDiagnosticRecorder = {
-  recordSetupStage,
-  recordSetupStageFailure,
-  recordSetupResult,
-  recordExpectedSetupFailure,
-  recordUnexpectedException,
-  flushTelemetryWithin,
-};
-
 export interface CreateSetupAttemptInput {
   provider: SetupDiagnosticProvider;
   method: SetupMethod;
-  recorder?: SetupDiagnosticRecorder;
-  randomUUID?: () => string;
-  now?: () => number;
 }
 
 export interface SetupFailureOutcome {
@@ -241,27 +172,16 @@ function durationBucket(durationMs: number): SetupStageInput["durationBucket"] {
   return "over_2m";
 }
 
-function validDiagnosticId(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
-}
-
 export function createSetupAttempt(input: CreateSetupAttemptInput): SetupAttempt {
-  const recorder = input.recorder ?? defaultRecorder;
-  const now = input.now ?? Date.now;
-  const startedAt = now();
-  const candidate = (input.randomUUID ?? nodeRandomUUID)();
-  const diagnosticId = validDiagnosticId(candidate) ? candidate : nodeRandomUUID();
-  const base = {
-    provider: input.provider,
-    method: input.method,
-    diagnosticId,
-  };
+  const startedAt = Date.now();
+  const diagnosticId = randomUUID();
+  const base = { provider: input.provider, method: input.method, diagnosticId };
   const withDuration = () => ({
     ...base,
-    durationBucket: durationBucket(Math.max(0, now() - startedAt)),
+    durationBucket: durationBucket(Math.max(0, Date.now() - startedAt)),
   });
 
-  recorder.recordSetupStage({ ...withDuration(), stage: "attempt_start" });
+  recordSetupStage({ ...withDuration(), stage: "attempt_start" });
 
   let terminal = false;
   const classify = (error: unknown, fallbackStage: SetupStage): SetupFailureClassification =>
@@ -281,7 +201,7 @@ export function createSetupAttempt(input: CreateSetupAttemptInput): SetupAttempt
     const exceptionCause = error instanceof SetupDiagnosticError && error.cause !== undefined
       ? error.cause
       : error;
-    recorder.recordUnexpectedException(exceptionCause, {
+    recordUnexpectedException(exceptionCause, {
       category: "setup",
       provider: input.provider,
       setupStage: classification.stage,
@@ -293,12 +213,12 @@ export function createSetupAttempt(input: CreateSetupAttemptInput): SetupAttempt
     ...base,
     stageCompleted(stage): void {
       if (terminal) return;
-      recorder.recordSetupStage({ ...withDuration(), stage });
+      recordSetupStage({ ...withDuration(), stage });
     },
     stageFailed(error, fallbackStage): SetupFailureOutcome {
       const classification = classify(error, fallbackStage);
       if (!terminal) {
-        recorder.recordSetupStageFailure(failureInput(classification));
+        recordSetupStageFailure(failureInput(classification));
         recordException(error, classification);
       }
       return { diagnosticId, unexpected: !classification.expected };
@@ -307,7 +227,7 @@ export function createSetupAttempt(input: CreateSetupAttemptInput): SetupAttempt
       const classification = classify(error, fallbackStage);
       if (!terminal) {
         terminal = true;
-        recorder.recordExpectedSetupFailure(failureInput(classification));
+        recordExpectedSetupFailure(failureInput(classification));
         recordException(error, classification);
       }
       return { diagnosticId, unexpected: !classification.expected };
@@ -315,44 +235,20 @@ export function createSetupAttempt(input: CreateSetupAttemptInput): SetupAttempt
     cancelled(): void {
       if (terminal) return;
       terminal = true;
-      recorder.recordSetupResult({ ...withDuration(), result: "cancelled" });
+      recordSetupResult({ ...withDuration(), result: "cancelled" });
     },
     succeeded(): void {
       if (terminal) return;
       terminal = true;
-      recorder.recordSetupResult({ ...withDuration(), result: "succeeded" });
+      recordSetupResult({ ...withDuration(), result: "succeeded" });
     },
   };
 }
 
-export async function persistSetupAttempts(
-  attempts: readonly SetupAttempt[],
-  persist: () => void | Promise<void>,
-): Promise<void> {
-  try {
-    await persist();
-  } catch (cause) {
-    const detail = cause instanceof Error ? cause.message : String(cause);
-    const error = new SetupDiagnosticError(`Account persistence failed: ${detail}`, {
-      stage: "persistence",
-      reason: "persistence_failure",
-      expected: false,
-    }, { cause });
-    for (const attempt of attempts) attempt.failed(error, "persistence");
-    throw error;
-  }
-  for (const attempt of attempts) {
-    attempt.stageCompleted("persistence");
-    attempt.succeeded();
-  }
-}
-
 export const SETUP_TELEMETRY_FLUSH_DEADLINE_MS = 1_500;
 
-export async function withSetupTelemetryFlush<T>(
-  operation: () => Promise<T>,
-  flush: (deadlineMs: number) => Promise<void> = flushTelemetryWithin,
-): Promise<T> {
+/** Never let a bounded telemetry flush change or delay a command result. */
+export async function withSetupTelemetryFlush<T>(operation: () => Promise<T>): Promise<T> {
   try {
     return await operation();
   } finally {
@@ -366,7 +262,7 @@ export async function withSetupTelemetryFlush<T>(
       };
       const timer = setTimeout(finish, SETUP_TELEMETRY_FLUSH_DEADLINE_MS);
       void Promise.resolve()
-        .then(() => flush(SETUP_TELEMETRY_FLUSH_DEADLINE_MS))
+        .then(() => flushTelemetryWithin(SETUP_TELEMETRY_FLUSH_DEADLINE_MS))
         .then(finish, finish);
     });
   }

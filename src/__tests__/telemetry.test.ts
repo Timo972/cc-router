@@ -1,1166 +1,414 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import * as fs from "fs";
+import { EventEmitter } from "node:events";
+import { context, propagation, trace } from "@opentelemetry/api";
+import { logs } from "@opentelemetry/api-logs";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import {
+  InMemoryLogRecordExporter,
+  LoggerProvider,
+  SimpleLogRecordProcessor,
+} from "@opentelemetry/sdk-logs";
+import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import type { Request, Response } from "express";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { TelemetrySnapshot } from "../config/telemetry.js";
+import type { PostHogTelemetryClient } from "../telemetry/posthog-client.js";
 
-// ─── Isolated temp directory for every run ───────────────────────────────────
-const MOCK_DIR = vi.hoisted(() => {
-  const tmp = process.env["TMPDIR"] ?? process.env["TEMP"] ?? "/tmp";
-  return `${tmp}/cc-router-telemetry-${Date.now()}-${Math.floor(Math.random() * 10_000)}`;
-});
+const INSTALL_ID = "123e4567-e89b-42d3-a456-426614174000";
+const DIAGNOSTIC_ID = "123e4567-e89b-42d3-a456-426614174001";
+const CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174010";
+const NEXT_CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174011";
 
-vi.mock("../config/paths.js", () => ({
-  CONFIG_DIR: MOCK_DIR,
-  TELEMETRY_PATH: `${MOCK_DIR}/telemetry.json`,
-  ACCOUNTS_PATH: `${MOCK_DIR}/accounts.json`,
-  CLAUDE_SETTINGS_PATH: `${MOCK_DIR}/settings.json`,
-  CONFIG_PATH: `${MOCK_DIR}/config.json`,
-  PROXY_PORT: 3456,
-  LITELLM_PORT: 4000,
-  LITELLM_URL: undefined,
+function snapshotOf(enabled = true, consentGeneration = CONSENT_GENERATION): TelemetrySnapshot {
+  const state = {
+    enabled,
+    installId: INSTALL_ID,
+    firstRunAt: "2026-08-01T00:00:00.000Z",
+    consentGeneration,
+    revision: 0,
+  };
+  return { state, environmentDisabled: false, enabled };
+}
+
+const shared = vi.hoisted(() => ({
+  snapshot: undefined as unknown,
+  claimed: undefined as unknown,
+  runtimeStarts: [] as unknown[],
+  runtimeFlushes: [] as number[],
+  runtimeShutdowns: [] as number[],
 }));
 
-import {
-  loadTelemetryState,
-  writeTelemetryState,
-  updateTelemetryConsent,
-  getTelemetrySnapshot,
-  isTelemetryEnabled,
-  claimTelemetryFirstStart,
-  createTelemetryConsentGate,
-  type TelemetryState,
-} from "../config/telemetry.js";
+vi.mock("../config/telemetry.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../config/telemetry.js")>(),
+  getTelemetrySnapshot: () => shared.snapshot,
+  claimTelemetryFirstStart: () => {
+    const claimed = shared.claimed;
+    shared.claimed = undefined;
+    return claimed;
+  },
+}));
+
+vi.mock("../telemetry/runtime.js", () => ({
+  startTelemetryRuntime: (options: unknown) => shared.runtimeStarts.push(options) > 0,
+  isTelemetryRuntimeActive: () => shared.runtimeStarts.length > 0,
+  flushTelemetryRuntimeWithin: async (ms: number) => { shared.runtimeFlushes.push(ms); },
+  shutdownTelemetryRuntimeWithin: async (ms: number) => { shared.runtimeShutdowns.push(ms); },
+  noopPropagator: { inject: () => undefined, extract: (value: unknown) => value, fields: () => [] },
+}));
+
+const {
+  annotateActiveSpan,
+  createTelemetryFacade,
+  httpFailureReason,
+  httpOutcome,
+  modelFamilyOf,
+  runtimeMode,
+  startTelemetrySpan,
+  telemetryRequestMiddleware,
+  withTelemetrySpan,
+} = await import("../telemetry/facade.js");
+
+type CapturedEvent = { event: string; properties: Record<string, unknown>; distinctId?: string };
+type CapturedException = { error: Error; diagnosticId: string };
+
+function analyticsStub() {
+  const events: CapturedEvent[] = [];
+  const exceptions: CapturedException[] = [];
+  const calls = { flush: 0, shutdown: 0, discard: 0 };
+  const capture = (value: unknown): void => { exceptions.push(value as CapturedException); };
+  const client = {
+    captureAnalytics: (event: unknown) => { events.push(event as CapturedEvent); },
+    // TEMP(A2): the donor client still declares captureAnalyticsImmediate.
+    captureAnalyticsImmediate: async () => expect.unreachable("analytics are queued"),
+    captureException: capture,
+    captureExceptionImmediate: async (value: unknown) => capture(value),
+    flushWithin: async () => { calls.flush += 1; },
+    shutdownWithin: async () => { calls.shutdown += 1; },
+    discardPending: () => { calls.discard += 1; },
+  } as unknown as PostHogTelemetryClient;
+  return { client, events, exceptions, calls };
+}
+
+const spanExporter = new InMemorySpanExporter();
+const logExporter = new InMemoryLogRecordExporter();
+
+function recordedSpans() {
+  return spanExporter.getFinishedSpans()
+    .map(span => ({ name: span.name, attributes: span.attributes, status: span.status.code }));
+}
+
+function recordedLogs() {
+  return logExporter.getFinishedLogRecords().map(record =>
+    ({ body: record.body, severityText: record.severityText, attributes: record.attributes }));
+}
+
+let analytics: ReturnType<typeof analyticsStub>;
+
+function facadeFor(snapshot: () => TelemetrySnapshot) {
+  return createTelemetryFacade({
+    getSnapshot: snapshot,
+    analytics: analytics.client,
+    now: () => 1_800_000_000_000,
+    randomUUID: () => DIAGNOSTIC_ID,
+  });
+}
 
 beforeEach(() => {
-  fs.mkdirSync(MOCK_DIR, { recursive: true });
-  // Reset env vars
-  delete process.env["DO_NOT_TRACK"];
-  delete process.env["CC_ROUTER_TELEMETRY"];
+  Object.assign(shared, {
+    snapshot: snapshotOf(),
+    claimed: undefined,
+    runtimeStarts: [],
+    runtimeFlushes: [],
+    runtimeShutdowns: [],
+  });
+  analytics = analyticsStub();
+  // An explicit resource keeps span and log export synchronous in tests.
+  const resource = resourceFromAttributes({ "service.name": "cc-router" });
+  new NodeTracerProvider({ resource, spanProcessors: [new SimpleSpanProcessor(spanExporter)] })
+    .register();
+  logs.setGlobalLoggerProvider(new LoggerProvider({
+    resource,
+    processors: [new SimpleLogRecordProcessor({ exporter: logExporter })],
+  }));
 });
 
 afterEach(() => {
-  fs.rmSync(MOCK_DIR, { recursive: true, force: true });
-  delete process.env["DO_NOT_TRACK"];
-  delete process.env["CC_ROUTER_TELEMETRY"];
+  spanExporter.reset();
+  logExporter.reset();
+  for (const api of [trace, context, propagation, logs]) api.disable();
+  vi.restoreAllMocks();
 });
 
-// ─── TelemetryState persistence ──────────────────────────────────────────────
-
-describe("loadTelemetryState", () => {
-  it("creates fresh state with UUID and persists on first call", () => {
-    const state = loadTelemetryState();
-    expect(state.enabled).toBe(true);
-    expect((state as TelemetryState & { revision?: unknown }).revision).toBe(0);
-    expect(state.consentGeneration).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
-    );
-    expect(state.installId).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
-    );
-    expect(new Date(state.firstRunAt).getTime()).toBeGreaterThan(0);
-
-    // Was persisted to disk
-    const onDisk = JSON.parse(
-      fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"),
-    ) as TelemetryState;
-    expect(onDisk.installId).toBe(state.installId);
+describe("telemetry facade", () => {
+  it("exposes only closed recording operations", () => {
+    expect(Object.keys(facadeFor(snapshotOf)).sort().join(" ")).toBe([
+      "flushTelemetryWithin recordApplicationStart recordExpectedSetupFailure recordProxyStarted",
+      "recordRuntimeError recordSafeLog recordSetupResult recordSetupStage recordSetupStageFailure",
+      "recordUnexpectedException recordUpstreamStatus shutdownTelemetryWithin startProxyHeartbeat",
+    ].join(" "));
   });
 
-  it("returns the same installId on subsequent calls", () => {
-    const first = loadTelemetryState();
-    const second = loadTelemetryState();
-    expect(second.installId).toBe(first.installId);
-  });
+  it("makes every capture a no-op while telemetry is disabled", () => {
+    shared.snapshot = snapshotOf(false);
+    const facade = facadeFor(() => snapshotOf(false));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-  it("lets only the process that creates fresh state claim first start once", () => {
-    const created = loadTelemetryState();
-
-    expect(claimTelemetryFirstStart()?.state.installId).toBe(created.installId);
-    expect(claimTelemetryFirstStart()).toBeUndefined();
-
-    fs.rmSync(MOCK_DIR, { recursive: true, force: true });
-    fs.mkdirSync(MOCK_DIR, { recursive: true });
-    loadTelemetryState();
-    expect(claimTelemetryFirstStart()).toBeUndefined();
-
-    fs.rmSync(MOCK_DIR, { recursive: true, force: true });
-    fs.mkdirSync(MOCK_DIR, { recursive: true });
-    writeTelemetryState({
-      enabled: true,
-      installId: "existing-install-id",
-      firstRunAt: "2026-01-01T00:00:00.000Z",
-    });
-    expect(loadTelemetryState().installId).toBe("existing-install-id");
-    expect(claimTelemetryFirstStart()).toBeUndefined();
-  });
-
-  it("recovers from corrupted JSON", () => {
-    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, "NOT_JSON{}", "utf-8");
-    const state = loadTelemetryState();
-    expect(state.enabled).toBe(true);
-    expect(state.installId).toBeDefined();
-  });
-
-  it("normalizes a legacy state without rewriting it or replacing its install identity", () => {
-    const legacy = {
-      installId: "existing-install-id",
-      firstRunAt: "2026-01-01T00:00:00.000Z",
-    };
-    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, JSON.stringify(legacy), "utf-8");
-
-    expect(loadTelemetryState()).toEqual({
-      enabled: true,
-      installId: "existing-install-id",
-      firstRunAt: "2026-01-01T00:00:00.000Z",
-      consentGeneration: expect.stringMatching(
-        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
-      ),
-      revision: 0,
-    });
-    expect(JSON.parse(fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"))).toEqual(legacy);
-  });
-
-  it.each([true, false])("preserves a persisted enabled value of %s", (enabled) => {
-    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, JSON.stringify({
-      enabled,
-      installId: "existing-install-id",
-      firstRunAt: "2026-01-01T00:00:00.000Z",
-    }), "utf-8");
-
-    expect(loadTelemetryState().enabled).toBe(enabled);
-  });
-
-  it("atomically rewrites every missing state field", () => {
-    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, "{}", "utf-8");
-
-    const state = loadTelemetryState();
-
-    expect(state.enabled).toBe(true);
-    expect(state.installId).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
-    );
-    expect(new Date(state.firstRunAt).getTime()).toBeGreaterThan(0);
-    expect(JSON.parse(fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"))).toEqual(state);
-    expect(fs.existsSync(`${MOCK_DIR}/telemetry.json.tmp`)).toBe(false);
-  });
-});
-
-describe("writeTelemetryState", () => {
-  it("atomically writes state", () => {
-    const state: TelemetryState = {
-      enabled: false,
-      installId: "test-uuid",
-      firstRunAt: "2026-01-01T00:00:00.000Z",
-      consentGeneration: "123e4567-e89b-42d3-a456-426614174020",
-      revision: 0,
-    };
-    writeTelemetryState(state);
-    const raw = JSON.parse(
-      fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"),
-    ) as TelemetryState;
-    expect(raw).toEqual(state);
-    // .tmp was cleaned up (rename replaces)
-    expect(fs.existsSync(`${MOCK_DIR}/telemetry.json.tmp`)).toBe(false);
-  });
-
-  it("creates a unique generation for every explicit choice, including repeats", () => {
-    const first = updateTelemetryConsent(false);
-    const second = updateTelemetryConsent(false);
-    const third = updateTelemetryConsent(true);
-
-    expect([first.revision, second.revision, third.revision]).toEqual([1, 2, 3]);
-    expect(new Set([
-      first.consentGeneration,
-      second.consentGeneration,
-      third.consentGeneration,
-    ]).size).toBe(3);
-    expect(loadTelemetryState()).toEqual(third);
-    expect(fs.existsSync(`${MOCK_DIR}/telemetry.json.lock`)).toBe(false);
-  });
-});
-
-// ─── Effective telemetry enablement ──────────────────────────────────────────
-
-describe("isTelemetryEnabled", () => {
-  it("returns true for fresh persisted state", () => {
-    expect(isTelemetryEnabled()).toBe(true);
-  });
-
-  it("lets DO_NOT_TRACK=1 disable a persisted opt-in", () => {
-    writeTelemetryState({
-      enabled: true,
-      installId: "existing-install-id",
-      firstRunAt: "2026-01-01T00:00:00.000Z",
-    });
-    process.env["DO_NOT_TRACK"] = "1";
-    expect(isTelemetryEnabled()).toBe(false);
-  });
-
-  it("lets CC_ROUTER_TELEMETRY=0 disable a persisted opt-in", () => {
-    writeTelemetryState({
-      enabled: true,
-      installId: "existing-install-id",
-      firstRunAt: "2026-01-01T00:00:00.000Z",
-    });
-    process.env["CC_ROUTER_TELEMETRY"] = "0";
-    expect(isTelemetryEnabled()).toBe(false);
-  });
-
-  it("does not let non-kill-switch environment values override a persisted opt-out", () => {
-    writeTelemetryState({
-      enabled: false,
-      installId: "existing-install-id",
-      firstRunAt: "2026-01-01T00:00:00.000Z",
-    });
-    process.env["DO_NOT_TRACK"] = "0";
-    process.env["CC_ROUTER_TELEMETRY"] = "1";
-
-    expect(isTelemetryEnabled()).toBe(false);
-  });
-});
-
-describe("getTelemetrySnapshot", () => {
-  it("returns the persisted state with the authoritative effective value", () => {
-    writeTelemetryState({
-      enabled: true,
-      installId: "existing-install-id",
-      firstRunAt: "2026-01-01T00:00:00.000Z",
-    });
-    process.env["DO_NOT_TRACK"] = "1";
-
-    expect(getTelemetrySnapshot()).toEqual({
-      state: {
-        enabled: true,
-        installId: "existing-install-id",
-        firstRunAt: "2026-01-01T00:00:00.000Z",
-        consentGeneration: expect.stringMatching(
-          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
-        ),
-        revision: 0,
-      },
-      environmentDisabled: true,
-      enabled: false,
-    });
-  });
-
-  it.each([
-    ["invalid string", "not-a-consent-generation"],
-    ["null", null],
-    ["non-string type", 42],
-    ["wrong UUID version", "123e4567-e89b-12d3-a456-426614174010"],
-    ["wrong UUID variant", "123e4567-e89b-42d3-7456-426614174010"],
-  ] as const)("fails closed for a present %s consent generation", (_label, consentGeneration) => {
-    const malformed = {
-      enabled: true,
-      installId: "123e4567-e89b-42d3-a456-426614174000",
-      firstRunAt: "2026-08-11T12:00:00.000Z",
-      consentGeneration,
-      revision: 7,
-    };
-    fs.writeFileSync(`${MOCK_DIR}/telemetry.json`, JSON.stringify(malformed), "utf-8");
-
-    expect(() => getTelemetrySnapshot()).toThrow("Telemetry state is malformed");
-    expect(isTelemetryEnabled()).toBe(false);
-    expect(JSON.parse(fs.readFileSync(`${MOCK_DIR}/telemetry.json`, "utf-8"))).toEqual(malformed);
-  });
-
-  it("contains malformed-generation errors and latches off across invalid value changes", () => {
-    const malformed = (consentGeneration: string) => ({
-      enabled: true,
-      installId: "123e4567-e89b-42d3-a456-426614174000",
-      firstRunAt: "2026-08-11T12:00:00.000Z",
-      consentGeneration,
-      revision: 7,
-    });
-    fs.writeFileSync(
-      `${MOCK_DIR}/telemetry.json`,
-      JSON.stringify(malformed("invalid-generation-a")),
-      "utf-8",
-    );
-
-    const gate = createTelemetryConsentGate(getTelemetrySnapshot);
-    expect(gate.acceptedGeneration).toBeUndefined();
-    expect(gate.latchedDisabled).toBe(true);
-
-    fs.writeFileSync(
-      `${MOCK_DIR}/telemetry.json`,
-      JSON.stringify(malformed("invalid-generation-b")),
-      "utf-8",
-    );
-    expect(() => gate.getSnapshot()).not.toThrow();
-    expect(gate.getSnapshot()).toBeUndefined();
-    expect(gate.latchedDisabled).toBe(true);
-  });
-});
-
-// Typed application facade
-
-describe("typed telemetry facade", () => {
-  const INSTALL_ID = "123e4567-e89b-42d3-a456-426614174000";
-  const DIAGNOSTIC_ID = "123e4567-e89b-42d3-a456-426614174001";
-  const CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174010";
-  const NEXT_CONSENT_GENERATION = "123e4567-e89b-42d3-a456-426614174011";
-
-  function snapshot(enabled = true, consentGeneration = CONSENT_GENERATION, revision = 0) {
-    return {
-      state: {
-        enabled,
-        installId: INSTALL_ID,
-        firstRunAt: "2026-08-11T12:00:00.000Z",
-        consentGeneration,
-        revision,
-      },
-      environmentDisabled: false,
-      enabled,
-    };
-  }
-
-  it("exposes named operations without a generic event or property escape hatch", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(false),
-      claimFirstStart: () => undefined,
-    });
-
-    expect(Object.keys(facade).sort()).toEqual([
-      "annotateActiveSpan",
-      "flushTelemetryWithin",
-      "handoffCliTelemetryToProxyWithin",
-      "recordApplicationStart",
-      "recordExpectedSetupFailure",
-      "recordProxyStarted",
-      "recordSafeLog",
-      "recordSetupResult",
-      "recordSetupStage",
-      "recordSetupStageFailure",
-      "recordUnexpectedException",
-      "shutdownTelemetryWithin",
-      "startProxyHeartbeat",
-    ]);
-    expect(facade).not.toHaveProperty("trackEvent");
-    expect(facade).not.toHaveProperty("capture");
-    expect(facade).not.toHaveProperty("telemetryDisabled");
-  });
-
-  it("makes every disabled capture a synchronous no-op", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    let dependencyCalls = 0;
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(false),
-      claimFirstStart: () => undefined,
-      getAnalytics: () => {
-        dependencyCalls += 1;
-        throw new Error("must not initialize");
-      },
-      emitLog: () => { dependencyCalls += 1; },
-      annotateSpan: () => { dependencyCalls += 1; },
-      setInterval: () => {
-        dependencyCalls += 1;
-        throw new Error("must not schedule");
-      },
-    });
-
-    expect(facade.recordApplicationStart()).toBeUndefined();
-    expect(facade.recordProxyStarted(4)).toBeUndefined();
-    expect(facade.startProxyHeartbeat(() => 4)).toBeUndefined();
-    expect(facade.recordSafeLog({
-      operation: "proxy.request",
-      reason: "network_failure",
-      severity: "warn",
-    })).toBeUndefined();
-    expect(facade.recordSetupStage({
-      provider: "openai",
-      method: "device_oauth",
-      stage: "token_exchange",
+    facade.recordApplicationStart();
+    facade.recordProxyStarted(4);
+    facade.startProxyHeartbeat(() => 4);
+    facade.recordSafeLog({ operation: "proxy.request", reason: "timeout", severity: "warn" });
+    facade.recordUpstreamStatus("provider.inference", "openai", 503);
+    facade.recordRuntimeError(new Error("private"), { operation: "provider.inference" });
+    facade.recordSetupStage({
+      provider: "openai", method: "device_oauth", stage: "token_exchange",
       diagnosticId: DIAGNOSTIC_ID,
-    })).toBeUndefined();
-    expect(facade.recordSetupResult({
-      provider: "openai",
-      method: "device_oauth",
-      result: "succeeded",
-      diagnosticId: DIAGNOSTIC_ID,
-    })).toBeUndefined();
-    expect(facade.recordSetupStageFailure({
-      provider: "openai",
-      method: "device_oauth",
-      stage: "token_exchange",
-      reason: "unexpected_response_shape",
-      diagnosticId: DIAGNOSTIC_ID,
-    })).toBeUndefined();
-    expect(facade.recordExpectedSetupFailure({
-      provider: "openai",
-      method: "device_oauth",
-      stage: "token_exchange",
-      reason: "unauthorized",
-      diagnosticId: DIAGNOSTIC_ID,
-    })).toBeUndefined();
+    });
     expect(facade.recordUnexpectedException(new Error("private"), {
-      category: "runtime",
-      reason: "other",
+      category: "runtime", reason: "other",
     })).toBeUndefined();
-    expect(facade.annotateActiveSpan("proxy.request", { provider: "openai" })).toBeUndefined();
-    expect(dependencyCalls).toBe(0);
+    startTelemetrySpan("provider.inference", { provider: "openai" }).end("ok");
+
+    expect(analytics.events).toEqual([]);
+    expect(analytics.exceptions).toEqual([]);
+    expect(recordedLogs()).toEqual([]);
+    expect(recordedSpans()).toEqual([]);
+    expect(consoleError).not.toHaveBeenCalled();
+    expect(shared.runtimeStarts).toEqual([]);
   });
 
-  it("emits first start once only when this process created fresh state", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    const events: Array<{ event: string; properties: object }> = [];
-    let claim: ReturnType<typeof snapshot> | undefined = snapshot();
-    const analytics = {
-      captureAnalytics: (event: { event: string; properties: object }) => { events.push(event); },
-      captureAnalyticsImmediate: async (event: { event: string; properties: object }) => { events.push(event); },
-      captureException: () => undefined,
-      captureExceptionImmediate: async () => undefined,
-      flushWithin: async () => undefined,
-      shutdownWithin: async () => undefined,
-      discardPending: () => undefined,
-    };
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => {
-        const claimed = claim;
-        claim = undefined;
-        return claimed;
-      },
-      runtimeMetadata: () => ({
-        serviceVersion: "0.8.2",
-        osFamily: "linux",
-        runtimeMode: "foreground",
-      }),
-      getAnalytics: () => analytics,
-    });
-
+  it("claims app.first_start once, and only for this consent generation", () => {
+    shared.claimed = snapshotOf();
+    const facade = facadeFor(snapshotOf);
     facade.recordApplicationStart();
     facade.recordApplicationStart();
 
-    expect(events).toEqual([{
-      event: "app.first_start",
-      properties: {
-        serviceVersion: "0.8.2",
-        osFamily: "linux",
-        runtimeMode: "foreground",
-      },
-      distinctId: INSTALL_ID,
-      processPersonProfile: false,
-      disableGeoip: true,
-    }]);
+    shared.claimed = snapshotOf(true, NEXT_CONSENT_GENERATION);
+    facadeFor(snapshotOf).recordApplicationStart();
 
-    const nonCreatorEvents: unknown[] = [];
-    createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => undefined,
-      getAnalytics: () => ({
-        ...analytics,
-        captureAnalyticsImmediate: async event => { nonCreatorEvents.push(event); },
-      }),
-    }).recordApplicationStart();
-    expect(nonCreatorEvents).toEqual([]);
+    expect(analytics.events.map(event => event.event)).toEqual(["app.first_start"]);
+    expect(analytics.events[0]?.distinctId).toBe(INSTALL_ID);
+    expect(analytics.events[0]?.properties).toEqual({
+      serviceVersion: expect.any(String),
+      osFamily: expect.any(String),
+      runtimeMode: "foreground",
+    });
   });
 
-  it("loads state before claiming first start on a non-proxy CLI invocation", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    let stateLoaded = false;
-    const events: string[] = [];
-    const facade = createTelemetryFacade({
-      getSnapshot: () => {
-        stateLoaded = true;
-        return snapshot();
-      },
-      claimFirstStart: () => stateLoaded ? snapshot() : undefined,
-      getAnalytics: () => ({
-        captureAnalytics: event => { events.push(event.event); },
-        captureAnalyticsImmediate: async event => { events.push(event.event); },
-        captureException: () => undefined,
-        captureExceptionImmediate: async () => undefined,
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => undefined,
-        discardPending: () => undefined,
-      }),
-    });
+  it("clamps proxy lifecycle counts and unrefs the hourly heartbeat", () => {
+    vi.useFakeTimers();
+    try {
+      const facade = facadeFor(snapshotOf);
+      facade.recordProxyStarted(50_000);
+      facade.startProxyHeartbeat(() => -20);
+      vi.advanceTimersByTime(60 * 60 * 1_000);
+      vi.advanceTimersByTime(60 * 60 * 1_000 - 1);
 
-    facade.recordApplicationStart();
-
-    expect(events).toEqual(["app.first_start"]);
-  });
-
-  it("emits closed proxy lifecycle payloads, clamps account count, and unreferences heartbeat", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    const events: Array<{ event: string; properties: object }> = [];
-    let heartbeat: (() => void) | undefined;
-    let intervalMs = 0;
-    let unrefs = 0;
-    let accountCount = -20;
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => undefined,
-      runtimeMetadata: () => ({
-        serviceVersion: "0.8.2",
-        osFamily: "macos",
-        runtimeMode: "daemon",
-      }),
-      getAnalytics: () => ({
-        captureAnalytics: event => { events.push(event); },
-        captureAnalyticsImmediate: async event => { events.push(event); },
-        captureException: () => undefined,
-        captureExceptionImmediate: async () => undefined,
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => undefined,
-        discardPending: () => undefined,
-      }),
-      setInterval: (callback, delay) => {
-        heartbeat = callback;
-        intervalMs = delay;
-        return { unref: () => { unrefs += 1; } };
-      },
-    });
-
-    facade.recordProxyStarted(50_000);
-    facade.startProxyHeartbeat(() => accountCount);
-    heartbeat?.();
-    accountCount = 50_000;
-    heartbeat?.();
-
-    expect(intervalMs).toBe(60 * 60 * 1_000);
-    expect(unrefs).toBe(1);
-    expect(events.map(event => event.event)).toEqual([
-      "proxy.started",
-      "proxy.heartbeat",
-      "proxy.heartbeat",
-    ]);
-    expect(events.map(event => event.properties)).toEqual([
-      {
-        serviceVersion: "0.8.2",
-        osFamily: "macos",
-        runtimeMode: "daemon",
-        accountPoolSize: 10_000,
-      },
-      {
-        serviceVersion: "0.8.2",
-        osFamily: "macos",
-        runtimeMode: "daemon",
-        accountPoolSize: 0,
-      },
-      {
-        serviceVersion: "0.8.2",
-        osFamily: "macos",
-        runtimeMode: "daemon",
-        accountPoolSize: 10_000,
-      },
-    ]);
-  });
-
-  it("routes safe logs, setup outcomes, sanitized exceptions, and span annotations through closed dependencies", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    const events: Array<{ event: string }> = [];
-    const logs: Array<{ body: string; attributes: object }> = [];
-    const exceptions: Array<{ reason: string; diagnosticId: string }> = [];
-    const annotations: Array<{ operation: string; attributes: object }> = [];
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => undefined,
-      now: () => 1_800_000_000_000,
-      randomUUID: () => DIAGNOSTIC_ID,
-      runtimeMetadata: () => ({
-        serviceVersion: "0.8.2",
-        osFamily: "linux",
-        runtimeMode: "service",
-      }),
-      getAnalytics: () => ({
-        captureAnalytics: event => { events.push(event); },
-        captureAnalyticsImmediate: async event => { events.push(event); },
-        captureException: exception => {
-          exceptions.push({ reason: exception.reason, diagnosticId: exception.diagnosticId });
-        },
-        captureExceptionImmediate: async exception => {
-          exceptions.push({ reason: exception.reason, diagnosticId: exception.diagnosticId });
-        },
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => undefined,
-        discardPending: () => undefined,
-      }),
-      emitLog: log => { logs.push(log); },
-      annotateSpan: (operation, attributes) => { annotations.push({ operation, attributes }); },
-      sanitizeException: (_error, context, identity) => ({
-        error: new Error(context.reason),
-        category: context.category,
-        reason: context.reason,
-        errorKind: "unexpected_error",
-        frames: [],
-        fingerprint: "a".repeat(64) as never,
-        diagnosticId: identity.diagnosticId as never,
-      }),
-    });
-
-    facade.recordSafeLog({
-      operation: "provider.inference",
-      provider: "openai",
-      reason: "rate_limited",
-      severity: "warn",
-      httpStatusCode: 429,
-    });
-    facade.recordSetupStage({
-      provider: "openai",
-      method: "device_oauth",
-      stage: "token_exchange",
-      diagnosticId: DIAGNOSTIC_ID,
-    });
-    facade.recordSetupResult({
-      provider: "openai",
-      method: "device_oauth",
-      result: "cancelled",
-      diagnosticId: DIAGNOSTIC_ID,
-    });
-    facade.recordExpectedSetupFailure({
-      provider: "openai",
-      method: "device_oauth",
-      stage: "token_validation",
-      reason: "unauthorized",
-      diagnosticId: DIAGNOSTIC_ID,
-      httpStatusCode: 401,
-    });
-    expect(facade.recordUnexpectedException(new Error("private"), {
-      category: "runtime",
-      reason: "other",
-      operation: "proxy.request",
-    })).toBe(DIAGNOSTIC_ID);
-    facade.annotateActiveSpan("provider.inference", {
-      provider: "openai",
-      httpStatusCode: 429,
-      accountPoolSize: 2,
-    });
-
-    expect(events.map(event => event.event)).toEqual([
-      "account_setup.stage_completed",
-      "account_setup.cancelled",
-      "account_setup.failed",
-    ]);
-    expect(logs.map(log => ({ body: log.body, attributes: log.attributes }))).toEqual([
-      {
-        body: "runtime.failure",
-        attributes: expect.objectContaining({
-          operation: "provider.inference",
-          provider: "openai",
-          reason: "rate_limited",
-          httpStatusCode: 429,
-        }),
-      },
-      {
-        body: "account.setup.diagnostic",
-        attributes: expect.objectContaining({
-          provider: "openai",
-          method: "device_oauth",
-          stage: "token_exchange",
-          diagnosticId: DIAGNOSTIC_ID,
-        }),
-      },
-      {
-        body: "account.setup.diagnostic",
-        attributes: expect.objectContaining({
-          stage: "cancellation",
-          reason: "user_cancelled",
-          outcome: "cancelled",
-        }),
-      },
-      {
-        body: "account.setup.diagnostic",
-        attributes: expect.objectContaining({
-          stage: "token_validation",
-          reason: "unauthorized",
-          httpStatusCode: 401,
-        }),
-      },
-    ]);
-    expect(exceptions).toEqual([{ reason: "other", diagnosticId: DIAGNOSTIC_ID }]);
-    expect(annotations).toEqual([{
-      operation: "provider.inference",
-      attributes: {
-        provider: "openai",
-        httpStatusCode: 429,
-        accountPoolSize: 2,
-      },
-    }]);
-  });
-
-  it("latches an active facade off after a consent-generation change and requires a new facade", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    let current = snapshot(true, CONSENT_GENERATION, 4);
-    const oldEvents: string[] = [];
-    const oldFacade = createTelemetryFacade({
-      getSnapshot: () => current,
-      claimFirstStart: () => undefined,
-      runtimeMetadata: () => ({ serviceVersion: "0.8.2", osFamily: "macos", runtimeMode: "daemon" }),
-      getAnalytics: () => ({
-        captureAnalytics: event => { oldEvents.push(event.event); },
-        captureAnalyticsImmediate: async event => { oldEvents.push(event.event); },
-        captureException: () => undefined,
-        captureExceptionImmediate: async () => undefined,
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => undefined,
-        discardPending: () => undefined,
-      }),
-    });
-
-    oldFacade.recordProxyStarted(1);
-    current = snapshot(true, NEXT_CONSENT_GENERATION, 4);
-    oldFacade.recordProxyStarted(1);
-    current = snapshot(true, CONSENT_GENERATION, 4);
-    oldFacade.recordProxyStarted(1);
-
-    expect(oldEvents).toEqual(["proxy.started"]);
-
-    current = snapshot(true, NEXT_CONSENT_GENERATION, 4);
-    const newEvents: string[] = [];
-    const newFacade = createTelemetryFacade({
-      getSnapshot: () => current,
-      claimFirstStart: () => undefined,
-      runtimeMetadata: () => ({ serviceVersion: "0.8.2", osFamily: "macos", runtimeMode: "daemon" }),
-      getAnalytics: () => ({
-        captureAnalytics: event => { newEvents.push(event.event); },
-        captureAnalyticsImmediate: async event => { newEvents.push(event.event); },
-        captureException: () => undefined,
-        captureExceptionImmediate: async () => undefined,
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => undefined,
-        discardPending: () => undefined,
-      }),
-    });
-    newFacade.recordProxyStarted(1);
-    expect(newEvents).toEqual(["proxy.started"]);
-  });
-
-  it.each([
-    ["analytics", "repeated on"],
-    ["analytics", "off then on"],
-    ["exception", "repeated on"],
-    ["exception", "off then on"],
-  ] as const)(
-    "does not let stale facade %s cross a lazy PostHog client created after %s",
-    async (captureKind, transition) => {
-      const { PostHog } = await import("posthog-node");
-      const { createPostHogTelemetryClient } = await import("../telemetry/posthog-client.js");
-      const { createTelemetryFacade } = await import("../telemetry/facade.js");
-      let current = snapshot(true, CONSENT_GENERATION, 30);
-      let analyticsCalls = 0;
-      let sdkCreations = 0;
-      let sdkCaptureCalls = 0;
-      let captureOperation: Promise<void> | undefined;
-      let clientOwner: ReturnType<typeof createPostHogTelemetryClient> | undefined;
-      const transportRequests: unknown[] = [];
-      const safeError = new Error("persistence_failure");
-      safeError.stack = [
-        "Error: persistence_failure",
-        `    at persist (${process.cwd()}/dist/config/store.js:42:7)`,
-      ].join("\n");
-
-      const facade = createTelemetryFacade({
-        getSnapshot: () => current,
-        claimFirstStart: () => undefined,
-        runtimeMetadata: () => ({
-          serviceVersion: "0.8.2",
-          osFamily: "macos",
-          runtimeMode: "foreground",
-        }),
-        emitLog: () => undefined,
-        sanitizeException: (_error, _context, identity) => ({
-          error: safeError,
-          category: "setup",
-          reason: "persistence_failure",
-          errorKind: "unexpected_error",
-          frames: [{ filename: "dist/config/store.js", line: 42, column: 7 }],
-          fingerprint: "a".repeat(64) as never,
-          diagnosticId: identity.diagnosticId as never,
-        }),
-        getAnalytics: () => {
-          analyticsCalls += 1;
-          if (transition === "repeated on") {
-            current = snapshot(true, NEXT_CONSENT_GENERATION, 31);
-          } else {
-            current = snapshot(false, NEXT_CONSENT_GENERATION, 31);
-            current = snapshot(true, "123e4567-e89b-42d3-a456-426614174012", 32);
-          }
-          const client = createPostHogTelemetryClient({
-            getSnapshot: () => current,
-            transport: async (url, options) => {
-              transportRequests.push({ url, options });
-              return {
-                status: 200,
-                text: async () => "",
-                json: async () => ({}),
-                headers: { get: () => null },
-              };
-            },
-            createSdkClient: (token, options) => {
-              sdkCreations += 1;
-              const sdk = new PostHog(token, options);
-              const captureImmediate = sdk.captureImmediate.bind(sdk);
-              sdk.captureImmediate = (...args: Parameters<typeof sdk.captureImmediate>) => {
-                sdkCaptureCalls += 1;
-                return captureImmediate(...args);
-              };
-              const captureExceptionImmediate = sdk.captureExceptionImmediate.bind(sdk);
-              sdk.captureExceptionImmediate = (
-                ...args: Parameters<typeof sdk.captureExceptionImmediate>
-              ) => {
-                sdkCaptureCalls += 1;
-                return captureExceptionImmediate(...args);
-              };
-              return sdk;
-            },
-          });
-          clientOwner = client;
-          const trackImmediate = <Args extends unknown[]>(
-            operation: (...args: Args) => Promise<void>,
-          ) => (...args: Args): Promise<void> => {
-            captureOperation = operation(...args);
-            return captureOperation;
-          };
-          return {
-            ...client,
-            captureAnalyticsImmediate: trackImmediate(client.captureAnalyticsImmediate.bind(client)),
-            captureExceptionImmediate: trackImmediate(client.captureExceptionImmediate.bind(client)),
-          };
-        },
-      });
-
-      if (captureKind === "analytics") {
-        facade.recordSetupStage({
-          provider: "openai",
-          method: "device_oauth",
-          stage: "token_exchange",
-          diagnosticId: DIAGNOSTIC_ID,
-        });
-      } else {
-        expect(facade.recordUnexpectedException(new Error("PRIVATE raw failure"), {
-          category: "setup",
-          reason: "persistence_failure",
-          setupStage: "persistence",
-        }, DIAGNOSTIC_ID)).toBe(DIAGNOSTIC_ID);
-      }
-
-      expect(analyticsCalls).toBe(1);
-      expect(captureOperation).toBeDefined();
-      await captureOperation;
-      expect({
-        sdkCreations,
-        sdkCaptureCalls,
-        transportRequests: transportRequests.length,
-      }).toEqual({ sdkCreations: 0, sdkCaptureCalls: 0, transportRequests: 0 });
-      await clientOwner?.shutdownWithin(100);
-    },
-  );
-
-  it("reports the exact remote runtime diagnostic ID once with raw detail kept local", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    const ids = [
-      "123e4567-e89b-42d3-a456-426614174011",
-      "123e4567-e89b-42d3-a456-426614174012",
-    ];
-    const local: Array<{ error: unknown; diagnosticId: string }> = [];
-    const remote: Array<{ diagnosticId: string; serialized: string }> = [];
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(true, CONSENT_GENERATION, 7),
-      claimFirstStart: () => undefined,
-      randomUUID: () => ids.shift() ?? DIAGNOSTIC_ID,
-      reportRuntimeException: (error: unknown, diagnosticId: string) => {
-        local.push({ error, diagnosticId });
-      },
-      getAnalytics: () => ({
-        captureAnalytics: () => undefined,
-        captureAnalyticsImmediate: async () => undefined,
-        captureException: exception => {
-          remote.push({ diagnosticId: exception.diagnosticId, serialized: JSON.stringify(exception) });
-        },
-        captureExceptionImmediate: async () => undefined,
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => undefined,
-        discardPending: () => undefined,
-      }),
-    } as never);
-    const first = new Error("PRIVATE runtime detail one");
-    const second = new Error("PRIVATE runtime detail two");
-
-    facade.recordUnexpectedException(first, { category: "runtime", reason: "other", operation: "proxy.request" });
-    facade.recordUnexpectedException(second, { category: "runtime", reason: "other", operation: "proxy.request" });
-
-    expect(local).toEqual([
-      { error: first, diagnosticId: "123e4567-e89b-42d3-a456-426614174011" },
-      { error: second, diagnosticId: "123e4567-e89b-42d3-a456-426614174012" },
-    ]);
-    expect(remote.map(entry => entry.diagnosticId)).toEqual(local.map(entry => entry.diagnosticId));
-    expect(new Set(remote.map(entry => entry.diagnosticId)).size).toBe(2);
-    expect(remote.every(entry => entry.diagnosticId !== INSTALL_ID)).toBe(true);
-    expect(local.map(entry => (entry.error as Error).message)).toEqual([
-      "PRIVATE runtime detail one",
-      "PRIVATE runtime detail two",
-    ]);
-    expect(remote.map(entry => entry.serialized).join("\n")).not.toContain("PRIVATE runtime detail");
-  });
-
-  it("contains synchronous and asynchronous dependency failures", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    const brokenClient = {
-      captureAnalytics: () => { throw new Error("capture"); },
-      captureAnalyticsImmediate: async () => { throw new Error("capture immediate"); },
-      captureException: () => { throw new Error("exception"); },
-      captureExceptionImmediate: async () => { throw new Error("exception immediate"); },
-      flushWithin: async () => { throw new Error("flush"); },
-      shutdownWithin: async () => { throw new Error("shutdown"); },
-      discardPending: () => { throw new Error("discard"); },
-    };
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => snapshot(),
-      getAnalytics: () => brokenClient,
-      emitLog: () => { throw new Error("log"); },
-      annotateSpan: () => { throw new Error("span"); },
-      flushRuntime: async () => { throw new Error("runtime flush"); },
-      shutdownRuntime: async () => { throw new Error("runtime shutdown"); },
-      randomUUID: () => DIAGNOSTIC_ID,
-    });
-
-    expect(() => facade.recordApplicationStart()).not.toThrow();
-    expect(() => facade.recordProxyStarted(1)).not.toThrow();
-    expect(() => facade.recordSafeLog({
-      operation: "proxy.request",
-      reason: "other",
-      severity: "error",
-    })).not.toThrow();
-    expect(() => facade.recordUnexpectedException(new Error("private"), {
-      category: "runtime",
-      reason: "other",
-    })).not.toThrow();
-    expect(() => facade.annotateActiveSpan("proxy.request", {})).not.toThrow();
-    await expect(facade.flushTelemetryWithin(20)).resolves.toBeUndefined();
-    await expect(facade.shutdownTelemetryWithin(20)).resolves.toBeUndefined();
-  });
-
-  it("joins facade-owned immediate setup sends before combined CLI shutdown", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    let releaseImmediate!: () => void;
-    const immediate = new Promise<void>(resolve => { releaseImmediate = resolve; });
-    let analyticsShutdowns = 0;
-    let runtimeShutdowns = 0;
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => undefined,
-      getAnalytics: () => ({
-        captureAnalytics: () => undefined,
-        captureAnalyticsImmediate: () => immediate,
-        captureException: () => undefined,
-        captureExceptionImmediate: () => immediate,
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => { analyticsShutdowns += 1; },
-        discardPending: () => undefined,
-      }),
-      shutdownRuntime: async () => { runtimeShutdowns += 1; },
-    });
-    facade.recordSetupStage({
-      provider: "openai",
-      method: "device_oauth",
-      stage: "attempt_start",
-      diagnosticId: DIAGNOSTIC_ID,
-    });
-
-    let settled = false;
-    const shutdown = facade.shutdownTelemetryWithin(500).then(() => { settled = true; });
-    await new Promise(resolve => setImmediate(resolve));
-    expect(settled).toBe(false);
-    releaseImmediate();
-    await shutdown;
-    expect(analyticsShutdowns).toBe(1);
-    expect(runtimeShutdowns).toBe(1);
-  });
-
-  it("bounds a hung immediate setup send without changing shutdown success", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => undefined,
-      getAnalytics: () => ({
-        captureAnalytics: () => undefined,
-        captureAnalyticsImmediate: () => new Promise<void>(() => undefined),
-        captureException: () => undefined,
-        captureExceptionImmediate: () => new Promise<void>(() => undefined),
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => undefined,
-        discardPending: () => undefined,
-      }),
-      shutdownRuntime: async () => undefined,
-    });
-    facade.recordSetupStage({
-      provider: "anthropic",
-      method: "manual_token",
-      stage: "attempt_start",
-      diagnosticId: DIAGNOSTIC_ID,
-    });
-
-    const started = Date.now();
-    await expect(facade.shutdownTelemetryWithin(20)).resolves.toBeUndefined();
-    expect(Date.now() - started).toBeGreaterThanOrEqual(10);
-    expect(Date.now() - started).toBeLessThan(250);
-  });
-
-  it("rejects a non-random diagnostic identity at the facade boundary", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    let sanitizerCalls = 0;
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => undefined,
-      randomUUID: () => "account-id-from-upstream",
-      sanitizeException: () => {
-        sanitizerCalls += 1;
-        return undefined;
-      },
-    });
-
-    expect(facade.recordUnexpectedException(new Error("private"), {
-      category: "runtime",
-      reason: "other",
-    })).toBeUndefined();
-    expect(sanitizerCalls).toBe(0);
-  });
-
-  it("discards both analytics and runtime queues when flush observes opt-out", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    let enabled = true;
-    let discards = 0;
-    let runtimeFlushes = 0;
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(enabled),
-      claimFirstStart: () => undefined,
-      getAnalytics: () => ({
-        captureAnalytics: () => undefined,
-        captureAnalyticsImmediate: async () => undefined,
-        captureException: () => undefined,
-        captureExceptionImmediate: async () => undefined,
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => undefined,
-        discardPending: () => { discards += 1; },
-      }),
-      flushRuntime: async () => { runtimeFlushes += 1; },
-    });
-    facade.recordProxyStarted(1);
-    enabled = false;
-
-    await facade.flushTelemetryWithin(20);
-
-    expect(discards).toBe(1);
-    expect(runtimeFlushes).toBe(1);
-  });
-
-  it("drops an invalid runtime setup result without touching recorders or the client", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    let analyticsCalls = 0;
-    let logCalls = 0;
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => undefined,
-      getAnalytics: () => {
-        analyticsCalls += 1;
-        throw new Error("invalid result must not initialize analytics");
-      },
-      emitLog: () => { logCalls += 1; },
-    });
-
-    facade.recordSetupResult({
-      provider: "openai",
-      method: "device_oauth",
-      result: "bogus",
-      diagnosticId: DIAGNOSTIC_ID,
-    } as never);
-
-    expect(analyticsCalls).toBe(0);
-    expect(logCalls).toBe(0);
-  });
-
-  it.each([
-    ["not_found", undefined],
-    ["permission_denied", undefined],
-    ["malformed_credentials", undefined],
-    ["invalid_token", undefined],
-    ["unauthorized", "upstream_error"],
-    ["forbidden", "upstream_error"],
-    ["rate_limited", "rate_limited"],
-    ["upstream_4xx", "upstream_error"],
-    ["upstream_5xx", "upstream_error"],
-    ["timeout", "timeout"],
-    ["network_failure", undefined],
-    ["unexpected_response_shape", "upstream_error"],
-    ["persistence_failure", undefined],
-    ["user_cancelled", "cancelled"],
-    ["other", "other"],
-  ] as const)("maps expected setup reason %s to truthful outcome %s", async (reason, expectedOutcome) => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    const events: Array<{ properties: Record<string, unknown> }> = [];
-    const recordedLogs: Array<{ attributes: Record<string, unknown> }> = [];
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => undefined,
-      getAnalytics: () => ({
-        captureAnalytics: event => { events.push(event); },
-        captureAnalyticsImmediate: async event => { events.push(event); },
-        captureException: () => undefined,
-        captureExceptionImmediate: async () => undefined,
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => undefined,
-        discardPending: () => undefined,
-      }),
-      emitLog: log => { recordedLogs.push(log); },
-    });
-
-    facade.recordExpectedSetupFailure({
-      provider: "anthropic",
-      method: "manual_token",
-      stage: "token_validation",
-      reason,
-      diagnosticId: DIAGNOSTIC_ID,
-    });
-
-    expect(events).toHaveLength(1);
-    expect(recordedLogs).toHaveLength(1);
-    expect(events[0].properties).not.toHaveProperty("outcome");
-    if (expectedOutcome === undefined) {
-      expect(recordedLogs[0].attributes).not.toHaveProperty("outcome");
-    } else {
-      expect(recordedLogs[0].attributes.outcome).toBe(expectedOutcome);
+      expect(analytics.events.map(event => event.event)).toEqual(["proxy.started", "proxy.heartbeat"]);
+      expect(analytics.events[0]?.properties["accountPoolSize"]).toBe(10_000);
+      expect(analytics.events[1]?.properties["accountPoolSize"]).toBe(0);
+    } finally {
+      vi.useRealTimers();
     }
   });
 
-  it("keeps a recoverable stage failure out of the terminal failure funnel", async () => {
-    const { createTelemetryFacade } = await import("../telemetry/facade.js");
-    const events: unknown[] = [];
-    const logs: Array<{ severity: string; attributes: Record<string, unknown> }> = [];
-    const facade = createTelemetryFacade({
-      getSnapshot: () => snapshot(),
-      claimFirstStart: () => undefined,
-      getAnalytics: () => ({
-        captureAnalytics: event => { events.push(event); },
-        captureAnalyticsImmediate: async event => { events.push(event); },
-        captureException: () => undefined,
-        captureExceptionImmediate: async () => undefined,
-        flushWithin: async () => undefined,
-        shutdownWithin: async () => undefined,
-        discardPending: () => undefined,
-      }),
-      emitLog: log => { logs.push(log); },
-    });
-
-    facade.recordSetupStageFailure({
-      provider: "anthropic",
-      method: "manual_token",
-      stage: "token_validation",
-      reason: "invalid_token",
+  it("maps runtime failure logs through the closed key map", () => {
+    facadeFor(snapshotOf).recordSafeLog({
+      operation: "provider.inference",
+      provider: "openai",
+      reason: "upstream_5xx",
+      severity: "error",
+      httpStatusCode: 503,
+      attempt: 2,
+      operationDurationMs: 1_200,
       diagnosticId: DIAGNOSTIC_ID,
+      ...{ prompt: "never-exported", accountId: "never-exported" },
     });
 
-    expect(events).toEqual([]);
-    expect(logs).toEqual([
-      expect.objectContaining({
-        severity: "warn",
-        attributes: expect.objectContaining({
-          stage: "token_validation",
-          reason: "invalid_token",
-          diagnosticId: DIAGNOSTIC_ID,
-        }),
-      }),
+    expect(recordedLogs()).toEqual([{
+      body: "runtime.failure",
+      severityText: "ERROR",
+      attributes: {
+        "cc_router.operation": "provider.inference",
+        "cc_router.provider": "openai",
+        "cc_router.reason": "upstream_5xx",
+        "http.response.status_code": 503,
+        "cc_router.attempt": 2,
+        "cc_router.operation_duration_ms": 1_200,
+        "cc_router.diagnostic_id": DIAGNOSTIC_ID,
+        "service.version": expect.any(String),
+        "os.type": expect.any(String),
+        "cc_router.runtime_mode": "foreground",
+      },
+    }]);
+    expect(shared.runtimeStarts).toEqual([{ tracing: false, runtimeMode: "foreground" }]);
+  });
+
+  it("derives upstream reasons and outcomes from the status code alone", () => {
+    expect([401, 403, 429, 418, 503].map(httpFailureReason))
+      .toEqual(["unauthorized", "forbidden", "rate_limited", "upstream_4xx", "upstream_5xx"]);
+    expect([200, 429, 503].map(httpOutcome))
+      .toEqual(["complete", "rate_limited", "upstream_error"]);
+
+    facadeFor(snapshotOf).recordUpstreamStatus("oauth.refresh", "anthropic", 429, { attempt: 3 });
+
+    expect(recordedLogs()[0]).toMatchObject({
+      severityText: "WARN",
+      attributes: {
+        "cc_router.operation": "oauth.refresh",
+        "cc_router.reason": "rate_limited",
+        "cc_router.outcome": "rate_limited",
+        "http.response.status_code": 429,
+        "cc_router.attempt": 3,
+      },
+    });
+  });
+
+  it("logs expected transport failures and sanitizes unexpected ones", () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const facade = facadeFor(snapshotOf);
+
+    facade.recordRuntimeError(
+      Object.assign(new Error("PRIVATE_SOCKET_FAILURE"), { code: "ECONNRESET" }),
+      { operation: "provider.inference", provider: "openai" },
+    );
+    facade.recordRuntimeError(new TypeError("PRIVATE_PARSER_FAILURE"), {
+      operation: "provider.inference" });
+
+    expect(recordedLogs()).toHaveLength(1);
+    expect(recordedLogs()[0]?.attributes["cc_router.reason"]).toBe("network_failure");
+    expect(analytics.exceptions).toHaveLength(1);
+    expect(analytics.exceptions[0]?.diagnosticId).toBe(DIAGNOSTIC_ID);
+    expect(analytics.exceptions[0]?.error.message).not.toContain("PRIVATE_PARSER_FAILURE");
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining(DIAGNOSTIC_ID),
+      expect.any(TypeError),
+    );
+
+    // A diagnostic id must be a fresh random UUID and never the install id.
+    for (const identity of ["not-a-uuid", INSTALL_ID]) {
+      expect(facade.recordUnexpectedException(new Error("private"), {
+        category: "setup", reason: "other",
+      }, identity)).toBeUndefined();
+    }
+    expect(analytics.exceptions).toHaveLength(1);
+  });
+
+  it("records the setup funnel with one diagnostic id per attempt", () => {
+    const facade = facadeFor(snapshotOf);
+    const attempt = {
+      provider: "openai", method: "device_oauth",
+      diagnosticId: DIAGNOSTIC_ID, durationBucket: "under_1s",
+    } as const;
+
+    facade.recordSetupStage({ ...attempt, stage: "attempt_start" });
+    facade.recordSetupStage({ ...attempt, stage: "token_exchange" });
+    facade.recordSetupStageFailure({ ...attempt, stage: "token_exchange", reason: "rate_limited" });
+    facade.recordExpectedSetupFailure({ ...attempt, stage: "token_exchange", reason: "unauthorized" });
+    facade.recordSetupResult({ ...attempt, result: "cancelled" });
+
+    expect(analytics.events.map(event => event.event)).toEqual([
+      "account_setup.started", "account_setup.stage_completed",
+      "account_setup.failed", "account_setup.cancelled",
     ]);
+    expect(new Set(analytics.events.map(event => event.properties["diagnosticId"])))
+      .toEqual(new Set([DIAGNOSTIC_ID]));
+    expect(recordedLogs().map(log => log.attributes["cc_router.stage"])).toEqual([
+      "attempt_start", "token_exchange", "token_exchange", "token_exchange", "cancellation",
+    ]);
+    expect(recordedLogs().every(log => log.body === "account.setup.diagnostic")).toBe(true);
+  });
+
+  it("keeps span handles idempotent and callbacks single-shot", async () => {
+    const handle = startTelemetrySpan("provider.inference", { provider: "openai", attempt: 1 });
+    handle.annotate({ outcome: "complete" });
+    handle.end("ok");
+    handle.end("error");
+    handle.annotate({ outcome: "timeout" });
+
+    let calls = 0;
+    await expect(withTelemetrySpan("oauth.refresh", { provider: "anthropic" }, async () => {
+      calls += 1;
+      throw new Error("private");
+    })).rejects.toThrow("private");
+    await withTelemetrySpan("model.discovery", { provider: "anthropic" }, async () => {
+      annotateActiveSpan("model.discovery", { outcome: "complete" });
+      return undefined;
+    });
+
+    expect(calls).toBe(1);
+    expect(recordedSpans().map(span => span.name))
+      .toEqual(["provider.inference", "oauth.refresh", "model.discovery"]);
+    expect(recordedSpans()[0]?.attributes).toEqual({
+      "cc_router.operation": "provider.inference",
+      "cc_router.provider": "openai",
+      "cc_router.attempt": 1,
+      "cc_router.outcome": "complete",
+    });
+    expect(recordedSpans()[1]?.status).toBe(2);
+    expect(recordedSpans()[2]?.attributes["cc_router.outcome"]).toBe("complete");
+  });
+
+  it("wraps only the inference routes in an active proxy.request span", () => {
+    const middleware = telemetryRequestMiddleware();
+    const run = (path: string): { nextCalls: number; activeSpans: number } => {
+      const response = Object.assign(new EventEmitter(), { statusCode: 503 });
+      let nextCalls = 0;
+      let activeSpans = 0;
+      middleware({ path, method: "POST" } as Request, response as unknown as Response, () => {
+        nextCalls += 1;
+        if (trace.getActiveSpan()) activeSpans += 1;
+      });
+      response.emit("finish");
+      response.emit("close");
+      return { nextCalls, activeSpans };
+    };
+
+    expect(run("/v1/messages")).toEqual({ nextCalls: 1, activeSpans: 1 });
+    expect(run("/health")).toEqual({ nextCalls: 1, activeSpans: 0 });
+
+    expect(recordedSpans()).toEqual([{
+      name: "proxy.request",
+      status: 2,
+      attributes: {
+        "cc_router.operation": "proxy.request",
+        "http.request.method": "POST",
+        "cc_router.route": "messages",
+        "http.response.status_code": 503,
+      },
+    }]);
+  });
+
+  it("latches off after a consent change, then discards on flush and shutdown", async () => {
+    let snapshot = snapshotOf();
+    const facade = facadeFor(() => snapshot);
+    facade.recordProxyStarted(1);
+    await facade.flushTelemetryWithin(500);
+
+    // A new generation is an explicit choice: this facade never resumes.
+    snapshot = snapshotOf(true, NEXT_CONSENT_GENERATION);
+    facade.recordProxyStarted(1);
+    snapshot = snapshotOf();
+    facade.recordProxyStarted(1);
+    await facade.shutdownTelemetryWithin(500);
+
+    expect(analytics.events).toHaveLength(1);
+    expect(analytics.calls).toEqual({ flush: 1, shutdown: 1, discard: 2 });
+    expect(shared.runtimeFlushes).toEqual([500]);
+    expect(shared.runtimeShutdowns).toEqual([500]);
+  });
+
+  it("classifies model families and runtime modes from closed inputs", () => {
+    expect([
+      "claude-fable-5-20260219", "claude-sonnet-4-5", "claude-opus-4-1",
+      "claude-3-5-haiku", "gpt-5.2-codex", "mistral-large",
+    ].map(modelFamilyOf)).toEqual(["fable", "sonnet", "opus", "haiku", "codex", "other"]);
+
+    expect(runtimeMode()).toBe("foreground");
+    process.env["CC_ROUTER_DAEMON"] = "1";
+    expect(runtimeMode()).toBe("daemon");
+    process.env["CC_ROUTER_SERVICE"] = "1";
+    expect(runtimeMode()).toBe("service");
+    delete process.env["CC_ROUTER_DAEMON"];
+    delete process.env["CC_ROUTER_SERVICE"];
   });
 });
