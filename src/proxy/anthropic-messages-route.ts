@@ -630,17 +630,23 @@ export function mountAnthropicMessagesRoute(
       // decoder that never finishes cannot keep the span open.
       const contentType = String(upstream.headers["content-type"] ?? "");
       const encoding = String(upstream.headers["content-encoding"] ?? "");
-      const inspectedSse = contentType.includes("text/event-stream") && !/gzip|br|deflate/.test(encoding);
+      const isSse = contentType.includes("text/event-stream");
+      // The lifecycle tracker only reads uncompressed SSE; the usage capture's
+      // decoded copy reports the terminal event for compressed streams.
+      let decodedMessageStop = false;
       let responseClosed = false;
       let usageSettled = false;
       let usageDeadline: ReturnType<typeof setTimeout> | undefined;
       const finishAttempt = (): void => {
         if (usageDeadline !== undefined) clearTimeout(usageDeadline);
         const lifecycle = entry.streamLifecycle;
+        // A client hang-up destroys the upstream request too, so the client's
+        // own signal must win over the resulting upstream abort.
         const streamOutcome: StreamOutcome = status >= 400 ? "upstream_error"
+          : clientGone.signal.aborted ? "cancelled"
           : lifecycle?.upstreamAborted ? "upstream_error"
           : !res.writableEnded ? "cancelled"
-          : inspectedSse && !lifecycle?.sawMessageStop ? "upstream_error"
+          : isSse && !lifecycle?.sawMessageStop && !decodedMessageStop ? "upstream_error"
           : "complete";
         const attemptOutcome: Outcome = status >= 400 ? outcome
           : streamOutcome === "complete" ? outcome
@@ -664,6 +670,7 @@ export function mountAnthropicMessagesRoute(
         maybeFinishAttempt();
       });
       attachAnthropicResponseCapture(upstream, res, entry, startedAt, {
+        onMessageStop: () => { decodedMessageStop = true; },
         onUsageSettled: () => {
           usageSettled = true;
           maybeFinishAttempt();

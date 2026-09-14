@@ -29,6 +29,11 @@ export interface AnthropicUsageCaptureOptions {
    *  size cap, or decoder error). Compressed bodies decode asynchronously,
    *  so this can trail the relayed response's own close event. */
   onSettled?(): void;
+  /** Fired when the decoded SSE copy carries the `message_stop` terminal event.
+   *  Providing it keeps the passive decoder running to the end of the stream
+   *  (instead of stopping after both usage events) so a compressed stream's
+   *  completion can be verified without touching the forwarded bytes. */
+  onMessageStop?(): void;
 }
 
 export interface AnthropicUsageCapture {
@@ -94,9 +99,11 @@ export function createAnthropicUsageCapture(
           options.onOutputUsage(evt.usage);
           gotOutput = true;
         }
+        if (evt.type === "message_stop") options.onMessageStop?.();
         // Everything of interest has been seen — stop paying for the rest of
-        // the stream (and free the decompressor's zlib state).
-        if (gotInput && gotOutput) die();
+        // the stream (and free the decompressor's zlib state), unless the
+        // caller also wants the terminal event.
+        if (gotInput && gotOutput && !options.onMessageStop) die();
       } catch { /* partial JSON across chunk boundary — next chunk completes it */ }
     }
   };

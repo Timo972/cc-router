@@ -490,4 +490,88 @@ describe("proxy telemetry", () => {
     expect(forwarded[0]).not.toHaveProperty("tracestate");
     expect(forwarded[0]).not.toHaveProperty("baggage");
   });
+
+  it("classifies a compressed SSE stream that ends without message_stop as an upstream failure", async () => {
+    const body = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 4 } } })}\n\n`,
+      `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error" } })}\n\n`,
+    ].join("");
+    const upstream = createServer((_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(200, { "content-type": "text/event-stream", "content-encoding": "gzip" });
+      res.end(gzipSync(body));
+    });
+    const upstreamPort = await listen(upstream);
+    try {
+      await postMessages(mountAnthropic(upstreamPort), true);
+    } finally {
+      await close(upstream);
+    }
+    await waitFor(() => spansNamed("provider.inference").length >= 1);
+
+    expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
+      "cc_router.outcome": "upstream_error",
+      "cc_router.stream_outcome": "upstream_error",
+    });
+  });
+
+  it("classifies a compressed SSE stream that reaches message_stop as complete", async () => {
+    const body = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 4 } } })}\n\n`,
+      `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 2 } })}\n\n`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const upstream = createServer((_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(200, { "content-type": "text/event-stream", "content-encoding": "gzip" });
+      res.end(gzipSync(body));
+    });
+    const upstreamPort = await listen(upstream);
+    try {
+      await postMessages(mountAnthropic(upstreamPort), true);
+    } finally {
+      await close(upstream);
+    }
+    await waitFor(() => spansNamed("provider.inference").length >= 1);
+
+    expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
+      "cc_router.outcome": "complete",
+      "cc_router.stream_outcome": "complete",
+      "cc_router.input_tokens": 4,
+      "cc_router.output_tokens": 2,
+    });
+  });
+
+  it("classifies a client abort mid-stream as a cancellation, not an upstream failure", async () => {
+    const upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 4 } } })}\n\n`);
+      // Hold the stream open until the proxy tears the request down.
+      req.once("close", () => res.destroy());
+    });
+    const upstreamPort = await listen(upstream);
+    try {
+      await withApp(mountAnthropic(upstreamPort), async baseUrl => {
+        const controller = new AbortController();
+        const res = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "claude-sonnet-5", messages: [], stream: true }),
+          signal: controller.signal,
+        });
+        expect(res.status).toBe(200);
+        const reader = res.body!.getReader();
+        await reader.read();
+        controller.abort();
+        await waitFor(() => spansNamed("provider.inference").length >= 1);
+      });
+    } finally {
+      await close(upstream);
+    }
+
+    expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
+      "cc_router.outcome": "cancelled",
+      "cc_router.stream_outcome": "cancelled",
+    });
+    await waitFor(() => spansNamed("proxy.request").length >= 1);
+    expect(spansNamed("proxy.request")[0]?.attributes["cc_router.outcome"]).toBe("cancelled");
+  });
 });

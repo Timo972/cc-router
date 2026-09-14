@@ -32,6 +32,9 @@ export interface AnthropicResponseCaptureHooks {
    *  cannot carry usage), so telemetry can read token counts that a
    *  compressed body only yields after the downstream response closed. */
   onUsageSettled?(): void;
+  /** Fired when the decoded SSE copy carries `message_stop`; lets telemetry
+   *  verify completion of a compressed stream the lifecycle tracker cannot read. */
+  onMessageStop?(): void;
 }
 
 export function attachAnthropicResponseCapture(
@@ -58,6 +61,7 @@ export function attachAnthropicResponseCapture(
     onInputUsage: usage => applyAnthropicInputUsage(entry, usage),
     onOutputUsage: usage => applyAnthropicOutputUsage(entry, usage),
     onSettled: () => hooks.onUsageSettled?.(),
+    ...(hooks.onMessageStop ? { onMessageStop: hooks.onMessageStop } : {}),
   });
   if (usageCapture) {
     upstream.on("data", (chunk: Buffer) => usageCapture.write(chunk));
