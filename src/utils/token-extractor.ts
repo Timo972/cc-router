@@ -4,8 +4,55 @@ import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import os from "os";
 import type { OAuthTokens } from "../proxy/types.js";
+import { SetupDiagnosticError } from "../telemetry/setup-diagnostics.js";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Extraction outcome that keeps the raw failure local while exposing a closed
+ * classification for setup telemetry. The token-returning helpers below stay
+ * null-on-failure so callers that only need tokens are unaffected.
+ */
+export type CredentialExtractionResult =
+  | { ok: true; tokens: OAuthTokens }
+  | { ok: false; error: SetupDiagnosticError };
+
+function ownErrorCode(error: unknown): string | number | undefined {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+  return descriptor && "value" in descriptor
+    && (typeof descriptor.value === "string" || typeof descriptor.value === "number")
+    ? descriptor.value
+    : undefined;
+}
+
+function credentialReadError(
+  error: unknown,
+  source: "Keychain" | "credentials file",
+): SetupDiagnosticError {
+  const code = ownErrorCode(error);
+  // `security find-generic-password` exits 44 when the item does not exist.
+  const reason = code === "EACCES" || code === "EPERM"
+    ? "permission_denied" as const
+    : code === "ENOENT" || code === 44
+      ? "not_found" as const
+      : "other" as const;
+  const detail = error instanceof Error ? error.message : String(error);
+  return new SetupDiagnosticError(`${source} read failed: ${detail}`, {
+    stage: "credential_read",
+    reason,
+    expected: reason !== "other",
+  }, { cause: error });
+}
+
+function credentialParseError(error: unknown): SetupDiagnosticError {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new SetupDiagnosticError(`Credential parse failed: ${detail}`, {
+    stage: "credential_parse",
+    reason: "malformed_credentials",
+    expected: true,
+  }, { cause: error });
+}
 
 /**
  * macOS: extract OAuth tokens from the macOS Keychain.
@@ -13,20 +60,32 @@ const execFileAsync = promisify(execFile);
  * preventing any shell injection.
  */
 export async function extractFromKeychain(): Promise<OAuthTokens | null> {
+  const result = await extractFromKeychainDetailed();
+  return result.ok ? result.tokens : null;
+}
+
+export async function extractFromKeychainDetailed(): Promise<CredentialExtractionResult> {
+  let stdout: string;
   try {
-    const { stdout } = await execFileAsync("security", [
+    ({ stdout } = await execFileAsync("security", [
       "find-generic-password",
       "-s", "Claude Code-credentials",
       "-w",
-    ]);
+    ]));
+  } catch (error) {
+    return { ok: false, error: credentialReadError(error, "Keychain") };
+  }
+  try {
     const raw = JSON.parse(stdout.trim());
     // Keychain JSON can be either:
     //   { claudeAiOauth: { accessToken, refreshToken, ... }, mcpOAuth: {...} }
     //   { accessToken, refreshToken, ... }  (direct, older versions)
     const oauth = raw.claudeAiOauth ?? raw;
-    return parseCredentialJson(oauth);
-  } catch {
-    return null;
+    const tokens = parseCredentialJson(oauth);
+    if (!tokens) throw new TypeError("Credential object is missing required OAuth token fields");
+    return { ok: true, tokens };
+  } catch (error) {
+    return { ok: false, error: credentialParseError(error) };
   }
 }
 
@@ -36,17 +95,39 @@ export async function extractFromKeychain(): Promise<OAuthTokens | null> {
  * No shell — pure Node.js file read.
  */
 export function extractFromCredentialsFile(): OAuthTokens | null {
+  const result = extractFromCredentialsFileDetailed();
+  return result.ok ? result.tokens : null;
+}
+
+export function extractFromCredentialsFileDetailed(): CredentialExtractionResult {
   const credPath = join(os.homedir(), ".claude", ".credentials.json");
-  if (!existsSync(credPath)) return null;
+  if (!existsSync(credPath)) {
+    return {
+      ok: false,
+      error: new SetupDiagnosticError("Claude credentials file was not found", {
+        stage: "credential_read",
+        reason: "not_found",
+        expected: true,
+      }),
+    };
+  }
+  let contents: string;
   try {
-    const raw = JSON.parse(readFileSync(credPath, "utf-8"));
+    contents = readFileSync(credPath, "utf-8");
+  } catch (error) {
+    return { ok: false, error: credentialReadError(error, "credentials file") };
+  }
+  try {
+    const raw = JSON.parse(contents);
     // The file can have two shapes:
     //   { claudeAiOauth: { accessToken, refreshToken, expiresAt, scopes } }
     //   { accessToken, refreshToken, expiresAt, scopes }  (direct)
     const oauth = raw.claudeAiOauth ?? raw;
-    return parseCredentialJson(oauth);
-  } catch {
-    return null;
+    const tokens = parseCredentialJson(oauth);
+    if (!tokens) throw new TypeError("Credential object is missing required OAuth token fields");
+    return { ok: true, tokens };
+  } catch (error) {
+    return { ok: false, error: credentialParseError(error) };
   }
 }
 
