@@ -661,7 +661,7 @@ export function createTelemetryFacade(dependencies: TelemetryFacadeDependencies 
         provider: errorContext.provider,
         severity: "error",
         reason: expected,
-        outcome: expected === "timeout" ? "timeout" : "other",
+        outcome: expected === "timeout" ? "timeout" : "upstream_error",
         attempt: extra?.attempt,
         operationDurationMs: extra?.durationMs,
       });
@@ -694,7 +694,6 @@ export function createTelemetryFacade(dependencies: TelemetryFacadeDependencies 
     recordSetupResult(input: SetupResultInput): void {
       const snapshot = consent().getSnapshot();
       if (!snapshot) return;
-      if (input.result !== "succeeded" && input.result !== "cancelled") return;
       const cancelled = input.result === "cancelled";
       const properties = setupProperties({
         ...input,

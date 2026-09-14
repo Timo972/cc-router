@@ -36,8 +36,6 @@ const BATCH_SIZE = 20;
 const EXPORT_DELAY_MS = 500;
 const EXPORT_TIMEOUT_MS = 2_000;
 
-
-
 /** Telemetry must never join or emit a distributed trace outside this process. */
 export const noopPropagator: TextMapPropagator = {
   inject(): void {},
@@ -93,7 +91,6 @@ function testOtlpUrls(): { traceUrl?: string; logUrl?: string } {
 
 function exporterOptions(
   consent: TelemetryConsentGate,
-  snapshot: TelemetrySnapshot,
   options: StartTelemetryRuntimeOptions,
 ): { getSnapshot: () => TelemetrySnapshot | undefined; traceUrl?: string; logUrl?: string } {
   const test = testOtlpUrls();
@@ -133,7 +130,7 @@ function startTracing(
   snapshot: TelemetrySnapshot,
   options: StartTelemetryRuntimeOptions,
 ): NodeTracerProvider {
-  const { spanExporter } = createPostHogOtlpExporters(exporterOptions(consent, snapshot, options));
+  const { spanExporter } = createPostHogOtlpExporters(exporterOptions(consent, options));
   const provider = new NodeTracerProvider({
     resource: telemetryResource(snapshot, options.runtimeMode),
     sampler: consentGatedSampler(consent),
@@ -181,7 +178,7 @@ export function startTelemetryRuntime(options: StartTelemetryRuntimeOptions): bo
 
     let discardQueuedTelemetry = (): void => undefined;
     const consent = createTelemetryConsentGate(getTelemetrySnapshot, () => discardQueuedTelemetry());
-    const { logExporter } = createPostHogOtlpExporters(exporterOptions(consent, snapshot, options));
+    const { logExporter } = createPostHogOtlpExporters(exporterOptions(consent, options));
     const logProcessor = new BatchLogRecordProcessor({
       exporter: logExporter,
       maxQueueSize: QUEUE_SIZE,
