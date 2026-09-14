@@ -307,6 +307,22 @@ describe("gated PostHog EU client", () => {
     await client.shutdownWithin(100);
   });
 
+  it("drops a queued batch at the transport when consent is withdrawn without a new generation", async () => {
+    const requests: CapturedRequest[] = [];
+    let current = snapshot(true, CONSENT_GENERATION);
+    const client = createPostHogTelemetryClient({
+      getSnapshot: () => current,
+      fetch: captureTransport(requests),
+    });
+
+    client.captureAnalytics(analyticsEvent(), CONSENT_GENERATION);
+    current = { ...current, enabled: false };
+    await client.flushWithin(500);
+
+    expect(requests).toHaveLength(0);
+    await client.shutdownWithin(100);
+  });
+
   it("never revives queued captures after an explicit choice, and a new client adopts it", async () => {
     let current = snapshot(true, CONSENT_GENERATION);
     const requests: CapturedRequest[] = [];

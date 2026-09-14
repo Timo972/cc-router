@@ -25,6 +25,10 @@ export interface AnthropicUsageCaptureOptions {
   /** message_delta usage (output tokens), or the sole usage object of a
    *  non-streaming JSON body. */
   onOutputUsage(usage: Record<string, number>): void;
+  /** Fired once when the capture has seen everything it will see (end,
+   *  size cap, or decoder error). Compressed bodies decode asynchronously,
+   *  so this can trail the relayed response's own close event. */
+  onSettled?(): void;
 }
 
 export interface AnthropicUsageCapture {
@@ -63,6 +67,7 @@ export function createAnthropicUsageCapture(
     if (dead) return;
     dead = true;
     decoder?.destroy();
+    options.onSettled?.();
   };
 
   // ── SSE: incremental line parsing, stop once both events were seen ────────
@@ -124,6 +129,7 @@ export function createAnthropicUsageCapture(
     if (dead) return;
     if (isJSON) parseJSONBody();
     dead = true;
+    options.onSettled?.();
   };
 
   if (!decoder) {

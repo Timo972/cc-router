@@ -17,6 +17,7 @@ import type { TelemetrySnapshot } from "../config/telemetry.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
 import { createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
 import { OpenAITokenPool } from "../providers/openai/token-pool.js";
+import { gzipSync } from "node:zlib";
 import { mountAnthropicMessagesRoute } from "../proxy/anthropic-messages-route.js";
 import { mountResponsesRoutes } from "../proxy/responses-server.js";
 import { SessionRouter } from "../proxy/session-router.js";
@@ -363,5 +364,89 @@ describe("proxy telemetry", () => {
     });
     expect(call).toBe(2);
     expect(telemetryText()).not.toContain(SECRET.anthropicAccount);
+  });
+
+  function mountAnthropic(upstreamPort: number) {
+    const pool = new TokenPool([anthropicAccount(SECRET.anthropicAccount)]);
+    const app = express();
+    app.use(telemetryRequestMiddleware());
+    app.post(
+      "/v1/messages",
+      express.json({
+        limit: "10mb",
+        verify: (req, _res, buf) => { (req as Request)._ccRawBody = Buffer.from(buf); },
+      }),
+      (req, _res, next) => {
+        req._ccRouteContext = { requestedModel: "claude-sonnet-5", modelFamily: "sonnet" };
+        next();
+      },
+    );
+    mountAnthropicMessagesRoute(app, {
+      target: `http://127.0.0.1:${upstreamPort}`,
+      timeoutMs: 5_000,
+      pool,
+      sessionRouter: new SessionRouter(pool),
+      needsRefresh: () => false,
+      refresh: async () => true,
+      onRefreshFailure: () => undefined,
+      recordActivity: () => undefined,
+      sameAccountRetryDelayMs: 1,
+    });
+    return app;
+  }
+
+  async function postMessages(app: express.Express, stream: boolean): Promise<void> {
+    await withApp(app, async baseUrl => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-5", messages: [], stream }),
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+    });
+  }
+
+  it("waits for a compressed body's usage before ending the Anthropic provider span", async () => {
+    const upstream = createServer((_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(200, { "content-type": "application/json", "content-encoding": "gzip" });
+      res.end(gzipSync(JSON.stringify({ type: "message", usage: { input_tokens: 7, output_tokens: 3 } })));
+    });
+    const upstreamPort = await listen(upstream);
+    try {
+      await postMessages(mountAnthropic(upstreamPort), false);
+    } finally {
+      await close(upstream);
+    }
+    await waitFor(() => spansNamed("provider.inference").length >= 1);
+
+    expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
+      "cc_router.outcome": "complete",
+      "cc_router.stream_outcome": "complete",
+      "cc_router.input_tokens": 7,
+      "cc_router.output_tokens": 3,
+    });
+  });
+
+  it("classifies an SSE stream that ends without message_stop as an upstream failure", async () => {
+    const upstream = createServer((_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 4 } } })}\n\n`);
+      res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error" } })}\n\n`);
+      res.end();
+    });
+    const upstreamPort = await listen(upstream);
+    try {
+      await postMessages(mountAnthropic(upstreamPort), true);
+    } finally {
+      await close(upstream);
+    }
+    await waitFor(() => spansNamed("provider.inference").length >= 1);
+
+    expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
+      "http.response.status_code": 200,
+      "cc_router.outcome": "upstream_error",
+      "cc_router.stream_outcome": "upstream_error",
+    });
   });
 });

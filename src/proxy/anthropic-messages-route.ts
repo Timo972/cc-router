@@ -29,6 +29,9 @@ import {
   startTelemetrySpan,
 } from "../telemetry/facade.js";
 import type { Outcome, SafeSpanAttributes, StreamOutcome } from "../telemetry/facade.js";
+
+/** How long a provider span may wait for a compressed body's usage after the response closed. */
+const USAGE_SETTLE_GRACE_MS = 1_000;
 import {
   MAX_UPSTREAM_ATTEMPTS,
   RETRY_REFRESH_TIMEOUT_MS,
@@ -610,21 +613,50 @@ export function mountAnthropicMessagesRoute(
         operationDurationMs: now() - startedAt,
       });
       // Tokens and the stream verdict are only known once the relayed body
-      // settles; the span stays open until then and never outlives the
-      // response, whose close always fires.
-      res.once("close", () => {
-        const truncated = status < 400 && !res.writableEnded;
+      // settles. The span waits for both the response's close and the passive
+      // usage capture (a compressed body decodes after close), bounded so a
+      // decoder that never finishes cannot keep the span open.
+      const contentType = String(upstream.headers["content-type"] ?? "");
+      const encoding = String(upstream.headers["content-encoding"] ?? "");
+      const inspectedSse = contentType.includes("text/event-stream") && !/gzip|br|deflate/.test(encoding);
+      let responseClosed = false;
+      let usageSettled = false;
+      let usageDeadline: ReturnType<typeof setTimeout> | undefined;
+      const finishAttempt = (): void => {
+        if (usageDeadline !== undefined) clearTimeout(usageDeadline);
+        const lifecycle = entry.streamLifecycle;
         const streamOutcome: StreamOutcome = status >= 400 ? "upstream_error"
-          : truncated ? "cancelled"
+          : lifecycle?.upstreamAborted ? "upstream_error"
+          : !res.writableEnded ? "cancelled"
+          : inspectedSse && !lifecycle?.sawMessageStop ? "upstream_error"
           : "complete";
-        endAttempt(truncated ? "cancelled" : outcome, {
+        const attemptOutcome: Outcome = status >= 400 ? outcome
+          : streamOutcome === "complete" ? outcome
+          : streamOutcome;
+        endAttempt(attemptOutcome, {
           httpStatusCode: status,
           streamOutcome,
           ...(entry.inputTokens !== undefined ? { inputTokens: entry.inputTokens } : {}),
           ...(entry.outputTokens !== undefined ? { outputTokens: entry.outputTokens } : {}),
         });
+      };
+      const maybeFinishAttempt = (): void => {
+        if (responseClosed && usageSettled) finishAttempt();
+      };
+      res.once("close", () => {
+        responseClosed = true;
+        if (!usageSettled) {
+          usageDeadline = setTimeout(finishAttempt, USAGE_SETTLE_GRACE_MS);
+          usageDeadline.unref?.();
+        }
+        maybeFinishAttempt();
       });
-      attachAnthropicResponseCapture(upstream, res, entry, startedAt);
+      attachAnthropicResponseCapture(upstream, res, entry, startedAt, {
+        onUsageSettled: () => {
+          usageSettled = true;
+          maybeFinishAttempt();
+        },
+      });
       relayUpstreamResponse(upstream, req, res);
       return;
     }

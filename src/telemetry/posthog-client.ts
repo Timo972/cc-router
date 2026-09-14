@@ -330,7 +330,9 @@ export function createPostHogTelemetryClient(
 
   const gatedFetch: PostHogTransport = async (url, fetchOptions) => {
     try {
-      if (!getSnapshot()) return noOpResponse();
+      // Consent is re-read immediately before every transmission so a batch
+      // the SDK queued before an opt-out never leaves the process.
+      if (!getSnapshot()?.enabled) return noOpResponse();
       const controller = new AbortController();
       const inherited = fetchOptions.signal;
       const forwardAbort = (): void => { controller.abort(); };

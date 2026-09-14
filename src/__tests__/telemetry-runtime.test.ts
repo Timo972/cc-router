@@ -259,6 +259,8 @@ describe("telemetry runtime", () => {
 
   it("stops exporting after an opt-out rotates the consent generation mid-run", async () => {
     expect(runtime.startTelemetryRuntime({ tracing: true, runtimeMode: "foreground" })).toBe(true);
+    // A running proxy owns its shutdown; the CLI's exit path must leave it alone.
+    expect(runtime.isTelemetryTracingActive()).toBe(true);
     context.with(parentContext(true), () => {
       facade.startTelemetrySpan("provider.inference", { provider: "openai" }).end("ok");
     });
@@ -300,6 +302,7 @@ describe("telemetry runtime", () => {
 
   it("serves logs without tracing and upgrades to tracing on the proxy's call", async () => {
     expect(runtime.startTelemetryRuntime({ tracing: false, runtimeMode: "foreground" })).toBe(true);
+    expect(runtime.isTelemetryTracingActive()).toBe(false);
     facade.recordSafeLog({ operation: "proxy.request", reason: "network_failure", severity: "warn" });
     await flushExports();
     await vi.waitFor(() => {

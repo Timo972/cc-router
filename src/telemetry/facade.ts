@@ -419,8 +419,10 @@ export function createTelemetryFacade(dependencies: TelemetryFacadeDependencies 
   const analytics = (): PostHogTelemetryClient | undefined => {
     if (dependencies.analytics) return dependencies.analytics;
     try {
+      // The gate (not the raw state reader) feeds the transport so queued
+      // batches are dropped after an opt-out, not just new captures.
       return sharedAnalytics ??= createPostHogTelemetryClient({
-        getSnapshot: getSnapshot ?? getTelemetrySnapshot,
+        getSnapshot: () => consent().getSnapshot(),
       });
     } catch {
       return undefined;

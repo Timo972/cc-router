@@ -15,6 +15,7 @@ import { registerModels } from "./cmd-models.js";
 import { registerCliTargets } from "./cmd-cli-targets.js";
 import { getCurrentVersion, checkForUpdate, printUpdateBanner } from "../utils/self-update.js";
 import { recordApplicationStart, shutdownTelemetryWithin } from "../telemetry/facade.js";
+import { isTelemetryTracingActive } from "../telemetry/runtime.js";
 
 const program = new Command();
 
@@ -74,5 +75,10 @@ if (!process.env["NO_UPDATE_NOTIFIER"] && !process.env["CI"]) {
 recordApplicationStart();
 
 // Short-lived commands get a bounded flush of whatever they queued. Commands
-// that call process.exit() early simply lose their in-flight telemetry.
-void program.parseAsync().finally(() => shutdownTelemetryWithin(500));
+// that call process.exit() early simply lose their in-flight telemetry. A
+// `start` that is serving requests keeps its runtime: startServer() resolves
+// once it is listening, and its signal handler owns telemetry shutdown.
+void program.parseAsync().finally(() => {
+  if (isTelemetryTracingActive()) return undefined;
+  return shutdownTelemetryWithin(500);
+});

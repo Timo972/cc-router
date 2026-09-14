@@ -27,11 +27,19 @@ export interface CapturableUpstream extends LifecycleEmitter {
  * BEFORE the response is piped to the client, in the same synchronous block,
  * so no data event can slip past the taps.
  */
+export interface AnthropicResponseCaptureHooks {
+  /** Fired once the usage capture is settled (or immediately when the body
+   *  cannot carry usage), so telemetry can read token counts that a
+   *  compressed body only yields after the downstream response closed. */
+  onUsageSettled?(): void;
+}
+
 export function attachAnthropicResponseCapture(
   upstream: CapturableUpstream,
   downstream: LifecycleEmitter,
   entry: LogEntry,
   startedAt: number,
+  hooks: AnthropicResponseCaptureHooks = {},
 ): void {
   const contentType = String(upstream.headers["content-type"] ?? "");
   const encoding = String(upstream.headers["content-encoding"] ?? "");
@@ -49,9 +57,12 @@ export function attachAnthropicResponseCapture(
     contentEncoding: encoding,
     onInputUsage: usage => applyAnthropicInputUsage(entry, usage),
     onOutputUsage: usage => applyAnthropicOutputUsage(entry, usage),
+    onSettled: () => hooks.onUsageSettled?.(),
   });
   if (usageCapture) {
     upstream.on("data", (chunk: Buffer) => usageCapture.write(chunk));
     upstream.on("end", () => usageCapture.end());
+  } else {
+    hooks.onUsageSettled?.();
   }
 }

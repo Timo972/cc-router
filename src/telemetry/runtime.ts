@@ -186,7 +186,7 @@ export function startTelemetryRuntime(options: StartTelemetryRuntimeOptions): bo
       scheduledDelayMillis: EXPORT_DELAY_MS,
       exportTimeoutMillis: EXPORT_TIMEOUT_MS,
     });
-    const posthog = createPostHogTelemetryClient({ getSnapshot: getTelemetrySnapshot });
+    const posthog = createPostHogTelemetryClient({ getSnapshot: () => consent.getSnapshot() });
     const fatalMonitor = (error: unknown): void => {
       try {
         const current = consent.getSnapshot();
@@ -238,6 +238,11 @@ export function startTelemetryRuntime(options: StartTelemetryRuntimeOptions): bo
 
 export function isTelemetryRuntimeActive(): boolean {
   return activeRuntime !== undefined && !activeRuntime.shuttingDown;
+}
+
+/** True while this process runs the proxy's tracing runtime, which owns its own shutdown. */
+export function isTelemetryTracingActive(): boolean {
+  return isTelemetryRuntimeActive() && activeRuntime?.tracerProvider !== undefined;
 }
 
 export async function flushTelemetryRuntimeWithin(deadlineMs: number): Promise<void> {
