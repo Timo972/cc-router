@@ -5,11 +5,16 @@
  * Required header: anthropic-version (per API spec).
  * Auth: Authorization: Bearer <token> (OAuth tokens use Bearer, not x-api-key).
  */
-export interface ValidationResult {
-  valid: boolean;
-  /** Human-readable reason if invalid */
-  reason?: string;
-}
+import {
+  classifyHttpSetupFailure,
+  classifyNetworkSetupFailure,
+  type SetupDiagnosticError,
+} from "../telemetry/setup-diagnostics.js";
+
+export type ValidationResult =
+  | { valid: true }
+  /** Human-readable reason if invalid, plus its closed telemetry classification */
+  | { valid: false; reason: string; diagnostic: SetupDiagnosticError };
 
 export async function validateToken(accessToken: string): Promise<ValidationResult> {
   try {
@@ -24,17 +29,24 @@ export async function validateToken(accessToken: string): Promise<ValidationResu
 
     if (res.ok) return { valid: true };
 
-    if (res.status === 401) {
-      return { valid: false, reason: "Token invalid or expired (401)" };
-    }
-    if (res.status === 403) {
-      return { valid: false, reason: "Token lacks required scopes (403) — needs user:inference" };
-    }
-
-    // Any other non-ok status is unexpected but the token may still work
-    return { valid: false, reason: `Unexpected HTTP ${res.status}` };
+    const reason = res.status === 401
+      ? "Token invalid or expired (401)"
+      : res.status === 403
+        ? "Token lacks required scopes (403) — needs user:inference"
+        // Any other non-ok status is unexpected but the token may still work
+        : `Unexpected HTTP ${res.status}`;
+    return {
+      valid: false,
+      reason,
+      diagnostic: classifyHttpSetupFailure("token_validation", res.status, reason),
+    };
   } catch (err) {
     // Network error — can't validate, let user decide
-    return { valid: false, reason: `Network error: ${(err as Error).message}` };
+    const reason = `Network error: ${(err as Error).message}`;
+    return {
+      valid: false,
+      reason,
+      diagnostic: classifyNetworkSetupFailure("token_validation", err, reason),
+    };
   }
 }
