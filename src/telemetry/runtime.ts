@@ -1,23 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { IncomingMessage, type ClientRequest, type RequestOptions } from "node:http";
-import { isIP } from "node:net";
 import { fileURLToPath } from "node:url";
-import type { Context, TextMapPropagator } from "@opentelemetry/api";
+import { context, propagation, trace, type Context, type TextMapPropagator } from "@opentelemetry/api";
+import { logs } from "@opentelemetry/api-logs";
 import { resourceFromAttributes } from "@opentelemetry/resources";
-import { BatchLogRecordProcessor } from "@opentelemetry/sdk-logs";
-import { NodeSDK } from "@opentelemetry/sdk-node";
+import { BatchLogRecordProcessor, LoggerProvider } from "@opentelemetry/sdk-logs";
 import {
   BatchSpanProcessor,
   ParentBasedSampler,
-  RandomIdGenerator,
   SamplingDecision,
   TraceIdRatioBasedSampler,
-  type IdGenerator,
   type Sampler,
 } from "@opentelemetry/sdk-trace-base";
-import { ExpressInstrumentation } from "@opentelemetry/instrumentation-express";
-import { HttpInstrumentation } from "@opentelemetry/instrumentation-http";
-import { UndiciInstrumentation, type UndiciRequest } from "@opentelemetry/instrumentation-undici";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import {
   createTelemetryConsentGate,
   getTelemetrySnapshot,
@@ -25,11 +19,17 @@ import {
   type TelemetrySnapshot,
 } from "../config/telemetry.js";
 import { getCurrentVersion } from "../utils/self-update.js";
-import type { RuntimeMode } from "./contracts.js";
+import type {
+  CpuArchitecture,
+  OsFamily,
+  RuntimeMode,
+  SafeExceptionContext,
+  SafeExceptionContract,
+  TrustedTelemetryIdentity,
+} from "./contracts.js";
 import { createPostHogOtlpExporters } from "./otel-exporters.js";
 import { createPostHogTelemetryClient, type PostHogTelemetryClient } from "./posthog-client.js";
 import { sanitizeException } from "./privacy.js";
-import { reportFatalExceptionCorrelationLocally } from "./local-diagnostics.js";
 
 const TRACE_SAMPLE_RATIO = 0.1;
 const QUEUE_SIZE = 100;
@@ -38,26 +38,116 @@ const EXPORT_DELAY_MS = 500;
 const EXPORT_TIMEOUT_MS = 2_000;
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
-export const proxyNetworkPropagator: TextMapPropagator = {
+// TEMP(A2): the plan's privacy.ts takes three arguments; the donor still
+// requires the trusted filesystem root as a fourth.
+type DonorSanitizeException = (
+  error: unknown,
+  exceptionContext: SafeExceptionContext,
+  identity: TrustedTelemetryIdentity,
+  source: { projectRoot: string },
+) => SafeExceptionContract | undefined;
+
+function sanitize(
+  error: unknown,
+  exceptionContext: SafeExceptionContext,
+  identity: TrustedTelemetryIdentity,
+): SafeExceptionContract | undefined {
+  return (sanitizeException as DonorSanitizeException)(error, exceptionContext, identity, {
+    projectRoot: PROJECT_ROOT,
+  });
+}
+
+// TEMP(A2): the plan's consent gate takes (getSnapshot, onLatch); the donor
+// still threads an initial snapshot between them.
+function consentGate(
+  getSnapshot: () => TelemetrySnapshot,
+  onLatch: () => void,
+): TelemetryConsentGate {
+  return createTelemetryConsentGate(getSnapshot, undefined, onLatch);
+}
+
+/** Telemetry must never join or emit a distributed trace outside this process. */
+export const noopPropagator: TextMapPropagator = {
   inject(): void {},
-  extract(context: Context): Context {
-    return context;
+  extract(carrierContext: Context): Context {
+    return carrierContext;
   },
   fields(): string[] {
     return [];
   },
 };
 
-export interface ProxyTraceSamplerOptions {
-  getSnapshot?: () => TelemetrySnapshot;
-  initialSnapshot?: TelemetrySnapshot;
+export interface StartTelemetryRuntimeOptions {
+  tracing: boolean;
+  runtimeMode: RuntimeMode;
+  traceUrl?: string;
+  logUrl?: string;
 }
 
-export function createProxyTraceSampler(options: ProxyTraceSamplerOptions = {}): Sampler {
-  const consent = createTelemetryConsentGate(
-    options.getSnapshot ?? getTelemetrySnapshot,
-    options.initialSnapshot,
-  );
+interface ActiveRuntime {
+  loggerProvider: LoggerProvider;
+  tracerProvider?: NodeTracerProvider;
+  posthog: PostHogTelemetryClient;
+  consent: TelemetryConsentGate;
+  snapshot: TelemetrySnapshot;
+  fatalMonitor: (error: unknown) => void;
+  exitCleanup: () => void;
+  shuttingDown: boolean;
+}
+
+let activeRuntime: ActiveRuntime | undefined;
+
+function osFamily(): OsFamily {
+  switch (process.platform) {
+    case "darwin": return "macos";
+    case "linux": return "linux";
+    case "win32": return "windows";
+    default: return "other";
+  }
+}
+
+function cpuArchitecture(): CpuArchitecture {
+  return process.arch === "arm64" || process.arch === "x64" ? process.arch : "other";
+}
+
+/** Loopback OTLP endpoints for the telemetry test suite; never read in production. */
+function testOtlpUrls(): { traceUrl?: string; logUrl?: string } {
+  if (process.env["NODE_ENV"] !== "test") return {};
+  return {
+    traceUrl: process.env["CC_ROUTER_TEST_OTLP_TRACE_URL"],
+    logUrl: process.env["CC_ROUTER_TEST_OTLP_LOG_URL"],
+  };
+}
+
+function exporterOptions(
+  consent: TelemetryConsentGate,
+  snapshot: TelemetrySnapshot,
+  options: StartTelemetryRuntimeOptions,
+): { getSnapshot: () => TelemetrySnapshot; traceUrl?: string; logUrl?: string } {
+  const test = testOtlpUrls();
+  return {
+    // TEMP(A2): the plan lets exporters take a snapshot getter that returns
+    // undefined; the donor requires a snapshot, so consent withdrawal is
+    // expressed as an explicitly disabled one.
+    getSnapshot: () => consent.getSnapshot() ?? { ...snapshot, enabled: false },
+    traceUrl: options.traceUrl ?? test.traceUrl,
+    logUrl: options.logUrl ?? test.logUrl,
+  };
+}
+
+function telemetryResource(snapshot: TelemetrySnapshot, runtimeMode: RuntimeMode) {
+  return resourceFromAttributes({
+    "service.name": "cc-router",
+    "service.version": getCurrentVersion(),
+    "service.instance.id": snapshot.state.installId,
+    "process.runtime.version": process.versions.node,
+    "os.type": osFamily(),
+    "host.arch": cpuArchitecture(),
+    "cc_router.runtime_mode": runtimeMode,
+  });
+}
+
+function consentGatedSampler(consent: TelemetryConsentGate): Sampler {
   const delegate = new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(TRACE_SAMPLE_RATIO) });
   return {
     shouldSample(...args) {
@@ -69,281 +159,27 @@ export function createProxyTraceSampler(options: ProxyTraceSamplerOptions = {}):
   };
 }
 
-interface ActiveRuntime {
-  sdk: NodeSDK;
-  spanProcessor: BatchSpanProcessor;
-  logProcessor: BatchLogRecordProcessor;
-  posthog: PostHogTelemetryClient;
-  fatalMonitor: (error: unknown) => void;
-  exitCleanup: () => void;
-  consent: TelemetryConsentGate;
-  shuttingDown: boolean;
-}
-
-let activeRuntime: ActiveRuntime | undefined;
-
-function osFamily(): "macos" | "linux" | "windows" | "other" {
-  switch (process.platform) {
-    case "darwin": return "macos";
-    case "linux": return "linux";
-    case "win32": return "windows";
-    default: return "other";
-  }
-}
-
-function cpuArchitecture(): "arm64" | "x64" | "other" {
-  return process.arch === "arm64" || process.arch === "x64" ? process.arch : "other";
-}
-
-function requestPath(value: string | undefined): string {
-  if (!value) return "";
-  const query = value.indexOf("?");
-  return query === -1 ? value : value.slice(0, query);
-}
-
-function isProxyInferencePath(path: string): boolean {
-  return path === "/v1/messages" || path === "/v1/responses";
-}
-
-function isTelemetryEndpoint(hostname: string | undefined, path: string): boolean {
-  return hostname === "eu.i.posthog.com"
-    || path === "/i/v1/traces"
-    || path === "/i/v1/logs"
-    || path === "/batch/";
-}
-
-interface TestOtlpUrls {
-  configured: boolean;
-  valid: boolean;
-  traceUrl?: string;
-  logUrl?: string;
-}
-
-function literalLoopbackOtlpUrl(candidate: string | undefined, path: string): string | undefined {
-  if (!candidate) return undefined;
-  try {
-    const url = new URL(candidate);
-    const address = url.hostname.replace(/^\[|\]$/g, "");
-    const literalLoopback = isIP(address) === 4 ? address.startsWith("127.") : address === "::1";
-    return url.protocol === "http:" && literalLoopback && url.pathname === path
-      ? url.toString()
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function loopbackTestOtlpUrls(): TestOtlpUrls {
-  if (process.env["NODE_ENV"] !== "test") return { configured: false, valid: true };
-  const traceCandidate = process.env["CC_ROUTER_TEST_OTLP_TRACE_URL"];
-  const logCandidate = process.env["CC_ROUTER_TEST_OTLP_LOG_URL"];
-  if (!traceCandidate && !logCandidate) return { configured: false, valid: true };
-  const traceUrl = literalLoopbackOtlpUrl(traceCandidate, "/i/v1/traces");
-  const logUrl = literalLoopbackOtlpUrl(logCandidate, "/i/v1/logs");
-  return traceUrl && logUrl
-    ? { configured: true, valid: true, traceUrl, logUrl }
-    : { configured: true, valid: false };
-}
-
-function httpHostname(request: RequestOptions): string | undefined {
-  const hostname = request.hostname ?? request.host;
-  if (typeof hostname === "string") return hostname;
-  return undefined;
-}
-
-function normalizedHostname(hostname: string | undefined): string | undefined {
-  if (!hostname) return undefined;
-  const candidate = hostname.trim().toLowerCase();
-  if (candidate.startsWith("[")) {
-    const closingBracket = candidate.indexOf("]");
-    if (closingBracket === -1) return undefined;
-    const address = candidate.slice(1, closingBracket);
-    return isIP(address) !== 0 ? address : undefined;
-  }
-  if (isIP(candidate) !== 0) return candidate;
-  if (!candidate.includes(":")) return candidate;
-  try {
-    return new URL(`http://${candidate}`).hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  } catch {
-    return undefined;
-  }
-}
-
-function trustedTargetHostname(candidate: string | undefined): string | undefined {
-  if (!candidate) return undefined;
-  try {
-    const url = new URL(candidate);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
-    return normalizedHostname(url.hostname);
-  } catch {
-    return undefined;
-  }
-}
-
-function isTestLoopbackHostname(hostname: string | undefined): boolean {
-  if (process.env["NODE_ENV"] !== "test") return false;
-  const address = normalizedHostname(hostname);
-  if (!address) return false;
-  return isIP(address) === 4 ? address.startsWith("127.") : address === "::1";
-}
-
-interface AutomaticSpanClassification {
-  operation: "proxy.request" | "oauth.refresh" | "provider.usage_refresh" | "model.discovery";
-  provider?: "anthropic" | "openai";
-  route?: "messages" | "responses";
-}
-
-function incomingClassification(path: string): AutomaticSpanClassification | undefined {
-  if (path === "/v1/messages") return { operation: "proxy.request", route: "messages" };
-  if (path === "/v1/responses") return { operation: "proxy.request", route: "responses" };
-  return undefined;
-}
-
-export function classifyOutgoingTelemetryOperation(
-  hostname: string | undefined,
-  path: string,
-  method: string | undefined,
-  trustedProviderHostname?: string,
-): AutomaticSpanClassification | undefined {
-  const host = normalizedHostname(hostname);
-  const testLoopback = isTestLoopbackHostname(host);
-  const normalizedMethod = method?.toUpperCase();
-  // Provider request bodies outlive response headers, so the routing layers
-  // retain one manual provider.inference span through terminal body capture.
-  // Leaving these POSTs unclassified prevents HTTP/Undici header spans from
-  // duplicating that attempt and reporting a contradictory shorter duration.
-  if (normalizedMethod === "POST" && (
-    (host === "claude.ai" && path === "/v1/oauth/token")
-    || (host === "auth.openai.com" && path === "/oauth/token")
-    || (testLoopback && (path === "/v1/oauth/token" || path === "/oauth/token"))
-  )) {
-    return {
-      operation: "oauth.refresh",
-      provider: path === "/v1/oauth/token" ? "anthropic" : "openai",
-    };
-  }
-  if (normalizedMethod === "GET" && (host === "api.anthropic.com" || testLoopback)
-    && path === "/api/oauth/usage") {
-    return { operation: "provider.usage_refresh", provider: "anthropic" };
-  }
-  if (normalizedMethod === "GET" && (host === "api.anthropic.com" || testLoopback)
-    && path === "/v1/models") {
-    return {
-      operation: "model.discovery",
-      provider: "anthropic",
-    };
-  }
-  if (normalizedMethod === "GET" && path === "/backend-api/codex/models"
-    && (host === "chatgpt.com" || testLoopback)) {
-    return {
-      operation: "model.discovery",
-      provider: "openai",
-    };
-  }
-  return undefined;
-}
-
-function classificationAttributes(
-  classification: AutomaticSpanClassification,
-  runtimeMode: RuntimeMode,
-): Record<string, string> {
-  return {
-    "cc_router.operation": classification.operation,
-    "cc_router.runtime_mode": runtimeMode,
-    ...(classification.provider === undefined ? {} : { "cc_router.provider": classification.provider }),
-    ...(classification.route === undefined ? {} : { "cc_router.route": classification.route }),
-  };
-}
-
-function testIdGenerator(): IdGenerator | undefined {
-  if (process.env["NODE_ENV"] !== "test") return undefined;
-  const traceId = process.env["CC_ROUTER_TEST_TRACE_ID"]?.toLowerCase();
-  if (!traceId || !/^[0-9a-f]{32}$/.test(traceId) || /^0+$/.test(traceId)) return undefined;
-  const random = new RandomIdGenerator();
-  return {
-    generateTraceId: () => traceId,
-    generateSpanId: () => random.generateSpanId(),
-  };
-}
-
-function createInstrumentations(runtimeMode: RuntimeMode, trustedProviderHostname?: string): [
-  HttpInstrumentation,
-  ExpressInstrumentation,
-  UndiciInstrumentation,
-] {
-  return [
-    new HttpInstrumentation({
-      ignoreIncomingRequestHook(request) {
-        return !isProxyInferencePath(requestPath(request.url));
-      },
-      ignoreOutgoingRequestHook(request) {
-        const hostname = httpHostname(request);
-        const path = requestPath(request.path ?? undefined);
-        return isTelemetryEndpoint(hostname, path)
-          || classifyOutgoingTelemetryOperation(hostname, path, request.method, trustedProviderHostname) === undefined;
-      },
-      requireParentforOutgoingSpans: true,
-      startIncomingSpanHook(request) {
-        const classification = incomingClassification(requestPath(request.url));
-        return classification ? classificationAttributes(classification, runtimeMode) : {};
-      },
-      startOutgoingSpanHook(request) {
-        const classification = classifyOutgoingTelemetryOperation(
-          httpHostname(request),
-          requestPath(request.path ?? undefined),
-          request.method,
-          trustedProviderHostname,
-        );
-        return classification ? classificationAttributes(classification, runtimeMode) : {};
-      },
-      requestHook(span, request) {
-        const classification = request instanceof IncomingMessage
-          ? incomingClassification(requestPath(request.url))
-          : classifyOutgoingTelemetryOperation(
-            (request as ClientRequest).host,
-            requestPath((request as ClientRequest).path),
-            (request as ClientRequest).method,
-            trustedProviderHostname,
-          );
-        if (classification) span.setAttributes(classificationAttributes(classification, runtimeMode));
-      },
-    }),
-    new ExpressInstrumentation({
-      requestHook(span, info) {
-        const classification = incomingClassification(requestPath(info.request.path));
-        if (classification) span.setAttributes(classificationAttributes(classification, runtimeMode));
-      },
-    }),
-    new UndiciInstrumentation({
-      requireParentforSpans: true,
-      ignoreRequestHook(request: UndiciRequest) {
-        let hostname: string | undefined;
-        try {
-          hostname = new URL(request.origin).hostname;
-        } catch {
-          return true;
-        }
-        const path = requestPath(request.path);
-        return isTelemetryEndpoint(hostname, path)
-          || classifyOutgoingTelemetryOperation(hostname, path, request.method, trustedProviderHostname) === undefined;
-      },
-      startSpanHook(request) {
-        let hostname: string | undefined;
-        try {
-          hostname = new URL(request.origin).hostname;
-        } catch {
-          return {};
-        }
-        const classification = classifyOutgoingTelemetryOperation(
-          hostname,
-          requestPath(request.path),
-          request.method,
-          trustedProviderHostname,
-        );
-        return classification ? classificationAttributes(classification, runtimeMode) : {};
-      },
-    }),
-  ];
+function startTracing(
+  consent: TelemetryConsentGate,
+  snapshot: TelemetrySnapshot,
+  options: StartTelemetryRuntimeOptions,
+): NodeTracerProvider {
+  const { spanExporter } = createPostHogOtlpExporters(exporterOptions(consent, snapshot, options));
+  const provider = new NodeTracerProvider({
+    resource: telemetryResource(snapshot, options.runtimeMode),
+    sampler: consentGatedSampler(consent),
+    spanProcessors: [new BatchSpanProcessor(spanExporter, {
+      maxQueueSize: QUEUE_SIZE,
+      maxExportBatchSize: BATCH_SIZE,
+      scheduledDelayMillis: EXPORT_DELAY_MS,
+      exportTimeoutMillis: EXPORT_TIMEOUT_MS,
+    })],
+  });
+  // register() installs the AsyncLocalStorage context manager together with the
+  // global tracer provider; the inert propagator keeps trace ids off the wire.
+  provider.register({ propagator: noopPropagator });
+  trace.setGlobalTracerProvider(provider);
+  return provider;
 }
 
 function settleWithin(operation: () => Promise<void>, deadlineMs: number): Promise<void> {
@@ -358,131 +194,87 @@ function settleWithin(operation: () => Promise<void>, deadlineMs: number): Promi
   ]).then(() => undefined).catch(() => undefined).finally(() => clearTimeout(timer));
 }
 
-export interface StartProxyTelemetryOptions {
-  trustedProviderTarget?: string;
-}
-
-export function startProxyTelemetry(
-  runtimeMode: RuntimeMode,
-  options: StartProxyTelemetryOptions = {},
-): boolean {
-  if (activeRuntime) return true;
+/**
+ * Start (or upgrade to tracing) the one telemetry runtime of this process.
+ * Spans are created manually through the facade; no instrumentation is loaded.
+ */
+export function startTelemetryRuntime(options: StartTelemetryRuntimeOptions): boolean {
   try {
+    const existing = activeRuntime;
+    if (existing) {
+      if (options.tracing && !existing.tracerProvider && !existing.shuttingDown) {
+        existing.tracerProvider = startTracing(existing.consent, existing.snapshot, options);
+      }
+      return !existing.shuttingDown;
+    }
     const snapshot = getTelemetrySnapshot();
     if (!snapshot.enabled) return false;
+
     let discardQueuedTelemetry = (): void => undefined;
-    const consent = createTelemetryConsentGate(
-      getTelemetrySnapshot,
-      snapshot,
-      () => discardQueuedTelemetry(),
-    );
-    const testOtlpUrls = loopbackTestOtlpUrls();
-    if (!testOtlpUrls.valid) return false;
-    const exporterOptions = {
-      getSnapshot: () => consent.getSnapshot() ?? {
-        ...snapshot,
-        enabled: false,
-      },
-      ...(testOtlpUrls.configured ? {
-      traceUrl: testOtlpUrls.traceUrl,
-      logUrl: testOtlpUrls.logUrl,
-      } : {}),
-    };
-    const exporters = createPostHogOtlpExporters(exporterOptions);
-    const spanProcessor = new BatchSpanProcessor(exporters.spanExporter, {
-      maxQueueSize: QUEUE_SIZE,
-      maxExportBatchSize: BATCH_SIZE,
-      scheduledDelayMillis: EXPORT_DELAY_MS,
-      exportTimeoutMillis: EXPORT_TIMEOUT_MS,
-    });
+    const consent = consentGate(getTelemetrySnapshot, () => discardQueuedTelemetry());
+    const { logExporter } = createPostHogOtlpExporters(exporterOptions(consent, snapshot, options));
     const logProcessor = new BatchLogRecordProcessor({
-      exporter: exporters.logExporter,
+      exporter: logExporter,
       maxQueueSize: QUEUE_SIZE,
       maxExportBatchSize: BATCH_SIZE,
       scheduledDelayMillis: EXPORT_DELAY_MS,
       exportTimeoutMillis: EXPORT_TIMEOUT_MS,
-    });
-    const idGenerator = testIdGenerator();
-    const sdk = new NodeSDK({
-      autoDetectResources: false,
-      resourceDetectors: [],
-      resource: resourceFromAttributes({
-        "service.name": "cc-router",
-        "service.version": getCurrentVersion(),
-        "service.instance.id": snapshot.state.installId,
-        "process.runtime.version": process.versions.node,
-        "os.type": osFamily(),
-        "host.arch": cpuArchitecture(),
-        "cc_router.runtime_mode": runtimeMode,
-      }),
-      sampler: createProxyTraceSampler({
-        getSnapshot: getTelemetrySnapshot,
-        initialSnapshot: snapshot,
-      }),
-      textMapPropagator: proxyNetworkPropagator,
-      ...(idGenerator === undefined ? {} : { idGenerator }),
-      instrumentations: createInstrumentations(
-        runtimeMode,
-        trustedTargetHostname(options.trustedProviderTarget),
-      ),
-      spanProcessors: [spanProcessor],
-      logRecordProcessors: [logProcessor],
-      metricReaders: [],
-      views: [],
     });
     const posthog = createPostHogTelemetryClient({ getSnapshot: getTelemetrySnapshot });
-    discardQueuedTelemetry = () => {
-      posthog.discardPending();
-      void spanProcessor.shutdown().catch(() => undefined);
-      void logProcessor.shutdown().catch(() => undefined);
-    };
     const fatalMonitor = (error: unknown): void => {
       try {
         const current = consent.getSnapshot();
         if (!current) return;
-        const exception = sanitizeException(error, {
+        const exception = sanitize(error, {
           category: "runtime",
           reason: "other",
-          operation: "proxy.request",
-          runtimeMode,
+          runtimeMode: options.runtimeMode,
         }, {
           installationId: current.state.installId,
           diagnosticId: randomUUID(),
-        }, {
-          projectRoot: PROJECT_ROOT,
         });
-        if (exception) {
-          reportFatalExceptionCorrelationLocally(exception.diagnosticId);
-          void posthog.captureExceptionImmediate(exception, current.state.consentGeneration);
-        }
+        if (!exception) return;
+        // Node's default handler prints the Error itself; add correlation only.
+        console.error(`[cc-router] Unexpected runtime failure (diagnostic ID: ${exception.diagnosticId})`);
+        void posthog.captureExceptionImmediate(exception, current.state.consentGeneration);
       } catch {
         // The monitor observes only; it never changes Node's crash behavior.
       }
     };
-    const exitCleanup = (): void => {
-      process.removeListener("uncaughtExceptionMonitor", fatalMonitor);
-    };
-
-    sdk.start();
-    activeRuntime = {
-      sdk,
-      spanProcessor,
-      logProcessor,
+    const runtime: ActiveRuntime = {
+      loggerProvider: new LoggerProvider({
+        resource: telemetryResource(snapshot, options.runtimeMode),
+        processors: [logProcessor],
+      }),
       posthog,
-      fatalMonitor,
-      exitCleanup,
       consent,
+      snapshot,
+      fatalMonitor,
+      exitCleanup: () => process.removeListener("uncaughtExceptionMonitor", fatalMonitor),
       shuttingDown: false,
     };
+    discardQueuedTelemetry = () => {
+      posthog.discardPending();
+      void logProcessor.shutdown().catch(() => undefined);
+      void runtime.tracerProvider?.shutdown().catch(() => undefined);
+    };
+
+    logs.setGlobalLoggerProvider(runtime.loggerProvider);
+    if (options.tracing) runtime.tracerProvider = startTracing(consent, snapshot, options);
     process.on("uncaughtExceptionMonitor", fatalMonitor);
-    process.once("exit", exitCleanup);
+    process.once("exit", runtime.exitCleanup);
+    activeRuntime = runtime;
     return true;
   } catch {
     return false;
   }
 }
 
-export async function flushProxyTelemetryWithin(deadlineMs: number): Promise<void> {
+export function isTelemetryRuntimeActive(): boolean {
+  return activeRuntime !== undefined && !activeRuntime.shuttingDown;
+}
+
+export async function flushTelemetryRuntimeWithin(deadlineMs: number): Promise<void> {
   const runtime = activeRuntime;
   if (!runtime || runtime.shuttingDown) return;
   try {
@@ -495,14 +287,14 @@ export async function flushProxyTelemetryWithin(deadlineMs: number): Promise<voi
   }
   await settleWithin(async () => {
     await Promise.all([
-      runtime.spanProcessor.forceFlush(),
-      runtime.logProcessor.forceFlush(),
+      runtime.loggerProvider.forceFlush(),
+      runtime.tracerProvider?.forceFlush(),
       runtime.posthog.flushWithin(deadlineMs),
     ]);
   }, deadlineMs);
 }
 
-export async function shutdownProxyTelemetryWithin(deadlineMs: number): Promise<void> {
+export async function shutdownTelemetryRuntimeWithin(deadlineMs: number): Promise<void> {
   const runtime = activeRuntime;
   if (!runtime || runtime.shuttingDown) return;
   runtime.shuttingDown = true;
@@ -515,9 +307,16 @@ export async function shutdownProxyTelemetryWithin(deadlineMs: number): Promise<
   }
   await settleWithin(async () => {
     await Promise.all([
-      runtime.sdk.shutdown(),
+      runtime.loggerProvider.shutdown(),
+      runtime.tracerProvider?.shutdown(),
       runtime.posthog.shutdownWithin(deadlineMs),
     ]);
   }, deadlineMs);
+  logs.disable();
+  if (runtime.tracerProvider) {
+    trace.disable();
+    propagation.disable();
+    context.disable();
+  }
   activeRuntime = undefined;
 }

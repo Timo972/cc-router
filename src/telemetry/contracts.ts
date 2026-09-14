@@ -272,3 +272,7 @@ export interface SafeExceptionContract {
   fingerprint: SafeFingerprint;
   diagnosticId: DiagnosticId;
 }
+
+// TEMP(A2): constants.ts merges into this module in A1's rewrite; re-exported so
+// modules can already import the closed enums from "./contracts.js".
+export * from "./constants.js";
