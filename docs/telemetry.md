@@ -129,6 +129,12 @@ fresh random diagnostic ID. The original message, cause chain, custom
 properties, and unrecognized frames are dropped. The diagnostic ID is printed
 next to the detailed local error so an issue report can reference it.
 
+A fatal (uncaught) exception cannot be sent by the crashing process. Its
+sanitized record is written to `~/.cc-router/telemetry.json.pending.json`
+(mode 0600, at most 20 records) and sent by the next start only if the
+installation ID and consent generation still match; otherwise it is deleted
+unsent.
+
 ### Resource and bounds
 
 Resource: `service.name` (`cc-router`), `service.version`,
