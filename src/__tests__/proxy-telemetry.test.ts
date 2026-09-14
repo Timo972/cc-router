@@ -250,7 +250,7 @@ describe("proxy telemetry", () => {
     });
     expect(spansNamed("proxy.request")[0]?.attributes).toMatchObject({
       "cc_router.provider": "openai",
-      "cc_router.request_source": "other",
+      "cc_router.request_source": "cli",
       "cc_router.account_pool_size": 2,
       "http.response.status_code": 200,
     });
@@ -573,5 +573,36 @@ describe("proxy telemetry", () => {
     });
     await waitFor(() => spansNamed("proxy.request").length >= 1);
     expect(spansNamed("proxy.request")[0]?.attributes["cc_router.outcome"]).toBe("cancelled");
+  });
+
+  it("classifies a provider connection lost mid-stream as an upstream failure, not a cancellation", async () => {
+    const upstream = createServer((_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 4 } } })}\n\n`);
+      // The provider drops the connection mid-body.
+      setTimeout(() => res.destroy(), 20);
+    });
+    const upstreamPort = await listen(upstream);
+    try {
+      await withApp(mountAnthropic(upstreamPort), async baseUrl => {
+        const res = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "claude-sonnet-5", messages: [], stream: true }),
+        });
+        expect(res.status).toBe(200);
+        await res.text().catch(() => undefined);
+        await waitFor(() => spansNamed("provider.inference").length >= 1);
+      });
+    } finally {
+      await close(upstream);
+    }
+
+    expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
+      "cc_router.outcome": "upstream_error",
+      "cc_router.stream_outcome": "upstream_error",
+    });
+    await waitFor(() => spansNamed("proxy.request").length >= 1);
+    expect(spansNamed("proxy.request")[0]?.attributes["cc_router.outcome"]).toBe("upstream_error");
   });
 });

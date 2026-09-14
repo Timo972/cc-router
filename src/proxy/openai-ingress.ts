@@ -154,6 +154,17 @@ export interface OpenAIRelayReport {
   routerFailure: boolean;
 }
 
+/** Map the activity-log client label onto the closed telemetry request source. */
+function requestSourceOf(source: LogEntry["source"]): RequestSource {
+  switch (source) {
+    case "codex":
+    case "cli": return "cli";
+    case "desktop": return "desktop";
+    case "api": return "api";
+    default: return "other";
+  }
+}
+
 export interface OpenAIIngressOptions {
   res: Response;
   sessionKey: unknown;
@@ -229,7 +240,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     provider: "openai",
     route,
     modelFamily,
-    requestSource: opts.requestSource ?? "other",
+    requestSource: opts.requestSource ?? requestSourceOf(opts.source),
     streaming,
     accountPoolSize: openAIPool.getAll().length,
   });

@@ -9,11 +9,12 @@ import {
 } from "../../proxy/transport-diagnostics.js";
 import { DEFAULT_CLIENT_ID } from "./device-oauth.js";
 import {
-  annotateActiveSpan,
+  classifyExpectedRuntimeFailure,
   httpOutcome,
   recordRuntimeError,
   recordUpstreamStatus,
   withTelemetrySpan,
+  type ActiveTelemetrySpan,
 } from "../../telemetry/facade.js";
 
 const TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
@@ -129,8 +130,8 @@ export async function refreshOpenAISubscriptionToken(account: OpenAISubscription
   if (existing) return existing;
 
   const promise = withTelemetrySpan("oauth.refresh", { provider: "openai" }, async span => {
-    const refreshed = await doRefresh(account);
-    if (!refreshed) span.fail({ outcome: "upstream_error" });
+    const refreshed = await doRefresh(account, span);
+    if (!refreshed) span.fail();
     return refreshed;
   });
   refreshLocks.set(account, promise);
@@ -268,7 +269,7 @@ function logRefreshFailure(
   }));
 }
 
-async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
+async function doRefresh(account: OpenAISubscriptionAccount, span: ActiveTelemetrySpan): Promise<boolean> {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: account.refreshToken,
@@ -296,7 +297,7 @@ async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
       try { payload = await res.json(); } catch { /* intentionally do not retain response bodies */ }
       markRefreshFailure(account, rejectIsPermanent(res.status, payload));
       recordUpstreamStatus("oauth.refresh", "openai", res.status);
-      annotateActiveSpan("oauth.refresh", { httpStatusCode: res.status, outcome: httpOutcome(res.status) });
+      span.fail({ httpStatusCode: res.status, outcome: httpOutcome(res.status) });
       logRefreshFailure(account, correlationId, res.status);
       return false;
     }
@@ -307,6 +308,7 @@ async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
     // exactly like a non-ok HTTP response — never propagate as a rejection.
     markRefreshFailure(account, false);
     recordRuntimeError(error, { operation: "oauth.refresh", provider: "openai" });
+    span.fail({ outcome: classifyExpectedRuntimeFailure(error) === "timeout" ? "timeout" : "upstream_error" });
     logRefreshFailure(account, correlationId, responseStatus, error);
     return false;
   } finally {

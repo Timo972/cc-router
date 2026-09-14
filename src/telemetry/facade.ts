@@ -84,6 +84,8 @@ export interface TelemetrySpanHandle {
  *  failure value (false, { ok: false }, []) can still mark its span failed. */
 export interface ActiveTelemetrySpan {
   annotate(attributes: SafeSpanAttributes): void;
+  /** Mark the span failed. An outcome already annotated is kept; otherwise
+   *  `upstream_error` is recorded. */
   fail(attributes?: SafeSpanAttributes): void;
 }
 
@@ -346,13 +348,17 @@ export function withTelemetrySpan<T>(
       async span => {
         started = true;
         let failed = false;
+        let outcomeSet = false;
         const handle: ActiveTelemetrySpan = {
           annotate(next): void {
+            if (next.outcome !== undefined) outcomeSet = true;
             try { span.setAttributes(toOtelAttributes(SPAN_ATTRIBUTE_KEYS, next)); } catch { /* optional */ }
           },
           fail(next): void {
             failed = true;
             if (next) handle.annotate(next);
+            // A generic outcome only when no failure path classified one.
+            if (!outcomeSet) handle.annotate({ outcome: "upstream_error" });
           },
         };
         try {

@@ -194,7 +194,12 @@ function forwardAttempt(opts: {
  * its HTTP/1.0 accommodations, so moving /v1/messages off the generic proxy
  * changes nothing about what a client receives.
  */
-function relayUpstreamResponse(upstream: IncomingMessage, req: Request, res: Response): void {
+function relayUpstreamResponse(
+  upstream: IncomingMessage,
+  req: Request,
+  res: Response,
+  onUpstreamFailure?: () => void,
+): void {
   if (req.httpVersion === "1.0") {
     delete upstream.headers["transfer-encoding"];
     upstream.headers["connection"] = (req.headers["connection"] as string | undefined) ?? "close";
@@ -211,6 +216,9 @@ function relayUpstreamResponse(upstream: IncomingMessage, req: Request, res: Res
   // tear the client connection down rather than ending it cleanly, so the
   // client sees a broken transfer instead of a silently truncated body.
   upstream.once("error", () => {
+    // Recorded before the downstream teardown, which would otherwise look
+    // like a client hang-up to the response's own close listener.
+    onUpstreamFailure?.();
     if (!res.writableEnded) res.destroy();
   });
   upstream.pipe(res);
@@ -631,6 +639,9 @@ export function mountAnthropicMessagesRoute(
       const contentType = String(upstream.headers["content-type"] ?? "");
       const encoding = String(upstream.headers["content-encoding"] ?? "");
       const isSse = contentType.includes("text/event-stream");
+      // Set by the relay when the provider connection failed first; a client
+      // hang-up also destroys the upstream, so the order of events matters.
+      let upstreamFailedFirst = false;
       // The lifecycle tracker only reads uncompressed SSE; the usage capture's
       // decoded copy reports the terminal event for compressed streams.
       let decodedMessageStop = false;
@@ -643,6 +654,7 @@ export function mountAnthropicMessagesRoute(
         // A client hang-up destroys the upstream request too, so the client's
         // own signal must win over the resulting upstream abort.
         const streamOutcome: StreamOutcome = status >= 400 ? "upstream_error"
+          : upstreamFailedFirst ? "upstream_error"
           : clientGone.signal.aborted ? "cancelled"
           : lifecycle?.upstreamAborted ? "upstream_error"
           : !res.writableEnded ? "cancelled"
@@ -676,7 +688,9 @@ export function mountAnthropicMessagesRoute(
           maybeFinishAttempt();
         },
       });
-      relayUpstreamResponse(upstream, req, res);
+      relayUpstreamResponse(upstream, req, res, () => {
+        if (!clientGone.signal.aborted) upstreamFailedFirst = true;
+      });
       return;
     }
   };

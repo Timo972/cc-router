@@ -333,9 +333,11 @@ describe("telemetry facade", () => {
       annotateActiveSpan("model.discovery", { outcome: "complete" });
       return undefined;
     });
-    // An operation that resolves with a failure value marks its own span.
+    // An operation that resolves with a failure value marks its own span, and a
+    // later bare fail() keeps the outcome the failure path already classified.
     await expect(withTelemetrySpan("provider.usage_refresh", { provider: "openai" }, async span => {
-      span.fail({ httpStatusCode: 503, outcome: "upstream_error" });
+      span.fail({ httpStatusCode: 503, outcome: "rate_limited" });
+      span.fail();
       return { ok: false };
     })).resolves.toEqual({ ok: false });
 
@@ -345,7 +347,7 @@ describe("telemetry facade", () => {
     expect(recordedSpans()[3]?.status).toBe(2);
     expect(recordedSpans()[3]?.attributes).toMatchObject({
       "http.response.status_code": 503,
-      "cc_router.outcome": "upstream_error",
+      "cc_router.outcome": "rate_limited",
     });
     expect(recordedSpans()[0]?.attributes).toEqual({
       "cc_router.operation": "provider.inference",
