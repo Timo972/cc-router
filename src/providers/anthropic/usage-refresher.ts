@@ -4,6 +4,7 @@ import { fetchAnthropicUsage, type UsageFetchResult } from "./usage.js";
 import {
   httpOutcome,
   recordRuntimeError,
+  recordSafeLog,
   recordUpstreamStatus,
   withTelemetrySpan,
 } from "../../telemetry/facade.js";
@@ -45,7 +46,20 @@ export class AnthropicUsageRefresher extends UsageRefresher<Account, UsageFetchR
               recordUpstreamStatus("provider.usage_refresh", "anthropic", result.status);
               span.fail({ httpStatusCode: result.status, outcome: httpOutcome(result.status) });
             } else {
-              span.fail({ outcome: result.reason === "timeout" ? "timeout" : "other" });
+              // fetchAnthropicUsage resolves transport failures instead of
+              // throwing, so the unsampled failure log is emitted here.
+              const reason = result.reason === "timeout" ? "timeout"
+                : result.reason === "network" ? "network_failure"
+                : "other";
+              const outcome = reason === "timeout" ? "timeout" : "upstream_error";
+              recordSafeLog({
+                operation: "provider.usage_refresh",
+                provider: "anthropic",
+                severity: "error",
+                reason,
+                outcome,
+              });
+              span.fail({ outcome });
             }
           }
           return result;

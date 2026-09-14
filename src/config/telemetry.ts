@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { linkSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { ensureConfigDir } from "./directory.js";
 import { TELEMETRY_PATH } from "./paths.js";
 
@@ -95,11 +95,40 @@ function writeState(state: TelemetryState): void {
   }
 }
 
+/**
+ * Publish the initial state exclusively. A hard link fails with EEXIST when
+ * another process published first (possibly an explicit opt-out that landed
+ * between our read and our write), and that winner is adopted rather than
+ * replaced. Only an existing file that cannot be parsed is repaired.
+ */
 function createState(): TelemetryState {
-  const state = defaultState();
-  writeState(state);
-  if (!firstStartClaimed) pendingFirstStartInstallId = state.installId;
-  return state;
+  ensureConfigDir();
+  const fresh = defaultState();
+  const candidate = `${TELEMETRY_PATH}.${process.pid}.${randomUUID()}.init.tmp`;
+  writeFileSync(candidate, JSON.stringify(fresh, null, 2), { mode: 0o600 });
+  let published = false;
+  try {
+    linkSync(candidate, TELEMETRY_PATH);
+    published = true;
+  } catch (error) {
+    if (errorCode(error) !== "EEXIST") {
+      try { unlinkSync(candidate); } catch { /* the unique candidate is inert */ }
+      throw error;
+    }
+  } finally {
+    if (published) {
+      try { unlinkSync(candidate); } catch { /* the unique candidate is inert */ }
+    }
+  }
+  if (!published) {
+    try { unlinkSync(candidate); } catch { /* the unique candidate is inert */ }
+    const winner = readState();
+    if (winner) return winner;
+    // Present but unparseable: not a consent record, so replacing it loses nothing.
+    writeState(fresh);
+  }
+  if (!firstStartClaimed) pendingFirstStartInstallId = fresh.installId;
+  return fresh;
 }
 
 // Missing or malformed state is (re)initialized enabled; a supported legacy

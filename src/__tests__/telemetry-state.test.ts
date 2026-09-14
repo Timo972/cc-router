@@ -7,7 +7,11 @@ const MOCK_DIR = vi.hoisted(() => {
 });
 const TELEMETRY_PATH = `${MOCK_DIR}/telemetry.json`;
 
-const fsCalls = vi.hoisted(() => ({ writes: [] as string[], renames: [] as [string, string][] }));
+const fsCalls = vi.hoisted(() => ({
+  writes: [] as string[],
+  renames: [] as [string, string][],
+  beforeLink: undefined as (() => void) | undefined,
+}));
 
 vi.mock("../config/paths.js", () => ({
   CONFIG_DIR: MOCK_DIR,
@@ -31,6 +35,10 @@ vi.mock("fs", async (importOriginal) => {
     renameSync: (from: fs.PathLike, to: fs.PathLike) => {
       fsCalls.renames.push([String(from), String(to)]);
       return actual.renameSync(from, to);
+    },
+    linkSync: (from: fs.PathLike, to: fs.PathLike) => {
+      fsCalls.beforeLink?.();
+      return actual.linkSync(from, to);
     },
   };
 });
@@ -78,6 +86,29 @@ describe("persisted telemetry state", () => {
     expect(new Date(snapshot.state.firstRunAt).getTime()).toBeGreaterThan(0);
     expect(readFile()).toEqual(snapshot.state);
     expect(getTelemetrySnapshot().state.installId).toBe(snapshot.state.installId);
+  });
+
+  it("adopts an opt-out another process published between the read and the initial publish", async () => {
+    const { getTelemetrySnapshot, claimTelemetryFirstStart } = await freshModule();
+    const optOut = JSON.stringify({
+      enabled: false,
+      installId: "11111111-2222-4333-8444-555555555555",
+      firstRunAt: "2026-01-01T00:00:00.000Z",
+      consentGeneration: "66666666-7777-4888-9999-000000000000",
+    });
+    // Models `cc-router telemetry off` landing in another process after this
+    // one observed a missing file.
+    fsCalls.beforeLink = () => {
+      fsCalls.beforeLink = undefined;
+      fs.writeFileSync(TELEMETRY_PATH, optOut, "utf8");
+    };
+
+    const snapshot = getTelemetrySnapshot();
+
+    expect(snapshot.enabled).toBe(false);
+    expect(snapshot.state.installId).toBe("11111111-2222-4333-8444-555555555555");
+    expect(fs.readFileSync(TELEMETRY_PATH, "utf8")).toBe(optOut);
+    expect(claimTelemetryFirstStart()).toBeUndefined();
   });
 
   it("repairs a malformed state file instead of failing every later read", async () => {

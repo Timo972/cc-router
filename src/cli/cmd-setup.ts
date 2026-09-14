@@ -55,10 +55,6 @@ function printDiagnosticId(outcome: SetupFailureOutcome): void {
 
 // ─── Shared single-account setup (also used by `accounts add`) ───────────────
 
-export async function setupSingleAccount(index: number): Promise<Account | null> {
-  return (await setupSingleAccountWithAttempt(index)).account;
-}
-
 /**
  * Same step, but also hands back the setup attempt so the caller can mark the
  * `persistence` stage and the final outcome once the account is written.

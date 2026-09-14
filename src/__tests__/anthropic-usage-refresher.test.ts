@@ -1,4 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const telemetry = vi.hoisted(() => ({ safeLogs: [] as Array<Record<string, unknown>> }));
+vi.mock("../telemetry/facade.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../telemetry/facade.js")>()),
+  recordSafeLog: (input: Record<string, unknown>) => { telemetry.safeLogs.push(input); },
+}));
 import {
   fetchAnthropicUsage,
   type UsageFetchResult,
@@ -190,6 +196,27 @@ describe("AnthropicUsageRefresher", () => {
     await vi.advanceTimersByTimeAsync(5 * 60_000);
     expect(fetchUsage).toHaveBeenCalledTimes(5);
     refresher.stop();
+  });
+
+  it("emits an unsampled failure log when the usage fetch resolves a transport failure", async () => {
+    vi.useFakeTimers();
+    telemetry.safeLogs = [];
+    const refresher = new AnthropicUsageRefresher(new TokenPool([account("a")]), {
+      fetchUsage: async () => ({ ok: false, reason: "timeout" }),
+      startupStaggerMs: 0,
+    });
+    refresher.start();
+    await vi.advanceTimersByTimeAsync(0);
+    refresher.stop();
+
+    expect(telemetry.safeLogs).toEqual([expect.objectContaining({
+      operation: "provider.usage_refresh",
+      provider: "anthropic",
+      reason: "timeout",
+      outcome: "timeout",
+      severity: "error",
+    })]);
+    expect(JSON.stringify(telemetry.safeLogs)).not.toContain("secret-access");
   });
 
   it("marks accounts with no successful fetch unavailable", async () => {

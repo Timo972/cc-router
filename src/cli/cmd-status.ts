@@ -2,6 +2,11 @@ import type { Command } from "commander";
 import chalk from "chalk";
 import { PROXY_PORT } from "../config/paths.js";
 import { readConfig } from "../config/manager.js";
+import {
+  classifyHttpSetupFailure,
+  failAttemptFromError,
+  type SetupAttempt,
+} from "../telemetry/setup-diagnostics.js";
 
 /**
  * Resolves where the proxy's HTTP API lives and which bearer token to use.
@@ -185,10 +190,13 @@ async function dashboardLoop(port: number): Promise<void> {
  * success, or null if the user aborted / an error occurred.
  */
 async function runAddAccountFlow(target: StatusTarget): Promise<string | null> {
+  let attempt: SetupAttempt | undefined;
   try {
-    const { setupSingleAccount } = await import("./cmd-setup.js");
+    const { setupSingleAccountWithAttempt } = await import("./cmd-setup.js");
     // The index shown in the flow is just for display, pick something neutral.
-    const account = await setupSingleAccount(1);
+    const setup = await setupSingleAccountWithAttempt(1);
+    attempt = setup.attempt;
+    const account = setup.account;
     if (!account) return null;
 
     const res = await fetch(`${target.baseUrl}/cc-router/accounts`, {
@@ -211,11 +219,18 @@ async function runAddAccountFlow(target: StatusTarget): Promise<string | null> {
       const text = await res.text().catch(() => "");
       console.error(chalk.red(`\n✗ Server rejected account: HTTP ${res.status}`));
       if (text) console.error(chalk.gray(`  ${text}`));
+      attempt.failed(classifyHttpSetupFailure("persistence", res.status, "dashboard account add rejected"), "persistence");
       return null;
     }
+    attempt.stageCompleted("persistence");
+    attempt.succeeded();
     return account.id;
   } catch (err) {
     console.error(chalk.red(`\n✗ Failed to add account: ${(err as Error).message}`));
+    if (attempt) {
+      const outcome = failAttemptFromError(attempt, err, "persistence");
+      if (outcome?.unexpected) console.error(chalk.gray(`  Diagnostic ID: ${outcome.diagnosticId}`));
+    }
     return null;
   }
 }
