@@ -1,4 +1,5 @@
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
+import { MAX_RETAINED_SSE_LINE_BYTES } from "./stream-lifecycle.js";
 import type { Transform } from "node:stream";
 
 /**
@@ -77,13 +78,37 @@ export function createAnthropicUsageCapture(
 
   // ── SSE: incremental line parsing, stop once both events were seen ────────
   let lineBuf = "";
+  let discardingOversizedLine = false;
   let gotInput = false;
   let gotOutput = false;
   const parseSSEChunk = (text: string): void => {
-    lineBuf += text;
-    const lines = lineBuf.split("\n");
+    let rest = text;
+    if (discardingOversizedLine) {
+      const newline = rest.indexOf("\n");
+      if (newline === -1) return; // still inside the oversized line
+      rest = rest.slice(newline + 1);
+      discardingOversizedLine = false;
+    }
+    if (!rest.includes("\n")) {
+      // No line boundary yet: retain a bounded partial line and never re-split
+      // the accumulated tail (an unterminated tail would otherwise cost
+      // quadratic work and unbounded memory).
+      if (lineBuf.length + rest.length > MAX_RETAINED_SSE_LINE_BYTES) {
+        lineBuf = "";
+        discardingOversizedLine = true;
+      } else {
+        lineBuf += rest;
+      }
+      return;
+    }
+    const lines = (lineBuf + rest).split("\n");
     lineBuf = lines.pop() ?? ""; // keep incomplete last line
+    if (lineBuf.length > MAX_RETAINED_SSE_LINE_BYTES) {
+      lineBuf = "";
+      discardingOversizedLine = true;
+    }
     for (const line of lines) {
+      if (dead) return;
       if (!line.startsWith("data: ")) continue;
       try {
         const evt = JSON.parse(line.slice(6)) as {
@@ -99,7 +124,12 @@ export function createAnthropicUsageCapture(
           options.onOutputUsage(evt.usage);
           gotOutput = true;
         }
-        if (evt.type === "message_stop") options.onMessageStop?.();
+        if (evt.type === "message_stop") {
+          // The terminal event is the last thing of interest on the stream.
+          options.onMessageStop?.();
+          die();
+          return;
+        }
         // Everything of interest has been seen — stop paying for the rest of
         // the stream (and free the decompressor's zlib state), unless the
         // caller also wants the terminal event.

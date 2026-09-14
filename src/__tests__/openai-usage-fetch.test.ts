@@ -1,4 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
+
+const spanFailures = vi.hoisted(() => [] as Array<Record<string, unknown> | undefined>);
+vi.mock("../telemetry/facade.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../telemetry/facade.js")>()),
+  withTelemetrySpan: async (
+    _operation: string,
+    _attributes: unknown,
+    callback: (span: { annotate(a: unknown): void; fail(a?: Record<string, unknown>): void }) => Promise<unknown>,
+  ) => callback({ annotate: () => undefined, fail: attributes => { spanFailures.push(attributes); } }),
+}));
 import { parseCodexUsagePayload, DEFAULT_CODEX_LIMIT_ID } from "../providers/openai/usage.js";
 import {
   CODEX_USAGE_ENDPOINT,
@@ -300,5 +310,21 @@ describe("OpenAIUsageRefresher", () => {
     refresher.start();
     await vi.waitFor(() => expect(fetched.sort()).toEqual(["a", "b"]), { timeout: 1_000, interval: 5 });
     refresher.stop();
+  });
+
+  it("classifies usage-fetch failures on the span with status and outcome", async () => {
+    spanFailures.length = 0;
+    const account = makeAccount("a");
+
+    await fetchCodexUsage(account, { fetch: async () => new Response("slow down", { status: 429 }) });
+    await fetchCodexUsage(account, { fetch: async () => { throw new DOMException("aborted", "TimeoutError"); } });
+
+    // Each failure classifies at the site, then the wrapper's bare fail() keeps it.
+    expect(spanFailures).toEqual([
+      { httpStatusCode: 429, outcome: "rate_limited" },
+      undefined,
+      { outcome: "timeout" },
+      undefined,
+    ]);
   });
 });

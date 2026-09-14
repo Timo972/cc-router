@@ -4,9 +4,12 @@ import { parseCodexUsagePayload, type CodexRateLimitsUpdate } from "./usage.js";
 import { UsageRefresher } from "../../proxy/usage-refresher.js";
 import type { RefreshableAccountPool } from "../../proxy/usage-refresher.js";
 import {
+  classifyExpectedRuntimeFailure,
+  httpOutcome,
   recordRuntimeError,
   recordUpstreamStatus,
   withTelemetrySpan,
+  type ActiveTelemetrySpan,
 } from "../../telemetry/facade.js";
 
 /**
@@ -31,8 +34,10 @@ export function fetchCodexUsage(
   options: FetchCodexUsageOptions = {},
 ): Promise<CodexUsageFetchResult> {
   return withTelemetrySpan("provider.usage_refresh", { provider: "openai" }, async span => {
-    const result = await runCodexUsageFetch(account, options);
-    if (!result.ok) span.fail({ outcome: result.reason === "network" ? "other" : "upstream_error" });
+    const result = await runCodexUsageFetch(account, options, span);
+    // Failure paths classify the span where the status or error is known;
+    // this only covers the ones that could not (e.g. a malformed body).
+    if (!result.ok) span.fail();
     return result;
   });
 }
@@ -40,6 +45,7 @@ export function fetchCodexUsage(
 async function runCodexUsageFetch(
   account: Pick<OpenAIAccount, "accessToken">,
   options: FetchCodexUsageOptions,
+  span: ActiveTelemetrySpan,
 ): Promise<CodexUsageFetchResult> {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   const now = options.now ?? Date.now;
@@ -52,10 +58,12 @@ async function runCodexUsageFetch(
     });
   } catch (error) {
     recordRuntimeError(error, { operation: "provider.usage_refresh", provider: "openai" });
+    span.fail({ outcome: classifyExpectedRuntimeFailure(error) === "timeout" ? "timeout" : "upstream_error" });
     return { ok: false, reason: "network" };
   }
   if (!response.ok) {
     recordUpstreamStatus("provider.usage_refresh", "openai", response.status);
+    span.fail({ httpStatusCode: response.status, outcome: httpOutcome(response.status) });
   }
   if (response.status === 401 || response.status === 403) return { ok: false, reason: "auth" };
   if (!response.ok) return { ok: false, reason: "http" };
