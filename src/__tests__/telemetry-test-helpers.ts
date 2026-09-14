@@ -170,8 +170,9 @@ function parseJson(rawBody: Buffer): unknown | undefined {
  * the network is captured here instead, so tests can audit the wire directly.
  */
 export interface TransportCaptureOptions {
-  /** "reset" destroys the socket without answering, simulating a failed transport. */
-  responseMode?: "success" | "reset";
+  /** "reset" destroys the socket without answering, simulating a failed transport;
+   *  "unavailable" answers 503 (a status the stock OTLP exporters would retry). */
+  responseMode?: "success" | "reset" | "unavailable";
 }
 
 export async function startTransportCaptureServer(
@@ -187,6 +188,12 @@ export async function startTransportCaptureServer(
         return;
       }
       const rawBody = Buffer.concat(chunks);
+      if (options.responseMode === "unavailable") {
+        requests.push({ method: request.method ?? "GET", url: request.url ?? "/", headers: request.headers, rawBody, json: parseJson(rawBody) });
+        response.statusCode = 503;
+        response.end();
+        return;
+      }
       requests.push({
         method: request.method ?? "GET",
         url: request.url ?? "/",

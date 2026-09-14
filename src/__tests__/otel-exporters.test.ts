@@ -151,7 +151,7 @@ async function capture(options?: Parameters<typeof startTransportCaptureServer>[
 }
 
 async function exporters(getSnapshot: () => TelemetrySnapshot | undefined, options?: {
-  responseMode?: "success" | "reset";
+  responseMode?: "success" | "reset" | "unavailable";
 }) {
   const traces = await capture(options);
   const logs = await capture(options);
@@ -298,6 +298,19 @@ describe("consent-gated PostHog OTLP exporters", () => {
 
     await expect(exportSpans(spanExporter, [unsafeSpan()])).resolves.toEqual({ code: 1 });
     await expect(exportLogs(logExporter, [unsafeLog()])).resolves.toEqual({ code: 1 });
+  });
+
+  it("sends one request per export and never retries a rejected batch", async () => {
+    const { traces, logs, spanExporter, logExporter } = await exporters(() => snapshot(), { responseMode: "unavailable" });
+
+    // A 503 is what the stock OTLP exporters retry after a backoff (a second
+    // transmission that would skip the consent check); the consent-gated
+    // transport reports a plain failure and sends nothing twice.
+    await expect(exportSpans(spanExporter, [unsafeSpan()])).resolves.toEqual({ code: 1 });
+    await expect(exportLogs(logExporter, [unsafeLog()])).resolves.toEqual({ code: 1 });
+
+    expect(traces.requests).toHaveLength(1);
+    expect(logs.requests).toHaveLength(1);
   });
 
   it("settles shutdown even after the endpoint is gone", async () => {

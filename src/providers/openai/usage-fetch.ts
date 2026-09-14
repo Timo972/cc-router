@@ -30,8 +30,11 @@ export function fetchCodexUsage(
   account: Pick<OpenAIAccount, "accessToken">,
   options: FetchCodexUsageOptions = {},
 ): Promise<CodexUsageFetchResult> {
-  return withTelemetrySpan("provider.usage_refresh", { provider: "openai" }, () =>
-    runCodexUsageFetch(account, options));
+  return withTelemetrySpan("provider.usage_refresh", { provider: "openai" }, async span => {
+    const result = await runCodexUsageFetch(account, options);
+    if (!result.ok) span.fail({ outcome: result.reason === "network" ? "other" : "upstream_error" });
+    return result;
+  });
 }
 
 async function runCodexUsageFetch(

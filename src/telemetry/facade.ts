@@ -80,6 +80,13 @@ export interface TelemetrySpanHandle {
   end(status: "ok" | "error"): void;
 }
 
+/** Handed to a withTelemetrySpan callback so an operation that resolves with a
+ *  failure value (false, { ok: false }, []) can still mark its span failed. */
+export interface ActiveTelemetrySpan {
+  annotate(attributes: SafeSpanAttributes): void;
+  fail(attributes?: SafeSpanAttributes): void;
+}
+
 export interface SafeRuntimeLogInput {
   operation: Operation;
   reason: SetupReason;
@@ -282,6 +289,11 @@ const NOOP_SPAN_HANDLE: TelemetrySpanHandle = {
   end: () => undefined,
 };
 
+const NOOP_ACTIVE_SPAN: ActiveTelemetrySpan = {
+  annotate: () => undefined,
+  fail: () => undefined,
+};
+
 /**
  * Start a closed-schema span whose lifetime is owned by an event-driven body.
  * The handle never exposes the OTel span or accepts arbitrary attributes.
@@ -316,23 +328,36 @@ export function startTelemetrySpan(
   }
 }
 
-/** Run one closed runtime operation as the active span. The callback runs exactly once. */
+/**
+ * Run one closed runtime operation as the active span. The callback runs
+ * exactly once; a rejection or an explicit `span.fail()` marks the span failed.
+ */
 export function withTelemetrySpan<T>(
   operation: Operation,
   attributes: SafeSpanAttributes,
-  callback: () => Promise<T>,
+  callback: (span: ActiveTelemetrySpan) => Promise<T>,
 ): Promise<T> {
   let started = false;
   try {
-    if (!sharedConsentGate().getSnapshot()) return callback();
+    if (!sharedConsentGate().getSnapshot()) return callback(NOOP_ACTIVE_SPAN);
     return trace.getTracer(SCOPE).startActiveSpan(
       operation,
       { attributes: spanAttributes(operation, attributes) },
       async span => {
         started = true;
+        let failed = false;
+        const handle: ActiveTelemetrySpan = {
+          annotate(next): void {
+            try { span.setAttributes(toOtelAttributes(SPAN_ATTRIBUTE_KEYS, next)); } catch { /* optional */ }
+          },
+          fail(next): void {
+            failed = true;
+            if (next) handle.annotate(next);
+          },
+        };
         try {
-          const value = await callback();
-          finalizeSpan(span, "ok");
+          const value = await callback(handle);
+          finalizeSpan(span, failed ? "error" : "ok");
           return value;
         } catch (error) {
           finalizeSpan(span, "error");
@@ -342,7 +367,7 @@ export function withTelemetrySpan<T>(
     );
   } catch (error) {
     if (started) return Promise.reject(error);
-    return callback();
+    return callback(NOOP_ACTIVE_SPAN);
   }
 }
 

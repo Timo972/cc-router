@@ -332,10 +332,20 @@ describe("telemetry facade", () => {
       annotateActiveSpan("model.discovery", { outcome: "complete" });
       return undefined;
     });
+    // An operation that resolves with a failure value marks its own span.
+    await expect(withTelemetrySpan("provider.usage_refresh", { provider: "openai" }, async span => {
+      span.fail({ httpStatusCode: 503, outcome: "upstream_error" });
+      return { ok: false };
+    })).resolves.toEqual({ ok: false });
 
     expect(calls).toBe(1);
     expect(recordedSpans().map(span => span.name))
-      .toEqual(["provider.inference", "oauth.refresh", "model.discovery"]);
+      .toEqual(["provider.inference", "oauth.refresh", "model.discovery", "provider.usage_refresh"]);
+    expect(recordedSpans()[3]?.status).toBe(2);
+    expect(recordedSpans()[3]?.attributes).toMatchObject({
+      "http.response.status_code": 503,
+      "cc_router.outcome": "upstream_error",
+    });
     expect(recordedSpans()[0]?.attributes).toEqual({
       "cc_router.operation": "provider.inference",
       "cc_router.provider": "openai",

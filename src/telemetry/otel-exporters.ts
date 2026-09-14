@@ -1,7 +1,20 @@
 import { SpanKind, SpanStatusCode, TraceFlags, type HrTime } from "@opentelemetry/api";
 import { SeverityNumber } from "@opentelemetry/api-logs";
-import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
-import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import {
+  ExporterMetrics,
+  OTLPExporterBase,
+  createOtlpNetworkExportDelegate,
+  type ExportResponse,
+  type IExporterTransport,
+} from "@opentelemetry/otlp-exporter-base";
+import {
+  JsonLogsSerializer,
+  LogsExporterMetricsHelper,
+  ProtobufTraceSerializer,
+  TraceExporterMetricsHelper,
+  type IExporterMetricsHelper,
+  type ISerializer,
+} from "@opentelemetry/otlp-transformer";
 import { resourceFromAttributes, type Resource } from "@opentelemetry/resources";
 import type { LogRecordExporter, ReadableLogRecord } from "@opentelemetry/sdk-logs";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
@@ -292,23 +305,76 @@ function gatedExporter<T>(
   };
 }
 
-export function createPostHogOtlpExporters(options: PostHogOtlpExporterOptions): PostHogOtlpExporters {
-  const shared = {
-    headers: { Authorization: `Bearer ${POSTHOG_PROJECT_TOKEN}` },
-    timeoutMillis: POSTHOG_REQUEST_TIMEOUT_MS,
-    concurrencyLimit: 1,
-    keepAlive: false,
+/**
+ * One HTTP POST per export, consent re-read immediately before it. The SDK's
+ * stock exporters wrap their transport in a retrying layer that would resend a
+ * batch after a 503 without consulting consent again; this transport never
+ * reports a retryable result, so nothing is transmitted twice.
+ */
+function consentGatedTransport(
+  url: string,
+  contentType: string,
+  getSnapshot: () => TelemetrySnapshot | undefined,
+): IExporterTransport {
+  return {
+    async send(data: Uint8Array, timeoutMillis: number): Promise<ExportResponse> {
+      if (!getSnapshot()?.enabled) return { status: "success" };
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "content-type": contentType,
+            authorization: `Bearer ${POSTHOG_PROJECT_TOKEN}`,
+          },
+          body: new Uint8Array(data),
+          signal: AbortSignal.timeout(Math.max(1, timeoutMillis)),
+        });
+        if (response.ok) return { status: "success" };
+        return { status: "failure", error: new Error(`OTLP export rejected with HTTP ${response.status}`) };
+      } catch {
+        // The raw transport error may name hosts or addresses; it stays local.
+        return { status: "failure", error: new Error("OTLP export failed") };
+      }
+    },
+    shutdown(): void {},
   };
+}
+
+function otlpExporter<Internal, Response>(
+  url: string,
+  contentType: string,
+  serializer: ISerializer<Internal, Response>,
+  metricsHelper: IExporterMetricsHelper<Internal>,
+  getSnapshot: () => TelemetrySnapshot | undefined,
+): OTLPExporterBase<Internal> {
+  const options = { timeoutMillis: POSTHOG_REQUEST_TIMEOUT_MS, concurrencyLimit: 1, compression: "none" as const };
+  return new OTLPExporterBase(createOtlpNetworkExportDelegate(
+    options,
+    serializer,
+    new ExporterMetrics({
+      componentType: "cc_router_otlp_exporter",
+      metricsHelper,
+      url,
+      meterProvider: undefined,
+      responseAttributesFromError: () => ({}),
+    }),
+    consentGatedTransport(url, contentType, getSnapshot),
+  ));
+}
+
+export function createPostHogOtlpExporters(options: PostHogOtlpExporterOptions): PostHogOtlpExporters {
+  const traceUrl = options.traceUrl ?? POSTHOG_TRACE_URL;
+  const logUrl = options.logUrl ?? POSTHOG_LOG_URL;
   return {
     spanExporter: gatedExporter(
       options.getSnapshot,
       rebuildSpan,
-      new OTLPTraceExporter({ url: options.traceUrl ?? POSTHOG_TRACE_URL, ...shared }),
+      otlpExporter(traceUrl, "application/x-protobuf", ProtobufTraceSerializer, TraceExporterMetricsHelper, options.getSnapshot),
     ),
     logExporter: gatedExporter(
       options.getSnapshot,
       rebuildLog,
-      new OTLPLogExporter({ url: options.logUrl ?? POSTHOG_LOG_URL, ...shared }),
+      otlpExporter(logUrl, "application/json", JsonLogsSerializer, LogsExporterMetricsHelper, options.getSnapshot),
     ),
   };
 }

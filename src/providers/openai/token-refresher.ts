@@ -9,6 +9,8 @@ import {
 } from "../../proxy/transport-diagnostics.js";
 import { DEFAULT_CLIENT_ID } from "./device-oauth.js";
 import {
+  annotateActiveSpan,
+  httpOutcome,
   recordRuntimeError,
   recordUpstreamStatus,
   withTelemetrySpan,
@@ -126,7 +128,11 @@ export async function refreshOpenAISubscriptionToken(account: OpenAISubscription
   const existing = refreshLocks.get(account);
   if (existing) return existing;
 
-  const promise = withTelemetrySpan("oauth.refresh", { provider: "openai" }, () => doRefresh(account));
+  const promise = withTelemetrySpan("oauth.refresh", { provider: "openai" }, async span => {
+    const refreshed = await doRefresh(account);
+    if (!refreshed) span.fail({ outcome: "upstream_error" });
+    return refreshed;
+  });
   refreshLocks.set(account, promise);
   try {
     return await promise;
@@ -290,6 +296,7 @@ async function doRefresh(account: OpenAISubscriptionAccount): Promise<boolean> {
       try { payload = await res.json(); } catch { /* intentionally do not retain response bodies */ }
       markRefreshFailure(account, rejectIsPermanent(res.status, payload));
       recordUpstreamStatus("oauth.refresh", "openai", res.status);
+      annotateActiveSpan("oauth.refresh", { httpStatusCode: res.status, outcome: httpOutcome(res.status) });
       logRefreshFailure(account, correlationId, res.status);
       return false;
     }

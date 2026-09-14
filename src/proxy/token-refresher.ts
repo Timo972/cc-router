@@ -3,6 +3,8 @@ import { writeAnthropicAccountsPreservingOtherProviders, serialize } from "../co
 import { logRefresh } from "./logger.js";
 import { stats } from "./stats.js";
 import {
+  annotateActiveSpan,
+  httpOutcome,
   recordRuntimeError,
   recordUpstreamStatus,
   withTelemetrySpan,
@@ -81,7 +83,11 @@ export async function refreshAccountToken(account: Account): Promise<boolean> {
   const existing = rawRefreshLocks.get(account);
   if (existing) return existing;
 
-  const promise = withTelemetrySpan("oauth.refresh", { provider: "anthropic" }, () => _doRefresh(account));
+  const promise = withTelemetrySpan("oauth.refresh", { provider: "anthropic" }, async span => {
+    const refreshed = await _doRefresh(account);
+    if (!refreshed) span.fail({ outcome: "upstream_error" });
+    return refreshed;
+  });
   rawRefreshLocks.set(account, promise);
   try {
     return await promise;
@@ -205,6 +211,7 @@ async function _doRefresh(account: Account): Promise<boolean> {
     if (!res.ok) {
       const body = await res.text();
       recordUpstreamStatus("oauth.refresh", "anthropic", res.status);
+      annotateActiveSpan("oauth.refresh", { httpStatusCode: res.status, outcome: httpOutcome(res.status) });
       logRefresh(account.id, false);
       console.error(`  Status: ${res.status} — ${body}`);
       account.consecutiveErrors++;

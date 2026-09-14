@@ -1,6 +1,6 @@
 import type { OpenAISubscriptionAccount } from "./openai/token-refresher.js";
 import type { Account } from "../proxy/types.js";
-import { withTelemetrySpan } from "../telemetry/facade.js";
+import { classifyExpectedRuntimeFailure, httpOutcome, withTelemetrySpan } from "../telemetry/facade.js";
 import type { Provider } from "../telemetry/facade.js";
 
 export const ANTHROPIC_MODELS_ENDPOINT = "https://api.anthropic.com/v1/models";
@@ -56,12 +56,16 @@ function fetchModels(
   init: RequestInit,
   fetchImpl: FetchLike,
 ): Promise<string[]> {
-  return withTelemetrySpan("model.discovery", { provider }, async () => {
+  return withTelemetrySpan("model.discovery", { provider }, async span => {
     try {
       const res = await fetchImpl(url, init);
-      if (!res.ok) return [];
+      if (!res.ok) {
+        span.fail({ httpStatusCode: res.status, outcome: httpOutcome(res.status) });
+        return [];
+      }
       return normalizeModelIds(await res.json());
-    } catch {
+    } catch (error) {
+      span.fail({ outcome: classifyExpectedRuntimeFailure(error) === "timeout" ? "timeout" : "upstream_error" });
       return [];
     }
   });

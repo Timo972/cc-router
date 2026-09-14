@@ -1,7 +1,7 @@
 {
   "name": "@timo972/cc-router",
   "version": "0.12.1",
-  "description": "Cache-aware session router for Claude Max OAuth tokens — use multiple Claude Max accounts with Claude Code",
+  "description": "Cache-aware session router for Claude Max OAuth tokens \u2014 use multiple Claude Max accounts with Claude Code",
   "type": "module",
   "packageManager": "pnpm@11.18.0",
   "bin": {
@@ -52,8 +52,8 @@
     "@inquirer/prompts": "^7.0.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/api-logs": "^0.221.0",
-    "@opentelemetry/exporter-logs-otlp-http": "^0.221.0",
-    "@opentelemetry/exporter-trace-otlp-proto": "^0.221.0",
+    "@opentelemetry/otlp-exporter-base": "^0.221.0",
+    "@opentelemetry/otlp-transformer": "^0.221.0",
     "@opentelemetry/resources": "^2.10.0",
     "@opentelemetry/sdk-logs": "^0.221.0",
     "@opentelemetry/sdk-trace-base": "^2.10.0",

@@ -11,7 +11,7 @@ import { loginXaiWithDeviceCode } from "../providers/xai/device-oauth.js";
 import { isValidAccountId } from "../proxy/account-rename.js";
 import {
   createSetupAttempt,
-  isPromptCancellation,
+  failAttemptFromError,
   withSetupTelemetryFlush,
   type SetupAttempt,
 } from "../telemetry/setup-diagnostics.js";
@@ -172,10 +172,16 @@ export function registerAccounts(program: Command): void {
         account,
       ];
 
-      const { mode } = await addAccountRuntimeAware(serialize([account])[0], {
-        tryAddLive: tryAddAccountToRunningProxy,
-        addStored: () => saveAccounts(merged),
-      });
+      let mode: "live" | "stored";
+      try {
+        ({ mode } = await addAccountRuntimeAware(serialize([account])[0], {
+          tryAddLive: tryAddAccountToRunningProxy,
+          addStored: () => saveAccounts(merged),
+        }));
+      } catch (error) {
+        endFailedAttempt(attempt, error, "persistence");
+        throw error;
+      }
       attempt.stageCompleted("persistence");
       attempt.succeeded();
 
@@ -462,12 +468,8 @@ export function registerAccounts(program: Command): void {
  * diagnostic ID worth quoting in a bug report.
  */
 function endFailedAttempt(attempt: SetupAttempt, error: unknown, fallbackStage: SetupStage): void {
-  if (isPromptCancellation(error)) {
-    attempt.cancelled();
-    return;
-  }
-  const outcome = attempt.failed(error, fallbackStage);
-  if (outcome.unexpected) {
+  const outcome = failAttemptFromError(attempt, error, fallbackStage);
+  if (outcome?.unexpected) {
     console.log(chalk.gray(`  Diagnostic ID: ${outcome.diagnosticId}`));
   }
 }

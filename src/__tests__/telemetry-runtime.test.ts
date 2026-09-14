@@ -137,10 +137,13 @@ beforeEach(async () => {
   delete process.env["DO_NOT_TRACK"];
   process.env["CC_ROUTER_TEST_OTLP_TRACE_URL"] = capture.endpoint(TRACE_PATH);
   process.env["CC_ROUTER_TEST_OTLP_LOG_URL"] = capture.endpoint(LOG_PATH);
-  vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+  const realFetch = globalThis.fetch.bind(globalThis);
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const target = typeof input === "string"
       ? input
       : input instanceof URL ? input.href : input.url;
+    // Only the loopback capture server is reachable; PostHog and everything else are blocked.
+    if (target.startsWith("http://127.0.0.1:")) return realFetch(input, init);
     throw new Error(`telemetry runtime test blocked a network request to ${target}`);
   });
   vi.resetModules();

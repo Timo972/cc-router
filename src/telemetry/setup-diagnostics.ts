@@ -271,3 +271,19 @@ export async function withSetupTelemetryFlush<T>(operation: () => Promise<T>): P
 export function isPromptCancellation(error: unknown): boolean {
   return ownStringProperty(error, "name") === "ExitPromptError";
 }
+
+/**
+ * Close an attempt that ended in a thrown error: a cancelled prompt is a user
+ * decision (no outcome returned); anything else is a failure at the given stage.
+ */
+export function failAttemptFromError(
+  attempt: SetupAttempt,
+  error: unknown,
+  fallbackStage: SetupStage,
+): SetupFailureOutcome | undefined {
+  if (isPromptCancellation(error)) {
+    attempt.cancelled();
+    return undefined;
+  }
+  return attempt.failed(error, fallbackStage);
+}

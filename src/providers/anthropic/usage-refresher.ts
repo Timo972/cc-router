@@ -2,6 +2,7 @@ import type { Account, AccountUsageSnapshot } from "../../proxy/types.js";
 import { UsageRefresher } from "../../proxy/usage-refresher.js";
 import { fetchAnthropicUsage, type UsageFetchResult } from "./usage.js";
 import {
+  httpOutcome,
   recordRuntimeError,
   recordUpstreamStatus,
   withTelemetrySpan,
@@ -31,7 +32,7 @@ export class AnthropicUsageRefresher extends UsageRefresher<Account, UsageFetchR
     const fetchUsage = options.fetchUsage ?? fetchAnthropicUsage;
     super(pool, {
       fetchUsage: account => withTelemetrySpan("provider.usage_refresh", { provider: "anthropic" },
-        async () => {
+        async span => {
           let result: UsageFetchResult;
           try {
             result = await fetchUsage(account);
@@ -39,8 +40,13 @@ export class AnthropicUsageRefresher extends UsageRefresher<Account, UsageFetchR
             recordRuntimeError(error, { operation: "provider.usage_refresh", provider: "anthropic" });
             throw error;
           }
-          if (!result.ok && result.status !== undefined) {
-            recordUpstreamStatus("provider.usage_refresh", "anthropic", result.status);
+          if (!result.ok) {
+            if (result.status !== undefined) {
+              recordUpstreamStatus("provider.usage_refresh", "anthropic", result.status);
+              span.fail({ httpStatusCode: result.status, outcome: httpOutcome(result.status) });
+            } else {
+              span.fail({ outcome: result.reason === "timeout" ? "timeout" : "other" });
+            }
           }
           return result;
         }),

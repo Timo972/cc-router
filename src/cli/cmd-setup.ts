@@ -28,10 +28,12 @@ import {
 import { printDesktopSupportExplainer, printNetworkExtensionInstructions } from "./cmd-client.js";
 import {
   createSetupAttempt,
+  failAttemptFromError,
   withSetupTelemetryFlush,
   type SetupAttempt,
   type SetupFailureOutcome,
 } from "../telemetry/setup-diagnostics.js";
+import type { SetupStage } from "../telemetry/contracts.js";
 
 // ─── Public registration ──────────────────────────────────────────────────────
 
@@ -85,7 +87,23 @@ export async function setupSingleAccountWithAttempt(
       : method === "credentials" ? "claude_credentials_file" : "manual_token",
   });
   attempt.stageCompleted("credential_source_selection");
+  let reached: SetupStage = "credential_read";
+  try {
+    return await collectAnthropicAccount(index, method, attempt, stage => { reached = stage; });
+  } catch (error) {
+    // A thrown prompt or extraction error must still close the funnel record.
+    const outcome = failAttemptFromError(attempt, error, reached);
+    if (outcome) printDiagnosticId(outcome);
+    throw error;
+  }
+}
 
+async function collectAnthropicAccount(
+  index: number,
+  method: "keychain" | "credentials" | "manual",
+  attempt: SetupAttempt,
+  reached: (stage: SetupStage) => void,
+): Promise<{ account: Account | null; attempt: SetupAttempt }> {
   let tokens: OAuthTokens | null = null;
 
   if (method === "keychain") {
@@ -139,6 +157,7 @@ export async function setupSingleAccountWithAttempt(
 
   attempt.stageCompleted("credential_read");
   attempt.stageCompleted("credential_parse");
+  reached("token_validation");
 
   const defaultId = `max-account-${index}`;
   const accountId = await input({
@@ -300,7 +319,13 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
 
   console.log(chalk.bold(`\n${"━".repeat(40)}\n  Saving\n${"━".repeat(40)}\n`));
 
-  saveAccounts(merged);
+  try {
+    saveAccounts(merged);
+  } catch (error) {
+    const outcomes = savedAttempts.map(attempt => attempt.failed(error, "persistence"));
+    if (outcomes[0]) printDiagnosticId(outcomes[0]);
+    throw error;
+  }
   console.log(chalk.green(`  ✓ ${merged.length} account(s) saved to ~/.cc-router/accounts.json`));
 
   for (const attempt of savedAttempts) {

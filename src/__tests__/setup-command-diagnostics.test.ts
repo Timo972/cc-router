@@ -57,6 +57,7 @@ const saveAccounts = vi.hoisted(() => vi.fn());
 vi.mock("../proxy/token-refresher.js", () => ({ saveAccounts }));
 
 const { runSetupWizard, setupSingleAccountWithAttempt } = await import("../cli/cmd-setup.js");
+const prompts = await import("@inquirer/prompts");
 
 const PRIVATE_ACCESS = "sk-ant-oat01-PRIVATE-access";
 const PRIVATE_REFRESH = "sk-ant-ort01-PRIVATE-refresh";
@@ -178,5 +179,38 @@ describe("anthropic manual-token setup", () => {
       diagnosticId: attempt.diagnosticId,
     }]);
     expect(loggedLines()).toContain(`Diagnostic ID: ${attempt.diagnosticId}`);
+  });
+
+  it("marks every saved attempt failed when persisting the accounts file throws", async () => {
+    answerManualTokenSetup();
+    stubValidation({ ok: true, status: 200 });
+    saveAccounts.mockImplementationOnce(() => { throw new Error("PRIVATE disk detail"); });
+
+    await expect(runSetupWizard({ addMode: true })).rejects.toThrow("PRIVATE disk detail");
+
+    expect(recorded.results).toEqual([]);
+    expect(recorded.failures).toEqual([expect.objectContaining({ stage: "persistence", reason: "other" })]);
+    expect(recorded.exceptions).toEqual([expect.objectContaining({
+      context: expect.objectContaining({ setupStage: "persistence" }),
+    })]);
+    expect(loggedLines()).toContain("Diagnostic ID:");
+    expect(JSON.stringify(recorded.failures)).not.toContain("PRIVATE disk detail");
+  });
+
+  it("records a cancelled attempt when the user aborts a prompt after extraction", async () => {
+    answerManualTokenSetup();
+    vi.mocked(prompts.input).mockRejectedValueOnce(Object.assign(new Error("aborted"), { name: "ExitPromptError" }));
+
+    await expect(setupSingleAccountWithAttempt(1)).rejects.toThrow("aborted");
+
+    expect(recorded.stages.map(stage => stage["stage"])).toEqual([
+      "attempt_start",
+      "credential_source_selection",
+      "credential_read",
+      "credential_parse",
+    ]);
+    expect(recorded.results).toEqual([expect.objectContaining({ result: "cancelled" })]);
+    expect(recorded.failures).toEqual([]);
+    expect(recorded.exceptions).toEqual([]);
   });
 });
