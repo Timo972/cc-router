@@ -73,28 +73,35 @@ cc-router only makes outbound connections to:
 | Host | Purpose |
 |------|---------|
 | `api.anthropic.com` | Forwarding Claude Code requests (standalone mode) |
-| `console.anthropic.com` | OAuth token refresh |
+| `claude.ai` | Anthropic OAuth token refresh |
 | `chatgpt.com` | OpenAI Codex subscription Responses route |
 | `auth.openai.com` | OpenAI subscription OAuth token refresh |
 | `localhost:4000` | LiteLLM (full mode only) |
 | `registry.npmjs.org` | Update **check** (version lookup only; installs are manual by default) |
-| `eu.aptabase.com` | Anonymous telemetry — **only if you opt in** (see below) |
+| `eu.i.posthog.com` | Telemetry when enabled: analytics and sanitized exceptions (`/batch/`), OTLP traces and logs (`/i/v1/traces`, `/i/v1/logs`) |
 
 ## Telemetry
 
-Telemetry is **opt-in and off by default.** Nothing is sent unless you run
-`cc-router telemetry on`. When enabled, anonymous usage events are sent to
-Aptabase (`https://eu.aptabase.com`).
+Telemetry is **on by default for fresh installations**; an existing persisted
+opt-out stays off after upgrade. Disable it persistently with
+`cc-router telemetry off`, or for one process with `DO_NOT_TRACK=1` or
+`CC_ROUTER_TELEMETRY=0`. Environment variables can only turn it off. Turning it
+off stops new capture immediately and discards queued records; a request already
+in flight cannot be recalled. The endpoint is hardcoded and cannot be
+redirected.
 
-**What is sent:** a random install UUID (not linked to any identity), OS name/
-version, app and Node versions, and coarse counters (event name, account count,
-uptime). **What is never sent:** OAuth tokens, prompts, request/response bodies,
-account names, or email addresses. Your IP is visible to the endpoint at the
-network layer, as with any HTTPS request.
+**What is sent:** closed-schema records rebuilt from an allowlist immediately
+before export — sampled proxy spans, setup/runtime diagnostics, a few lifecycle
+events, and sanitized exceptions whose message is a fixed reason code. A random
+installation UUID is the only stable identifier; it is not derived from any
+user, account, host, or machine identity. No PostHog Person profile is created
+and GeoIP enrichment is disabled. Your IP is visible to the endpoint at the
+network layer, as with any HTTPS request, but is not part of the payload.
 
-**Opt out / stay off:** it is already off by default. You can also set
-`DO_NOT_TRACK=1` or `CC_ROUTER_TELEMETRY=0`, or run `cc-router telemetry off`.
-The endpoint is hardcoded and cannot be redirected.
+**What is never sent:** prompts, request/response bodies, headers, URLs, OAuth
+tokens, account or session identifiers, email addresses, hostnames, absolute
+paths, raw error messages. Console output and local logs are not forwarded.
+See [telemetry.md](telemetry.md) for the exhaustive inventory.
 
 ---
 
