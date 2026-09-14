@@ -64,6 +64,7 @@ const {
   modelFamilyOf,
   runtimeMode,
   startTelemetrySpan,
+  settleProxyRequestSpan,
   telemetryRequestMiddleware,
   withTelemetrySpan,
 } = await import("../telemetry/facade.js");
@@ -366,6 +367,8 @@ describe("telemetry facade", () => {
         nextCalls += 1;
         if (trace.getActiveSpan()) activeSpans += 1;
       });
+      // The route's verdict, not the HTTP status alone, finalizes the span.
+      settleProxyRequestSpan(response, { outcome: "upstream_error", streamOutcome: "upstream_error" });
       response.emit("finish");
       response.emit("close");
       return { nextCalls, activeSpans };
@@ -381,6 +384,8 @@ describe("telemetry facade", () => {
         "cc_router.operation": "proxy.request",
         "http.request.method": "POST",
         "cc_router.route": "messages",
+        "cc_router.outcome": "upstream_error",
+        "cc_router.stream_outcome": "upstream_error",
         "http.response.status_code": 503,
       },
     }]);

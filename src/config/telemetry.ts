@@ -60,9 +60,19 @@ function parseState(raw: unknown): TelemetryState | undefined {
   };
 }
 
+/** undefined means missing or malformed (both repairable); an unreadable file throws. */
 function readState(): TelemetryState | undefined {
+  let raw: string;
   try {
-    return parseState(JSON.parse(readFileSync(TELEMETRY_PATH, "utf8")));
+    raw = readFileSync(TELEMETRY_PATH, "utf8");
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return undefined;
+    // Fail closed: a record we cannot read may hold an opt-out, so it is
+    // never replaced with an enabled default. Callers treat this as disabled.
+    throw new Error(`Telemetry state is unreadable: ${TELEMETRY_PATH}`, { cause: error });
+  }
+  try {
+    return parseState(JSON.parse(raw));
   } catch {
     return undefined;
   }
@@ -93,7 +103,7 @@ function createState(): TelemetryState {
 }
 
 // Missing or malformed state is (re)initialized enabled; a supported legacy
-// record is normalized in memory only.
+// record is normalized in memory only; an unreadable file throws (see readState).
 export function getTelemetrySnapshot(): TelemetrySnapshot {
   const state = readState() ?? createState();
   const environmentDisabled =

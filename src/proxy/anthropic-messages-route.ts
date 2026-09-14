@@ -18,6 +18,7 @@ import { EmptyPoolError, NoEligibleAccountError, type TokenPool } from "./token-
 import type { Account } from "./types.js";
 import { applyRateLimitHeaders } from "../providers/anthropic/rate-limit-headers.js";
 import { attachAnthropicResponseCapture } from "./anthropic-response-capture.js";
+import { TRACE_CONTEXT_HEADERS } from "./anthropic-proxy.js";
 import { boundModelId, stats } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { logError, logRoute } from "./logger.js";
@@ -26,6 +27,7 @@ import {
   modelFamilyOf,
   recordRuntimeError,
   recordUpstreamStatus,
+  settleProxyRequestSpan,
   startTelemetrySpan,
 } from "../telemetry/facade.js";
 import type { Outcome, SafeSpanAttributes, StreamOutcome } from "../telemetry/facade.js";
@@ -117,6 +119,7 @@ function buildUpstreamHeaders(
   delete headers["content-length"];
   delete headers["transfer-encoding"];
   delete headers["x-api-key"];
+  for (const header of TRACE_CONTEXT_HEADERS) delete headers[header];
   headers["connection"] = "close";
   headers["host"] = target.host;
   headers["authorization"] = `Bearer ${account.tokens.accessToken}`;
@@ -270,6 +273,10 @@ export function mountAnthropicMessagesRoute(
       streaming,
       accountPoolSize: opts.pool.getAll().length,
     });
+    /** The request span's final verdict; the middleware ends the span from it. */
+    const settleRequest = (outcome: Outcome, extra: SafeSpanAttributes = {}): void => {
+      settleProxyRequestSpan(res, { ...extra, outcome, operationDurationMs: now() - startedAt });
+    };
 
     // A client that hangs up takes the in-flight upstream attempt (and any
     // pending retry) with it. `writableEnded` guards the normal-completion
@@ -336,6 +343,7 @@ export function mountAnthropicMessagesRoute(
         // resets either.
         if (clientGone.signal.aborted || res.writableEnded) {
           endAttempt("cancelled", { streamOutcome: "cancelled" });
+          settleRequest("cancelled", { streamOutcome: "cancelled", attempt });
           return;
         }
         const message = error instanceof Error ? error.message : String(error);
@@ -366,6 +374,7 @@ export function mountAnthropicMessagesRoute(
           });
         }
         endAttempt("upstream_error", { httpStatusCode: 502, streamOutcome: "upstream_error" });
+        settleRequest("upstream_error", { httpStatusCode: 502, attempt });
         return;
       }
       req.socket.setTimeout(0);
@@ -516,6 +525,7 @@ export function mountAnthropicMessagesRoute(
           release();
           upstream.destroy();
           endAttempt("cancelled", { httpStatusCode: status, streamOutcome: "cancelled" });
+          settleRequest("cancelled", { httpStatusCode: status, streamOutcome: "cancelled", attempt });
           return;
         }
         if (next) {
@@ -569,6 +579,7 @@ export function mountAnthropicMessagesRoute(
         upstream.destroy();
         release();
         endAttempt("cancelled", { httpStatusCode: status, streamOutcome: "cancelled" });
+        settleRequest("cancelled", { httpStatusCode: status, streamOutcome: "cancelled", attempt });
         return;
       }
 
@@ -587,6 +598,7 @@ export function mountAnthropicMessagesRoute(
         recordActivity(entry);
         release();
         endAttempt("upstream_error", { httpStatusCode: 502, streamOutcome: "upstream_error" });
+        settleRequest("upstream_error", { httpStatusCode: 502, attempt });
         logError(account.id, 502, `upstream ${status} response was lost before it could be relayed`);
         res.status(502).json({
           type: "error",
@@ -633,12 +645,12 @@ export function mountAnthropicMessagesRoute(
         const attemptOutcome: Outcome = status >= 400 ? outcome
           : streamOutcome === "complete" ? outcome
           : streamOutcome;
-        endAttempt(attemptOutcome, {
-          httpStatusCode: status,
-          streamOutcome,
+        const tokens = {
           ...(entry.inputTokens !== undefined ? { inputTokens: entry.inputTokens } : {}),
           ...(entry.outputTokens !== undefined ? { outputTokens: entry.outputTokens } : {}),
-        });
+        };
+        endAttempt(attemptOutcome, { httpStatusCode: status, streamOutcome, ...tokens });
+        settleRequest(attemptOutcome, { httpStatusCode: status, streamOutcome, attempt, ...tokens });
       };
       const maybeFinishAttempt = (): void => {
         if (responseClosed && usageSettled) finishAttempt();

@@ -18,6 +18,7 @@ import {
   modelFamilyOf,
   recordRuntimeError,
   recordUpstreamStatus,
+  settleProxyRequestSpan,
   startTelemetrySpan,
 } from "../telemetry/facade.js";
 import type { Outcome, RequestSource, StreamOutcome, TelemetrySpanHandle } from "../telemetry/facade.js";
@@ -471,7 +472,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
         httpStatusCode: timeout ? 504 : 502,
         streamOutcome: timeout ? "timeout" : "upstream_error",
       });
-      annotateActiveSpan("proxy.request", {
+      settleProxyRequestSpan(res, {
         httpStatusCode: timeout ? 504 : 502,
         outcome: timeout ? "timeout" : "upstream_error",
         attempt,
@@ -631,7 +632,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     if (sameAccount) await retryDelay(sameAccountDelayMs, clientGone.signal);
     if (clientGone.signal.aborted || responseTerminated(res)) {
       selected.release();
-      annotateActiveSpan("proxy.request", {
+      settleProxyRequestSpan(res, {
         outcome: "cancelled",
         streamOutcome: "cancelled",
         attempt,
@@ -769,7 +770,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   };
   attemptSpan?.annotate(tokens);
   endAttemptSpan(outcome, { httpStatusCode: finalStatus, streamOutcome });
-  annotateActiveSpan("proxy.request", {
+  settleProxyRequestSpan(res, {
     ...tokens,
     httpStatusCode: finalStatus,
     outcome,

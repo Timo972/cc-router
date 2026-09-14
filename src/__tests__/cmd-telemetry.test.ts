@@ -97,4 +97,20 @@ describe("cc-router telemetry consent changes", () => {
     expect(telemetry.writeTelemetryState).not.toHaveBeenCalled();
     expect(output.mock.calls.join("\n")).not.toContain("8");
   });
+
+  it("reports an unreadable state file and exits non-zero without touching it", async () => {
+    telemetry.getTelemetrySnapshot.mockImplementation(() => {
+      throw new Error("Telemetry state is unreadable: /tmp/telemetry.json");
+    });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const previousExitCode = process.exitCode;
+    try {
+      await runTelemetryStatus();
+      expect(process.exitCode).toBe(1);
+      expect(errors.mock.calls.map(([line]) => String(line)).join("\n")).toContain("unreadable");
+      expect(telemetry.updateTelemetryConsent).not.toHaveBeenCalled();
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+  });
 });

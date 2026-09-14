@@ -8,31 +8,42 @@ export function registerTelemetry(program: Command): void {
     .description("Manage privacy-safe telemetry: on, off, status (default: status; fresh installs: on)")
     .action(async (action?: string) => {
       const resolved = action ?? "status";
-
-      if (resolved === "status") {
-        showStatus();
-        return;
+      try {
+        runTelemetryAction(resolved);
+      } catch (error) {
+        // An unreadable state file keeps telemetry off; never replace it blindly.
+        console.error(chalk.red(error instanceof Error ? error.message : "Telemetry state could not be read."));
+        console.error(chalk.dim("Telemetry stays disabled until the file is readable again."));
+        process.exitCode = 1;
       }
-
-      if (resolved === "on") {
-        const state = updateTelemetryConsent(true);
-        console.log(chalk.green("Telemetry enabled for future daemon starts."));
-        console.log(chalk.dim("Restart a daemon that started with telemetry disabled to begin sending telemetry."));
-        console.log(chalk.dim(`Install ID: ${state.installId}`));
-        return;
-      }
-
-      if (resolved === "off") {
-        // Do not beacon on opt-out: an explicit "turn it off" must not send data.
-        updateTelemetryConsent(false);
-        console.log(chalk.yellow("Telemetry disabled. New outbound telemetry stops immediately."));
-        console.log(chalk.dim("Re-enable anytime with: cc-router telemetry on"));
-        return;
-      }
-
-      console.error(chalk.red(`Unknown action "${resolved}". Use: on, off, status`));
-      process.exitCode = 1;
     });
+}
+
+function runTelemetryAction(resolved: string): void {
+
+  if (resolved === "status") {
+    showStatus();
+    return;
+  }
+
+  if (resolved === "on") {
+    const state = updateTelemetryConsent(true);
+    console.log(chalk.green("Telemetry enabled for future daemon starts."));
+    console.log(chalk.dim("Restart a daemon that started with telemetry disabled to begin sending telemetry."));
+    console.log(chalk.dim(`Install ID: ${state.installId}`));
+    return;
+  }
+
+  if (resolved === "off") {
+    // Do not beacon on opt-out: an explicit "turn it off" must not send data.
+    updateTelemetryConsent(false);
+    console.log(chalk.yellow("Telemetry disabled. New outbound telemetry stops immediately."));
+    console.log(chalk.dim("Re-enable anytime with: cc-router telemetry on"));
+    return;
+  }
+
+  console.error(chalk.red(`Unknown action "${resolved}". Use: on, off, status`));
+  process.exitCode = 1;
 }
 
 function showStatus(): void {

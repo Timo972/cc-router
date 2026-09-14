@@ -271,14 +271,14 @@ function spanAttributes(operation: Operation, attributes: SafeSpanAttributes): A
   };
 }
 
-function finalizeSpan(span: Span, status: "ok" | "error"): void {
+function finalizeSpan(span: Span, status: "ok" | "error", endTimeMs?: number): void {
   try {
     span.setStatus({ code: status === "error" ? SpanStatusCode.ERROR : SpanStatusCode.OK });
   } catch {
     // Telemetry finalization never changes application behavior.
   }
   try {
-    span.end();
+    span.end(endTimeMs);
   } catch {
     // A broken tracer must not replace the callback value or error identity.
   }
@@ -380,6 +380,54 @@ export function annotateActiveSpan(operation: Operation, attributes: SafeSpanAtt
   }
 }
 
+interface RequestSpanState {
+  span: Span;
+  response: { statusCode: number };
+  ended: boolean;
+  settled: boolean;
+  closedAt?: number;
+  outcome?: Outcome;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+/** How long a closed response's span waits for the route's final verdict. */
+const REQUEST_SPAN_SETTLE_GRACE_MS = 1_500;
+const requestSpans = new WeakMap<object, RequestSpanState>();
+
+function endRequestSpan(state: RequestSpanState): void {
+  if (state.ended) return;
+  state.ended = true;
+  if (state.timer !== undefined) clearTimeout(state.timer);
+  try {
+    state.span.setAttributes(toOtelAttributes(SPAN_ATTRIBUTE_KEYS, { httpStatusCode: state.response.statusCode }));
+  } catch {
+    // Response telemetry never changes the response itself.
+  }
+  const failed = state.outcome !== undefined
+    ? state.outcome !== "complete"
+    : state.response.statusCode >= 500;
+  // The span ends when the response did, even if the verdict arrived later.
+  finalizeSpan(state.span, failed ? "error" : "ok", state.closedAt);
+}
+
+/**
+ * Record the route's final verdict for the request span. The HTTP status alone
+ * cannot tell a relayed stream that failed midway from a complete one, so the
+ * span stays open (bounded) until the route settles it or the grace expires.
+ */
+export function settleProxyRequestSpan(response: object, attributes: SafeSpanAttributes): void {
+  try {
+    const state = requestSpans.get(response);
+    if (!state || state.ended) return;
+    state.span.setAttributes(toOtelAttributes(SPAN_ATTRIBUTE_KEYS, attributes));
+    if (attributes.outcome !== undefined) state.outcome = attributes.outcome;
+    state.settled = true;
+    if (state.closedAt !== undefined) endRequestSpan(state);
+  } catch {
+    // Span enrichment is optional.
+  }
+}
+
 /** Wrap the two inference routes in a server span; every other route passes through. */
 export function telemetryRequestMiddleware(): RequestHandler {
   return (request, response, next) => {
@@ -404,21 +452,20 @@ export function telemetryRequestMiddleware(): RequestHandler {
         "proxy.request",
         { kind: SpanKind.SERVER, attributes: spanAttributes("proxy.request", attributes) },
         span => {
-          let ended = false;
-          const end = (): void => {
-            if (ended) return;
-            ended = true;
-            try {
-              span.setAttributes(toOtelAttributes(SPAN_ATTRIBUTE_KEYS, {
-                httpStatusCode: response.statusCode,
-              }));
-            } catch {
-              // Response telemetry never changes the response itself.
+          const state: RequestSpanState = { span, response, ended: false, settled: false };
+          requestSpans.set(response, state);
+          const closed = (): void => {
+            if (state.closedAt !== undefined) return;
+            state.closedAt = Date.now();
+            if (state.settled) {
+              endRequestSpan(state);
+              return;
             }
-            finalizeSpan(span, response.statusCode >= 500 ? "error" : "ok");
+            state.timer = setTimeout(() => endRequestSpan(state), REQUEST_SPAN_SETTLE_GRACE_MS);
+            state.timer.unref?.();
           };
-          response.once("finish", end);
-          response.once("close", end);
+          response.once("finish", closed);
+          response.once("close", closed);
           proceed();
         },
       );

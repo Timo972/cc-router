@@ -448,5 +448,46 @@ describe("proxy telemetry", () => {
       "cc_router.outcome": "upstream_error",
       "cc_router.stream_outcome": "upstream_error",
     });
+    // The request span follows the route's verdict, not the 200 status.
+    await waitFor(() => spansNamed("proxy.request").length >= 1);
+    expect(spansNamed("proxy.request")[0]?.attributes).toMatchObject({
+      "http.response.status_code": 200,
+      "cc_router.outcome": "upstream_error",
+      "cc_router.stream_outcome": "upstream_error",
+    });
+    expect(spanExporter.getFinishedSpans().find(span => span.name === "proxy.request")?.status.code).toBe(2);
+  });
+
+  it("strips inbound trace context before the messages transport reaches the provider", async () => {
+    const forwarded: Record<string, string | string[] | undefined>[] = [];
+    const upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+      forwarded.push(req.headers);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ type: "message", usage: { input_tokens: 1, output_tokens: 1 } }));
+    });
+    const upstreamPort = await listen(upstream);
+    try {
+      await withApp(mountAnthropic(upstreamPort), async baseUrl => {
+        const res = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            traceparent: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+            tracestate: "vendor=private",
+            baggage: "user=private",
+          },
+          body: JSON.stringify({ model: "claude-sonnet-5", messages: [], stream: false }),
+        });
+        expect(res.status).toBe(200);
+        await res.text();
+      });
+    } finally {
+      await close(upstream);
+    }
+
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]).not.toHaveProperty("traceparent");
+    expect(forwarded[0]).not.toHaveProperty("tracestate");
+    expect(forwarded[0]).not.toHaveProperty("baggage");
   });
 });

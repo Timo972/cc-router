@@ -3,8 +3,12 @@ import type { Request, RequestHandler } from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
 import type { Options } from "http-proxy-middleware";
 
-/** Inbound trace context is stripped rather than forwarded (see proxyReq). */
-const TRACE_CONTEXT_HEADERS = ["traceparent", "tracestate", "baggage"];
+/**
+ * Inbound trace context is stripped rather than forwarded, by every Anthropic
+ * relay: telemetry never joins a client's distributed trace, and a client's
+ * context headers must not reach the upstream provider through this proxy.
+ */
+export const TRACE_CONTEXT_HEADERS = ["traceparent", "tracestate", "baggage"] as const;
 
 export interface AnthropicProxyOptions {
   target: string;

@@ -93,6 +93,31 @@ describe("persisted telemetry state", () => {
     expect(getTelemetrySnapshot().state.installId).toMatch(UUID);
   });
 
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "fails closed on an unreadable state file instead of replacing a persisted opt-out",
+    async () => {
+      const { getTelemetrySnapshot, isTelemetryEnabled, createTelemetryConsentGate } = await freshModule();
+      const optOut = JSON.stringify({
+        enabled: false,
+        installId: "11111111-2222-4333-8444-555555555555",
+        firstRunAt: "2026-01-01T00:00:00.000Z",
+        consentGeneration: "66666666-7777-4888-9999-000000000000",
+      });
+      fs.writeFileSync(TELEMETRY_PATH, optOut, "utf8");
+      fs.chmodSync(TELEMETRY_PATH, 0o000);
+      try {
+        expect(() => getTelemetrySnapshot()).toThrow(/unreadable/);
+        expect(isTelemetryEnabled()).toBe(false);
+        const gate = createTelemetryConsentGate();
+        expect(gate.getSnapshot()).toBeUndefined();
+        expect(gate.latched).toBe(true);
+      } finally {
+        fs.chmodSync(TELEMETRY_PATH, 0o600);
+      }
+      expect(fs.readFileSync(TELEMETRY_PATH, "utf8")).toBe(optOut);
+    },
+  );
+
   it("reads a legacy record without a consent generation and never rewrites it", async () => {
     const { getTelemetrySnapshot } = await freshModule();
     const legacy = JSON.stringify({
