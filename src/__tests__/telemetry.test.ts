@@ -68,7 +68,7 @@ const {
   withTelemetrySpan,
 } = await import("../telemetry/facade.js");
 
-type CapturedEvent = { event: string; properties: Record<string, unknown>; distinctId?: string };
+type CapturedEvent = { event: string; properties: Record<string, unknown>; installationId?: string };
 type CapturedException = { error: Error; diagnosticId: string };
 
 function analyticsStub() {
@@ -78,8 +78,6 @@ function analyticsStub() {
   const capture = (value: unknown): void => { exceptions.push(value as CapturedException); };
   const client = {
     captureAnalytics: (event: unknown) => { events.push(event as CapturedEvent); },
-    // TEMP(A2): the donor client still declares captureAnalyticsImmediate.
-    captureAnalyticsImmediate: async () => expect.unreachable("analytics are queued"),
     captureException: capture,
     captureExceptionImmediate: async (value: unknown) => capture(value),
     flushWithin: async () => { calls.flush += 1; },
@@ -186,7 +184,7 @@ describe("telemetry facade", () => {
     facadeFor(snapshotOf).recordApplicationStart();
 
     expect(analytics.events.map(event => event.event)).toEqual(["app.first_start"]);
-    expect(analytics.events[0]?.distinctId).toBe(INSTALL_ID);
+    expect(analytics.events[0]?.installationId).toBe(INSTALL_ID);
     expect(analytics.events[0]?.properties).toEqual({
       serviceVersion: expect.any(String),
       osFamily: expect.any(String),

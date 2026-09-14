@@ -1,5 +1,4 @@
 import { randomUUID as nodeRandomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
 import {
   context,
   ROOT_CONTEXT,
@@ -23,7 +22,6 @@ import { getCurrentVersion } from "../utils/self-update.js";
 import { MAX_ACCOUNT_POOL_SIZE } from "./contracts.js";
 import type {
   DurationBucket,
-  LogEventCode,
   ModelFamily,
   Operation,
   OsFamily,
@@ -32,6 +30,7 @@ import type {
   RuntimeMode,
   SafeExceptionContext,
   SafeExceptionContract,
+  SafeLog,
   SafeSpanAttributes,
   SetupMethod,
   SetupReason,
@@ -40,7 +39,13 @@ import type {
   TrustedTelemetryIdentity,
 } from "./contracts.js";
 import { createPostHogTelemetryClient, type PostHogTelemetryClient } from "./posthog-client.js";
-import { reconstructAnalyticsEvent, sanitizeException } from "./privacy.js";
+import {
+  LOG_ATTRIBUTE_KEYS,
+  SPAN_ATTRIBUTE_KEYS,
+  reconstructAnalyticsEvent,
+  sanitizeException,
+  toOtelAttributes,
+} from "./privacy.js";
 import {
   flushTelemetryRuntimeWithin,
   isTelemetryRuntimeActive,
@@ -69,90 +74,6 @@ export type {
 const HEARTBEAT_INTERVAL_MS = 60 * 60 * 1_000;
 const SCOPE = "cc-router";
 const PROXY_REQUEST_PATHS = new Set(["/v1/messages", "/v1/responses"]);
-const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
-
-// TEMP(A2): move to privacy.ts (SPAN_ATTRIBUTE_KEYS / LOG_ATTRIBUTE_KEYS /
-// toOtelAttributes). The key map is the facade's only attribute filter: a value
-// whose key is absent here can never reach an exporter.
-const SPAN_ATTRIBUTE_KEYS: Readonly<Record<keyof SafeSpanAttributes, string>> = {
-  httpMethod: "http.request.method",
-  httpStatusCode: "http.response.status_code",
-  provider: "cc_router.provider",
-  route: "cc_router.route",
-  modelFamily: "cc_router.model_family",
-  requestSource: "cc_router.request_source",
-  runtimeMode: "cc_router.runtime_mode",
-  streaming: "cc_router.streaming",
-  streamOutcome: "cc_router.stream_outcome",
-  outcome: "cc_router.outcome",
-  attempt: "cc_router.attempt",
-  accountPoolSize: "cc_router.account_pool_size",
-  concurrency: "cc_router.concurrency",
-  inputTokens: "cc_router.input_tokens",
-  outputTokens: "cc_router.output_tokens",
-  operationDurationMs: "cc_router.operation_duration_ms",
-};
-
-// TEMP(A2): move to privacy.ts.
-const LOG_ATTRIBUTE_KEYS: Readonly<Record<string, string>> = {
-  operation: "cc_router.operation",
-  provider: "cc_router.provider",
-  method: "cc_router.method",
-  stage: "cc_router.stage",
-  reason: "cc_router.reason",
-  outcome: "cc_router.outcome",
-  httpStatusCode: "http.response.status_code",
-  durationBucket: "cc_router.duration_bucket",
-  attempt: "cc_router.attempt",
-  accountPoolSize: "cc_router.account_pool_size",
-  concurrency: "cc_router.concurrency",
-  operationDurationMs: "cc_router.operation_duration_ms",
-  serviceVersion: "service.version",
-  osFamily: "os.type",
-  runtimeMode: "cc_router.runtime_mode",
-  diagnosticId: "cc_router.diagnostic_id",
-};
-
-// TEMP(A2): move to privacy.ts.
-function toOtelAttributes(map: Readonly<Record<string, string>>, safe: object): Attributes {
-  const output: Attributes = {};
-  for (const [key, value] of Object.entries(safe)) {
-    const name = map[key];
-    if (name === undefined) continue;
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      output[name] = value;
-    }
-  }
-  return output;
-}
-
-// TEMP(A2): the plan's privacy.ts takes three arguments; the donor still
-// requires the trusted filesystem root as a fourth.
-type DonorSanitizeException = (
-  error: unknown,
-  exceptionContext: SafeExceptionContext,
-  identity: TrustedTelemetryIdentity,
-  source: { projectRoot: string },
-) => SafeExceptionContract | undefined;
-
-function sanitize(
-  error: unknown,
-  exceptionContext: SafeExceptionContext,
-  identity: TrustedTelemetryIdentity,
-): SafeExceptionContract | undefined {
-  return (sanitizeException as DonorSanitizeException)(error, exceptionContext, identity, {
-    projectRoot: PROJECT_ROOT,
-  });
-}
-
-// TEMP(A2): the plan's consent gate takes (getSnapshot, onLatch); the donor
-// still threads an initial snapshot between them.
-function consentGate(
-  getSnapshot: () => TelemetrySnapshot,
-  onLatch: () => void,
-): TelemetryConsentGate {
-  return createTelemetryConsentGate(getSnapshot, undefined, onLatch);
-}
 
 export interface TelemetrySpanHandle {
   annotate(attributes: SafeSpanAttributes): void;
@@ -321,7 +242,7 @@ let sharedGate: TelemetryConsentGate | undefined;
 let sharedAnalytics: PostHogTelemetryClient | undefined;
 
 function sharedConsentGate(): TelemetryConsentGate {
-  return sharedGate ??= consentGate(getTelemetrySnapshot, () => {
+  return sharedGate ??= createTelemetryConsentGate(getTelemetrySnapshot, () => {
     try { sharedAnalytics?.discardPending(); } catch { /* isolated */ }
   });
 }
@@ -489,7 +410,7 @@ export function createTelemetryFacade(dependencies: TelemetryFacadeDependencies 
   let gate: TelemetryConsentGate | undefined;
   // Lazy: binding the consent generation must not read the state file at import.
   const consent = (): TelemetryConsentGate => gate ??= getSnapshot
-    ? consentGate(getSnapshot, () => {
+    ? createTelemetryConsentGate(getSnapshot, () => {
       try { dependencies.analytics?.discardPending(); } catch { /* isolated */ }
     })
     : sharedConsentGate();
@@ -538,7 +459,7 @@ export function createTelemetryFacade(dependencies: TelemetryFacadeDependencies 
   };
 
   const emitLog = (
-    body: LogEventCode,
+    body: SafeLog["body"],
     severity: Severity,
     attributes: object,
   ): void => {
@@ -603,7 +524,7 @@ export function createTelemetryFacade(dependencies: TelemetryFacadeDependencies 
     try {
       const candidate = diagnosticId ?? uuid();
       if (!isRandomUuid(candidate) || candidate === snapshot.state.installId) return undefined;
-      const exception = sanitize(error, exceptionContext, {
+      const exception = sanitizeException(error, exceptionContext, {
         installationId: snapshot.state.installId,
         diagnosticId: candidate,
       });

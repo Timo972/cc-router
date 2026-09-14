@@ -169,12 +169,23 @@ function parseJson(rawBody: Buffer): unknown | undefined {
  * Loopback OTLP/PostHog endpoint. Every byte the telemetry stack would send to
  * the network is captured here instead, so tests can audit the wire directly.
  */
-export async function startTransportCaptureServer(): Promise<TransportCaptureServer> {
+export interface TransportCaptureOptions {
+  /** "reset" destroys the socket without answering, simulating a failed transport. */
+  responseMode?: "success" | "reset";
+}
+
+export async function startTransportCaptureServer(
+  options: TransportCaptureOptions = {},
+): Promise<TransportCaptureServer> {
   const requests: CapturedTransportRequest[] = [];
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", chunk => chunks.push(Buffer.from(chunk)));
     request.on("end", () => {
+      if (options.responseMode === "reset") {
+        request.socket.destroy();
+        return;
+      }
       const rawBody = Buffer.concat(chunks);
       requests.push({
         method: request.method ?? "GET",

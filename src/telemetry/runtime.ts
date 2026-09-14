@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
 import { context, propagation, trace, type Context, type TextMapPropagator } from "@opentelemetry/api";
 import { logs } from "@opentelemetry/api-logs";
 import { resourceFromAttributes } from "@opentelemetry/resources";
@@ -36,35 +35,8 @@ const QUEUE_SIZE = 100;
 const BATCH_SIZE = 20;
 const EXPORT_DELAY_MS = 500;
 const EXPORT_TIMEOUT_MS = 2_000;
-const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
-// TEMP(A2): the plan's privacy.ts takes three arguments; the donor still
-// requires the trusted filesystem root as a fourth.
-type DonorSanitizeException = (
-  error: unknown,
-  exceptionContext: SafeExceptionContext,
-  identity: TrustedTelemetryIdentity,
-  source: { projectRoot: string },
-) => SafeExceptionContract | undefined;
 
-function sanitize(
-  error: unknown,
-  exceptionContext: SafeExceptionContext,
-  identity: TrustedTelemetryIdentity,
-): SafeExceptionContract | undefined {
-  return (sanitizeException as DonorSanitizeException)(error, exceptionContext, identity, {
-    projectRoot: PROJECT_ROOT,
-  });
-}
-
-// TEMP(A2): the plan's consent gate takes (getSnapshot, onLatch); the donor
-// still threads an initial snapshot between them.
-function consentGate(
-  getSnapshot: () => TelemetrySnapshot,
-  onLatch: () => void,
-): TelemetryConsentGate {
-  return createTelemetryConsentGate(getSnapshot, undefined, onLatch);
-}
 
 /** Telemetry must never join or emit a distributed trace outside this process. */
 export const noopPropagator: TextMapPropagator = {
@@ -123,13 +95,10 @@ function exporterOptions(
   consent: TelemetryConsentGate,
   snapshot: TelemetrySnapshot,
   options: StartTelemetryRuntimeOptions,
-): { getSnapshot: () => TelemetrySnapshot; traceUrl?: string; logUrl?: string } {
+): { getSnapshot: () => TelemetrySnapshot | undefined; traceUrl?: string; logUrl?: string } {
   const test = testOtlpUrls();
   return {
-    // TEMP(A2): the plan lets exporters take a snapshot getter that returns
-    // undefined; the donor requires a snapshot, so consent withdrawal is
-    // expressed as an explicitly disabled one.
-    getSnapshot: () => consent.getSnapshot() ?? { ...snapshot, enabled: false },
+    getSnapshot: () => consent.getSnapshot(),
     traceUrl: options.traceUrl ?? test.traceUrl,
     logUrl: options.logUrl ?? test.logUrl,
   };
@@ -211,7 +180,7 @@ export function startTelemetryRuntime(options: StartTelemetryRuntimeOptions): bo
     if (!snapshot.enabled) return false;
 
     let discardQueuedTelemetry = (): void => undefined;
-    const consent = consentGate(getTelemetrySnapshot, () => discardQueuedTelemetry());
+    const consent = createTelemetryConsentGate(getTelemetrySnapshot, () => discardQueuedTelemetry());
     const { logExporter } = createPostHogOtlpExporters(exporterOptions(consent, snapshot, options));
     const logProcessor = new BatchLogRecordProcessor({
       exporter: logExporter,
@@ -225,7 +194,7 @@ export function startTelemetryRuntime(options: StartTelemetryRuntimeOptions): bo
       try {
         const current = consent.getSnapshot();
         if (!current) return;
-        const exception = sanitize(error, {
+        const exception = sanitizeException(error, {
           category: "runtime",
           reason: "other",
           runtimeMode: options.runtimeMode,
