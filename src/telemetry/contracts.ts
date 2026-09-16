@@ -294,6 +294,7 @@ export interface SafeAnalyticsEvent {
 }
 
 export interface SafeStackFrame {
+  function?: string;
   path: `dist/${string}` | `node_modules/${string}`;
   line?: number;
   column?: number;
@@ -312,6 +313,7 @@ export interface SafeExceptionContext {
 export interface SafeExceptionContract {
   /** The only Error object that may be passed to a remote exception client. */
   error: Error;
+  errorName: string;
   category: "setup" | "runtime";
   reason: SetupReason;
   errorKind: ErrorKind;

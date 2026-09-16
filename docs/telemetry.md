@@ -118,15 +118,18 @@ Providers `anthropic` (`macos_keychain`, `claude_credentials_file`,
 ### Sanitized exceptions
 
 An unexpected failure is rebuilt as a *new* `Error` containing only: category
-(`setup`/`runtime`), one safe reason, error kind (`error`, `type_error`,
+(`setup`/`runtime`), one safe reason, the original error name (including custom
+error names), error kind (`error`, `type_error`,
 `range_error`, `reference_error`, `syntax_error`, `uri_error`, `eval_error`,
 `aggregate_error`, `unexpected_error`), optional system code (`EAI_AGAIN`,
 `ECONNREFUSED`, `ECONNRESET`, `ENETUNREACH`, `ENOTFOUND`, `EPIPE`,
 `ETIMEDOUT`), optional HTTP status, operation, provider, setup stage, runtime
 mode, stack frames normalized to `dist/...` or `node_modules/<package>/...`
-(max 20 frames, 256 chars each), a fingerprint over those safe fields, and a
-fresh random diagnostic ID. The original message, cause chain, custom
-properties, and unrecognized frames are dropped. The diagnostic ID is printed
+with function names (max 20 frames, 256 chars per path and function), a
+fingerprint over those safe fields, and a fresh random diagnostic ID. Anonymous frames use `<anonymous>`. Error names are
+bounded code identifiers (max 128 chars); malformed names fall back to `Error`.
+The exception message is empty; the classified reason remains separate metadata.
+The original message, cause chain, custom properties, and unrecognized frames are dropped. The diagnostic ID is printed
 next to the detailed local error so an issue report can reference it.
 
 A fatal (uncaught) exception cannot be sent by the crashing process. Its

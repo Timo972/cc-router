@@ -9,7 +9,7 @@ import {
   type PostHogSdkClient,
   type PostHogTransport,
 } from "../telemetry/posthog-client.js";
-import { reconstructAnalyticsEvent, sanitizeException } from "../telemetry/privacy.js";
+import { rebuildSanitizedException, reconstructAnalyticsEvent, sanitizeException } from "../telemetry/privacy.js";
 
 const INSTALL_ID = "70d8062e-1fa0-4ae4-a115-bf782ecca462";
 const OTHER_INSTALL_ID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
@@ -102,6 +102,32 @@ function capturedEvent(request: CapturedRequest): Record<string, unknown> {
 }
 
 describe("gated PostHog EU client", () => {
+  it.each(["TypeError", "ProviderConnectionError"])("preserves %s and named/anonymous frames through persisted capture", async (name) => {
+    const requests: CapturedRequest[] = [];
+    const client = createPostHogTelemetryClient({ getSnapshot: () => snapshot(), fetch: captureTransport(requests) });
+    const error = new Error("PRIVATE message");
+    error.name = name;
+    error.stack = `${name}: PRIVATE message\n    at async Provider.connect (${PROJECT_ROOT}/dist/provider.js:4:2)\n    at ${PROJECT_ROOT}/dist/server.js:9:3`;
+    const safe = sanitizeException(error, { category: "runtime", reason: "other" }, {
+      installationId: INSTALL_ID, diagnosticId: DIAGNOSTIC_ID,
+    })!;
+    const { error: _error, ...persisted } = safe;
+    const replayed = rebuildSanitizedException(JSON.parse(JSON.stringify(persisted)))!;
+    await client.captureExceptionImmediate(replayed, CONSENT_GENERATION);
+    expect(requests).toHaveLength(1);
+    const event = capturedEvent(requests[0]!);
+    expect(event.properties).toMatchObject({
+      reason: "other",
+      $exception_list: [{ type: name, value: "", stacktrace: { type: "raw", frames: [
+        { function: "<anonymous>", filename: "dist/server.js" },
+        { function: "Provider.connect", filename: "dist/provider.js" },
+      ] } }],
+    });
+    expect(JSON.stringify(event)).not.toContain("PRIVATE");
+    expect(JSON.stringify(event)).not.toContain(PROJECT_ROOT);
+    await client.shutdownWithin(100);
+  });
+
   it("exposes only typed capture and lifecycle methods", () => {
     const client = createPostHogTelemetryClient({ getSnapshot: () => undefined });
 
@@ -217,19 +243,20 @@ describe("gated PostHog EU client", () => {
     expect(event.distinct_id).toBe(INSTALL_ID);
     expect(event.properties).toEqual({
       $exception_list: [{
-        type: "Error",
-        value: "persistence_failure",
+        type: "TypeError",
+        value: "",
         mechanism: { type: "generic", handled: true, synthetic: false },
         stacktrace: {
           type: "raw",
           frames: [
             {
               platform: "node:javascript",
+              function: "dependency",
               filename: "node_modules/@scope/safe-package/lib/index.js",
               lineno: 19,
               colno: 4,
             },
-            { platform: "node:javascript", filename: "dist/config/store.js", lineno: 42, colno: 7 },
+            { platform: "node:javascript", function: "persist", filename: "dist/config/store.js", lineno: 42, colno: 7 },
           ],
         },
       }],
