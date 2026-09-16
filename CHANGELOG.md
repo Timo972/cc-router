@@ -8,6 +8,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.12.2] — 2026-09-16
+
 ### Added
 
 - Privacy-bounded OpenTelemetry and PostHog EU telemetry: 10%-sampled proxy
@@ -25,6 +29,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Aptabase telemetry has been removed. An existing persisted opt-out remains
   off after upgrade; no PostHog Person profiles are created and GeoIP
   enrichment is disabled.
+- `cc-router telemetry status` now explains the effective consent state,
+  signal inventory, installation pseudonym, and network privacy boundary.
+  Re-enabling telemetry requires restarting a daemon that started disabled.
+- Expanded the telemetry and security guides, added diagnostic-ID guidance for
+  reporting setup and runtime failures, and included the telemetry inventory
+  in the published package.
+
+### Fixed
+
+- Sanitized exceptions retain validated error names and stack function names
+  for more useful error grouping and diagnosis, while omitting raw messages
+  and removing machine-specific paths.
+- Builds clean stale compiled output before compiling, preventing removed
+  modules from remaining in release artifacts.
 
 ---
 
@@ -739,6 +757,7 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
+[0.12.2]: https://github.com/Timo972/cc-router/releases/tag/v0.12.2
 [0.12.1]: https://github.com/Timo972/cc-router/releases/tag/v0.12.1
 [0.12.0]: https://github.com/Timo972/cc-router/releases/tag/v0.12.0
 [0.11.0]: https://github.com/Timo972/cc-router/releases/tag/v0.11.0
