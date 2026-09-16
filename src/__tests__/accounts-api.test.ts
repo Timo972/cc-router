@@ -78,12 +78,22 @@ describe("createAccountsApi", () => {
         id: "max-1",
         provider: "anthropic_subscription",
         rateLimits: { usage: { modelLimits: [] } },
+        accountInfo: {
+          email: "test@example.com", accountType: "workspace", workspaceName: "Example",
+          plan: "business", fetchedAt: 123, fetchStatus: "fresh", accessToken: "must-not-be-retained",
+          subscription: { startedAt: "2025-01-01T00:00:00Z" },
+        },
         accessToken: "must-not-be-retained",
       }],
     }), { status: 200, headers: { "content-type": "application/json" } }));
 
     const api = createAccountsApi("http://router.local", "secret");
     const accounts = await api.list();
+    expect(accounts[0]?.accountInfo).toEqual({
+      email: "test@example.com", accountType: "workspace", workspaceName: "Example",
+      plan: "business", fetchedAt: 123, fetchStatus: "fresh",
+      subscription: { startedAt: "2025-01-01T00:00:00.000Z" },
+    });
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://router.local/cc-router/accounts",

@@ -52,6 +52,16 @@ function makeAnthropicAccount(): Account {
 }
 
 describe("createHealthAccountViews", () => {
+  it("never discloses private identity metadata, even if attached to a runtime account", () => {
+    const account = Object.assign(makeAnthropicAccount(), {
+      accountInfo: { email: "private@example.com", workspaceName: "Private workspace", plan: "Max" },
+    });
+    const output = JSON.stringify(createHealthAccountViews([account], []));
+    expect(output).not.toContain("accountInfo");
+    expect(output).not.toContain("private@example.com");
+    expect(output).not.toContain("Private workspace");
+  });
+
   it("combines Anthropic pool stats with OpenAI subscription account status", () => {
     const openAIAccount: OpenAISubscriptionAccount = {
       id: "openai-primary",

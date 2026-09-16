@@ -18,6 +18,7 @@ import {
 } from "../utils/cli-routing.js";
 import { mergeGrokIntoHealth, loadGrokHealthSnapshotsWithSubscription } from "../providers/xai/overview.js";
 import type { GrokAccountSnapshot } from "../providers/xai/overview.js";
+import { formatAccountInfo, type AccountInfo } from "../providers/account-info.js";
 
 const POLL_INTERVAL_MS = 2_000;
 /** Progress banner for the manual reload; replaced by the result banner, so
@@ -906,6 +907,27 @@ function LiveDashboard({
   onRefreshAll?: () => Promise<void>;
   resetSession: ResetSession;
 }) {
+  // Private identity comes only from the authenticated account endpoint, never health.
+  const [accountInfo, setAccountInfo] = useState<Record<string, AccountInfo | undefined>>({});
+  useEffect(() => {
+    let cancelled = false;
+    let pending = false;
+    const poll = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const accounts = await api.list();
+        if (!cancelled) setAccountInfo(Object.fromEntries(accounts.map(account => [
+          `${account.provider ?? "anthropic_subscription"}:${account.id}`, account.accountInfo,
+        ])));
+      } catch {
+        if (!cancelled) setAccountInfo({});
+      } finally { pending = false; }
+    };
+    void poll();
+    const timer = setInterval(() => { void poll(); }, POLL_INTERVAL_MS);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [api]);
   const [cliRouting, setCliRouting] = useState(() => ({
     claude: readClaudeRouting(),
     codex: readCodexRouting(),
@@ -1618,6 +1640,11 @@ function LiveDashboard({
             focused={focus === "accounts"}
           />
         </Box>
+        {focus === "accounts" && selectedAccount && (
+          <Text color="gray" wrap="truncate-end">
+            {"  "}{formatAccountInfo(accountInfo[`${selectedAccount.provider ?? "anthropic_subscription"}:${selectedAccount.id}`])}
+          </Text>
+        )}
       </Box>
 
       {/* ── Banner (transient action feedback) ── */}
