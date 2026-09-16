@@ -91,8 +91,8 @@ creation date, not the start of its current billing period.
 Metadata is cached in memory and refreshed in the background. **R** requests an
 immediate refresh alongside usage and credentials. Failed lookups retain the last
 successful data with a stale marker; an initial lookup may show unavailable.
-Missing billing intervals and renewal dates are not guessed from token expiry or
-usage resets. Stored Grok accounts currently supply plan metadata only.
+Billing interval is not supported. Missing renewal dates are not guessed from
+token expiry or usage resets. Stored Grok accounts currently supply plan metadata only.
 
 Identity metadata is retrieved through the authenticated account endpoint, never
 through health responses or telemetry. It is not written to `accounts.json`.

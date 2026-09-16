@@ -103,9 +103,10 @@ describe("account metadata disclosure and display", () => {
     });
     expect(safe).toEqual({
       accountType: "workspace", plan: "business", fetchedAt: now, fetchStatus: "fresh",
-      subscription: { interval: "annual", currentPeriodEnd: "2027-02-03T10:00:00.000Z", cancelAtPeriodEnd: true },
+      subscription: { currentPeriodEnd: "2027-02-03T10:00:00.000Z", cancelAtPeriodEnd: true },
     });
-    expect(formatAccountInfo(safe)).toContain("annual");
+    expect(formatAccountInfo(safe)).not.toContain("annual");
+    expect(safe?.subscription).not.toHaveProperty("interval");
     expect(formatAccountInfo(safe)).toContain("Ends 2027-02-03");
     expect(formatAccountInfo(safe)).not.toContain("Renews");
   });

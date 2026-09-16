@@ -9,7 +9,6 @@ export interface AccountInfo {
   subscription?: {
     status?: string;
     startedAt?: string;
-    interval?: "monthly" | "annual" | "other";
     currentPeriodStart?: string;
     currentPeriodEnd?: string;
     renewsAt?: string;
@@ -61,7 +60,6 @@ export function sanitizeAccountInfo(value: unknown): AccountInfo | undefined {
     const date = timestamp(sub[key]);
     if (date) subscription[key] = date;
   }
-  if (sub.interval === "monthly" || sub.interval === "annual" || sub.interval === "other") subscription.interval = sub.interval;
   if (typeof sub.cancelAtPeriodEnd === "boolean") subscription.cancelAtPeriodEnd = sub.cancelAtPeriodEnd;
   if (Object.keys(subscription).length) info.subscription = subscription;
   return info;
@@ -73,7 +71,6 @@ export function formatAccountInfo(value: AccountInfo | undefined): string {
   const parts = [info.email, info.accountType === "unknown" ? undefined : info.accountType, info.workspaceName, info.plan];
   const sub = info.subscription;
   if (sub?.status) parts.push(sub.status);
-  if (sub?.interval) parts.push(sub.interval);
   if (sub?.cancelAtPeriodEnd && sub.currentPeriodEnd) parts.push(`Ends ${sub.currentPeriodEnd.slice(0, 10)}`);
   else if (sub?.renewsAt) parts.push(`Renews ${sub.renewsAt.slice(0, 10)}`);
   else if (sub?.startedAt) parts.push(`Since ${sub.startedAt.slice(0, 10)}`);

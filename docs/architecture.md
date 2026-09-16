@@ -47,8 +47,8 @@ Account listings include an optional `accountInfo` object with `email`, `account
 `workspaceName`, `plan`, `subscription`, `fetchedAt`, and `fetchStatus`
 (`fresh`, `stale`, or `unavailable`). Fields not supplied by the provider are
 omitted. Claude's `subscription.startedAt` is subscription creation, not the
-current billing-period start. Billing interval, period, and renewal fields remain
-absent unless confirmed by provider data.
+current billing-period start. Billing interval is not supported. Period and
+renewal fields remain absent unless confirmed by provider data.
 
 Metadata is memory-only, refreshed in the background with a five-minute cache
 and one-minute failure retries. Listing does not wait for provider requests.
