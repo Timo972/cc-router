@@ -305,42 +305,56 @@ function stackHeaderName(kind: ErrorKind): string {
   }
 }
 
-function normalizedFrames(input: Error, kind: ErrorKind): readonly SafeStackFrame[] {
+/** Keep code symbols, not arbitrary messages or paths supplied as names. */
+export function exceptionName(value: unknown): string {
+  return typeof value === "string" && /^[A-Za-z_$][\w.$-]{0,127}$/.test(value) ? value : "Error";
+}
+
+export function frameFunction(value: unknown): string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256
+    && /^[\w$.[\]<> ():-]+$/.test(value) ? value : "<anonymous>";
+}
+
+function normalizedFrames(input: Error): readonly SafeStackFrame[] {
   const stack = input.stack;
   if (typeof stack !== "string") return [];
 
-  // The header carries the raw message. Parse frames only after removing it
-  // verbatim, so a multiline message can never inject a frame.
+  // Remove the complete raw header so multiline messages cannot inject frames.
   const rawMessage = own(input, "message");
   if (rawMessage !== undefined && typeof rawMessage !== "string") return [];
-  const header = `${stackHeaderName(kind)}${rawMessage ? `: ${rawMessage}` : ""}`;
+  const rawName = input.name;
+  if (typeof rawName !== "string" || /[\r\n]/.test(rawName)) return [];
+  const header = rawName ? `${rawName}${rawMessage ? `: ${rawMessage}` : ""}` : (rawMessage ?? "");
   if (!stack.startsWith(`${header}\n`)) return [];
 
   const frames: SafeStackFrame[] = [];
   for (const line of stack.slice(header.length + 1).split("\n")) {
     if (frames.length >= MAX_STACK_FRAMES) break;
-    const match = line.match(/(?:\(|\bat\s+)(.+):(\d+):(\d+)\)?\s*$/);
-    if (!match) continue;
-    const path = normalizedFramePath(match[1]);
-    const frameLine = boundedInteger(Number(match[2]), Number.MAX_SAFE_INTEGER, 1);
-    const column = boundedInteger(Number(match[3]), Number.MAX_SAFE_INTEGER, 1);
+    const named = line.match(/^\s*at (.+) \((.+):(\d+):(\d+)\)\s*$/);
+    const anonymous = named ? null : line.match(/^\s*at (.+):(\d+):(\d+)\s*$/);
+    if (!named && !anonymous) continue;
+    const path = normalizedFramePath(named ? named[2] : anonymous![1]);
+    const frameLine = boundedInteger(Number(named ? named[3] : anonymous![2]), Number.MAX_SAFE_INTEGER, 1);
+    const column = boundedInteger(Number(named ? named[4] : anonymous![3]), Number.MAX_SAFE_INTEGER, 1);
     if (!path || frameLine === undefined || column === undefined) continue;
-    frames.push({ path, line: frameLine, column });
+    frames.push({ path, line: frameLine, column, function: frameFunction(named?.[1]) });
   }
   return frames;
 }
 
-function sanitizedError(reason: SetupReason, frames: readonly SafeStackFrame[]): Error {
-  const error = new Error(reason);
+function sanitizedError(name: string, frames: readonly SafeStackFrame[]): Error {
+  const error = new Error();
+  Object.defineProperty(error, "name", { value: name, configurable: true, writable: true });
   error.stack = [
-    `Error: ${reason}`,
-    ...frames.map(frame => `    at ${frame.path}:${frame.line}:${frame.column}`),
+    name,
+    ...frames.map(frame => `    at ${frameFunction(frame.function)} (${frame.path}:${frame.line}:${frame.column})`),
   ].join("\n");
   return error;
 }
 
 function fingerprint(
   kind: ErrorKind,
+  name: string,
   context: SafeExceptionContext,
   systemErrorCode: SystemErrorCode | undefined,
   status: number | undefined,
@@ -348,6 +362,7 @@ function fingerprint(
 ): string {
   return createHash("sha256").update(JSON.stringify({
     errorKind: kind,
+    errorName: name,
     category: context.category,
     reason: context.reason,
     operation: context.operation,
@@ -393,7 +408,8 @@ export function sanitizeException(
 
     const isError = input instanceof Error;
     const kind: ErrorKind = isError ? errorKind(input) : "unexpected_error";
-    const frames = isError ? normalizedFrames(input, kind) : [];
+    const name = isError ? exceptionName(input.name) : "Error";
+    const frames = isError ? normalizedFrames(input) : [];
     const code = isError
       ? member(SYSTEM_ERROR_CODES, own(input, "code")) as SystemErrorCode | undefined
       : undefined;
@@ -401,11 +417,12 @@ export function sanitizeException(
       ? httpStatusCode(own(input, "statusCode")) ?? httpStatusCode(own(input, "status"))
       : undefined;
     const output: SafeExceptionContract = {
-      error: sanitizedError(context.reason, frames),
+      error: sanitizedError(name, frames),
+      errorName: name,
       ...context,
       errorKind: kind,
       frames,
-      fingerprint: fingerprint(kind, context, code, status, frames),
+      fingerprint: fingerprint(kind, name, context, code, status, frames),
       diagnosticId: trustedDiagnosticId,
     };
     assignIfDefined(output, "systemErrorCode", code);
@@ -650,13 +667,18 @@ export function rebuildSanitizedException(input: unknown): SafeExceptionContract
     if ((frame.line !== undefined && line === undefined) || (frame.column !== undefined && column === undefined)) {
       return undefined;
     }
-    const safeFrame: SafeStackFrame = { path: path as SafeStackFrame["path"] };
+    const safeFrame: SafeStackFrame = {
+      path: path as SafeStackFrame["path"],
+      function: frameFunction(frame.function),
+    };
     assignIfDefined(safeFrame, "line", line);
     assignIfDefined(safeFrame, "column", column);
     frames.push(safeFrame);
   }
+  const name = exceptionName(input.errorName ?? stackHeaderName(errorKind));
   const contract: SafeExceptionContract = {
-    error: sanitizedError(reason, frames),
+    error: sanitizedError(name, frames),
+    errorName: name,
     category,
     reason,
     errorKind,

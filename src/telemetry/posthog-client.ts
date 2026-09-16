@@ -19,7 +19,7 @@ import {
   type SafeAnalyticsEvent,
   type SafeExceptionContract,
 } from "./contracts.js";
-import { reconstructAnalyticsEvent } from "./privacy.js";
+import { exceptionName, frameFunction, reconstructAnalyticsEvent } from "./privacy.js";
 
 export type PostHogTransport = NonNullable<PostHogOptions["fetch"]>;
 
@@ -128,17 +128,24 @@ function reconstructExceptionFrames(input: unknown): UnknownRecord[] | undefined
     const line = positiveInteger(own(candidate, "lineno"));
     const column = positiveInteger(own(candidate, "colno"));
     if (!filename || !line || !column) return undefined;
-    frames.push({ platform: "node:javascript", filename, lineno: line, colno: column });
+    frames.push({
+      platform: "node:javascript",
+      function: frameFunction(own(candidate, "function")),
+      filename,
+      lineno: line,
+      colno: column,
+    });
   }
   return frames;
 }
 
-function reconstructExceptionList(input: unknown, reason: string): UnknownRecord[] | undefined {
+function reconstructExceptionList(input: unknown): UnknownRecord[] | undefined {
   if (!Array.isArray(input) || input.length !== 1 || !isRecord(input[0])) return undefined;
   const exception = input[0];
   const mechanism = own(exception, "mechanism");
-  if (own(exception, "type") !== "Error"
-    || own(exception, "value") !== reason
+  const name = exceptionName(own(exception, "type"));
+  if (own(exception, "type") !== name
+    || own(exception, "value") !== ""
     || !isRecord(mechanism)
     || own(mechanism, "type") !== "generic"
     || own(mechanism, "handled") !== true
@@ -148,14 +155,14 @@ function reconstructExceptionList(input: unknown, reason: string): UnknownRecord
 
   const stacktrace = own(exception, "stacktrace");
   if (stacktrace === undefined) {
-    return [{ type: "Error", value: reason, mechanism: { type: "generic", handled: true, synthetic: false } }];
+    return [{ type: name, value: "", mechanism: { type: "generic", handled: true, synthetic: false } }];
   }
   if (!isRecord(stacktrace) || own(stacktrace, "type") !== "raw") return undefined;
   const frames = reconstructExceptionFrames(own(stacktrace, "frames"));
   if (!frames) return undefined;
   return [{
-    type: "Error",
-    value: reason,
+    type: name,
+    value: "",
     mechanism: { type: "generic", handled: true, synthetic: false },
     stacktrace: { type: "raw", frames },
   }];
@@ -181,7 +188,7 @@ function reconstructExceptionEvent(event: SdkEvent, installationId: string): Sdk
     return null;
   }
 
-  const exceptionList = reconstructExceptionList(own(properties, "$exception_list"), reason);
+  const exceptionList = reconstructExceptionList(own(properties, "$exception_list"));
   if (!exceptionList) return null;
 
   const systemErrorCode = optionalMember(SYSTEM_ERROR_CODES, own(properties, "systemErrorCode"));

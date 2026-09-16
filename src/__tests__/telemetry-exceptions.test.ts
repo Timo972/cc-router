@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { sanitizeException } from "../telemetry/privacy.js";
+import { rebuildSanitizedException, sanitizeException } from "../telemetry/privacy.js";
 
 const INSTALL_ID = "70d8062e-1fa0-4ae4-a115-bf782ecca462";
 const OTHER_INSTALL_ID = "916ce1d6-2e8d-48b2-a70e-0337bdf82df7";
@@ -50,6 +50,45 @@ function hostileError(message: string): TypeError {
 }
 
 describe("exception sanitization", () => {
+  it("preserves inherited custom names and includes them in grouping", () => {
+    class ProviderError extends Error {}
+    ProviderError.prototype.name = "ProviderError";
+    const custom = sanitizeException(new ProviderError("PRIVATE"), context, identity)!;
+    const generic = sanitizeException(new Error("PRIVATE"), context, identity)!;
+    expect(custom.error.name).toBe("ProviderError");
+    expect(custom.error.message).toBe("");
+    expect(custom.errorName).toBe("ProviderError");
+    expect(custom.fingerprint).not.toBe(generic.fingerprint);
+  });
+
+  it("replays older records without error names or function fields", () => {
+    const { error: _error, errorName: _name, ...legacy } = sanitizeException(hostileError("PRIVATE"), context, identity)!;
+    legacy.frames = legacy.frames.map(({ function: _function, ...frame }) => frame);
+    const replayed = rebuildSanitizedException(legacy)!;
+    expect(replayed.error.name).toBe("TypeError");
+    expect(replayed.error.message).toBe("");
+    expect(replayed.frames.every(frame => frame.function === "<anonymous>")).toBe(true);
+  });
+
+  it.each(["PRIVATE\nInjectedError", "https://private.example/error", "A".repeat(129)])(
+    "rejects malformed exception names: %s", (name) => {
+      const error = new Error("PRIVATE");
+      error.name = name;
+      const safe = sanitizeException(error, context, identity)!;
+      expect(safe.errorName).toBe("Error");
+      expect(safe.error.message).toBe("");
+      expect(safe.error.stack).not.toContain(name);
+    },
+  );
+
+  it("does not retain paths embedded in function labels", () => {
+    const error = new Error("PRIVATE");
+    error.stack = `Error: PRIVATE\n    at /Users/alice/private (${PROJECT_ROOT}/dist/server.js:1:2)`;
+    const safe = sanitizeException(error, context, identity)!;
+    expect(safe.frames[0]?.function).toBe("<anonymous>");
+    expect(safe.error.stack).not.toContain("/Users/alice");
+  });
+
   it("reconstructs a hostile Error without messages, causes, properties, or identifying paths", () => {
     const original = hostileError("Bearer PRIVATE_MESSAGE");
 
@@ -71,24 +110,24 @@ describe("exception sanitization", () => {
       runtimeMode: "foreground",
       diagnosticId: DIAGNOSTIC_ID,
       frames: [
-        { path: "dist/config/store.js", line: 42, column: 7 },
-        { path: "dist/state/load.js", line: 8, column: 2 },
-        { path: "node_modules/@scope/safe-package/lib/index.js", line: 19, column: 4 },
-        { path: "node_modules/inner/lib.js", line: 3, column: 9 },
+        { function: "persist", path: "dist/config/store.js", line: 42, column: 7 },
+        { function: "load", path: "dist/state/load.js", line: 8, column: 2 },
+        { function: "scoped", path: "node_modules/@scope/safe-package/lib/index.js", line: 19, column: 4 },
+        { function: "nested", path: "node_modules/inner/lib.js", line: 3, column: 9 },
       ],
     }));
     expect(result?.fingerprint).toMatch(/^[0-9a-f]{64}$/);
     expect(result?.error).toBeInstanceOf(Error);
     expect(result?.error).not.toBe(original);
-    expect(result?.error.message).toBe("persistence_failure");
+    expect(result?.error.message).toBe("");
     expect(Object.keys(result?.error ?? {})).toEqual([]);
     expect("cause" in (result?.error ?? {})).toBe(false);
     expect(result?.error.stack).toBe([
-      "Error: persistence_failure",
-      "    at dist/config/store.js:42:7",
-      "    at dist/state/load.js:8:2",
-      "    at node_modules/@scope/safe-package/lib/index.js:19:4",
-      "    at node_modules/inner/lib.js:3:9",
+      "TypeError",
+      "    at persist (dist/config/store.js:42:7)",
+      "    at load (dist/state/load.js:8:2)",
+      "    at scoped (node_modules/@scope/safe-package/lib/index.js:19:4)",
+      "    at nested (node_modules/inner/lib.js:3:9)",
     ].join("\n"));
 
     const serialized = JSON.stringify(result);
@@ -162,7 +201,7 @@ describe("exception sanitization", () => {
       setupStage: "credential_parse",
       runtimeMode: "daemon",
       diagnosticId: DIAGNOSTIC_ID,
-      frames: [{ path: "dist/auth/parser.js", line: 71, column: 13 }],
+      frames: [{ function: "parse", path: "dist/auth/parser.js", line: 71, column: 13 }],
     }));
     expect(result?.fingerprint).toMatch(/^[0-9a-f]{64}$/);
     expect(result?.error.stack).not.toContain("PRIVATE_JSON");
@@ -283,7 +322,7 @@ describe("exception sanitization", () => {
     expect(firstResult?.frames).toEqual([]);
     expect(secondResult?.frames).toEqual([]);
     expect(firstResult?.fingerprint).toBe(secondResult?.fingerprint);
-    expect(firstResult?.error.stack).toBe("Error: persistence_failure");
+    expect(firstResult?.error.stack).toBe("Error");
   });
 
   it("classifies project frames before generic dependency frames", () => {
@@ -297,8 +336,8 @@ describe("exception sanitization", () => {
     const result = sanitizeException(error, context, identity);
 
     expect(result?.frames).toEqual([
-      { path: "dist/cli/index.js", line: 12, column: 4 },
-      { path: "node_modules/chalk/source/index.js", line: 20, column: 6 },
+      { function: "start", path: "dist/cli/index.js", line: 12, column: 4 },
+      { function: "dependency", path: "node_modules/chalk/source/index.js", line: 20, column: 6 },
     ]);
   });
 
@@ -313,7 +352,7 @@ describe("exception sanitization", () => {
 
     const result = sanitizeException(error, context, identity);
 
-    expect(result?.frames).toEqual([{ path: "dist/server/index.js", line: 31, column: 7 }]);
+    expect(result?.frames).toEqual([{ function: "trusted", path: "dist/server/index.js", line: 31, column: 7 }]);
     expect(JSON.stringify(result)).not.toContain(unrelatedCanary);
     expect(JSON.stringify(result)).not.toContain("/srv/");
   });
