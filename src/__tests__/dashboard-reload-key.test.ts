@@ -81,6 +81,35 @@ function routeFetch(refresh: (init: RequestInit | undefined) => Promise<Response
 }
 
 describe("dashboard reload key", () => {
+  it("shows private metadata for the selected account without wrapping the frame", async () => {
+    const dash = renderDashboard(health(), {}, { rows: 28, columns: 90 });
+    try {
+      const fetchMock = vi.mocked(globalThis.fetch);
+      fetchMock.mockImplementation(input => {
+        if (String(input).endsWith("/cc-router/accounts")) return Promise.resolve(Response.json({
+          accounts: [{
+            id: "max-account-1", provider: "anthropic_subscription",
+            accountInfo: {
+              accountType: "personal", email: "test@example.com", plan: "Max 20x",
+              fetchStatus: "fresh", fetchedAt: Date.now(),
+              subscription: { startedAt: "2025-02-03T10:00:00Z" },
+            },
+          }],
+        }));
+        return Promise.resolve(Response.json(health()));
+      });
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      await dash.press("\t");
+      await dash.waitUntil(() => {
+        expect(dash.lastFrame()).toContain("test@example.com");
+        expect(dash.lastFrame()).toContain("Since 2025-02-03");
+        expect(dash.lastFrame().trimEnd().split("\n").length).toBeLessThanOrEqual(27);
+      });
+    } finally {
+      await dash.cleanup();
+    }
+  });
+
   it("posts /cc-router/refresh on R and shows the summary banner", async () => {
     const dash = renderDashboard(health(), {}, { rows: 40, columns: 220 });
     try {

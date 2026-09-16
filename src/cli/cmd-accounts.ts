@@ -18,6 +18,7 @@ import {
 import type { SetupStage } from "../telemetry/contracts.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
+import { sanitizeAccountInfo, formatAccountInfo, type AccountInfo } from "../providers/account-info.js";
 
 export function registerAccounts(program: Command): void {
   const accounts = program
@@ -83,6 +84,8 @@ export function registerAccounts(program: Command): void {
             `  errors: ${chalk.red(String(s.errorCount).padStart(3))}` +
             `  expires: ${exp}`
           );
+          const info = formatAccountInfo(s.accountInfo);
+          if (info) console.log(chalk.gray(`    ${info}`));
         }
 
         // The proxy reads accounts.json once at startup, so anything that
@@ -766,9 +769,12 @@ export async function addAccountRuntimeAware(
 async function fetchLiveStats(): Promise<null | Array<{
   id: string; provider?: string; healthy: boolean; busy: boolean;
   requestCount: number; errorCount: number; expiresInMs: number;
+  accountInfo?: AccountInfo;
 }>> {
   try {
-    const res = await fetch(`http://localhost:${PROXY_PORT}/cc-router/health`, {
+    const { proxySecret } = readConfig();
+    const res = await fetch(`http://localhost:${PROXY_PORT}/cc-router/accounts`, {
+      headers: proxySecret ? { authorization: `Bearer ${proxySecret}` } : {},
       signal: AbortSignal.timeout(1_000),
     });
     if (!res.ok) return null;
@@ -776,6 +782,7 @@ async function fetchLiveStats(): Promise<null | Array<{
       accounts: Array<{
         id: string; provider?: string; healthy: boolean; busy: boolean;
         requestCount: number; errorCount: number; expiresInMs: number;
+        accountInfo?: AccountInfo;
       }>;
       operational?: {
         providers: {
@@ -787,7 +794,9 @@ async function fetchLiveStats(): Promise<null | Array<{
     };
     if (!Array.isArray(data.accounts)) return null;
     const { mergeGrokIntoHealth } = await import("../providers/xai/overview.js");
-    return mergeGrokIntoHealth(data).accounts;
+    return mergeGrokIntoHealth(data).accounts.map(account => ({
+      ...account, accountInfo: sanitizeAccountInfo(account.accountInfo),
+    }));
   } catch {
     return null;
   }

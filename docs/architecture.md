@@ -40,7 +40,22 @@ Claude Desktop ─[mitmproxy]─┐  (optional — intercepts api.anthropic.com)
 | `POST /v1/responses` | OpenAI Responses API — the Codex CLI route |
 | `GET /v1/models` | OpenAI-compatible model list, discovered live from both providers |
 | `GET /cc-router/health` | Operational health; detail requires the proxy secret |
-| `GET /cc-router/accounts` | Account inventory and live stats (authenticated) |
+| `GET /cc-router/accounts` | Account inventory, live stats, and cached identity/subscription metadata (authenticated) |
+
+Account listings include an optional `accountInfo` object with `email`, `accountId`,
+`accountType` (`personal`, `workspace`, or `unknown`), `workspaceId`,
+`workspaceName`, `plan`, `subscription`, `fetchedAt`, and `fetchStatus`
+(`fresh`, `stale`, or `unavailable`). Fields not supplied by the provider are
+omitted. Claude's `subscription.startedAt` is subscription creation, not the
+current billing-period start. Billing interval, period, and renewal fields remain
+absent unless confirmed by provider data.
+
+Metadata is memory-only, refreshed in the background with a five-minute cache
+and one-minute failure retries. Listing does not wait for provider requests.
+`POST /cc-router/refresh` also refreshes metadata. The account endpoint uses the
+proxy's existing authentication rules (loopback-only when no secret is set) and
+returns `Cache-Control: no-store`. Metadata is excluded from all health responses,
+including authenticated health, and is not sent to telemetry.
 
 ## What passes through untouched
 

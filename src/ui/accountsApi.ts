@@ -1,4 +1,5 @@
 import type { CodexResetCode } from "../providers/openai/usage-reset.js";
+import { sanitizeAccountInfo, type AccountInfo } from "../providers/account-info.js";
 /**
  * Tiny authenticated HTTP client for /cc-router/accounts.
  *
@@ -26,6 +27,7 @@ type Severity = "" | "warning" | "critical" | "unknown";
 
 export interface AccountSafeView {
   id: string;
+  accountInfo?: AccountInfo;
   provider?: "anthropic_subscription" | "openai_subscription" | "xai_subscription";
   rateLimits?: {
     status: "allowed" | "rate_limited" | "unknown";
@@ -170,10 +172,12 @@ function publicAccountSafeView(value: unknown): AccountSafeView[] {
     ? value.provider
     : undefined;
   const rateLimits = publicRateLimits(value.rateLimits);
+  const accountInfo = sanitizeAccountInfo(value.accountInfo);
   const modelCooldowns = publicCooldowns(value.modelCooldowns);
   return [{
     id: publicText(value.id, 128, "unknown-account"),
     ...(provider ? { provider } : {}),
+    ...(accountInfo ? { accountInfo } : {}),
     ...(rateLimits ? { rateLimits } : {}),
     globalCooldownUntilMs: publicTimestamp(value.globalCooldownUntilMs),
     modelCooldowns,

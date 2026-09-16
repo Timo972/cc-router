@@ -79,6 +79,9 @@ import {
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
 import { createAllowanceView } from "./allowance.js";
+import { AccountInfoCache } from "./account-info-cache.js";
+import type { AccountInfoSource } from "../providers/account-info-fetch.js";
+import { loadXaiAccounts } from "../config/manager.js";
 
 /** Upper bound on how long a shutdown may wait for telemetry to drain. */
 const TELEMETRY_SHUTDOWN_DEADLINE_MS = 1_000;
@@ -702,6 +705,23 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   });
   openAIUsageRefresher.start();
 
+  const accountInfoSources = (): AccountInfoSource[] => [
+    ...pool.getAll().map(account => ({
+      id: account.id, provider: "anthropic_subscription" as const,
+      accessToken: account.tokens.accessToken, expiresAt: account.tokens.expiresAt, enabled: account.enabled,
+    })),
+    ...openAIAccounts.map(account => ({
+      id: account.id, provider: "openai_subscription" as const,
+      accessToken: account.accessToken, expiresAt: account.expiresAt, enabled: account.enabled,
+    })),
+    ...loadXaiAccounts(accountsPath).map(account => ({
+      id: account.id, provider: "xai_subscription" as const,
+      accessToken: account.accessToken, expiresAt: account.expiresAt, enabled: account.enabled,
+    })),
+  ];
+  const accountInfoCache = new AccountInfoCache(accountInfoSources);
+  accountInfoCache.start();
+
   const app = express();
   const proxyRequestTimeoutMs = getProxyRequestTimeoutMs();
   // Router-side 429 failover / 5xx retry is on by default; `"autoFailover":
@@ -836,12 +856,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // account's usage re-fetched — without dropping in-flight requests or
   // sticky sessions. Each provider contributes its own hooks; the route
   // itself knows nothing about OAuth or usage formats.
-  const runRefreshAll = createRefreshAllRunner(() => {
+  const runRefreshAll = createRefreshAllRunner(async () => {
     const onError = (provider: string, error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       logError(provider, 0, `manual refresh: ${message}`);
     };
-    return refreshAllAccounts([
+    const summary = await refreshAllAccounts([
       {
         provider: "anthropic",
         getAll: () => pool.getAll(),
@@ -867,6 +887,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       },
       onError,
     });
+    const metadataStartedAt = Date.now();
+    await accountInfoCache.refresh(true);
+    summary.durationMs += Math.max(0, Date.now() - metadataStartedAt);
+    return summary;
   });
   app.post("/cc-router/refresh", async (_req, res) => {
     let summary;
@@ -900,6 +924,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // Shape returned to clients — NEVER includes access/refresh tokens.
   accountsRouter.get("/", (_req, res) => {
     const resolveRoutingMetrics = createRoutingMetricsResolver();
+    // Never wait on an upstream metadata request while listing accounts.
+    void accountInfoCache.refresh();
+    const sources = accountInfoSources();
+    res.setHeader("Cache-Control", "no-store");
     res.json({
       accounts: createHealthAccountViews(
         pool.getAll(),
@@ -907,7 +935,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         resolveRoutingMetrics,
         createOpenAIRoutingResolver(),
         loadGrokHealthSnapshots(),
-      ),
+      ).map(view => {
+        const source = sources.find(account => account.id === view.id && account.provider === view.provider);
+        return { ...view, ...(source ? { accountInfo: accountInfoCache.get(source) } : {}) };
+      }),
     });
   });
 
@@ -1696,6 +1727,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     console.log(chalk.yellow("\nShutting down — saving tokens..."));
     usageRefresher.stop();
     openAIUsageRefresher.stop();
+    accountInfoCache.stop();
     saveAccounts(pool.getAll());
     if (managesPidFile()) {
       removePid();

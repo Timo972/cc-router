@@ -8,6 +8,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Account identity and plan details in live account listings and the dashboard's
+  selected-account details: email and workspace information for Claude and
+  ChatGPT, Claude subscription status/start date, and plans for stored Grok
+  accounts. Metadata refreshes in the background and with **R**; unavailable
+  billing intervals and renewal dates remain unknown. Private identity details
+  are excluded from health responses and telemetry.
+
 ---
 
 ## [0.12.2] — 2026-09-16

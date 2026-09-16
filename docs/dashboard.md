@@ -83,6 +83,20 @@ token counts.
 
 ## Keybindings
 
+With **ACCOUNTS** focused, the selected account's detail line shows its email,
+personal/workspace type, workspace name, and plan when available. Claude accounts
+can also show subscription status and a **Since** date. This is the subscription's
+creation date, not the start of its current billing period.
+
+Metadata is cached in memory and refreshed in the background. **R** requests an
+immediate refresh alongside usage and credentials. Failed lookups retain the last
+successful data with a stale marker; an initial lookup may show unavailable.
+Missing billing intervals and renewal dates are not guessed from token expiry or
+usage resets. Stored Grok accounts currently supply plan metadata only.
+
+Identity metadata is retrieved through the authenticated account endpoint, never
+through health responses or telemetry. It is not written to `accounts.json`.
+
 Focus moves between three panels — logs, accounts and models — and some keys
 depend on which has focus.
 
@@ -93,7 +107,7 @@ depend on which has focus.
 | `Esc` | Return to logs, or quit if logs already has focus |
 | `q` | Quit |
 | `z` | Compact view — hides TOTALS and RECENT ACTIVITY so more accounts fit |
-| `R` | Reload account usage and due credentials without restarting the router |
+| `R` | Reload account metadata, usage, and due credentials without restarting the router |
 | `m` | Load discovered provider models |
 | `n` | Add an account |
 | `c` | Toggle Claude Code routing — or set the Claude default when MODELS is focused |

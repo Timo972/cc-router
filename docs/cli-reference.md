@@ -26,7 +26,7 @@ cc-router logs               View proxy logs (background mode)
 cc-router logs -f            Follow log output in real time
 cc-router logs --lines 100   Show last 100 lines
 
-cc-router accounts list      List Claude, ChatGPT and Grok accounts (live stats if proxy is running)
+cc-router accounts list      List Claude, ChatGPT and Grok accounts (live stats and metadata when running)
 cc-router accounts list --json  Same, as JSON
 cc-router accounts add       Add a Claude account interactively
 cc-router accounts login-openai  Sign in to OpenAI subscription auth with device code
