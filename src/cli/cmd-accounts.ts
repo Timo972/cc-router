@@ -19,6 +19,7 @@ import type { SetupStage } from "../telemetry/contracts.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import { sanitizeAccountInfo, formatAccountInfo, type AccountInfo } from "../providers/account-info.js";
+import { needsReauthentication } from "../providers/auth-state.js";
 
 export function registerAccounts(program: Command): void {
   const accounts = program
@@ -61,6 +62,9 @@ export function registerAccounts(program: Command): void {
           : `\n  Accounts (${stored.length + openAIStored.length + xaiStored.length} configured)\n`,
       ));
 
+      /** Ids whose credentials only re-authentication can restore. */
+      const reauthNeeded: string[] = [];
+
       if (liveStats) {
         console.log(chalk.green("  ● Proxy is running — showing live stats\n"));
         for (const s of liveStats) {
@@ -69,9 +73,15 @@ export function registerAccounts(program: Command): void {
             : s.provider === "xai_subscription"
               ? chalk.magenta("grok".padEnd(9))
               : chalk.gray("claude".padEnd(9));
-          const status = s.healthy
-            ? chalk.green("✓ healthy")
-            : chalk.red("✗ unhealthy");
+          // "unhealthy" covers everything from a five-minute network blip to a
+          // permanently rejected refresh token. Only the latter needs the
+          // operator, so it gets its own label rather than hiding in the crowd.
+          if (needsReauthentication(s)) reauthNeeded.push(s.id);
+          const status = needsReauthentication(s)
+            ? chalk.red("✗ re-auth required")
+            : s.healthy
+              ? chalk.green("✓ healthy")
+              : chalk.red("✗ unhealthy");
           const busy = s.busy ? chalk.yellow(" [busy]") : "";
           const exp = s.expiresInMs > 0
             ? chalk.yellow(formatMs(s.expiresInMs))
@@ -120,11 +130,15 @@ export function registerAccounts(program: Command): void {
           const expColor = a.tokens.expiresAt > Date.now()
             ? chalk.yellow(exp)
             : chalk.red(exp);
+          // `authExpired` is persisted, so the dead state is knowable without
+          // the proxy running — and this is exactly when an operator looks.
+          if (needsReauthentication(a)) reauthNeeded.push(a.id);
           console.log(
             `  ${chalk.bold(a.id.padEnd(24))}` +
             `  ${redactToken(a.tokens.accessToken).padEnd(26)}` +
             `  expires: ${expColor}` +
-            `  scopes: ${chalk.gray(a.tokens.scopes.join(" "))}`
+            `  scopes: ${chalk.gray(a.tokens.scopes.join(" "))}` +
+            (needsReauthentication(a) ? `  ${chalk.red("✗ re-auth required")}` : "")
           );
         }
         for (const a of openAIStored) {
@@ -149,6 +163,21 @@ export function registerAccounts(program: Command): void {
             `  expires: ${exp}`
           );
         }
+      }
+
+      // A dead refresh token is the one failure the router cannot work its way
+      // out of: the refresh loop has deliberately stopped retrying, so nothing
+      // changes until someone re-authenticates. Say so, and say how.
+      if (reauthNeeded.length > 0) {
+        console.log(chalk.red(
+          `\n  ⚠ Needs re-authentication: ${reauthNeeded.join(", ")}`,
+        ));
+        console.log(chalk.gray(
+          "    The provider rejected these refresh tokens permanently; they cannot\n"
+          + "    be recovered and the refresh loop has stopped retrying them. Re-add\n"
+          + "    each one to resume routing:\n"
+          + `      cc-router accounts remove ${reauthNeeded[0]} && cc-router accounts add`,
+        ));
       }
 
       console.log();
@@ -769,6 +798,7 @@ export async function addAccountRuntimeAware(
 async function fetchLiveStats(): Promise<null | Array<{
   id: string; provider?: string; healthy: boolean; busy: boolean;
   requestCount: number; errorCount: number; expiresInMs: number;
+  authExpired?: boolean; authFailure?: string; authState?: string;
   accountInfo?: AccountInfo;
 }>> {
   try {
@@ -782,6 +812,7 @@ async function fetchLiveStats(): Promise<null | Array<{
       accounts: Array<{
         id: string; provider?: string; healthy: boolean; busy: boolean;
         requestCount: number; errorCount: number; expiresInMs: number;
+        authExpired?: boolean; authFailure?: string; authState?: string;
         accountInfo?: AccountInfo;
       }>;
       operational?: {

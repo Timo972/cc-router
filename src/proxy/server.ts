@@ -130,6 +130,12 @@ export interface HealthAccountView {
    *  the write lands would fall back to the old refresh token, which the
    *  provider already invalidated, and require re-authentication. */
   credentialsPendingWrite?: boolean;
+  /** True when this account's refresh token was terminally rejected by the
+   *  provider (Anthropic `invalid_grant`). The account can never recover on
+   *  its own — the refresh loop deliberately stops retrying it — so this is
+   *  what separates "needs the operator to re-authenticate" from an ordinary
+   *  expired access token that the next refresh tick will replace. */
+  authExpired?: boolean;
   /** Safe runtime-only OAuth routing state; no provider response details or
    * credentials are exposed through health. */
   authState?: "ok" | "quarantined";
@@ -353,7 +359,12 @@ function publicAnthropicAccountView(
     enabled: a.enabled,
     sessionLimitPercent: a.sessionLimitPercent,
     weeklyLimitPercent: a.weeklyLimitPercent,
-    healthy: a.enabled !== false && a.healthy,
+    // `authExpired` is checked here rather than relying on `healthy` alone:
+    // a dead refresh token must never read as healthy regardless of which
+    // code path last touched the flag. Mirrors the OpenAI view's treatment
+    // of `authState === "quarantined"`.
+    healthy: a.enabled !== false && a.healthy && a.authExpired !== true,
+    ...(a.authExpired ? { authExpired: true as const } : {}),
     busy: a.busy || metrics.coolingDown,
     cooldownUntilMs: metrics.cooldownUntilMs ?? 0,
     globalCooldownUntilMs: metrics.globalCooldownUntilMs ?? 0,

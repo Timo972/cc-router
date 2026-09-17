@@ -988,6 +988,10 @@ export class TokenPool implements AccountPool<Account> {
       lastRefreshMs: a.lastRefresh,
       rateLimits: a.rateLimits,
       enabled: a.enabled,
+      // Without this, a terminally rejected refresh token is indistinguishable
+      // from a token that is merely stale: both read as unhealthy with an
+      // expired timestamp, but only this one needs the operator to re-auth.
+      authExpired: a.authExpired === true,
       sessionLimitPercent: a.sessionLimitPercent,
       weeklyLimitPercent: a.weeklyLimitPercent,
     }));
