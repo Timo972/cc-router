@@ -8,14 +8,40 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.12.3] — 2026-09-17
+
 ### Added
 
-- Account identity and plan details in live account listings and the dashboard's
-  selected-account details: email and workspace information for Claude and
-  ChatGPT, Claude subscription status/start date, and plans for stored Grok
-  accounts. Metadata refreshes in the background and with **R**; unavailable
-  renewal dates remain unknown. Billing interval is not supported. Private identity details
-  are excluded from health responses and telemetry.
+- Account identity and plan details in the dashboard's selected-account line and
+  in `cc-router accounts list` while the proxy is running: email, personal or
+  workspace type, workspace name, and plan for Claude and ChatGPT accounts,
+  Claude subscription status and start date, and plans for stored Grok accounts.
+  Claude's start date is when the subscription was created, not the start of the
+  current billing period; billing interval is not supported, and renewal dates
+  are left unknown rather than guessed from token expiry or usage resets.
+- `GET /cc-router/accounts` returns an optional `accountInfo` object per account,
+  with a `fetchStatus` of `fresh`, `stale`, or `unavailable`. Metadata is cached
+  in memory for five minutes, refreshed in the background with one-minute retries
+  after a failure, and refreshed on demand by `POST /cc-router/refresh` or the
+  dashboard's **R**. Listings never block on a provider request; a failed lookup
+  keeps the last successful data and marks it stale.
+
+### Changed
+
+- `cc-router accounts list` reads live stats from the authenticated
+  `/cc-router/accounts` endpoint instead of `/cc-router/health`, sending the
+  configured proxy secret.
+
+### Security
+
+- Identity metadata is memory-only: it is never written to `accounts.json`,
+  never included in health responses — including authenticated health — and
+  never sent to telemetry. Provider responses are rebuilt field by field from an
+  allowlist with bounded, control-character-free strings and strict timestamps,
+  metadata requests refuse redirects so credentials cannot follow one, and
+  decoded token claims are used for display only, never to authorize a request.
 
 ---
 
@@ -766,6 +792,7 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
+[0.12.3]: https://github.com/Timo972/cc-router/releases/tag/v0.12.3
 [0.12.2]: https://github.com/Timo972/cc-router/releases/tag/v0.12.2
 [0.12.1]: https://github.com/Timo972/cc-router/releases/tag/v0.12.1
 [0.12.0]: https://github.com/Timo972/cc-router/releases/tag/v0.12.0
