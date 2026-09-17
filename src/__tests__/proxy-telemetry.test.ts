@@ -631,10 +631,11 @@ describe("proxy telemetry", () => {
       // wins instead, which makes the size of that margin what decides whether
       // this test is stable.
       //
-      // At 50ms a single ~50ms gap in byte arrival flipped the race, and a
-      // busy CI runner produced exactly that. Measured on this branch: with
-      // 50ms the test fails once the trickle is starved to 60ms; at 500ms it
-      // still passes at 60ms.
+      // The tolerated gap tracks this timeout, so at 50ms a single ~50ms stall
+      // in byte arrival flipped the race — and a loaded CI runner produces
+      // stalls that big. Measured by starving the trickle: at 50ms it already
+      // fails with a 60ms gap; at 500ms it still passes at 400ms and only
+      // fails past 600ms.
       await withApp(mountAnthropic(upstreamPort, 500), async baseUrl => {
         // Trickling a pipelined second request keeps the client socket busy so
         // the upstream timeout is the one that fires.
