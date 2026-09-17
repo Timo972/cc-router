@@ -73,3 +73,20 @@ it("startup recovers pending rename before reconciling aliases without inventing
   const runtime = startUsageRuntime(usage, after); closers.push(() => runtime.close());
   expect(runtime.snapshot().accounts).toEqual([{ key, provider: "openai_subscription", alias: "new" }]); expect(runtime.snapshot().subscriptions[0]?.accountKey).toBe(key);
 });
+
+it("initializes the first account beside preconfigured usage pricing", async () => {
+  const { mkdirSync } = await import("node:fs"); const dir = mkdtempSync(join(tmpdir(), "usage-initial-account-")); dirs.push(dir);
+  const file = join(dir, "accounts.json"), usage = usageDirectoryForAccounts(file); mkdirSync(usage); const pricing = '{"version":1,"models":[]}'; writeFileSync(join(usage, "pricing.json"), pricing);
+  coordinateAccountWrite(file, [], after, () => writeFileSync(file, JSON.stringify(after)));
+  expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(after); expect(UsageStore.read(usage).accounts[0]?.alias).toBe("new");
+  expect(readFileSync(join(usage, "pricing.json"), "utf8")).toBe(pricing); expect(existsSync(join(usage, "account-transition.json"))).toBe(false);
+});
+it.each([false, true])("restores an originally missing accounts file on initialization failure (published=%s)", async published => {
+  const { mkdirSync } = await import("node:fs"); const dir = mkdtempSync(join(tmpdir(), "usage-initial-rollback-")); dirs.push(dir);
+  const file = join(dir, "accounts.json"), usage = usageDirectoryForAccounts(file); mkdirSync(usage);
+  expect(() => coordinateAccountWrite(file, [], after, () => {
+    const pending = JSON.parse(readFileSync(join(usage, "account-transition.json"), "utf8")); expect(pending.previousFileExisted).toBe(false);
+    if (published) writeFileSync(file, JSON.stringify(after)); throw new Error("initial credential write failed");
+  })).toThrow("initial credential write failed");
+  expect(existsSync(file)).toBe(false); expect(existsSync(join(usage, "account-transition.json"))).toBe(false); expect(UsageStore.read(usage).accounts).toEqual([]);
+});

@@ -1752,9 +1752,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     await shutdownTelemetryWithin(TELEMETRY_SHUTDOWN_DEADLINE_MS);
     process.exit(0);
   };
-  process.on("SIGTERM", () => { void shutdown(); });
-  process.on("SIGINT", () => { void shutdown(); });
-
   // ─── Update handling ──────────────────────────────────────────────────────
   // Auto-update is OFF by default: installing code unattended from the npm
   // registry (no signature/provenance check) turns any publish-channel
@@ -1818,7 +1815,32 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  const server = app.listen(port, host, () => {
+  const server = app.listen(port, host);
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      usageRefresher.stop();
+      openAIUsageRefresher.stop();
+      accountInfoCache.stop();
+      usageRuntime.close();
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+  });
+
+  process.on("SIGTERM", () => { void shutdown(); });
+  process.on("SIGINT", () => { void shutdown(); });
+
+  // Preserve Node's fatal handling for unexpected server errors after startup.
+  // The temporary startup listener above exists only long enough to reject
+  // startServer() cleanly on EADDRINUSE/EACCES.
+
+  {
     // Write PID for daemon/service process management
     if (managesPidFile()) {
       writePid(process.pid);
@@ -1838,7 +1860,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     recordProxyStarted(totalAccountCount);
     startProxyHeartbeat(() => pool.getAll().length + openAIPool.getAll().length);
-  });
+  }
   server.once("close", () => usageRuntime.close());
-  server.once("error", () => usageRuntime.close());
 }

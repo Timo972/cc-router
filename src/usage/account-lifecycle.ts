@@ -6,7 +6,14 @@ import { UsageStore } from "./store.js";
 import { boundedString, object, usageProvider, type UsageProvider } from "./types.js";
 
 export interface AccountAlias { id: string; provider?: UsageProvider }
-interface Transition { version: 1; before: AccountAlias[]; after: AccountAlias[]; rename?: { oldId: string; newId: string } }
+interface Transition {
+  version: 1;
+  before: AccountAlias[];
+  after: AccountAlias[];
+  /** Older transition files always came from an existing accounts.json. */
+  previousFileExisted?: boolean;
+  rename?: { oldId: string; newId: string };
+}
 const writers = new Map<string, { store: UsageStore; failed?: () => void }>();
 const renameHints = new Map<string, { oldId: string; newId: string }>();
 export function usageDirectoryForAccounts(accountsPath: string): string { return process.env.USAGE_DIR ?? join(dirname(accountsPath), "usage"); }
@@ -29,10 +36,16 @@ function clearTransition(directory: string): void { unlinkSync(join(directory, "
 function readTransition(directory: string): Transition | undefined {
   const file = join(directory, "account-transition.json"); if (!existsSync(file)) return undefined;
   const text = readFileSync(file, "utf8"); if (text.length > 4 * 1024 * 1024) throw new Error("Invalid account transition size");
-  const raw = object(JSON.parse(text), ["version", "before", "after", "rename"]);
+  const raw = object(JSON.parse(text), ["version", "before", "after", "previousFileExisted", "rename"]);
   if (raw.version !== 1 || !Array.isArray(raw.before) || !Array.isArray(raw.after)) throw new Error("Invalid account transition");
+  if (raw.previousFileExisted !== undefined && typeof raw.previousFileExisted !== "boolean") throw new Error("Invalid account transition");
   const parse = (list: unknown[]): AccountAlias[] => aliases(list.map(row => { const r = object(row, ["id", "provider"]); return { id: boundedString(r.id, "alias", 128), provider: usageProvider(r.provider) }; }));
-  const result: Transition = { version: 1, before: parse(raw.before), after: parse(raw.after) };
+  const result: Transition = {
+    version: 1,
+    before: parse(raw.before),
+    after: parse(raw.after),
+    ...(raw.previousFileExisted === false ? { previousFileExisted: false } : {}),
+  };
   if (raw.rename !== undefined) { const r = object(raw.rename, ["oldId", "newId"]); result.rename = { oldId: boundedString(r.oldId, "old alias", 128), newId: boundedString(r.newId, "new alias", 128) }; }
   return result;
 }
@@ -77,8 +90,16 @@ export function coordinateAccountWrite(accountsPath: string, previous: readonly 
   try {
     recoverAccountTransition(store, directory, aliases(previous));
     reconcileUsageAccounts(store, aliases(previous));
-    const transition: Transition = { version: 1, before: aliases(previous), after: aliases(next), ...(renameHints.has(resolve(accountsPath)) ? { rename: renameHints.get(resolve(accountsPath))! } : {}) };
-    const previousText = readFileSync(accountsPath, "utf8"); // Memory only. Never written into the sidecar.
+    const previousFileExisted = existsSync(accountsPath);
+    const transition: Transition = {
+      version: 1,
+      before: aliases(previous),
+      after: aliases(next),
+      ...(previousFileExisted ? {} : { previousFileExisted: false }),
+      ...(renameHints.has(resolve(accountsPath)) ? { rename: renameHints.get(resolve(accountsPath))! } : {}),
+    };
+    // Memory only. Credentials are never written into the transition sidecar.
+    const previousText = previousFileExisted ? readFileSync(accountsPath, "utf8") : undefined;
     atomicPrivate(join(directory, "account-transition.json"), JSON.stringify(transition));
     try {
       applyRename(store, transition, true);
@@ -86,7 +107,14 @@ export function coordinateAccountWrite(accountsPath: string, previous: readonly 
     } catch (error) {
       // A writer can throw after publication (directory fsync). Restore credentials before the alias.
       try {
-        if (equal(JSON.parse(readFileSync(accountsPath, "utf8")) as AccountAlias[], next)) atomicPrivate(accountsPath, previousText);
+        if (existsSync(accountsPath) && equal(JSON.parse(readFileSync(accountsPath, "utf8")) as AccountAlias[], next)) {
+          if (previousFileExisted) {
+            atomicPrivate(accountsPath, previousText!);
+          } else {
+            unlinkSync(accountsPath);
+            syncDirectory(dirname(accountsPath));
+          }
+        }
         if (store.snapshot().health.status !== "ok") throw new Error("Usage transition needs recovery");
         applyRename(store, transition, false);
         clearTransition(directory);

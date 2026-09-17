@@ -16,7 +16,7 @@ it("excludes count-token preflights and retains exact native Anthropic cumulativ
     HOST: "127.0.0.1", CC_ROUTER_TELEMETRY: "0", DO_NOT_TRACK: "1", CC_ROUTER_DAEMON: "0", CC_ROUTER_SERVICE: "0", CC_ROUTER_NO_AUTO_UPDATE: "1", NO_UPDATE_NOTIFIER: "1" }, stdio: ["ignore", "pipe", "pipe", "ipc"] });
   const exited = once(child, "exit"); let logs = ""; child.stdout?.on("data", b => { logs += b; }); child.stderr?.on("data", b => { logs += b; });
   let stopped = false;
-  async function stop() { if (stopped) return; stopped = true; child.kill("SIGTERM"); const kill = setTimeout(() => child.kill("SIGKILL"), 3_000); try { const [code, signal] = await exited; expect(signal).toBeNull(); expect(code).toBe(0); } finally { clearTimeout(kill); } }
+  async function stop() { if (stopped) return; stopped = true; child.kill("SIGTERM"); const kill = setTimeout(() => child.kill("SIGKILL"), 3_000); try { const [code, signal] = await exited; if (process.platform === "win32") expect(signal === "SIGTERM" || code === 0).toBe(true); else { expect(signal).toBeNull(); expect(code).toBe(0); } } finally { clearTimeout(kill); } }
   try {
     const [{ port }] = await Promise.race([once(child, "message"), exited.then(() => { throw new Error(`Fixture exited: ${logs}`); })]) as [{ port: number }];
     const base = `http://127.0.0.1:${port}`, headers = { authorization: "Bearer fixture-router-secret", "content-type": "application/json", "anthropic-version": "2023-06-01" };

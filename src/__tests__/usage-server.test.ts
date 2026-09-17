@@ -25,7 +25,7 @@ it("persists native/cross-protocol usage and subscription identity through a rea
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const [{ port }] = await Promise.race([once(child, "message"), exited.then(() => { throw new Error(`Fixture exited: ${logs}`); }), new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("Fixture startup timed out")), 8_000); })]) as [{ port: number }];
-      return { base: `http://127.0.0.1:${port}`, logs: () => logs, async stop() { child.kill("SIGTERM"); const kill = setTimeout(() => child.kill("SIGKILL"), 3_000); try { const [code, signal] = await exited; expect(signal).toBeNull(); expect(code).toBe(0); } finally { clearTimeout(kill); } } };
+      return { base: `http://127.0.0.1:${port}`, logs: () => logs, async stop() { child.kill("SIGTERM"); const kill = setTimeout(() => child.kill("SIGKILL"), 3_000); try { const [code, signal] = await exited; if (process.platform === "win32") expect(signal === "SIGTERM" || code === 0).toBe(true); else { expect(signal).toBeNull(); expect(code).toBe(0); } } finally { clearTimeout(kill); } } };
     } catch (error) { child.kill("SIGKILL"); await exited; throw error; }
     finally { clearTimeout(timeout); }
   }

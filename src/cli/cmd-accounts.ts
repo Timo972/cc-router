@@ -324,9 +324,9 @@ export function registerAccounts(program: Command): void {
         validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
       });
       const record = { ...imported, id };
-      upsertAccountRecord(record);
+      const { mode } = await addAccountRuntimeAware(record);
       console.log(chalk.green(`\n✓ Grok account "${record.id}" imported from ~/.grok.\n`));
-      printAddOutcome("stored");
+      printAddOutcome(mode);
     });
 
   // ── accounts login-grok ──────────────────────────────────────────────────
@@ -355,9 +355,9 @@ export function registerAccounts(program: Command): void {
         },
       });
 
-      upsertAccountRecord(record);
+      const { mode } = await addAccountRuntimeAware(record);
       console.log(chalk.green(`\n✓ Grok account "${record.id}" saved via device login.\n`));
-      printAddOutcome("stored");
+      printAddOutcome(mode);
     });
 
   // ── accounts remove ───────────────────────────────────────────────────────
@@ -704,6 +704,27 @@ export interface LiveAccountAddOptions {
   baseUrl?: string;
   authToken?: string;
   fetch?: typeof globalThis.fetch;
+}
+
+/** Read-only probe used before operations that cannot be represented by the
+ * live account API, such as replacing the complete account inventory. */
+export async function isAccountApiReachable(
+  options: LiveAccountAddOptions = {},
+): Promise<boolean> {
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  const baseUrl = (options.baseUrl ?? `http://localhost:${PROXY_PORT}`).replace(/\/+$/, "");
+  const authToken = options.authToken ?? readConfig().proxySecret;
+  let response: Response;
+  try {
+    response = await fetchImpl(`${baseUrl}/cc-router/accounts`, {
+      headers: authToken ? { authorization: `Bearer ${authToken}` } : {},
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch {
+    return false;
+  }
+  if (!response.ok) throw new Error(`HTTP ${response.status} while checking the running proxy`);
+  return true;
 }
 
 /**

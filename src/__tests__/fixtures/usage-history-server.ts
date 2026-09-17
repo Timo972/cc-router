@@ -28,4 +28,4 @@ express.application.listen = function (this: express.Application, ...args: Param
   server.once("listening", () => process.send?.({ port: (server.address() as AddressInfo).port }));
   return server;
 } as typeof listen;
-await startServer({ port: 0, accountsPath: process.env.ACCOUNTS_PATH });
+await startServer({ port: Number(process.env.USAGE_FIXTURE_PORT ?? 0), accountsPath: process.env.ACCOUNTS_PATH });

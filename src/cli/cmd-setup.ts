@@ -11,7 +11,7 @@ import {
 import { validateToken } from "../utils/token-validator.js";
 import { writeClaudeSettings, readClaudeProxySettings } from "../utils/claude-config.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
-import { loadAccounts, accountsFileExists, readConfig, writeConfig, generateProxySecret, type ClientConfig } from "../config/manager.js";
+import { loadAccounts, accountsFileExists, readConfig, writeConfig, generateProxySecret, serialize, type ClientConfig } from "../config/manager.js";
 import { PROXY_PORT } from "../config/paths.js";
 import type { Account, OAuthTokens } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS } from "../proxy/types.js";
@@ -34,6 +34,11 @@ import {
   type SetupFailureOutcome,
 } from "../telemetry/setup-diagnostics.js";
 import type { SetupStage } from "../telemetry/contracts.js";
+import {
+  addAccountRuntimeAware,
+  isAccountApiReachable,
+  tryAddAccountToRunningProxy,
+} from "./cmd-accounts.js";
 
 // ─── Public registration ──────────────────────────────────────────────────────
 
@@ -241,6 +246,8 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
     }
   }
 
+  let replaceExisting = false;
+  let includeExisting = addMode;
   if (hasExisting && !addMode) {
     const existing = loadAccounts();
     console.log(chalk.yellow(`  Found ${existing.length} existing account(s).\n`));
@@ -262,6 +269,9 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
         default: false,
       });
       if (!sure) { console.log(chalk.gray("\nCancelled.\n")); return; }
+      replaceExisting = true;
+    } else {
+      includeExisting = true;
     }
   }
 
@@ -315,7 +325,7 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
   }
 
   // Merge: existing accounts minus any overwritten by ID, plus new ones
-  const existingAccounts = (hasExisting && !addMode) ? [] : (hasExisting ? loadAccounts() : []);
+  const existingAccounts = hasExisting && includeExisting ? loadAccounts() : [];
   const merged = [
     ...existingAccounts.filter(a => !newAccounts.some(n => n.id === a.id)),
     ...newAccounts,
@@ -323,14 +333,22 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
 
   console.log(chalk.bold(`\n${"━".repeat(40)}\n  Saving\n${"━".repeat(40)}\n`));
 
+  let persistenceMode: "live" | "stored";
   try {
-    saveAccounts(merged);
+    persistenceMode = await persistSetupAccountsRuntimeAware({
+      newAccounts,
+      merged,
+      replaceExisting,
+    });
   } catch (error) {
     const outcomes = savedAttempts.map(attempt => attempt.failed(error, "persistence"));
     if (outcomes[0]) printDiagnosticId(outcomes[0]);
     throw error;
   }
   console.log(chalk.green(`  ✓ ${merged.length} account(s) saved to ~/.cc-router/accounts.json`));
+  if (persistenceMode === "live") {
+    console.log(chalk.gray("  Loaded into the running proxy — available now, no restart needed."));
+  }
 
   for (const attempt of savedAttempts) {
     attempt.stageCompleted("persistence");
@@ -339,6 +357,51 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
 
   // ─── Post-setup interactive flow ─────────────────────────────────────────
   await runPostSetupFlow(merged.length);
+}
+
+export interface SetupAccountPersistenceDependencies {
+  isLive(): Promise<boolean>;
+  tryAddLive(record: ReturnType<typeof serialize>[number]): Promise<boolean>;
+  saveStored(accounts: Account[]): void;
+}
+
+/**
+ * Additive setup can be applied through the daemon one account at a time.
+ * Replacing the whole inventory has no live transaction endpoint, so it is
+ * deliberately restricted to the exclusive offline writer path.
+ */
+export async function persistSetupAccountsRuntimeAware(
+  input: {
+    newAccounts: Account[];
+    merged: Account[];
+    replaceExisting: boolean;
+  },
+  dependencies: SetupAccountPersistenceDependencies = {
+    isLive: isAccountApiReachable,
+    tryAddLive: tryAddAccountToRunningProxy,
+    saveStored: saveAccounts,
+  },
+): Promise<"live" | "stored"> {
+  if (input.replaceExisting) {
+    if (await dependencies.isLive()) {
+      throw new Error(
+        "Cannot replace all accounts while the proxy is running. Stop it first: cc-router stop --keep-config",
+      );
+    }
+    dependencies.saveStored(input.merged);
+    return "stored";
+  }
+
+  for (const record of serialize(input.newAccounts)) {
+    const { mode } = await addAccountRuntimeAware(record, {
+      tryAddLive: dependencies.tryAddLive,
+      // If the daemon is unreachable, publish the complete merged inventory
+      // once; the remaining records are already included in this write.
+      addStored: () => dependencies.saveStored(input.merged),
+    });
+    if (mode === "stored") return "stored";
+  }
+  return "live";
 }
 
 // ─── Post-setup interactive flow ─────────────────────────────────────────────

@@ -35,13 +35,32 @@ function writeFileSecureSync(path: string, data: string): void {
   writeFileSync(tmp, data, { encoding: "utf-8", mode: SECRET_FILE_MODE });
   try { chmodSync(tmp, SECRET_FILE_MODE); } catch { /* best effort */ }
   const fd = openSync(tmp, "r");
-  try { fsyncSync(fd); } finally { closeSync(fd); }
+  try { fsyncFileBestEffort(fd); } finally { closeSync(fd); }
   renameSync(tmp, path);
   if (process.platform !== "win32") {
     const parent = openSync(dirname(path), "r");
     try { fsyncSync(parent); } finally { closeSync(parent); }
   }
   try { chmodSync(path, SECRET_FILE_MODE); } catch { /* best effort */ }
+}
+
+/**
+ * Some supported Windows filesystems reject fsync on ordinary file handles
+ * with EPERM/EINVAL. The atomic rename still protects readers from partial
+ * JSON, and Windows does not offer the directory-fsync durability guarantee
+ * used on POSIX. Preserve the previous cross-platform write behavior there.
+ */
+export function fsyncFileBestEffort(
+  fd: number,
+  sync: (fd: number) => void = fsyncSync,
+): void {
+  try {
+    sync(fd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform === "win32" && (code === "EPERM" || code === "EINVAL")) return;
+    throw error;
+  }
 }
 
 export function accountsFileExists(path?: string): boolean {
