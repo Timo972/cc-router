@@ -93,6 +93,45 @@ describe("replaceAnthropicAccountTransaction", () => {
     expect(pool.findById("max-d")).toBe(dead);
   });
 
+  it("restores the replaced account's cooldown when persistence fails", async () => {
+    const { pool, dead } = deadPool("max-cooled");
+    pool.setCooldown("max-cooled", 60_000);
+    expect(pool.getStats()[0].coolingDown).toBe(true);
+
+    await expect(replaceAnthropicAccountTransaction({
+      record: anthropicRecord("max-cooled", "fresh"),
+      pool,
+      sessionRouter: { invalidateAccount: vi.fn() },
+      persist: () => { throw new Error("disk full"); },
+    })).rejects.toThrow("disk full");
+
+    // A failed replacement must leave the account exactly as it was. Dropping
+    // the cooldown would make a rate-limited account look idle and send it
+    // traffic it is still benched for.
+    expect(pool.getAll()).toEqual([dead]);
+    expect(pool.getStats()[0].coolingDown).toBe(true);
+  });
+
+  it("restores the replaced account's in-flight count when persistence fails", async () => {
+    // A healthy account, because only a routable one can hold an in-flight
+    // request — and replacing a live account is exactly when losing its
+    // in-flight count would let the pool over-commit it.
+    const pool = new TokenPool([]);
+    pool.addAccount(anthropicRecord("max-inflight", "live"));
+    const lease = pool.acquireBest(new Map());
+    expect(pool.getStats()[0].inFlightRequests).toBe(1);
+
+    await expect(replaceAnthropicAccountTransaction({
+      record: anthropicRecord("max-inflight", "fresh"),
+      pool,
+      sessionRouter: { invalidateAccount: vi.fn() },
+      persist: () => { throw new Error("disk full"); },
+    })).rejects.toThrow("disk full");
+
+    expect(pool.getStats()[0].inFlightRequests).toBe(1);
+    lease.release();
+  });
+
   it("drops sticky sessions pinned to the replaced incarnation", async () => {
     const { pool } = deadPool("max-e");
     const sessionRouter = { invalidateAccount: vi.fn() };

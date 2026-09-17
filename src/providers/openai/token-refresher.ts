@@ -169,7 +169,14 @@ export async function prepareOpenAIAccountForRequest(
   // quarantine branch below would otherwise retry it on every request and
   // every scheduled tick — thousands of dead POSTs on one client_id. The way
   // back is replacement credentials (re-add the account), not another retry.
-  if (isOpenAIAuthExpired(account)) return false;
+  if (isOpenAIAuthExpired(account)) {
+    // The flag itself still has to reach disk. If the write that recorded it
+    // failed, returning here without retrying would strand `authExpired` in
+    // memory, and the next start would POST the dead token all over again —
+    // exactly what persisting it prevents. Cheap: no request goes out.
+    if (hasPendingCredentialWrite(account)) persistCredentials(account, allAccounts, saveAccounts);
+    return false;
+  }
   // A revoked but unexpired access token must not bypass the refresh gate.
   if (!needsOpenAIRefresh(account) && runtime.authState !== "quarantined") {
     // No refresh due, but a previous rotation from this account never made it

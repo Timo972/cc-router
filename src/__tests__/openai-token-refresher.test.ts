@@ -215,6 +215,31 @@ describe("OpenAI subscription token refresher", () => {
     expect(save.mock.calls[0]?.[0]?.[0]).toMatchObject({ authExpired: true });
   });
 
+  it("retries a failed write of the terminal rejection on a later pass", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-dirty-flag", provider: "openai_subscription", accessToken: "access",
+      refreshToken: "revoked", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({ error: "invalid_grant" }, { status: 400 }),
+    );
+    const failingSave = vi.fn(() => { throw new Error("disk full"); });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await prepareOpenAIAccountForRequest(account, [account], failingSave);
+    expect(account.authExpired).toBe(true);
+    expect(hasPendingCredentialWrite(account)).toBe(true);
+
+    // Left unretried, `authExpired` stays memory-only: after a restart the
+    // dead refresh token is POSTed all over again, which is the whole thing
+    // persisting it was meant to stop.
+    const save = vi.fn();
+    await prepareOpenAIAccountForRequest(account, [account], save);
+
+    expect(save).toHaveBeenCalledWith([account]);
+    expect(hasPendingCredentialWrite(account)).toBe(false);
+  });
+
   it("keeps retrying a transient rejection rather than writing it off", async () => {
     const account = createOpenAIAccount({
       id: "openai-blip", provider: "openai_subscription", accessToken: "access",

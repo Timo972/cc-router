@@ -74,7 +74,11 @@ describe("accounts list — accounts needing re-authentication", () => {
     const output = await runList();
 
     expect(output).toContain("re-auth required");
-    expect(output).toContain("cc-router accounts remove");
+    // Replacement by id works now, so the hint must not tell the operator to
+    // delete first: removing a lone Claude account is refused outright by the
+    // running proxy, and deleting is destructive where replacing is not.
+    expect(output).toContain("cc-router accounts add");
+    expect(output).not.toContain("accounts remove");
   });
 
   it("flags a live OpenAI account quarantined by a permanent auth failure", async () => {
@@ -90,6 +94,47 @@ describe("accounts list — accounts needing re-authentication", () => {
     const output = await runList();
 
     expect(output).toContain("re-auth required");
+  });
+
+  it("names the OpenAI sign-in command for a dead OpenAI account, not the Claude one", async () => {
+    storedOpenAI = [{ id: "team-dead", expiresAt: Date.now() - 60_000, enabled: true }];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
+      accounts: [{
+        id: "team-dead", provider: "openai_subscription", healthy: false, busy: false,
+        requestCount: 0, errorCount: 6, expiresInMs: -1_000,
+        authState: "quarantined", authFailure: "permanent",
+      }],
+    }));
+
+    const output = await runList();
+
+    // `accounts add` runs the Claude Max flow. Pointing an OpenAI operator at
+    // it would re-add the id under the wrong provider entirely.
+    expect(output).toContain("cc-router accounts login-openai");
+    expect(output).not.toMatch(/cc-router accounts add\b/);
+  });
+
+  it("names each provider's own command when both need re-auth", async () => {
+    storedAnthropic = [makeStoredAccount("max-dead", true)];
+    storedOpenAI = [{ id: "team-dead", expiresAt: Date.now() - 60_000, enabled: true }];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
+      accounts: [
+        {
+          id: "max-dead", provider: "anthropic_subscription", healthy: false, busy: false,
+          requestCount: 0, errorCount: 0, expiresInMs: -1_000, authExpired: true,
+        },
+        {
+          id: "team-dead", provider: "openai_subscription", healthy: false, busy: false,
+          requestCount: 0, errorCount: 6, expiresInMs: -1_000,
+          authState: "quarantined", authFailure: "permanent",
+        },
+      ],
+    }));
+
+    const output = await runList();
+
+    expect(output).toContain("cc-router accounts add");
+    expect(output).toContain("cc-router accounts login-openai");
   });
 
   it("leaves a merely-stale live account reported as unhealthy, not as needing re-auth", async () => {

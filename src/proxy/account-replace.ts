@@ -65,15 +65,15 @@ export async function replaceAnthropicAccountTransaction(
       throw new AccountReplacementConflictError(id);
     }
 
-    // `removeAccount` also drops the old incarnation's in-flight count and
-    // cooldowns, so the replacement does not inherit a bench it never earned.
-    options.pool.removeAccount(id);
-    const added = options.pool.addAccount(options.record);
+    // One pool operation rather than remove-then-add: the swap discards the
+    // old incarnation's in-flight count and cooldowns (the replacement must
+    // not inherit a bench it never earned) and hands back a rollback that
+    // restores every bit of it if the write below fails.
+    const { added, rollback } = options.pool.replaceAccount(options.record);
     try {
       options.persist(options.pool.getAll());
     } catch (error) {
-      options.pool.removeAccount(added.id);
-      options.pool.insertAccount(previous);
+      rollback();
       throw error;
     }
 

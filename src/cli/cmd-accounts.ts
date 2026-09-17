@@ -62,8 +62,13 @@ export function registerAccounts(program: Command): void {
           : `\n  Accounts (${stored.length + openAIStored.length + xaiStored.length} configured)\n`,
       ));
 
-      /** Ids whose credentials only re-authentication can restore. */
-      const reauthNeeded: string[] = [];
+      /**
+       * Accounts only re-authentication can restore, tagged with the provider
+       * whose sign-in command actually recovers them — `accounts add` runs the
+       * Claude Max flow, so pointing an OpenAI or Grok operator at it would
+       * re-add the id under the wrong provider.
+       */
+      const reauthNeeded: Array<{ id: string; provider?: string }> = [];
 
       if (liveStats) {
         console.log(chalk.green("  ● Proxy is running — showing live stats\n"));
@@ -76,7 +81,7 @@ export function registerAccounts(program: Command): void {
           // "unhealthy" covers everything from a five-minute network blip to a
           // permanently rejected refresh token. Only the latter needs the
           // operator, so it gets its own label rather than hiding in the crowd.
-          if (needsReauthentication(s)) reauthNeeded.push(s.id);
+          if (needsReauthentication(s)) reauthNeeded.push({ id: s.id, provider: s.provider });
           const status = needsReauthentication(s)
             ? chalk.red("✗ re-auth required")
             : s.healthy
@@ -132,7 +137,7 @@ export function registerAccounts(program: Command): void {
             : chalk.red(exp);
           // `authExpired` is persisted, so the dead state is knowable without
           // the proxy running — and this is exactly when an operator looks.
-          if (needsReauthentication(a)) reauthNeeded.push(a.id);
+          if (needsReauthentication(a)) reauthNeeded.push({ id: a.id, provider: "anthropic_subscription" });
           console.log(
             `  ${chalk.bold(a.id.padEnd(24))}` +
             `  ${redactToken(a.tokens.accessToken).padEnd(26)}` +
@@ -145,7 +150,7 @@ export function registerAccounts(program: Command): void {
           const exp = a.expiresAt > Date.now()
             ? chalk.yellow(formatExpiry(a.expiresAt))
             : chalk.red("EXPIRED");
-          if (needsReauthentication(a)) reauthNeeded.push(a.id);
+          if (needsReauthentication(a)) reauthNeeded.push({ id: a.id, provider: "openai_subscription" });
           console.log(
             `  ${chalk.bold(a.id.padEnd(24))}` +
             `  ${chalk.magenta("openai".padEnd(10))}` +
@@ -172,14 +177,17 @@ export function registerAccounts(program: Command): void {
       // changes until someone re-authenticates. Say so, and say how.
       if (reauthNeeded.length > 0) {
         console.log(chalk.red(
-          `\n  ⚠ Needs re-authentication: ${reauthNeeded.join(", ")}`,
+          `\n  ⚠ Needs re-authentication: ${reauthNeeded.map(a => a.id).join(", ")}`,
         ));
         console.log(chalk.gray(
           "    The provider rejected these refresh tokens permanently; they cannot\n"
-          + "    be recovered and the refresh loop has stopped retrying them. Re-add\n"
-          + "    each one to resume routing:\n"
-          + `      cc-router accounts remove ${reauthNeeded[0]} && cc-router accounts add`,
+          + "    be recovered and the refresh loop has stopped retrying them. Sign in\n"
+          + "    again under the same account id to resume routing — the existing\n"
+          + "    account is replaced, so there is nothing to remove first:",
         ));
+        for (const { id, provider } of reauthNeeded) {
+          console.log(chalk.gray(`      ${reauthCommand(provider)}   (for ${id})`));
+        }
       }
 
       console.log();
@@ -208,8 +216,10 @@ export function registerAccounts(program: Command): void {
 
       let mode: "live" | "stored";
       try {
+        // Only `addStored` is overridden: this flow merges by id across the
+        // whole Claude pool. `tryAddLive` must stay the default so the live
+        // pool is asked to replace an existing id rather than reject it.
         ({ mode } = await addAccountRuntimeAware(serialize([account])[0], {
-          tryAddLive: tryAddAccountToRunningProxy,
           addStored: () => saveAccounts(merged),
         }));
       } catch (error) {
@@ -796,17 +806,37 @@ export interface RuntimeAwareAddDependencies {
  */
 export async function addAccountRuntimeAware(
   record: AccountRecord,
-  dependencies: RuntimeAwareAddDependencies = {
+  dependencies: Partial<RuntimeAwareAddDependencies> = {},
+): Promise<{ mode: "live" } | { mode: "stored" }> {
+  // Each dependency defaults independently. Taking the whole object as one
+  // default meant a caller that only needed its own `addStored` — the Claude
+  // `accounts add` flow does, to merge by id — had to restate `tryAddLive`
+  // too, and that restatement silently dropped the replacement request. The
+  // path that most needs replacement was the one path not asking for it.
+  const tryAddLive = dependencies.tryAddLive
     // `upsertAccountRecord` already replaces by id on disk; asking the live
     // pool for the same thing is what keeps the two halves of an `accounts
     // add` in agreement instead of failing on the account that most needs it.
-    tryAddLive: record => tryAddAccountToRunningProxy(record, { replace: true }),
-    addStored: upsertAccountRecord,
-  },
-): Promise<{ mode: "live" } | { mode: "stored" }> {
-  if (await dependencies.tryAddLive(record)) return { mode: "live" };
-  dependencies.addStored(record);
+    ?? (live => tryAddAccountToRunningProxy(live, { replace: true }));
+  const addStored = dependencies.addStored ?? upsertAccountRecord;
+
+  if (await tryAddLive(record)) return { mode: "live" };
+  addStored(record);
   return { mode: "stored" };
+}
+
+/**
+ * The sign-in command that recovers an account of this provider.
+ *
+ * `accounts add` is the Claude Max flow specifically; the other providers have
+ * their own. Each re-registers under the id the operator types, and the live
+ * pool now replaces rather than rejects it, so no deletion step is needed —
+ * which also avoids the running proxy refusing to delete a lone Claude account.
+ */
+function reauthCommand(provider: string | undefined): string {
+  if (provider === "openai_subscription") return "cc-router accounts login-openai";
+  if (provider === "xai_subscription") return "cc-router accounts login-grok";
+  return "cc-router accounts add";
 }
 
 async function fetchLiveStats(): Promise<null | Array<{
