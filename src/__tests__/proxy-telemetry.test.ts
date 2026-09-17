@@ -90,10 +90,20 @@ function telemetryText(): string {
     ({ name: span.name, attributes: span.attributes })), recordedLogs()]);
 }
 
-async function waitFor(condition: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 200 && !condition(); attempt++) {
+/**
+ * Poll until `condition` holds, then fail loudly if it never does.
+ *
+ * Returning quietly on exhaustion made every timeout surface as whatever the
+ * next assertion happened to say — a missing span read as
+ * "expected undefined to match object", which names neither the span nor the
+ * wait that gave up. `what` puts the real failure in the message.
+ */
+async function waitFor(condition: () => boolean, what = "condition"): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (condition()) return;
     await new Promise(resolve => setTimeout(resolve, 5));
   }
+  if (!condition()) throw new Error(`Timed out after 1000ms waiting for ${what}`);
 }
 
 async function listen(server: Server): Promise<number> {
@@ -232,7 +242,7 @@ describe("proxy telemetry", () => {
     await withApp(app, async baseUrl => {
       expect((await postResponses(baseUrl)).status).toBe(200);
     });
-    await waitFor(() => spansNamed("provider.inference").length >= 2);
+    await waitFor(() => spansNamed("provider.inference").length >= 2, "2 provider.inference span(s)");
 
     const attempts = spansNamed("provider.inference");
     expect(attempts).toHaveLength(2);
@@ -268,7 +278,7 @@ describe("proxy telemetry", () => {
     await withApp(app, async baseUrl => {
       expect((await postResponses(baseUrl)).status).toBe(502);
     });
-    await waitFor(() => recordedLogs().length >= 1);
+    await waitFor(() => recordedLogs().length >= 1, "1 recorded log");
 
     const failures = recordedLogs().filter(record => record.body === "runtime.failure");
     expect(failures).toHaveLength(1);
@@ -340,7 +350,7 @@ describe("proxy telemetry", () => {
     } finally {
       await close(upstream);
     }
-    await waitFor(() => spansNamed("provider.inference").length >= 2);
+    await waitFor(() => spansNamed("provider.inference").length >= 2, "2 provider.inference span(s)");
 
     const attempts = spansNamed("provider.inference");
     expect(attempts).toHaveLength(2);
@@ -418,7 +428,7 @@ describe("proxy telemetry", () => {
     } finally {
       await close(upstream);
     }
-    await waitFor(() => spansNamed("provider.inference").length >= 1);
+    await waitFor(() => spansNamed("provider.inference").length >= 1, "1 provider.inference span(s)");
 
     expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
       "cc_router.outcome": "complete",
@@ -441,7 +451,7 @@ describe("proxy telemetry", () => {
     } finally {
       await close(upstream);
     }
-    await waitFor(() => spansNamed("provider.inference").length >= 1);
+    await waitFor(() => spansNamed("provider.inference").length >= 1, "1 provider.inference span(s)");
 
     expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
       "http.response.status_code": 200,
@@ -449,7 +459,7 @@ describe("proxy telemetry", () => {
       "cc_router.stream_outcome": "upstream_error",
     });
     // The request span follows the route's verdict, not the 200 status.
-    await waitFor(() => spansNamed("proxy.request").length >= 1);
+    await waitFor(() => spansNamed("proxy.request").length >= 1, "1 proxy.request span(s)");
     expect(spansNamed("proxy.request")[0]?.attributes).toMatchObject({
       "http.response.status_code": 200,
       "cc_router.outcome": "upstream_error",
@@ -506,7 +516,7 @@ describe("proxy telemetry", () => {
     } finally {
       await close(upstream);
     }
-    await waitFor(() => spansNamed("provider.inference").length >= 1);
+    await waitFor(() => spansNamed("provider.inference").length >= 1, "1 provider.inference span(s)");
 
     expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
       "cc_router.outcome": "upstream_error",
@@ -530,7 +540,7 @@ describe("proxy telemetry", () => {
     } finally {
       await close(upstream);
     }
-    await waitFor(() => spansNamed("provider.inference").length >= 1);
+    await waitFor(() => spansNamed("provider.inference").length >= 1, "1 provider.inference span(s)");
 
     expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
       "cc_router.outcome": "complete",
@@ -561,7 +571,7 @@ describe("proxy telemetry", () => {
         const reader = res.body!.getReader();
         await reader.read();
         controller.abort();
-        await waitFor(() => spansNamed("provider.inference").length >= 1);
+        await waitFor(() => spansNamed("provider.inference").length >= 1, "1 provider.inference span(s)");
       });
     } finally {
       await close(upstream);
@@ -571,7 +581,7 @@ describe("proxy telemetry", () => {
       "cc_router.outcome": "cancelled",
       "cc_router.stream_outcome": "cancelled",
     });
-    await waitFor(() => spansNamed("proxy.request").length >= 1);
+    await waitFor(() => spansNamed("proxy.request").length >= 1, "1 proxy.request span(s)");
     expect(spansNamed("proxy.request")[0]?.attributes["cc_router.outcome"]).toBe("cancelled");
   });
 
@@ -592,7 +602,7 @@ describe("proxy telemetry", () => {
         });
         expect(res.status).toBe(200);
         await res.text().catch(() => undefined);
-        await waitFor(() => spansNamed("provider.inference").length >= 1);
+        await waitFor(() => spansNamed("provider.inference").length >= 1, "1 provider.inference span(s)");
       });
     } finally {
       await close(upstream);
@@ -602,7 +612,7 @@ describe("proxy telemetry", () => {
       "cc_router.outcome": "upstream_error",
       "cc_router.stream_outcome": "upstream_error",
     });
-    await waitFor(() => spansNamed("proxy.request").length >= 1);
+    await waitFor(() => spansNamed("proxy.request").length >= 1, "1 proxy.request span(s)");
     expect(spansNamed("proxy.request")[0]?.attributes["cc_router.outcome"]).toBe("upstream_error");
   });
 
@@ -613,10 +623,22 @@ describe("proxy telemetry", () => {
     });
     const upstreamPort = await listen(upstream);
     try {
-      await withApp(mountAnthropic(upstreamPort, 50), async baseUrl => {
-        // The route arms the incoming socket with the same idle timeout as the
-        // upstream request. Trickling a pipelined second request keeps the
-        // client socket busy so the upstream timeout is the one that fires.
+      // The route arms the incoming socket with the SAME idle timeout as the
+      // upstream request, and arms it first, so on an unanswered upstream the
+      // incoming timer is the one that would naturally fire — classifying the
+      // request `cancelled` rather than the `timeout` this test is about. The
+      // trickle below keeps the incoming socket busy so the upstream timer
+      // wins instead, which makes the size of that margin what decides whether
+      // this test is stable.
+      //
+      // The tolerated gap tracks this timeout, so at 50ms a single ~50ms stall
+      // in byte arrival flipped the race — and a loaded CI runner produces
+      // stalls that big. Measured by starving the trickle: at 50ms it already
+      // fails with a 60ms gap; at 500ms it still passes at 400ms and only
+      // fails past 600ms.
+      await withApp(mountAnthropic(upstreamPort, 500), async baseUrl => {
+        // Trickling a pipelined second request keeps the client socket busy so
+        // the upstream timeout is the one that fires.
         const { port } = new URL(baseUrl);
         const body = JSON.stringify({ model: "claude-sonnet-5", messages: [], stream: false });
         const first = `POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n`
@@ -640,12 +662,12 @@ describe("proxy telemetry", () => {
           socket.on("error", reject);
           socket.on("close", () => { clearInterval(timer); resolve(); });
         });
-        await waitFor(() => spansNamed("provider.inference").length >= 1);
+        await waitFor(() => spansNamed("provider.inference").length >= 1, "1 provider.inference span(s)");
       });
     } finally {
       await close(upstream);
     }
-    await waitFor(() => spansNamed("provider.inference").length >= 1);
+    await waitFor(() => spansNamed("provider.inference").length >= 1, "1 provider.inference span(s)");
 
     expect(spansNamed("provider.inference")[0]?.attributes).toMatchObject({
       "cc_router.outcome": "timeout",
