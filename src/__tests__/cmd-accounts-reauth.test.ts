@@ -6,7 +6,9 @@ import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
 
 /** Mutable so each test can decide what `accounts list` reads from disk. */
 let storedAnthropic: Account[] = [];
-let storedOpenAI: Array<{ id: string; expiresAt: number; enabled: boolean }> = [];
+let storedOpenAI: Array<{
+  id: string; accessToken?: string; expiresAt: number; enabled: boolean; authExpired?: boolean;
+}> = [];
 
 vi.mock("../config/manager.js", async importOriginal => ({
   ...await importOriginal<typeof import("../config/manager.js")>(),
@@ -112,6 +114,19 @@ describe("accounts list — accounts needing re-authentication", () => {
     const output = await runList();
 
     expect(output).toContain("re-auth required");
+  });
+
+  it("flags a stored OpenAI account whose terminal rejection was persisted", async () => {
+    storedOpenAI = [{
+      id: "team-dead", accessToken: "sk-openai-dead",
+      expiresAt: Date.now() - 60_000, enabled: true, authExpired: true,
+    }];
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const output = await runList();
+
+    expect(output).toContain("re-auth required");
+    expect(output).toContain("team-dead");
   });
 
   it("does not flag a stored account that only has an expired access token", async () => {

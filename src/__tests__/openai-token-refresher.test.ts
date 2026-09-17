@@ -4,6 +4,7 @@ import {
   needsOpenAIRefresh,
   OPENAI_REFRESH_TIMEOUT_MS,
   prepareOpenAIAccountForRequest,
+  refreshOpenAIAccountsOnce,
   refreshOpenAISubscriptionToken,
   startOpenAIRefreshLoop,
 } from "../providers/openai/token-refresher.js";
@@ -148,12 +149,103 @@ describe("OpenAI subscription token refresher", () => {
     expect(account.authState).toBe("quarantined");
     expect(() => pool.acquireBest(new Map())).toThrow(NoEligibleAccountError);
 
+    // Re-authentication replaces the credentials rather than re-trying the
+    // rejected ones, so recovery runs through a fresh account record — which
+    // is what `accounts add` installs. Retrying the same dead refresh token
+    // is deliberately no longer attempted.
+    const reauthed = createOpenAIAccount({
+      id: "openai-revoked", provider: "openai_subscription", accessToken: "replacement",
+      refreshToken: "replacement-refresh", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    const reauthedPool = new OpenAITokenPool([reauthed]);
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({
-      access_token: "replacement", refresh_token: "replacement-refresh", expires_in: 3600,
+      access_token: "replacement", refresh_token: "rotated-refresh", expires_in: 3600,
     }), { status: 200 }));
-    expect(await prepareOpenAIAccountForRequest(account, [account], vi.fn())).toBe(true);
+    expect(await prepareOpenAIAccountForRequest(reauthed, [reauthed], vi.fn())).toBe(true);
+    expect(reauthed.authState).toBe("ok");
+    expect(reauthedPool.acquireBest(new Map()).account.id).toBe("openai-revoked");
+  });
+
+  it("stops POSTing a refresh token the provider rejected permanently", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-dead", provider: "openai_subscription", accessToken: "access",
+      refreshToken: "revoked", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({ error: "invalid_grant" }, { status: 400 }),
+    );
+
+    expect(await prepareOpenAIAccountForRequest(account, [account], vi.fn())).toBe(false);
+    expect(account.authExpired).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Retrying a permanently rejected token can only fail again. Left alone it
+    // hammers the OAuth endpoint every tick, forever.
+    expect(await prepareOpenAIAccountForRequest(account, [account], vi.fn())).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a permanently rejected account out of the scheduled refresh pass", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-dead-loop", provider: "openai_subscription", accessToken: "access",
+      refreshToken: "revoked", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    account.authExpired = true;
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    const { failed } = await refreshOpenAIAccountsOnce([account], vi.fn());
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(failed).toBe(1);
+  });
+
+  it("persists the terminal rejection so it is not retried after a restart", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-persist-dead", provider: "openai_subscription", accessToken: "access",
+      refreshToken: "revoked", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    const save = vi.fn();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({ error: "invalid_grant" }, { status: 400 }),
+    );
+
+    await prepareOpenAIAccountForRequest(account, [account], save);
+
+    expect(save).toHaveBeenCalledWith([account]);
+    expect(save.mock.calls[0]?.[0]?.[0]).toMatchObject({ authExpired: true });
+  });
+
+  it("keeps retrying a transient rejection rather than writing it off", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-blip", provider: "openai_subscription", accessToken: "access",
+      refreshToken: "refresh", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network unavailable"));
+
+    expect(await prepareOpenAIAccountForRequest(account, [account], vi.fn())).toBe(false);
+    expect(await prepareOpenAIAccountForRequest(account, [account], vi.fn())).toBe(false);
+
+    expect(account.authExpired).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears the terminal rejection once replacement credentials refresh successfully", async () => {
+    const account = createOpenAIAccount({
+      id: "openai-reauthed", provider: "openai_subscription", accessToken: "access",
+      refreshToken: "replacement-refresh", expiresAt: Date.now() + 60_000, enabled: true,
+    });
+    account.authExpired = true;
+    account.authState = "quarantined";
+    account.authFailure = "permanent";
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({ access_token: "fresh", refresh_token: "fresh-refresh", expires_in: 3600 }, { status: 200 }),
+    );
+
+    expect(await refreshOpenAISubscriptionToken(account)).toBe(true);
+
+    expect(account.authExpired).toBe(false);
     expect(account.authState).toBe("ok");
-    expect(pool.acquireBest(new Map()).account.id).toBe("openai-revoked");
+    expect(account.authFailure).toBeUndefined();
   });
 
   it("keeps transient refresh failures routable once their normal cooldown ends", async () => {

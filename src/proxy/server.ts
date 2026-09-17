@@ -500,6 +500,7 @@ function publicOpenAIAccountView(
     lastRefreshMs: a.lastRefresh,
     codexRateLimits: publicCodexRateLimits(a, routing.cooldowns),
     ...(hasPendingCredentialWrite(a) ? { credentialsPendingWrite: true } : {}),
+    ...(a.authExpired ? { authExpired: true as const } : {}),
     ...(a.authState === "quarantined" ? { authState: "quarantined" as const } : {}),
     ...(a.authFailure ? { authFailure: a.authFailure } : {}),
   };

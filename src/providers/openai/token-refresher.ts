@@ -101,7 +101,24 @@ export type OpenAISubscriptionAccount = ProviderAccount & {
   scopes?: string[];
   sessionLimitPercent?: number;
   weeklyLimitPercent?: number;
+  /** Set when the provider rejects this refresh token permanently
+   *  (`invalid_grant`, `invalid_token`, `token_revoked`, `token_expired`).
+   *  Such a token can never be refreshed again, so it is taken out of the
+   *  refresh path entirely and the account needs re-authentication.
+   *
+   *  Persisted, unlike the runtime `authState`/`authFailure` pair: a dead
+   *  token that is only remembered in memory is POSTed from scratch after
+   *  every restart. Mirrors Anthropic's `Account.authExpired`. */
+  authExpired?: boolean;
 };
+
+/**
+ * True when this account's refresh token was terminally rejected. A refresh
+ * must never be attempted for it — see `authExpired` above.
+ */
+export function isOpenAIAuthExpired(account: OpenAISubscriptionAccount): boolean {
+  return account.authExpired === true;
+}
 
 /**
  * Runtime health-tracking fields that live on `OpenAIAccount` (see
@@ -148,6 +165,11 @@ export async function prepareOpenAIAccountForRequest(
   saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
 ): Promise<boolean> {
   const runtime = account as OpenAISubscriptionAccount & OpenAIRuntimeHealthFields;
+  // A terminally rejected refresh token can only fail again, and the
+  // quarantine branch below would otherwise retry it on every request and
+  // every scheduled tick — thousands of dead POSTs on one client_id. The way
+  // back is replacement credentials (re-add the account), not another retry.
+  if (isOpenAIAuthExpired(account)) return false;
   // A revoked but unexpired access token must not bypass the refresh gate.
   if (!needsOpenAIRefresh(account) && runtime.authState !== "quarantined") {
     // No refresh due, but a previous rotation from this account never made it
@@ -177,8 +199,16 @@ export async function refreshAndPersistOpenAIAccount(
   allAccounts: OpenAISubscriptionAccount[],
   saveAccounts: (accounts: OpenAISubscriptionAccount[]) => void,
 ): Promise<boolean> {
+  const wasAuthExpired = isOpenAIAuthExpired(account);
   const ok = await refreshOpenAISubscriptionToken(account);
-  if (ok) persistCredentials(account, allAccounts, saveAccounts);
+  // Persist on a rotated credential, and also on a newly terminal rejection:
+  // an `authExpired` that never reaches disk is re-tried from scratch after
+  // every restart, which is how a dead token keeps generating OAuth traffic
+  // for days. A failed write here is best-effort — the flag is still live in
+  // memory for this process, and the next start re-derives it from one POST.
+  if (ok || (!wasAuthExpired && isOpenAIAuthExpired(account))) {
+    persistCredentials(account, allAccounts, saveAccounts);
+  }
   return ok;
 }
 
@@ -250,6 +280,15 @@ function markRefreshFailure(account: OpenAISubscriptionAccount, permanent: boole
   if (permanent) {
     runtime.authFailure = "permanent";
     runtime.authState = "quarantined";
+    // Tell the operator exactly once. Before this, a dead token produced one
+    // indistinguishable 401 diagnostic line per tick and nothing that said
+    // the account would never recover on its own.
+    if (account.authExpired !== true) {
+      account.authExpired = true;
+      console.error(
+        `  Account ${account.id} needs re-authentication: its refresh token was rejected permanently. Re-add the account to resume routing.`,
+      );
+    }
   } else if (runtime.authState !== "quarantined") {
     runtime.authFailure = "transient";
   }
@@ -363,6 +402,10 @@ async function doRefresh(account: OpenAISubscriptionAccount, span: ActiveTelemet
   if (runtime.lastRefresh !== undefined) runtime.lastRefresh = Date.now();
   runtime.authState = "ok";
   runtime.authFailure = undefined;
+  // Replacement credentials proved themselves, so the account is no longer
+  // stranded. Written rather than deleted so the cleared state is persisted
+  // over a previously stored `authExpired: true`.
+  account.authExpired = false;
 
   // The rotated access token can carry a different plan than the one decoded
   // at account creation (e.g. a Plus->Pro upgrade). Mirrors createOpenAIAccount's

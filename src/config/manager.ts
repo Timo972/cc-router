@@ -171,6 +171,9 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
       refreshToken: a.refreshToken,
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
+      // Without this the flag is lost on restart and the dead refresh token is
+      // POSTed again from scratch — the whole point of persisting it.
+      ...(a.authExpired === true ? { authExpired: true as const } : {}),
       ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
       ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
       ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
@@ -192,6 +195,7 @@ export function saveOpenAIAccountsToPath(accounts: OpenAISubscriptionAccount[], 
     expiresAt: a.expiresAt,
     scopes: a.scopes ?? ["openid", "profile", "email", "offline_access"],
     enabled: a.enabled,
+    ...(a.authExpired ? { authExpired: true as const } : {}),
     ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
     ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
   }));

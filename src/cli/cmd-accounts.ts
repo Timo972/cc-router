@@ -145,11 +145,13 @@ export function registerAccounts(program: Command): void {
           const exp = a.expiresAt > Date.now()
             ? chalk.yellow(formatExpiry(a.expiresAt))
             : chalk.red("EXPIRED");
+          if (needsReauthentication(a)) reauthNeeded.push(a.id);
           console.log(
             `  ${chalk.bold(a.id.padEnd(24))}` +
             `  ${chalk.magenta("openai".padEnd(10))}` +
             `  ${redactToken(a.accessToken).padEnd(26)}` +
-            `  expires: ${exp}`
+            `  expires: ${exp}` +
+            (needsReauthentication(a) ? `  ${chalk.red("✗ re-auth required")}` : "")
           );
         }
         for (const a of xaiStored) {
