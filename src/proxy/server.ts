@@ -1255,7 +1255,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             },
             accounts: openAIAccounts,
             persist: persistOpenAIAccounts,
-            forgetAccount: account => openAIPool.forgetAccount(account as OpenAIAccount),
+            forgetAccount: account => openAIPool.forgetAccount(account),
             invalidateAccount: accountId => { openAIRouter.invalidateAccount(accountId); },
           });
           res.json({ account: publicOpenAIAccountView(replaced, resolveOpenAIRouting(replaced.id)) });
