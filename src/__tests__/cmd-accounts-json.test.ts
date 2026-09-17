@@ -190,6 +190,37 @@ describe("runtime-aware account add", () => {
     );
   });
 
+  it("asks the proxy to replace an existing id when re-authenticating", async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ account: { id: "openai-1" } }), { status: 200 }));
+
+    await expect(tryAddAccountToRunningProxy(record, { fetch, replace: true })).resolves.toBe(true);
+
+    const body = JSON.parse(String((fetch.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body).toMatchObject({ ...record, replace: true });
+  });
+
+  it("does not ask for replacement unless the caller opts in", async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ account: { id: "openai-1" } }), { status: 201 }));
+
+    await tryAddAccountToRunningProxy(record, { fetch });
+
+    const body = JSON.parse(String((fetch.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body).not.toHaveProperty("replace");
+  });
+
+  it("re-authenticates an existing account through the running proxy instead of losing the token", async () => {
+    // The live add used to reject a known id, and the CLI rethrew before it
+    // wrote anything — discarding the refresh token the OAuth login had just
+    // minted. Replacement has to be requested for that to be recoverable.
+    const tryAddLive = vi.fn(async () => true);
+    const addStored = vi.fn();
+
+    await expect(addAccountRuntimeAware(record, { tryAddLive, addStored }))
+      .resolves.toEqual({ mode: "live" });
+
+    expect(addStored).not.toHaveBeenCalled();
+  });
+
   it("reports no reachable proxy when the POST connection fails", async () => {
     const fetch = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
 

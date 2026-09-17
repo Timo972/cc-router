@@ -1080,6 +1080,22 @@ export class TokenPool implements AccountPool<Account> {
   }
 
   /**
+   * Re-insert an account object the pool previously held.
+   *
+   * Unlike `addAccount`, this takes the live object rather than a record, so a
+   * rolled-back replacement restores the *same* incarnation the refresher's
+   * object-keyed locks and reservations already reference. Rebuilding it from
+   * a record would hand back an object those maps know nothing about.
+   */
+  insertAccount(account: Account): Account {
+    if (this.findById(account.id)) {
+      throw new Error(`Account "${account.id}" already exists`);
+    }
+    this.accounts.push(account);
+    return account;
+  }
+
+  /**
    * Remove an account by id. Returns true if something was removed.
    *
    * CRITICAL: mutates `this.accounts` IN PLACE via splice() rather than

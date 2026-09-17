@@ -735,6 +735,15 @@ export interface LiveAccountAddOptions {
   baseUrl?: string;
   authToken?: string;
   fetch?: typeof globalThis.fetch;
+  /**
+   * Ask the proxy to replace an account already holding this id rather than
+   * refusing the add. This is what re-authenticating means: `accounts add`
+   * already replaces by id on disk, and without the same intent on the live
+   * pool the proxy answered 409 and the freshly minted refresh token was
+   * thrown away. Off by default so the endpoint still protects any other
+   * client from an accidental id collision.
+   */
+  replace?: boolean;
 }
 
 /**
@@ -758,7 +767,7 @@ export async function tryAddAccountToRunningProxy(
         "content-type": "application/json",
         ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
       },
-      body: JSON.stringify(record),
+      body: JSON.stringify(options.replace ? { ...record, replace: true } : record),
       signal: AbortSignal.timeout(3_000),
     });
   } catch {
@@ -788,7 +797,10 @@ export interface RuntimeAwareAddDependencies {
 export async function addAccountRuntimeAware(
   record: AccountRecord,
   dependencies: RuntimeAwareAddDependencies = {
-    tryAddLive: tryAddAccountToRunningProxy,
+    // `upsertAccountRecord` already replaces by id on disk; asking the live
+    // pool for the same thing is what keeps the two halves of an `accounts
+    // add` in agreement instead of failing on the account that most needs it.
+    tryAddLive: record => tryAddAccountToRunningProxy(record, { replace: true }),
     addStored: upsertAccountRecord,
   },
 ): Promise<{ mode: "live" } | { mode: "stored" }> {

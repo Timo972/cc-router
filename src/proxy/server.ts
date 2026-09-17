@@ -75,6 +75,11 @@ import {
 } from "./account-deletion.js";
 import { addOpenAIAccountTransaction } from "./account-add.js";
 import {
+  accountReplacementStatusCode,
+  replaceAnthropicAccountTransaction,
+  replaceOpenAIAccountTransaction,
+} from "./account-replace.js";
+import {
   createAnthropicRefreshMiddleware,
   createAnthropicRoutingMiddleware,
 } from "./anthropic-routing.js";
@@ -1192,8 +1197,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     });
   });
 
-  accountsRouter.post("/", (req, res) => {
+  accountsRouter.post("/", async (req, res) => {
     const body = (req.body ?? {}) as Partial<AccountRecord>;
+    // Opt-in upsert. Re-authenticating an existing id is the only recovery for
+    // a terminally rejected refresh token, and refusing it here discarded the
+    // OAuth login the operator had just completed. It stays opt-in so an
+    // accidental id collision from any other API client still gets its 409.
+    const wantsReplace = (req.body as { replace?: unknown } | undefined)?.replace === true;
     const required: (keyof AccountRecord)[] = ["id", "accessToken", "refreshToken", "expiresAt"];
     for (const k of required) {
       if (body[k] === undefined || body[k] === null || body[k] === "") {
@@ -1218,9 +1228,69 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     }
     // IDs are unique across providers, so a new account may not collide with an
     // existing account in either the Claude pool or the OpenAI pool.
-    if (pool.findById(body.id) || openAIAccounts.some(a => a.id === body.id)) {
-      res.status(409).json({ error: `Account "${body.id}" already exists` });
-      return;
+    const existingAnthropic = pool.findById(body.id);
+    const existingOpenAI = openAIAccounts.find(a => a.id === body.id);
+    if (existingAnthropic || existingOpenAI) {
+      // Replacement is within a provider only: swapping a Claude account for
+      // an OpenAI one under the same id is an id collision, not a re-auth.
+      const sameProvider = body.provider === "openai_subscription"
+        ? existingOpenAI !== undefined
+        : body.provider !== "xai_subscription" && existingAnthropic !== null;
+      if (!wantsReplace || !sameProvider) {
+        res.status(409).json({ error: `Account "${body.id}" already exists` });
+        return;
+      }
+
+      try {
+        if (existingOpenAI) {
+          const replaced = replaceOpenAIAccountTransaction({
+            record: {
+              id: body.id,
+              accessToken: body.accessToken,
+              refreshToken: body.refreshToken,
+              expiresAt: body.expiresAt,
+              enabled: body.enabled,
+              sessionLimitPercent: body.sessionLimitPercent,
+              weeklyLimitPercent: body.weeklyLimitPercent,
+            },
+            accounts: openAIAccounts,
+            persist: persistOpenAIAccounts,
+            forgetAccount: account => openAIPool.forgetAccount(account as OpenAIAccount),
+            invalidateAccount: accountId => { openAIRouter.invalidateAccount(accountId); },
+          });
+          res.json({ account: publicOpenAIAccountView(replaced, resolveOpenAIRouting(replaced.id)) });
+          return;
+        }
+
+        const replaced = await replaceAnthropicAccountTransaction({
+          record: {
+            id: body.id,
+            provider: "anthropic_subscription",
+            accessToken: body.accessToken,
+            refreshToken: body.refreshToken,
+            expiresAt: body.expiresAt,
+            scopes: Array.isArray(body.scopes) ? body.scopes : ["user:inference", "user:profile"],
+            enabled: body.enabled,
+            sessionLimitPercent: body.sessionLimitPercent,
+            weeklyLimitPercent: body.weeklyLimitPercent,
+          },
+          pool,
+          sessionRouter,
+          persist: saveAccounts,
+        });
+        res.json({ account: publicAnthropicAccountView(replaced, createRoutingMetricsResolver()(replaced.id)) });
+        return;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const status = accountReplacementStatusCode(err);
+        if (status === 409) {
+          res.status(409).json({ error: message });
+          return;
+        }
+        logError("accounts", 0, `Failed to replace account: ${message}`);
+        res.status(500).json({ error: `Failed to replace account: ${message}` });
+        return;
+      }
     }
 
     if (body.provider === "xai_subscription") {
