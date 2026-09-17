@@ -47,6 +47,14 @@ function makeStoredAccount(id: string, authExpired: boolean): Account {
   };
 }
 
+async function runListJson(): Promise<Array<Record<string, unknown>>> {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const program = new Command();
+  registerAccounts(program);
+  await program.parseAsync(["accounts", "list", "--json"], { from: "user" });
+  return JSON.parse(log.mock.calls.map(args => args.join(" ")).join("\n")) as Array<Record<string, unknown>>;
+}
+
 async function runList(): Promise<string> {
   const log = vi.spyOn(console, "log").mockImplementation(() => {});
   const program = new Command();
@@ -172,6 +180,47 @@ describe("accounts list — accounts needing re-authentication", () => {
 
     expect(output).toContain("re-auth required");
     expect(output).toContain("team-dead");
+  });
+
+  it("reports authExpired in --json for a stored Claude account when the proxy is down", async () => {
+    storedAnthropic = [makeStoredAccount("max-dead", true), makeStoredAccount("max-stale", false)];
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const accounts = await runListJson();
+
+    // Without this a JSON consumer sees two identically-expired accounts and
+    // cannot tell which one will never recover on its own.
+    expect(accounts.find(a => a.id === "max-dead")).toMatchObject({ authExpired: true });
+    expect(accounts.find(a => a.id === "max-stale")).not.toHaveProperty("authExpired");
+  });
+
+  it("carries the terminal auth state through --json while the proxy is running", async () => {
+    storedAnthropic = [makeStoredAccount("max-dead", true)];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
+      accounts: [{
+        id: "max-dead", provider: "anthropic_subscription", healthy: false, busy: false,
+        requestCount: 0, errorCount: 0, expiresInMs: -1_000, authExpired: true,
+      }],
+    }));
+
+    const accounts = await runListJson();
+
+    expect(accounts.find(a => a.id === "max-dead")).toMatchObject({ authExpired: true });
+  });
+
+  it("reports authExpired in --json for a stored OpenAI account when the proxy is down", async () => {
+    storedOpenAI = [{
+      id: "team-dead", accessToken: "sk-openai-dead",
+      expiresAt: Date.now() - 60_000, enabled: true, authExpired: true,
+    }];
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const accounts = await runListJson();
+
+    expect(accounts.find(a => a.id === "team-dead")).toMatchObject({
+      provider: "openai_subscription",
+      authExpired: true,
+    });
   });
 
   it("does not flag a stored account that only has an expired access token", async () => {

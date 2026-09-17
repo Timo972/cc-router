@@ -15,7 +15,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   live and the stored view — and named once with the command that recovers
   them. Previously they were indistinguishable from an account holding a
   merely stale access token, which the next refresh tick replaces on its own.
-  `authExpired` is exposed through the health endpoint for the same reason.
+  `authExpired` is exposed through the health endpoint and in
+  `cc-router accounts list --json` — with and without a running proxy — for
+  the same reason: both states otherwise read as nothing but a past
+  `expiresAt`.
 
 ### Changed
 

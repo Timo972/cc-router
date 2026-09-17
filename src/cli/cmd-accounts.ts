@@ -593,6 +593,12 @@ export function buildStoredAccountsJson(
   enabled: boolean;
   expiresAt: number;
   scopes?: string[];
+  /** Present only when true: this account's refresh token was rejected
+   *  permanently and only re-authentication restores it. A JSON consumer
+   *  cannot otherwise tell it apart from an ordinarily expired access token,
+   *  since both simply read as a past `expiresAt`. A boolean, so nothing
+   *  credential-bearing is added to the output. */
+  authExpired?: true;
 }> {
   return [
     ...anthropicAccounts.map(a => ({
@@ -601,12 +607,14 @@ export function buildStoredAccountsJson(
       enabled: a.enabled,
       expiresAt: a.tokens.expiresAt,
       scopes: a.tokens.scopes,
+      ...(needsReauthentication(a) ? { authExpired: true as const } : {}),
     })),
     ...openAIAccounts.map(a => ({
       id: a.id,
       provider: "openai_subscription" as const,
       enabled: a.enabled !== false,
       expiresAt: a.expiresAt,
+      ...(needsReauthentication(a) ? { authExpired: true as const } : {}),
     })),
     ...xaiAccounts.map(a => ({
       id: a.id,
