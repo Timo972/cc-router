@@ -38,6 +38,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A dead OpenAI refresh token no longer generates an OAuth request every five
   minutes indefinitely. One account produced 1754 identical 401 diagnostics
   over four days and dominated the proxy log.
+- `cc-router start --accounts <path>` now writes Claude accounts back to that
+  file. Every Anthropic write — token rotation, re-authentication, add, patch,
+  rename, delete, and the shutdown save — targeted the default
+  `~/.cc-router/accounts.json` regardless of the file the pool was loaded from.
+  Rotated refresh tokens therefore never reached the selected file and were
+  lost on the next restart, while the default file was overwritten with a pool
+  it does not describe. OpenAI accounts were already persisted correctly.
 
 ---
 

@@ -263,8 +263,8 @@ async function _doRefresh(account: Account, span: ActiveTelemetrySpan): Promise<
  * Uses atomic write (tmp + rename) to prevent corruption if process dies mid-write.
  * Must be called after every successful refresh since refresh_token ROTATES.
  */
-export function saveAccounts(accounts: Account[]): void {
-  writeAnthropicAccountsPreservingOtherProviders(serialize(accounts));
+export function saveAccounts(accounts: Account[], path?: string): void {
+  writeAnthropicAccountsPreservingOtherProviders(serialize(accounts), path);
 }
 
 export interface RefreshAccountsOnceOptions {
@@ -298,8 +298,11 @@ export async function refreshAccountsOnce(
  * Background refresh loop: checks every 5 minutes and refreshes any
  * token expiring within the REFRESH_BUFFER_MS window.
  */
-export function startRefreshLoop(accounts: Account[]): void {
-  const check = () => refreshAccountsOnce(accounts);
+export function startRefreshLoop(
+  accounts: Account[],
+  options: RefreshAccountsOnceOptions = {},
+): void {
+  const check = () => refreshAccountsOnce(accounts, options);
 
   // Run immediately on startup (catches already-expired tokens)
   check().catch(console.error);
