@@ -8,6 +8,47 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Accounts whose refresh token the provider rejected permanently are now
+  reported as `re-auth required` in `cc-router accounts list` — in both the
+  live and the stored view — and named once with the command that recovers
+  them. Previously they were indistinguishable from an account holding a
+  merely stale access token, which the next refresh tick replaces on its own.
+  `authExpired` is exposed through the health endpoint and in
+  `cc-router accounts list --json` — with and without a running proxy — for
+  the same reason: both states otherwise read as nothing but a past
+  `expiresAt`.
+
+### Changed
+
+- A permanently rejected OpenAI account is no longer retried on the same
+  credentials. `authExpired` now persists for OpenAI as it already did for
+  Claude, so the rejection survives a restart, and such an account loads
+  quarantined rather than being handed live traffic. Recovery is by
+  re-authentication rather than by a retry that can only fail again.
+
+### Fixed
+
+- Re-authenticating an existing account id while the proxy is running no
+  longer discards the new credentials. `cc-router accounts add` already
+  replaced by id on disk, but the live pool refused the id and the CLI
+  aborted before writing anything — so the OAuth login that had just
+  completed, and the refresh token it minted, were lost. This was the
+  documented recovery for an account needing re-authentication.
+  `POST /cc-router/accounts` accepts an opt-in `replace` flag; without it the
+  endpoint still answers 409, and replacement is refused across providers.
+- A dead OpenAI refresh token no longer generates an OAuth request every five
+  minutes indefinitely. One account produced 1754 identical 401 diagnostics
+  over four days and dominated the proxy log.
+- `cc-router start --accounts <path>` now writes Claude accounts back to that
+  file. Every Anthropic write — token rotation, re-authentication, add, patch,
+  rename, delete, and the shutdown save — targeted the default
+  `~/.cc-router/accounts.json` regardless of the file the pool was loaded from.
+  Rotated refresh tokens therefore never reached the selected file and were
+  lost on the next restart, while the default file was overwritten with a pool
+  it does not describe. OpenAI accounts were already persisted correctly.
+
 ---
 
 ## [0.12.3] — 2026-09-17

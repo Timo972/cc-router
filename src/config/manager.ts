@@ -69,13 +69,28 @@ function writeAccountsAtomicToPath(path: string, data: unknown[]): void {
   writeFileSecureSync(path, JSON.stringify(data, null, 2));
 }
 
-export function writeAnthropicAccountsPreservingOtherProviders(data: AccountRecord[]): void {
+/**
+ * Replace the Anthropic records in an accounts file, leaving every other
+ * provider's records in it untouched.
+ *
+ * `path` defaults to `ACCOUNTS_PATH`, but a server started with
+ * `--accounts <path>` must write back to the file it read: sending rotated
+ * refresh tokens to the default file instead loses them on the next restart
+ * *and* overwrites a file describing a different pool. Mirrors
+ * `saveOpenAIAccountsToPath`, which has always taken the path.
+ */
+export function writeAnthropicAccountsPreservingOtherProviders(
+  data: AccountRecord[],
+  path: string = ACCOUNTS_PATH,
+): void {
   ensureConfigDir();
-  const existing = readAccountsRaw() as AccountRecord[];
+  // Read from the same file being written, or the merge would carry another
+  // file's non-Anthropic records into this one.
+  const existing = readRawFromPath(path) as AccountRecord[];
   const nonAnthropic = existing.filter(a =>
     a.provider !== undefined && a.provider !== "anthropic_subscription"
   );
-  writeAccountsAtomicToPath(ACCOUNTS_PATH, [...data, ...nonAnthropic]);
+  writeAccountsAtomicToPath(path, [...data, ...nonAnthropic]);
 }
 
 export function upsertAccountRecord(record: AccountRecord): void {
@@ -171,6 +186,9 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
       refreshToken: a.refreshToken,
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
+      // Without this the flag is lost on restart and the dead refresh token is
+      // POSTed again from scratch — the whole point of persisting it.
+      ...(a.authExpired === true ? { authExpired: true as const } : {}),
       ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
       ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
       ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
@@ -192,6 +210,7 @@ export function saveOpenAIAccountsToPath(accounts: OpenAISubscriptionAccount[], 
     expiresAt: a.expiresAt,
     scopes: a.scopes ?? ["openid", "profile", "email", "offline_access"],
     enabled: a.enabled,
+    ...(a.authExpired ? { authExpired: true as const } : {}),
     ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
     ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
   }));

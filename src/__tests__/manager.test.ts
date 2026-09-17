@@ -537,6 +537,47 @@ describe("serialize", () => {
   });
 });
 
+describe("OpenAI terminal auth state persistence", () => {
+  it("round-trips authExpired so a dead refresh token is not re-tried after a restart", () => {
+    writeAccountsAtomic([]);
+
+    saveOpenAIAccounts([
+      {
+        id: "openai-dead",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "revoked",
+        expiresAt: 1999999999000,
+        enabled: true,
+        authExpired: true,
+      },
+    ]);
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0]).toMatchObject({ id: "openai-dead", authExpired: true });
+    expect(loadOpenAIAccounts()[0]).toMatchObject({ authExpired: true });
+  });
+
+  it("omits authExpired for a healthy OpenAI account", () => {
+    writeAccountsAtomic([]);
+
+    saveOpenAIAccounts([
+      {
+        id: "openai-live",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: 1999999999000,
+        enabled: true,
+      },
+    ]);
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0]).not.toHaveProperty("authExpired");
+    expect(loadOpenAIAccounts()[0]).not.toHaveProperty("authExpired");
+  });
+});
+
 describe("loadOpenAIAccounts", () => {
   it("loads OpenAI subscription records separately from Anthropic accounts", () => {
     writeAccountsAtomic([

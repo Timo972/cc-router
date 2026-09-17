@@ -19,6 +19,7 @@ import type { SetupStage } from "../telemetry/contracts.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import { sanitizeAccountInfo, formatAccountInfo, type AccountInfo } from "../providers/account-info.js";
+import { needsReauthentication } from "../providers/auth-state.js";
 
 export function registerAccounts(program: Command): void {
   const accounts = program
@@ -61,6 +62,14 @@ export function registerAccounts(program: Command): void {
           : `\n  Accounts (${stored.length + openAIStored.length + xaiStored.length} configured)\n`,
       ));
 
+      /**
+       * Accounts only re-authentication can restore, tagged with the provider
+       * whose sign-in command actually recovers them — `accounts add` runs the
+       * Claude Max flow, so pointing an OpenAI or Grok operator at it would
+       * re-add the id under the wrong provider.
+       */
+      const reauthNeeded: Array<{ id: string; provider?: string }> = [];
+
       if (liveStats) {
         console.log(chalk.green("  ● Proxy is running — showing live stats\n"));
         for (const s of liveStats) {
@@ -69,9 +78,15 @@ export function registerAccounts(program: Command): void {
             : s.provider === "xai_subscription"
               ? chalk.magenta("grok".padEnd(9))
               : chalk.gray("claude".padEnd(9));
-          const status = s.healthy
-            ? chalk.green("✓ healthy")
-            : chalk.red("✗ unhealthy");
+          // "unhealthy" covers everything from a five-minute network blip to a
+          // permanently rejected refresh token. Only the latter needs the
+          // operator, so it gets its own label rather than hiding in the crowd.
+          if (needsReauthentication(s)) reauthNeeded.push({ id: s.id, provider: s.provider });
+          const status = needsReauthentication(s)
+            ? chalk.red("✗ re-auth required")
+            : s.healthy
+              ? chalk.green("✓ healthy")
+              : chalk.red("✗ unhealthy");
           const busy = s.busy ? chalk.yellow(" [busy]") : "";
           const exp = s.expiresInMs > 0
             ? chalk.yellow(formatMs(s.expiresInMs))
@@ -120,22 +135,28 @@ export function registerAccounts(program: Command): void {
           const expColor = a.tokens.expiresAt > Date.now()
             ? chalk.yellow(exp)
             : chalk.red(exp);
+          // `authExpired` is persisted, so the dead state is knowable without
+          // the proxy running — and this is exactly when an operator looks.
+          if (needsReauthentication(a)) reauthNeeded.push({ id: a.id, provider: "anthropic_subscription" });
           console.log(
             `  ${chalk.bold(a.id.padEnd(24))}` +
             `  ${redactToken(a.tokens.accessToken).padEnd(26)}` +
             `  expires: ${expColor}` +
-            `  scopes: ${chalk.gray(a.tokens.scopes.join(" "))}`
+            `  scopes: ${chalk.gray(a.tokens.scopes.join(" "))}` +
+            (needsReauthentication(a) ? `  ${chalk.red("✗ re-auth required")}` : "")
           );
         }
         for (const a of openAIStored) {
           const exp = a.expiresAt > Date.now()
             ? chalk.yellow(formatExpiry(a.expiresAt))
             : chalk.red("EXPIRED");
+          if (needsReauthentication(a)) reauthNeeded.push({ id: a.id, provider: "openai_subscription" });
           console.log(
             `  ${chalk.bold(a.id.padEnd(24))}` +
             `  ${chalk.magenta("openai".padEnd(10))}` +
             `  ${redactToken(a.accessToken).padEnd(26)}` +
-            `  expires: ${exp}`
+            `  expires: ${exp}` +
+            (needsReauthentication(a) ? `  ${chalk.red("✗ re-auth required")}` : "")
           );
         }
         for (const a of xaiStored) {
@@ -148,6 +169,24 @@ export function registerAccounts(program: Command): void {
             `  ${redactToken(a.accessToken).padEnd(26)}` +
             `  expires: ${exp}`
           );
+        }
+      }
+
+      // A dead refresh token is the one failure the router cannot work its way
+      // out of: the refresh loop has deliberately stopped retrying, so nothing
+      // changes until someone re-authenticates. Say so, and say how.
+      if (reauthNeeded.length > 0) {
+        console.log(chalk.red(
+          `\n  ⚠ Needs re-authentication: ${reauthNeeded.map(a => a.id).join(", ")}`,
+        ));
+        console.log(chalk.gray(
+          "    The provider rejected these refresh tokens permanently; they cannot\n"
+          + "    be recovered and the refresh loop has stopped retrying them. Sign in\n"
+          + "    again under the same account id to resume routing — the existing\n"
+          + "    account is replaced, so there is nothing to remove first:",
+        ));
+        for (const { id, provider } of reauthNeeded) {
+          console.log(chalk.gray(`      ${reauthCommand(provider)}   (for ${id})`));
         }
       }
 
@@ -177,8 +216,10 @@ export function registerAccounts(program: Command): void {
 
       let mode: "live" | "stored";
       try {
+        // Only `addStored` is overridden: this flow merges by id across the
+        // whole Claude pool. `tryAddLive` must stay the default so the live
+        // pool is asked to replace an existing id rather than reject it.
         ({ mode } = await addAccountRuntimeAware(serialize([account])[0], {
-          tryAddLive: tryAddAccountToRunningProxy,
           addStored: () => saveAccounts(merged),
         }));
       } catch (error) {
@@ -552,6 +593,12 @@ export function buildStoredAccountsJson(
   enabled: boolean;
   expiresAt: number;
   scopes?: string[];
+  /** Present only when true: this account's refresh token was rejected
+   *  permanently and only re-authentication restores it. A JSON consumer
+   *  cannot otherwise tell it apart from an ordinarily expired access token,
+   *  since both simply read as a past `expiresAt`. A boolean, so nothing
+   *  credential-bearing is added to the output. */
+  authExpired?: true;
 }> {
   return [
     ...anthropicAccounts.map(a => ({
@@ -560,12 +607,14 @@ export function buildStoredAccountsJson(
       enabled: a.enabled,
       expiresAt: a.tokens.expiresAt,
       scopes: a.tokens.scopes,
+      ...(needsReauthentication(a) ? { authExpired: true as const } : {}),
     })),
     ...openAIAccounts.map(a => ({
       id: a.id,
       provider: "openai_subscription" as const,
       enabled: a.enabled !== false,
       expiresAt: a.expiresAt,
+      ...(needsReauthentication(a) ? { authExpired: true as const } : {}),
     })),
     ...xaiAccounts.map(a => ({
       id: a.id,
@@ -704,6 +753,15 @@ export interface LiveAccountAddOptions {
   baseUrl?: string;
   authToken?: string;
   fetch?: typeof globalThis.fetch;
+  /**
+   * Ask the proxy to replace an account already holding this id rather than
+   * refusing the add. This is what re-authenticating means: `accounts add`
+   * already replaces by id on disk, and without the same intent on the live
+   * pool the proxy answered 409 and the freshly minted refresh token was
+   * thrown away. Off by default so the endpoint still protects any other
+   * client from an accidental id collision.
+   */
+  replace?: boolean;
 }
 
 /**
@@ -727,7 +785,7 @@ export async function tryAddAccountToRunningProxy(
         "content-type": "application/json",
         ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
       },
-      body: JSON.stringify(record),
+      body: JSON.stringify(options.replace ? { ...record, replace: true } : record),
       signal: AbortSignal.timeout(3_000),
     });
   } catch {
@@ -756,19 +814,43 @@ export interface RuntimeAwareAddDependencies {
  */
 export async function addAccountRuntimeAware(
   record: AccountRecord,
-  dependencies: RuntimeAwareAddDependencies = {
-    tryAddLive: tryAddAccountToRunningProxy,
-    addStored: upsertAccountRecord,
-  },
+  dependencies: Partial<RuntimeAwareAddDependencies> = {},
 ): Promise<{ mode: "live" } | { mode: "stored" }> {
-  if (await dependencies.tryAddLive(record)) return { mode: "live" };
-  dependencies.addStored(record);
+  // Each dependency defaults independently. Taking the whole object as one
+  // default meant a caller that only needed its own `addStored` — the Claude
+  // `accounts add` flow does, to merge by id — had to restate `tryAddLive`
+  // too, and that restatement silently dropped the replacement request. The
+  // path that most needs replacement was the one path not asking for it.
+  const tryAddLive = dependencies.tryAddLive
+    // `upsertAccountRecord` already replaces by id on disk; asking the live
+    // pool for the same thing is what keeps the two halves of an `accounts
+    // add` in agreement instead of failing on the account that most needs it.
+    ?? (live => tryAddAccountToRunningProxy(live, { replace: true }));
+  const addStored = dependencies.addStored ?? upsertAccountRecord;
+
+  if (await tryAddLive(record)) return { mode: "live" };
+  addStored(record);
   return { mode: "stored" };
+}
+
+/**
+ * The sign-in command that recovers an account of this provider.
+ *
+ * `accounts add` is the Claude Max flow specifically; the other providers have
+ * their own. Each re-registers under the id the operator types, and the live
+ * pool now replaces rather than rejects it, so no deletion step is needed —
+ * which also avoids the running proxy refusing to delete a lone Claude account.
+ */
+function reauthCommand(provider: string | undefined): string {
+  if (provider === "openai_subscription") return "cc-router accounts login-openai";
+  if (provider === "xai_subscription") return "cc-router accounts login-grok";
+  return "cc-router accounts add";
 }
 
 async function fetchLiveStats(): Promise<null | Array<{
   id: string; provider?: string; healthy: boolean; busy: boolean;
   requestCount: number; errorCount: number; expiresInMs: number;
+  authExpired?: boolean; authFailure?: string; authState?: string;
   accountInfo?: AccountInfo;
 }>> {
   try {
@@ -782,6 +864,7 @@ async function fetchLiveStats(): Promise<null | Array<{
       accounts: Array<{
         id: string; provider?: string; healthy: boolean; busy: boolean;
         requestCount: number; errorCount: number; expiresInMs: number;
+        authExpired?: boolean; authFailure?: string; authState?: string;
         accountInfo?: AccountInfo;
       }>;
       operational?: {

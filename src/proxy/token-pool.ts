@@ -320,6 +320,39 @@ export interface TokenPoolOptions {
   nextSequence?: () => number;
 }
 
+/**
+ * Build a runtime account from a stored record. Shared by `addAccount` and
+ * `replaceAccount` so a replaced account is constructed exactly like a newly
+ * added one — including starting healthy, which is what clears a previous
+ * incarnation's terminal auth state.
+ */
+function buildAccount(record: AccountRecord): Account {
+  return {
+    id: record.id,
+    tokens: {
+      accessToken: record.accessToken,
+      refreshToken: record.refreshToken,
+      expiresAt: record.expiresAt,
+      scopes: record.scopes ?? ["user:inference", "user:profile"],
+    },
+    healthy: true,
+    busy: false,
+    requestCount: 0,
+    errorCount: 0,
+    lastUsed: 0,
+    lastRefresh: 0,
+    consecutiveErrors: 0,
+    rateLimits: { ...DEFAULT_RATE_LIMITS },
+    enabled: record.enabled !== false,
+    sessionLimitPercent: record.sessionLimitPercent !== undefined
+      ? clampPercent(record.sessionLimitPercent)
+      : ACCOUNT_USER_DEFAULTS.sessionLimitPercent,
+    weeklyLimitPercent: record.weeklyLimitPercent !== undefined
+      ? clampPercent(record.weeklyLimitPercent)
+      : ACCOUNT_USER_DEFAULTS.weeklyLimitPercent,
+  };
+}
+
 export class TokenPool implements AccountPool<Account> {
   private readonly inFlight = new Map<string, number>();
   private readonly cooldowns = new Map<Account, AccountCooldowns>();
@@ -988,6 +1021,10 @@ export class TokenPool implements AccountPool<Account> {
       lastRefreshMs: a.lastRefresh,
       rateLimits: a.rateLimits,
       enabled: a.enabled,
+      // Without this, a terminally rejected refresh token is indistinguishable
+      // from a token that is merely stale: both read as unhealthy with an
+      // expired timestamp, but only this one needs the operator to re-auth.
+      authExpired: a.authExpired === true,
       sessionLimitPercent: a.sessionLimitPercent,
       weeklyLimitPercent: a.weeklyLimitPercent,
     }));
@@ -1047,34 +1084,51 @@ export class TokenPool implements AccountPool<Account> {
     if (this.findById(record.id)) {
       throw new Error(`Account "${record.id}" already exists`);
     }
-    const account: Account = {
-      id: record.id,
-      tokens: {
-        accessToken: record.accessToken,
-        refreshToken: record.refreshToken,
-        expiresAt: record.expiresAt,
-        scopes: record.scopes ?? ["user:inference", "user:profile"],
-      },
-      healthy: true,
-      busy: false,
-      requestCount: 0,
-      errorCount: 0,
-      lastUsed: 0,
-      lastRefresh: 0,
-      consecutiveErrors: 0,
-      rateLimits: { ...DEFAULT_RATE_LIMITS },
-      enabled: record.enabled !== false,
-      sessionLimitPercent: record.sessionLimitPercent !== undefined
-        ? clampPercent(record.sessionLimitPercent)
-        : ACCOUNT_USER_DEFAULTS.sessionLimitPercent,
-      weeklyLimitPercent: record.weeklyLimitPercent !== undefined
-        ? clampPercent(record.weeklyLimitPercent)
-        : ACCOUNT_USER_DEFAULTS.weeklyLimitPercent,
-    };
+    const account = buildAccount(record);
     this.accounts.push(account);
     return account;
   }
 
+  /**
+   * Swap `record` in for the account currently holding its id, returning the
+   * replacement and a rollback that undoes the whole swap.
+   *
+   * `removeAccount` deliberately discards the departing account's in-flight
+   * count and cooldowns — for a real removal that state is garbage. A
+   * replacement whose persistence then fails has to put all of it back, or a
+   * rate-limited account returns to the pool looking idle and takes traffic it
+   * is still benched for. Capturing that state is only possible in here, which
+   * is why the swap is one pool operation rather than remove-then-add.
+   *
+   * The account keeps its position, so `currentIndex` stays valid and the
+   * rotation order is undisturbed.
+   */
+  replaceAccount(record: AccountRecord): { added: Account; rollback: () => void } {
+    const index = this.accounts.findIndex(a => a.id === record.id);
+    if (index === -1) throw new Error(`Account "${record.id}" not found`);
+
+    const previous = this.accounts[index]!;
+    const previousInFlight = this.inFlight.get(record.id);
+    const previousCooldowns = this.cooldowns.get(previous);
+
+    const added = buildAccount(record);
+    this.accounts.splice(index, 1, added);
+    // The replacement starts clean: cooldowns and in-flight counts belonged to
+    // credentials that no longer exist.
+    this.inFlight.delete(record.id);
+    this.cooldowns.delete(previous);
+
+    return {
+      added,
+      rollback: () => {
+        this.accounts.splice(index, 1, previous);
+        this.cooldowns.delete(added);
+        if (previousInFlight === undefined) this.inFlight.delete(record.id);
+        else this.inFlight.set(record.id, previousInFlight);
+        if (previousCooldowns !== undefined) this.cooldowns.set(previous, previousCooldowns);
+      },
+    };
+  }
   /**
    * Remove an account by id. Returns true if something was removed.
    *

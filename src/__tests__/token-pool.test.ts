@@ -908,6 +908,17 @@ describe("TokenPool — stats", () => {
     lease.release();
   });
 
+  it("getStats() reports authExpired so an account needing re-auth is distinguishable", () => {
+    const dead = makeAccount("dead");
+    dead.authExpired = true;
+    dead.healthy = false;
+    const pool = new TokenPool([dead, makeAccount("live")]);
+
+    const stats = pool.getStats();
+    expect(stats[0].authExpired).toBe(true);
+    expect(stats[1].authExpired).toBe(false);
+  });
+
   it("reports only the earliest active scoped cooldown timestamp", () => {
     const account = makeAccount("a");
     const pool = new TokenPool([account], { now: () => 1_000 });
