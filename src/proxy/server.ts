@@ -1,3 +1,7 @@
+import { finishUsageAttempt } from "./stats.js";
+import { startUsageRuntime } from "../usage/runtime.js";
+import { createUsageRouter } from "../usage/http.js";
+import { usageDirectoryForAccounts, withUsageRename } from "../usage/account-lifecycle.js";
 import { consumeCodexResetCredit } from "../providers/openai/usage-reset.js";
 import { createUsageResetHandler } from "./account-usage-reset.js";
 import express from "express";
@@ -8,8 +12,8 @@ import type { IncomingMessage } from "http";
 import type { Socket } from "net";
 import type { Request, Response } from "express";
 import { EmptyPoolError, NoEligibleAccountError, TokenPool } from "./token-pool.js";
-import { needsRefresh, refreshAccountIfCurrent, refreshAccountsOnce, saveAccounts, startRefreshLoop } from "./token-refresher.js";
-import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
+import { needsRefresh, refreshAccountIfCurrent, refreshAccountsOnce, startRefreshLoop } from "./token-refresher.js";
+import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById, writeAnthropicAccountsPreservingOtherProviders, serialize } from "../config/manager.js";
 import { createRefreshAllRunner, describeRefreshAll, refreshAllAccounts } from "./pool-refresh.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
 import {
@@ -610,6 +614,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const mode = litellmUrl ? "litellm" : "standalone";
 
   const accountsPath = opts.accountsPath;
+  const accountsFile = accountsPath ?? ACCOUNTS_PATH;
+  const persistAnthropicAccounts = (accounts: Account[]) => writeAnthropicAccountsPreservingOtherProviders(serialize(accounts), accountsFile);
   const persistOpenAIAccounts = createOpenAIPersister(accountsPath);
 
   if (!accountsFileExists(accountsPath)) {
@@ -627,6 +633,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
+  const usageRuntime = startUsageRuntime(usageDirectoryForAccounts(accountsFile), [
+    ...accounts.map(a => ({ id: a.id, provider: "anthropic_subscription" as const })),
+    ...openAIAccounts, ...loadXaiAccounts(accountsPath),
+  ], { unmeasuredProviders: litellmUrl ? ["anthropic_subscription"] : [] });
   const pool = new TokenPool(accounts);
   const sessionRouter = new SessionRouter(pool);
   const createRoutingMetricsResolver = (): RoutingMetricsResolver => {
@@ -691,7 +701,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stats.addLog({ ts: Date.now(), accountId: a.id, model: "-", type: "route", details: `${a.id} cooldown expired — rate limit cleared` });
   };
 
-  startRefreshLoop(accounts);
+  startRefreshLoop(accounts, persistAnthropicAccounts);
   startOpenAIRefreshLoop(openAIAccounts, persistOpenAIAccounts);
   const usageRefresher = new AnthropicUsageRefresher(pool);
   usageRefresher.start();
@@ -769,6 +779,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       next();
     });
   }
+
+  app.use("/cc-router/usage", createUsageRouter(usageRuntime));
 
   // ─── Health endpoint (cc-router internal, NOT proxied) ────────────────────
   // Always reachable without auth so PM2/monitoring liveness checks keep
@@ -867,7 +879,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         getAll: () => pool.getAll(),
         refreshTokens: async () => {
           let failed = 0;
-          await refreshAccountsOnce(pool.getAll(), { onError: error => { failed++; onError("anthropic", error); } });
+          await refreshAccountsOnce(pool.getAll(), { persist: persistAnthropicAccounts, onError: error => { failed++; onError("anthropic", error); } });
           return { failed };
         },
         refreshUsage: account => usageRefresher.refreshNow(account as Account),
@@ -1048,7 +1060,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
    */
   const tryPersist = (rollback: () => void): { ok: true } | { ok: false; message: string } => {
     try {
-      saveAccounts(pool.getAll());
+      persistAnthropicAccounts(pool.getAll());
       return { ok: true };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1093,12 +1105,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           ? {
               rename: (oldId, nextId) => pool.renameAccount(oldId, nextId) !== null,
               renameSessions: (oldId, nextId) => { sessionRouter.renameAccount(oldId, nextId); },
-              persist: () => saveAccounts(pool.getAll()),
+              persist: () => withUsageRename(accountsFile, id, newId, () => persistAnthropicAccounts(pool.getAll())),
             }
           : {
               rename: (oldId, nextId) => openAIPool.renameAccount(oldId, nextId) !== null,
               renameSessions: (oldId, nextId) => { openAIRouter.renameAccount(oldId, nextId); },
-              persist: () => persistOpenAIAccounts(openAIAccounts),
+              persist: () => withUsageRename(accountsFile, id, newId, () => persistOpenAIAccounts(openAIAccounts)),
             });
       } catch (err) {
         if (err instanceof AccountRenameConflictError) {
@@ -1221,7 +1233,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           expiresAt: body.expiresAt,
           scopes: Array.isArray(body.scopes) ? body.scopes : [],
           enabled: body.enabled !== false,
-        });
+        }, accountsFile);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
@@ -1309,7 +1321,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     const existing = pool.findById(id);
     const openAIExisting = openAIAccounts.find(account => account.id === id);
     if (!existing && !openAIExisting) {
-      const removedXai = removeAccountRecordById(id);
+      const removedXai = removeAccountRecordById(id, accountsFile);
       if (removedXai?.provider === "xai_subscription") {
         res.json({ deleted: id, remaining: pool.getAll().length + openAIAccounts.length });
         return;
@@ -1354,7 +1366,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         id,
         pool,
         sessionRouter,
-        persist: saveAccounts,
+        persist: persistAnthropicAccounts,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1399,6 +1411,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   app.use(telemetryRequestMiddleware());
 
   mountResponsesRoutes(app, {
+    usageRuntime,
     openAIRouter,
     openAIPool,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
@@ -1409,6 +1422,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   });
 
   mountMessagesCrossProviderRoute(app, {
+    usageRuntime,
     openAIRouter,
     openAIPool,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
@@ -1443,20 +1457,21 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // router-side 429 failover and 5xx retry; every other /v1 endpoint stays on
   // the generic byte-transparent proxy below.
   mountAnthropicMessagesRoute(app, {
+    usageRuntime,
     target,
     timeoutMs: proxyRequestTimeoutMs,
     pool,
     sessionRouter,
     ...upstreamAttempts,
     needsRefresh,
-    refresh: account => refreshAccountIfCurrent(account, pool),
+    refresh: account => refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts }),
     onRefreshFailure: onAnthropicRefreshFailure,
     onEmptyPool: onAnthropicEmptyPool,
     onNoEligibleAccount: onAnthropicNoEligibleAccount,
     // A relayed 401 means the token is stale — refresh in the background so
     // the next request succeeds without making this client wait on it.
     onUpstream401: account => {
-      void refreshAccountIfCurrent(account, pool).catch(console.error);
+      void refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts }).catch(console.error);
     },
     // Refresh in the background to narrow only ambiguity-owned global state
     // when fresh usage proves a requested-model exhaustion.
@@ -1556,7 +1571,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             : "token-invalid";
           logError(account.id, 401, "Token invalid — scheduling background refresh");
 
-          void refreshAccountIfCurrent(account, pool).catch(console.error);
+          void refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts }).catch(console.error);
         } else if (status === 429) {
           // Rate limited — put account on cooldown for Retry-After seconds.
           stats.totalErrors++;
@@ -1629,6 +1644,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
       error: (err: Error, _req: IncomingMessage, res: ServerResponse | Socket) => {
         const request = _req as Request;
+        if (request._ccUsageEntry) finishUsageAttempt(request._ccUsageEntry, false);
         request._ccReleaseLease?.();
         stats.totalErrors++;
         logError("proxy", 0, err.message);
@@ -1664,12 +1680,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // CRITICAL: Do NOT use express.json() here — it consumes the body stream
   // and breaks SSE streaming passthrough.
   app.use("/v1", createAnthropicRoutingMiddleware({
+    usageRuntime,
     sessionRouter,
     onEmptyPool: onAnthropicEmptyPool,
     onNoEligibleAccount: onAnthropicNoEligibleAccount,
   }), createAnthropicRefreshMiddleware({
     needsRefresh,
-    refresh: account => refreshAccountIfCurrent(account, pool),
+    refresh: account => refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts }),
     onRefreshFailure: onAnthropicRefreshFailure,
   }), (req, _res, next) => {
     const route = req._ccRoute!;
@@ -1690,16 +1707,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       concurrency: pool.getInFlight(account.id),
     });
 
-    req._pendingLog = {
+    req._pendingLog = Object.assign(req._ccUsageEntry ?? {}, {
       ts: Date.now(),
       accountId: account.id,
       model: "-",
-      type: "route",
+      type: "route" as const,
       method: req.method,
       path: req.path,
       source,
       details: routeReasonDetails(route),
-    };
+    });
     stats.totalRequests++;
 
     logRoute(
@@ -1728,7 +1745,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     usageRefresher.stop();
     openAIUsageRefresher.stop();
     accountInfoCache.stop();
-    saveAccounts(pool.getAll());
+    try { persistAnthropicAccounts(pool.getAll()); } finally { usageRuntime.close(); }
     if (managesPidFile()) {
       removePid();
     }
@@ -1758,7 +1775,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const ok = await performUpdate(check.latest);
         if (ok) {
           console.log(chalk.green("[auto-update] Restarting with new version..."));
-          saveAccounts(pool.getAll());
+          persistAnthropicAccounts(pool.getAll());
+          usageRuntime.close();
           restartSelf();
         }
       } catch (err) {
@@ -1800,7 +1818,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  app.listen(port, host, () => {
+  const server = app.listen(port, host, () => {
     // Write PID for daemon/service process management
     if (managesPidFile()) {
       writePid(process.pid);
@@ -1821,4 +1839,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     recordProxyStarted(totalAccountCount);
     startProxyHeartbeat(() => pool.getAll().length + openAIPool.getAll().length);
   });
+  server.once("close", () => usageRuntime.close());
+  server.once("error", () => usageRuntime.close());
 }

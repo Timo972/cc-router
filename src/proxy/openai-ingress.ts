@@ -1,3 +1,4 @@
+import type { UsageRuntime } from "../usage/runtime.js";
 import type { Response } from "express";
 import { forwardOpenAICodexResponse } from "../providers/openai/codex-transport.js";
 import type { OpenAIResponsesRequest } from "../protocol/openai-responses-types.js";
@@ -6,7 +7,7 @@ import { headersToRecord, parseCodexRateLimits } from "../providers/openai/usage
 import { applyCodexFailureRouting } from "../providers/openai/failure-routing.js";
 import { needsOpenAIRefresh } from "../providers/openai/token-refresher.js";
 import type { OpenAITokenPool } from "../providers/openai/token-pool.js";
-import { stats, boundModelId, createLocalRoutingErrorLog } from "./stats.js";
+import { stats, boundModelId, createLocalRoutingErrorLog, finishUsageAttempt, discardUsageAttempt } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { logError, logRoute } from "./logger.js";
 import { EmptyPoolError, NoEligibleAccountError } from "./account-pool.js";
@@ -166,6 +167,7 @@ function requestSourceOf(source: LogEntry["source"]): RequestSource {
 }
 
 export interface OpenAIIngressOptions {
+  usageRuntime?: UsageRuntime;
   res: Response;
   sessionKey: unknown;
   requestedModel: string;
@@ -325,9 +327,20 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
    * sends instead is its own decision — the first attempt answers a local
    * 401, a retry attempt relays the upstream failure it already holds.
    */
+  const attemptEntries = new WeakMap<object, LogEntry>();
+  const entryFor = (routed: { route: RoutedAccountLease<OpenAIAccount> }): LogEntry => {
+    let entry = attemptEntries.get(routed);
+    if (!entry) {
+      entry = { ts: now(), accountId: routed.route.account.id, model: requestedModel, type: "route", path };
+      opts.usageRuntime?.bind(entry, "openai_subscription");
+      attemptEntries.set(routed, entry);
+    }
+    return entry;
+  };
   const prepareRoute = async (
     routed: { route: RoutedAccountLease<OpenAIAccount>; release: () => void },
   ): Promise<boolean> => {
+    entryFor(routed); // Bind immutable identity before token refresh can yield to account rename.
     const account = routed.route.account;
     const needed = needsOpenAIRefresh(account);
     const refreshStartedAt = now();
@@ -344,6 +357,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     const refreshDurationMs = now() - refreshStartedAt;
     refreshDurations.set(account, refreshDurationMs);
     if (!ready) {
+      discardUsageAttempt(entryFor(routed));
       routed.release();
       // Intentionally does not touch `account.healthy`: a single failed
       // refresh fails only this request. Disabling the account here would
@@ -393,6 +407,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     // Just release the lease and stop — no response to send, and it is safe to
     // release again even if the response's own close/finish listener already
     // did so (`attachLeaseLifecycle`'s release() is idempotent).
+    discardUsageAttempt(entryFor(selected));
     selected.release();
     return;
   }
@@ -410,6 +425,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     outcome: Outcome,
     extra: { httpStatusCode?: number; streamOutcome?: StreamOutcome } = {},
   ): void => {
+    finishUsageAttempt(entryFor(selected), false);
     attemptSpan?.annotate({
       ...extra,
       outcome,
@@ -601,6 +617,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
       clientGone.signal,
     );
     if (prepared === "still-pending") {
+      discardUsageAttempt(entryFor(next));
       if (!clientGone.signal.aborted) {
         logError(
           next.route.account.id,
@@ -642,6 +659,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     // produced the 5xx still in progress; a failover needs no pause.
     if (sameAccount) await retryDelay(sameAccountDelayMs, clientGone.signal);
     if (clientGone.signal.aborted || responseTerminated(res)) {
+      discardUsageAttempt(entryFor(selected));
       selected.release();
       settleProxyRequestSpan(res, {
         outcome: "cancelled",
@@ -654,7 +672,8 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
   }
 
   const account = selected.route.account;
-  const entry: LogEntry = {
+  const entry = entryFor(selected);
+  Object.assign(entry, {
     ts: startedAt,
     accountId: account.id,
     model: requestedModel,
@@ -666,7 +685,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     headerDurationMs,
     correlationId,
     details,
-  };
+  });
 
   let finalStatus = upstream.status;
   let relayFailed = false;
@@ -763,6 +782,7 @@ export async function runOpenAIIngress(opts: OpenAIIngressOptions): Promise<void
     account.consecutiveErrors = 0;
     stats.totalRequests++;
   }
+  finishUsageAttempt(entry, !relayFailed && !clientCancelled && finalStatus < 400);
   entry.type = failedFinal ? "error" : "route";
   entry.statusCode = finalStatus;
   entry.durationMs = now() - startedAt;

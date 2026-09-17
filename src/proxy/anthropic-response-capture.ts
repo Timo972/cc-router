@@ -1,4 +1,4 @@
-import { applyAnthropicInputUsage, applyAnthropicOutputUsage } from "./stats.js";
+import { applyAnthropicInputUsage, applyAnthropicOutputUsage, setUsageModel, finishUsageAttempt } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { createAnthropicUsageCapture } from "./usage-capture.js";
 import { createStreamLifecycleTracker } from "./stream-lifecycle.js";
@@ -55,18 +55,26 @@ export function attachAnthropicResponseCapture(
   streamTracker.attach(upstream, downstream);
   upstream.on("data", (chunk: Buffer) => streamTracker.observeChunk(chunk));
 
+  let terminal = false;
+  let ended = false;
   const usageCapture = createAnthropicUsageCapture({
     contentType,
     contentEncoding: encoding,
     onInputUsage: usage => applyAnthropicInputUsage(entry, usage),
     onOutputUsage: usage => applyAnthropicOutputUsage(entry, usage),
-    onSettled: () => hooks.onUsageSettled?.(),
-    ...(hooks.onMessageStop ? { onMessageStop: hooks.onMessageStop } : {}),
+    onModel: model => setUsageModel(entry, model),
+    onJSONComplete: () => { terminal = true; },
+    onSettled: () => { finishUsageAttempt(entry, terminal); hooks.onUsageSettled?.(); },
+    onMessageStop: () => { terminal = true; hooks.onMessageStop?.(); },
   });
   if (usageCapture) {
     upstream.on("data", (chunk: Buffer) => usageCapture.write(chunk));
-    upstream.on("end", () => usageCapture.end());
+    upstream.on("end", () => { ended = true; usageCapture.end(); });
+    upstream.once("close", () => { if (!ended) usageCapture.abort(); });
+    upstream.once("error", () => { if (!ended) usageCapture.abort(); });
+    downstream.once("close", () => { if (!ended) usageCapture.abort(); });
   } else {
+    finishUsageAttempt(entry, false);
     hooks.onUsageSettled?.();
   }
 }

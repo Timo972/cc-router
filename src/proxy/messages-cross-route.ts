@@ -1,3 +1,4 @@
+import type { UsageRuntime } from "../usage/runtime.js";
 import express from "express";
 import type { Express, NextFunction, Request, Response } from "express";
 import { selectRoute } from "../providers/route-selector.js";
@@ -22,7 +23,7 @@ import {
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 import type { RouteContext } from "./types.js";
 import { extractAnthropicRouteContext } from "./request-model.js";
-import { stats, applyCodexUsage } from "./stats.js";
+import { stats, applyCodexUsage, captureCodexResponse } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import type { SessionRouter } from "./session-router.js";
 import { extractCodexSessionKey } from "./openai-routing.js";
@@ -47,6 +48,7 @@ declare module "express-serve-static-core" {
 }
 
 export interface MessagesCrossProviderRouteOptions {
+  usageRuntime?: UsageRuntime;
   openAIRouter: SessionRouter<OpenAIAccount>;
   openAIPool: OpenAITokenPool;
   prepareOpenAIAccount?: (account: OpenAIAccount) => Promise<boolean>;
@@ -165,7 +167,7 @@ async function sendOpenAIAsAnthropic(
       return { statusCode: failure === undefined ? upstream.status : 502 };
     }
 
-    const collected = await collectOpenAIStreamAsAnthropicMessage(upstream, report);
+    const collected = await collectOpenAIStreamAsAnthropicMessage(upstream, report, entry);
     onUsage(collected.usage);
     if (collected.failure !== undefined) {
       // Mirrors collectCodexResponseStream on the /v1/responses path: a stream
@@ -188,6 +190,7 @@ async function sendOpenAIAsAnthropic(
   }
 
   const json = await upstream.json() as OpenAIResponseCompleted;
+  captureCodexResponse(entry, json);
   onUsage(usageFromResponseBody(json));
   res.status(upstream.status).json(openAIResponseToAnthropicMessage(json));
   return { statusCode: upstream.status };
@@ -196,6 +199,7 @@ async function sendOpenAIAsAnthropic(
 async function collectOpenAIStreamAsAnthropicMessage(
   upstream: globalThis.Response,
   report: OpenAIRelayReport,
+  entry: LogEntry,
 ): Promise<{
   message: ReturnType<typeof openAIResponseToAnthropicMessage>;
   usage: CodexUsageTotals | undefined;
@@ -232,6 +236,7 @@ async function collectOpenAIStreamAsAnthropicMessage(
   const callsByIndex = new Map<number, OpenAIFunctionCall>();
 
   const applyEvent = (event: unknown) => {
+    if (event && typeof event === "object") captureCodexResponse(entry, (event as { response?: unknown }).response);
     if (typeof event !== "object" || event === null) return;
     const openAIEvent = event as {
       type?: string;
@@ -454,6 +459,7 @@ async function sendOpenAIStreamAsAnthropic(
   };
 
   const inspect = (event: unknown): void => {
+    if (event && typeof event === "object") captureCodexResponse(entry, (event as { response?: unknown }).response);
     totals = usageFromTerminalEvent(event) ?? totals;
     if (typeof event !== "object" || event === null) return;
     const typed = event as {
@@ -604,6 +610,7 @@ export function mountMessagesCrossProviderRoute(
         source: detectAnthropicClientSource(req.headers),
         openAIRouter: opts.openAIRouter,
         openAIPool: opts.openAIPool,
+      usageRuntime: opts.usageRuntime,
         prepareOpenAIAccount,
         forwardOpenAI,
         forwardBody: body,

@@ -298,8 +298,8 @@ export async function refreshAccountsOnce(
  * Background refresh loop: checks every 5 minutes and refreshes any
  * token expiring within the REFRESH_BUFFER_MS window.
  */
-export function startRefreshLoop(accounts: Account[]): void {
-  const check = () => refreshAccountsOnce(accounts);
+export function startRefreshLoop(accounts: Account[], persist?: (accounts: Account[]) => void): void {
+  const check = () => refreshAccountsOnce(accounts, { persist });
 
   // Run immediately on startup (catches already-expired tokens)
   check().catch(console.error);

@@ -87,6 +87,7 @@ export async function collectCodexResponseStream(
    *  such interruption into a generic "malformed stream" and would otherwise
    *  bury it. */
   onUpstreamFailure?: () => void,
+  onResponse?: (body: unknown) => void,
 ): Promise<CollectedCodexResponse> {
   if (!upstream.ok) {
     onUpstreamFailure?.();
@@ -97,7 +98,9 @@ export async function collectCodexResponseStream(
   const contentType = upstream.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
     try {
-      return { kind: "json", status: upstream.status, body: await upstream.json() };
+      const body: unknown = await upstream.json();
+      onResponse?.(body);
+      return { kind: "json", status: upstream.status, body };
     } catch {
       return upstreamError("Malformed upstream JSON body");
     }
@@ -112,6 +115,7 @@ export async function collectCodexResponseStream(
   let failure: string | undefined;
 
   const applyEvent = (event: unknown): void => {
+    if (event && typeof event === "object") onResponse?.((event as CodexStreamEvent).response);
     const payload = terminalResponsePayload(event);
     if (payload !== undefined) {
       terminalResponse = payload;
@@ -199,7 +203,7 @@ export function usageFromTerminalEvent(event: unknown): CodexUsageTotals | undef
  * ended in failure can still be reported (for stats/activity only) as the
  * failure it was, without altering a single byte written to the client.
  */
-export function createCodexUsageObserver(): {
+export function createCodexUsageObserver(onResponse?: (body: unknown) => void, contentType = "text/event-stream"): {
   push(chunk: Uint8Array): void;
   finish(): CodexUsageTotals | undefined;
   /** The failure message observed via `response.failed`/`error`, or a
@@ -217,11 +221,14 @@ export function createCodexUsageObserver(): {
 } {
   const decoder = new TextDecoder();
   let remainder = "";
+  const isJSON = contentType.includes("application/json");
+  let json = ""; let jsonOversized = false;
   let totals: CodexUsageTotals | undefined;
   let failure: string | undefined;
   let completed = false;
 
   const applyEvent = (event: unknown): void => {
+    if (event && typeof event === "object") onResponse?.((event as CodexStreamEvent).response);
     totals = usageFromTerminalEvent(event) ?? totals;
     if (typeof event !== "object" || event === null) return;
     const e = event as CodexStreamEvent;
@@ -243,6 +250,11 @@ export function createCodexUsageObserver(): {
       // frame goes uncaptured, never that the response breaks. Tolerant
       // parsing keeps the rest of the chunk's valid events.
       try {
+        if (isJSON) {
+          if (json.length + chunk.byteLength > 20 * 1024 * 1024) { jsonOversized = true; json = ""; }
+          if (!jsonOversized) json += decoder.decode(chunk, { stream: true });
+          return;
+        }
         const parsed = parseSseLines(remainder + decoder.decode(chunk, { stream: true }), { tolerant: true });
         remainder = parsed.remainder;
         parsed.events.forEach(applyEvent);
@@ -252,6 +264,10 @@ export function createCodexUsageObserver(): {
     },
     finish(): CodexUsageTotals | undefined {
       try {
+        if (isJSON) {
+          if (!jsonOversized) { const body: unknown = JSON.parse(json + decoder.decode()); onResponse?.(body); totals = usageFromResponseBody(body); }
+          json = ""; jsonOversized = true; return totals;
+        }
         const tail = decoder.decode();
         if (tail || remainder) {
           parseSseLines(remainder + tail + "\n", { tolerant: true }).events.forEach(applyEvent);

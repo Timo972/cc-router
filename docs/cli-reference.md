@@ -95,3 +95,100 @@ These rewrite `~/.claude/settings.json` or the managed block in
 `~/.codex/config.toml`. The proxy keeps listening. Restart any already-running
 Claude Code or Codex process so it picks up the new config. From
 `cc-router status`, `[c]` / `[x]` do the same toggles.
+
+## Persistent token usage and savings
+
+```bash
+cc-router usage
+cc-router usage --period day --date 2026-09-01
+cc-router usage --period week --provider claude --provider openai
+cc-router usage --period year --json
+
+cc-router usage subscription set personal --monthly-usd 100 --from 2026-09-01
+cc-router usage subscription set personal --monthly-usd 200 --from 2026-10-01
+cc-router usage subscription end personal --on 2026-11-01
+cc-router usage subscription list --json
+```
+
+`--period` accepts `day`, `week`, `month` (default), or `year`. `--date` selects
+its containing period. Dates and boundaries are UTC; weeks begin on Monday.
+Provider selectors accept `claude`/`anthropic`, `openai`, `grok`/`xai`, or the
+full provider identifiers. Repeat `--provider` to select more than one.
+`--port` selects the local service port. In client mode, all operations use the
+configured remote server and its authentication; remote failures never fall
+back to this machine's history. An older server must be upgraded first.
+
+`--json` prints the full report and exits without starting Ink. Redirected
+non-JSON output is a plain-text summary. When the local service is stopped,
+reports can read local history; local subscription updates take an exclusive
+writer lock. Authentication failures do not trigger an offline fallback.
+
+### Subscription costs
+
+Enter your own **monthly USD cost**, not a plan name. An annual subscription
+can be entered as its monthly equivalent. Setting a later effective date closes
+the preceding open interval. Dates are inclusive at the start and exclusive
+at the end. Historical overlaps are rejected. Use the opaque account key from
+`subscription list --json` to disambiguate retired accounts whose names were
+reused. Removing an account does not cancel its subscription cost: end the
+cost interval explicitly when payment ends.
+
+Costs are prorated across each actual UTC calendar month, including inactive
+days, and stop at the current time for an ongoing period. Provider filters
+apply to both usage and costs. Model differentiation is visual only; it does
+not allocate a subscription's cost between models.
+
+### How savings are estimated
+
+**Net savings = estimated standard API token cost − configured subscription
+cost**, for the same period. Cached input and cache-write durations use their
+own rates. Negative savings remain negative; a zero API baseline has no savings
+percentage. These are token-cost comparisons, not invoices: tool charges,
+taxes, negotiated discounts, regional processing and fast-mode surcharges are
+not included.
+
+Missing model rates or subscription costs are marked partial/unconfigured, not
+silently priced at zero. Incomplete tracking suppresses an authoritative net
+savings figure while preserving priced subtotals. History starts when tracking
+is installed; past activity cannot be recovered from the short status log.
+Grok is currently an account overview, not routed token usage.
+
+### Pricing overrides and storage
+
+History lives in `~/.cc-router/usage/` (`USAGE_DIR` overrides the directory).
+With a custom accounts file, the default is a sibling `usage/` directory.
+Set the same `ACCOUNTS_PATH` or `USAGE_DIR` when reading that history offline.
+Keep this directory on a persistent volume when using a container. API rates
+are snapshotted with usage, so later rate changes do not rewrite old estimates.
+To price an unsupported model, create `pricing.json` in that directory, then
+restart the service:
+
+```json
+{
+  "version": 1,
+  "models": [{
+    "provider": "openai_subscription",
+    "model": "your-exact-model-id",
+    "input": 2,
+    "output": 8,
+    "cacheRead": 0.2,
+    "source": "user-configured",
+    "effectiveDate": "2026-09-01"
+  }]
+}
+```
+
+The amounts above are **illustrative**, in USD per million tokens, not prices
+for a real model. Optional `cacheWrite5m` and `cacheWrite1h` rates price the
+corresponding duration subsets. `cacheWrite` prices only cache creation whose
+duration is unknown. Unspecified categories with positive token counts remain
+unpriced. Overrides use exact provider/model IDs and do not reprice history.
+
+The usage journal is independent of telemetry consent. It does not store
+prompts, response bodies, credentials, emails, or provider profile objects.
+Usage is attributed to the UTC start time of each upstream attempt.
+Graceful shutdown closes the writer. Abrupt termination can lose observations
+that have not reached the journal; recovery and storage errors are surfaced
+rather than presented as complete usage. A pending account-identity transition
+requires recovery before read-only offline reports are available; restart the
+router to recover it.
