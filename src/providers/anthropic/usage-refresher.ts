@@ -1,6 +1,7 @@
 import type { Account, AccountUsageSnapshot } from "../../proxy/types.js";
 import { UsageRefresher } from "../../proxy/usage-refresher.js";
 import { fetchAnthropicUsage, type UsageFetchResult } from "./usage.js";
+import { canReadProfile } from "./scopes.js";
 import {
   httpOutcome,
   recordRuntimeError,
@@ -32,7 +33,13 @@ export class AnthropicUsageRefresher extends UsageRefresher<Account, UsageFetchR
     const now = options.now ?? Date.now;
     const fetchUsage = options.fetchUsage ?? fetchAnthropicUsage;
     super(pool, {
-      fetchUsage: account => withTelemetrySpan("provider.usage_refresh", { provider: "anthropic" },
+      // The OAuth usage endpoint needs `user:profile`. An inference-only
+      // credential (`claude setup-token`) can only ever be answered with a
+      // 403, so the request is never sent: the account lands on the same
+      // "unavailable" usage state without spending an upstream call.
+      fetchUsage: account => !canReadProfile(account.tokens.scopes)
+        ? Promise.resolve<UsageFetchResult>({ ok: false, reason: "http", status: 403 })
+        : withTelemetrySpan("provider.usage_refresh", { provider: "anthropic" },
         async span => {
           let result: UsageFetchResult;
           try {

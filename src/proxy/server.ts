@@ -753,6 +753,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     ...pool.getAll().map(account => ({
       id: account.id, provider: "anthropic_subscription" as const,
       accessToken: account.tokens.accessToken, expiresAt: account.tokens.expiresAt, enabled: account.enabled,
+      scopes: account.tokens.scopes,
     })),
     ...openAIAccounts.map(account => ({
       id: account.id, provider: "openai_subscription" as const,

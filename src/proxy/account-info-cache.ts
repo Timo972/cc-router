@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { fetchAccountInfo, type AccountInfoSource, type AccountInfoFetchOptions } from "../providers/account-info-fetch.js";
 import { sanitizeAccountInfo, type AccountInfo } from "../providers/account-info.js";
+import { canReadProfile } from "../providers/anthropic/scopes.js";
 
 const TTL_MS = 5 * 60_000;
 const RETRY_MS = 60_000;
@@ -74,7 +75,10 @@ export class AccountInfoCache {
         this.entries.set(id, entry);
       }
       const ttl = entry.info?.fetchStatus === "fresh" ? TTL_MS : RETRY_MS;
+      // An inference-only Claude credential cannot read the profile endpoint;
+      // fetching would only ever produce a 403. Other providers are never gated.
       return account.enabled !== false && account.expiresAt > this.now()
+        && (account.provider !== "anthropic_subscription" || canReadProfile(account.scopes))
         && (force || entry.attemptedAt === undefined || this.now() - entry.attemptedAt >= ttl);
     });
     const worker = async () => {
