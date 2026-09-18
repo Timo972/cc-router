@@ -16,6 +16,7 @@ import {
   redactToken,
 } from "../utils/token-extractor.js";
 import { validateToken } from "../utils/token-validator.js";
+import { parseExpiryInput } from "../utils/expiry-input.js";
 import { serialize, loadOpenAIAccounts, loadXaiAccounts } from "../config/manager.js";
 import type { Account, AccountRecord, OAuthTokens } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS } from "../proxy/types.js";
@@ -156,7 +157,7 @@ async function collectAnthropicAccount(
     const useDefaultExpiry = await confirm({ message: "Token valid for 1 year (default)?", default: true });
     const expiresAt = useDefaultExpiry
       ? Date.now() + LONG_LIVED_TOKEN_TTL_MS
-      : new Date(await input({ message: "Paste expiresAt (ISO date or ms timestamp):" })).getTime();
+      : await promptExpiry();
     tokens = { accessToken, refreshToken: undefined, expiresAt, scopes: ["user:inference"] };
     console.log(chalk.gray("  This token has no refresh token and the inference scope only: usage and identity metadata are unavailable for it."));
   }
@@ -299,7 +300,7 @@ async function promptManualTokens(): Promise<OAuthTokens | null> {
 
   const expiresAt = useDefaultExpiry
     ? Date.now() + 8 * 60 * 60 * 1000
-    : new Date(await input({ message: "Paste expiresAt (ISO date or ms timestamp):" })).getTime();
+    : await promptExpiry();
 
   return {
     accessToken,
@@ -485,6 +486,15 @@ export async function collectReauthRecord(
     ...(options.longLived ? { method: "setup_token" as const } : {}),
   });
   return account ? { record: credentialsOnly(accountToRecord(account)), attempt } : null;
+}
+
+/** An explicit expiry: ISO date or Unix milliseconds, validated as typed. */
+async function promptExpiry(): Promise<number> {
+  const raw = await input({
+    message: "Paste expiresAt (ISO date or ms timestamp):",
+    validate: v => parseExpiryInput(v) !== null || "Enter an ISO date (2027-01-01) or a Unix timestamp in milliseconds",
+  });
+  return parseExpiryInput(raw)!;
 }
 
 /**

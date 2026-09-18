@@ -35,6 +35,7 @@ describe("createAccountRefreshRunner", () => {
     expect(result).toEqual({ id: "a", tokenRefreshed: null, usageRefreshed: true, durationMs: 0 });
     expect(h.refreshAnthropicToken).not.toHaveBeenCalled();
     expect(h.refreshIdentity).toHaveBeenCalledTimes(1);
+    expect(h.refreshIdentity).toHaveBeenCalledWith({ id: "a", provider: "anthropic_subscription" });
   });
 
   it("refreshes the token first when due", async () => {

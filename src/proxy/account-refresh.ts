@@ -18,7 +18,8 @@ export interface AccountRefreshHooks {
   refreshOpenAIToken(account: OpenAIAccount): Promise<boolean>;
   openAITokenDue(account: OpenAIAccount): boolean;
   refreshOpenAIUsage(account: OpenAIAccount): Promise<{ ok: boolean }>;
-  refreshIdentity(): Promise<void>;
+  /** Refresh identity metadata for this one account, never the whole cache. */
+  refreshIdentity(target: { id: string; provider: "anthropic_subscription" | "openai_subscription" }): Promise<void>;
   /**
    * Called once per completed pass, never for a caller that joined a running
    * one. Activity logging belongs here rather than in the route: two
@@ -65,7 +66,10 @@ export function createAccountRefreshRunner(
         }
         usageRefreshed = (await attempt(() => hooks.refreshOpenAIUsage(openai), { ok: false })).ok;
       }
-      await attempt(() => hooks.refreshIdentity(), undefined);
+      await attempt(() => hooks.refreshIdentity({
+        id,
+        provider: anthropic ? "anthropic_subscription" : "openai_subscription",
+      }), undefined);
       const result = { id, tokenRefreshed, usageRefreshed, durationMs: Math.max(0, now() - started) };
       // A reporting failure must not turn a completed refresh into a 500.
       try { hooks.onComplete?.(result); } catch { /* best effort */ }

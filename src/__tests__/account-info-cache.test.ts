@@ -24,3 +24,30 @@ describe("AccountInfoCache scopes", () => {
     cache.stop();
   });
 });
+
+describe("AccountInfoCache.refreshOne", () => {
+  const sources = () => [
+    { id: "a", provider: "anthropic_subscription" as const, accessToken: "a", expiresAt: 2_000, scopes: ["user:inference", "user:profile"] },
+    { id: "b", provider: "openai_subscription" as const, accessToken: "b", expiresAt: 2_000 },
+  ];
+
+  it("fetches identity for that account only and makes it readable", async () => {
+    const fetchInfo = vi.fn(async () => ({ accountType: "personal" as const, email: "a@example.com", fetchStatus: "fresh" as const, fetchedAt: 1 }));
+    const cache = new AccountInfoCache(sources, { now: () => 1, fetchInfo });
+    await cache.refreshOne({ id: "a", provider: "anthropic_subscription" });
+    expect(fetchInfo.mock.calls.map(([source]) => source.id)).toEqual(["a"]);
+    expect(cache.get(sources()[0]!)).toMatchObject({ email: "a@example.com", fetchStatus: "fresh" });
+    cache.stop();
+  });
+
+  it("ignores an unknown account and an inference-only Claude token", async () => {
+    const fetchInfo = vi.fn(async () => ({ accountType: "personal" as const, fetchStatus: "fresh" as const, fetchedAt: 1 }));
+    const cache = new AccountInfoCache(() => [
+      { id: "long", provider: "anthropic_subscription" as const, accessToken: "x", expiresAt: 2_000, scopes: ["user:inference"] },
+    ], { now: () => 1, fetchInfo });
+    await cache.refreshOne({ id: "nope", provider: "anthropic_subscription" });
+    await cache.refreshOne({ id: "long", provider: "anthropic_subscription" });
+    expect(fetchInfo).not.toHaveBeenCalled();
+    cache.stop();
+  });
+});

@@ -1001,7 +1001,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     openAITokenDue: account => needsOpenAIRefresh(account),
     refreshOpenAIToken: account => refreshAndPersistOpenAIAccount(account, openAIAccounts, persistOpenAIAccounts),
     refreshOpenAIUsage: account => openAIUsageRefresher.refreshNow(account),
-    refreshIdentity: () => accountInfoCache.refresh(true),
+    refreshIdentity: target => accountInfoCache.refreshOne(target),
     // Logged from here, not from the route: concurrent requests for one id
     // share a single pass, and a per-request write would record it twice.
     onComplete: result => stats.addLog({
