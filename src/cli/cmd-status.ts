@@ -185,16 +185,16 @@ async function dashboardLoop(port: number): Promise<void> {
 }
 
 /**
- * Runs the existing setupSingleAccount() OAuth flow, then POSTs the resulting
- * tokens to /cc-router/accounts on the active target. Returns the new id on
- * success, or null if the user aborted / an error occurred.
+ * Runs the shared Claude sign-in flow, then POSTs the resulting record to
+ * /cc-router/accounts on the active target. Returns the new id on success, or
+ * null if the user aborted / an error occurred.
  */
 async function runAddAccountFlow(target: StatusTarget): Promise<string | null> {
   let attempt: SetupAttempt | undefined;
   try {
-    const { setupSingleAccountWithAttempt } = await import("./cmd-setup.js");
+    const { collectClaudeAccount, accountToRecord } = await import("./account-flows.js");
     // The index shown in the flow is just for display, pick something neutral.
-    const setup = await setupSingleAccountWithAttempt(1);
+    const setup = await collectClaudeAccount({ index: 1 });
     attempt = setup.attempt;
     const account = setup.account;
     if (!account) return null;
@@ -205,13 +205,10 @@ async function runAddAccountFlow(target: StatusTarget): Promise<string | null> {
         "content-type": "application/json",
         ...target.headers,
       },
-      body: JSON.stringify({
-        id: account.id,
-        accessToken: account.tokens.accessToken,
-        refreshToken: account.tokens.refreshToken,
-        expiresAt: account.tokens.expiresAt,
-        scopes: account.tokens.scopes,
-      }),
+      // The record form is what the endpoint stores, and it is the only shape
+      // that survives a `setup-token` credential: a hand-built body would have
+      // to invent a refresh token that account does not have.
+      body: JSON.stringify({ ...accountToRecord(account) }),
       signal: AbortSignal.timeout(5_000),
     });
 

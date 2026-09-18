@@ -1,16 +1,11 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { loadAccounts, loadOpenAIAccounts, loadXaiAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById, renameAccountRecordById, readConfig, serialize } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, loadXaiAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById, renameAccountRecordById, readConfig } from "../config/manager.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
 import { formatExpiry, redactToken } from "../utils/token-extractor.js";
 import { PROXY_PORT } from "../config/paths.js";
-import { createOpenAIAccountRecord } from "../providers/openai/account-record.js";
-import { loginOpenAIWithDeviceCode } from "../providers/openai/device-oauth.js";
-import { importGrokCliAuth } from "../providers/xai/import-auth.js";
-import { loginXaiWithDeviceCode } from "../providers/xai/device-oauth.js";
 import { isValidAccountId } from "../proxy/account-rename.js";
 import {
-  createSetupAttempt,
   failAttemptFromError,
   withSetupTelemetryFlush,
   type SetupAttempt,
@@ -198,10 +193,10 @@ export function registerAccounts(program: Command): void {
     .command("add")
     .description("Add a new Claude Max account interactively")
     .action(async () => {
-      const { setupSingleAccountWithAttempt } = await import("./cmd-setup.js");
+      const { collectClaudeAccount, accountToRecord } = await import("./account-flows.js");
 
       const existing = accountsFileExists() ? loadAccounts() : [];
-      const { account, attempt } = await setupSingleAccountWithAttempt(existing.length + 1);
+      const { account, attempt } = await collectClaudeAccount({ index: existing.length + 1 });
 
       if (!account) {
         console.log(chalk.yellow("\nNo account added.\n"));
@@ -219,7 +214,7 @@ export function registerAccounts(program: Command): void {
         // Only `addStored` is overridden: this flow merges by id across the
         // whole Claude pool. `tryAddLive` must stay the default so the live
         // pool is asked to replace an existing id rather than reject it.
-        ({ mode } = await addAccountRuntimeAware(serialize([account])[0], {
+        ({ mode } = await addAccountRuntimeAware(accountToRecord(account), {
           addStored: () => saveAccounts(merged),
         }));
       } catch (error) {
@@ -238,61 +233,22 @@ export function registerAccounts(program: Command): void {
     .command("add-openai")
     .description("Add an OpenAI ChatGPT/Codex subscription account manually")
     .action(async () => withSetupTelemetryFlush(async () => {
-      const { input, password } = await import("@inquirer/prompts");
+      const { importOpenAIAccount } = await import("./account-flows.js");
+      const { record, attempt } = await importOpenAIAccount();
 
-      const attempt = createSetupAttempt({ provider: "openai", method: "manual_token" });
-      attempt.stageCompleted("credential_source_selection");
-      let reached: SetupStage = "credential_read";
-
+      let mode: "live" | "stored";
       try {
-        const id = await input({
-          message: "OpenAI account ID:",
-          default: `openai-account-${loadOpenAIAccounts().length + 1}`,
-          validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-        });
-        const accessToken = await password({
-          message: "OpenAI access token:",
-          mask: "*",
-          validate: (v) => v.trim().length > 0 || "Access token is required",
-        });
-        const refreshToken = await password({
-          message: "OpenAI refresh token:",
-          mask: "*",
-          validate: (v) => v.trim().length > 0 || "Refresh token is required",
-        });
-        const expiresAt = await input({
-          message: "Access token expiry (Unix ms):",
-          default: String(Date.now() + 60 * 60 * 1000),
-          validate: (v) => Number.isFinite(Number(v)) && Number(v) > 0 || "Enter a positive Unix timestamp in milliseconds",
-        });
-        const scopes = await input({
-          message: "Scopes:",
-          default: "openid profile email offline_access",
-        });
-        attempt.stageCompleted("credential_read");
-
-        reached = "credential_parse";
-        const record = createOpenAIAccountRecord({
-          id,
-          accessToken,
-          refreshToken,
-          expiresAt,
-          scopes,
-        });
-        attempt.stageCompleted("credential_parse");
-
-        reached = "persistence";
-        const { mode } = await addAccountRuntimeAware(record);
-        attempt.stageCompleted("persistence");
-        attempt.succeeded();
-
-        console.log(chalk.green(`\n✓ OpenAI account "${record.id}" saved.\n`));
-        printAddOutcome(mode);
-        console.log(chalk.yellow("  Treat this as experimental until the OAuth login wizard lands.\n"));
+        ({ mode } = await addAccountRuntimeAware(record));
       } catch (error) {
-        endFailedAttempt(attempt, error, reached);
+        endFailedAttempt(attempt, error, "persistence");
         throw error;
       }
+      attempt.stageCompleted("persistence");
+      attempt.succeeded();
+
+      console.log(chalk.green(`\n✓ OpenAI account "${record.id}" saved.\n`));
+      printAddOutcome(mode);
+      console.log(chalk.yellow("  Treat this as experimental until the OAuth login wizard lands.\n"));
     }));
 
   // ── accounts login-openai ────────────────────────────────────────────────
@@ -300,47 +256,21 @@ export function registerAccounts(program: Command): void {
     .command("login-openai")
     .description("Sign in to an OpenAI ChatGPT/Codex subscription account with device code")
     .action(async () => withSetupTelemetryFlush(async () => {
-      const { input } = await import("@inquirer/prompts");
+      const { loginOpenAIAccount } = await import("./account-flows.js");
+      const { record, attempt } = await loginOpenAIAccount();
 
-      const attempt = createSetupAttempt({ provider: "openai", method: "device_oauth" });
-      let reached: SetupStage = "device_code_request";
-
+      let mode: "live" | "stored";
       try {
-        const accountId = await input({
-          message: "OpenAI account ID:",
-          default: `openai-account-${loadOpenAIAccounts().length + 1}`,
-          validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-        });
-
-        console.log(chalk.cyan("\nOpenAI Codex device login"));
-        console.log(chalk.gray("This will open no local callback server. You will approve the login in your browser.\n"));
-
-        const record = await loginOpenAIWithDeviceCode({
-          accountId,
-          onDeviceCode: (code) => {
-            console.log(chalk.bold("1. Open this URL:"));
-            console.log(`   ${chalk.cyan(code.verificationUrl)}`);
-            console.log(chalk.bold("2. Enter this code:"));
-            console.log(`   ${chalk.cyan(code.userCode)}\n`);
-            console.log(chalk.gray("Waiting for authorization..."));
-          },
-          onStageCompleted: (stage) => {
-            attempt.stageCompleted(stage);
-            reached = stage;
-          },
-        });
-
-        reached = "persistence";
-        const { mode } = await addAccountRuntimeAware(record);
-        attempt.stageCompleted("persistence");
-        attempt.succeeded();
-
-        console.log(chalk.green(`\n✓ OpenAI account "${record.id}" saved via device login.\n`));
-        printAddOutcome(mode);
+        ({ mode } = await addAccountRuntimeAware(record));
       } catch (error) {
-        endFailedAttempt(attempt, error, reached);
+        endFailedAttempt(attempt, error, "persistence");
         throw error;
       }
+      attempt.stageCompleted("persistence");
+      attempt.succeeded();
+
+      console.log(chalk.green(`\n✓ OpenAI account "${record.id}" saved via device login.\n`));
+      printAddOutcome(mode);
     }));
 
   // ── accounts add-grok ────────────────────────────────────────────────────
@@ -348,23 +278,8 @@ export function registerAccounts(program: Command): void {
     .command("add-grok")
     .description("Import the Grok CLI login from ~/.grok/auth.json")
     .action(async () => {
-      const { input } = await import("@inquirer/prompts");
-      let imported;
-      try {
-        imported = importGrokCliAuth();
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.log(chalk.red(`\n✗ ${message}\n`));
-        console.log(chalk.gray("  Or sign in here: cc-router accounts login-grok\n"));
-        process.exit(1);
-      }
-
-      const id = await input({
-        message: "Grok account ID:",
-        default: imported.id,
-        validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-      });
-      const record = { ...imported, id };
+      const { importGrokAccount } = await import("./account-flows.js");
+      const record = await importGrokAccount();
       upsertAccountRecord(record);
       console.log(chalk.green(`\n✓ Grok account "${record.id}" imported from ~/.grok.\n`));
       printAddOutcome("stored");
@@ -375,27 +290,8 @@ export function registerAccounts(program: Command): void {
     .command("login-grok")
     .description("Sign in to a Grok / xAI account with device code")
     .action(async () => {
-      const { input } = await import("@inquirer/prompts");
-      const accountId = await input({
-        message: "Grok account ID:",
-        default: loadXaiAccounts().length === 0 ? "grok" : `grok-${loadXaiAccounts().length + 1}`,
-        validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-      });
-
-      console.log(chalk.cyan("\nGrok device login"));
-      console.log(chalk.gray("Approve the login in your browser. No local callback server is used.\n"));
-
-      const record = await loginXaiWithDeviceCode({
-        accountId,
-        onDeviceCode: (code) => {
-          console.log(chalk.bold("1. Open this URL:"));
-          console.log(`   ${chalk.cyan(code.verificationUrl)}`);
-          console.log(chalk.bold("2. Enter this code if the page does not fill it in:"));
-          console.log(`   ${chalk.cyan(code.userCode)}\n`);
-          console.log(chalk.gray("Waiting for authorization..."));
-        },
-      });
-
+      const { loginGrokAccount } = await import("./account-flows.js");
+      const record = await loginGrokAccount();
       upsertAccountRecord(record);
       console.log(chalk.green(`\n✓ Grok account "${record.id}" saved via device login.\n`));
       printAddOutcome("stored");

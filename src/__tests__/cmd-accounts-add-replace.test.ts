@@ -32,14 +32,22 @@ const reauthed: Account = {
   weeklyLimitPercent: 100,
 };
 
-vi.mock("../cli/cmd-setup.js", () => ({
-  setupSingleAccountWithAttempt: async () => ({
+vi.mock("../cli/account-flows.js", () => ({
+  collectClaudeAccount: async () => ({
     account: reauthed,
     attempt: {
       stageCompleted: () => {},
       succeeded: () => {},
       failed: () => {},
     },
+  }),
+  accountToRecord: (a: Account) => ({
+    id: a.id,
+    provider: "anthropic_subscription" as const,
+    accessToken: a.tokens.accessToken,
+    refreshToken: a.tokens.refreshToken,
+    expiresAt: a.tokens.expiresAt,
+    scopes: a.tokens.scopes,
   }),
 }));
 
