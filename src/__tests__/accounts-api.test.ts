@@ -45,7 +45,7 @@ function makeExtraUsageAccount(id: string, extraUsage: ExtraUsageState): Account
 }
 
 describe("createAccountsApi", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
   it("updates all accounts for a provider through the management endpoint", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
@@ -241,5 +241,27 @@ describe("createAccountsApi", () => {
       expect.objectContaining({ label: "Claude Future", state: "paid extra active", color: "yellow" }),
     ]);
     expect(JSON.stringify(accounts)).not.toContain("private-billing-reason");
+  });
+
+  it("posts /cc-router/accounts/:id/refresh and parses the result", async () => {
+    const fetchMock = vi.fn(async () => Response.json({ refresh: { id: "a b", tokenRefreshed: null, usageRefreshed: true, durationMs: 12 } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = createAccountsApi("http://x", "s");
+    await expect(api.refreshAccount("a b")).resolves.toEqual({ id: "a b", tokenRefreshed: null, usageRefreshed: true, durationMs: 12 });
+    expect(String(fetchMock.mock.calls[0]![0])).toBe("http://x/cc-router/accounts/a%20b/refresh");
+  });
+
+  it("normalizes an adversarial refresh response and never invents a success", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      refresh: { id: "\u0000evil", tokenRefreshed: "yes", usageRefreshed: "yes", durationMs: -5, secret: "must-not-be-retained" },
+    })));
+    const result = await createAccountsApi("http://x", "s").refreshAccount("max-1");
+    expect(result).toEqual({ id: "evil", tokenRefreshed: null, usageRefreshed: false, durationMs: 0 });
+    expect(JSON.stringify(result)).not.toContain("must-not-be-retained");
+  });
+
+  it("throws when the refresh endpoint answers non-2xx", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 404 })));
+    await expect(createAccountsApi("http://x", "s").refreshAccount("nope")).rejects.toThrow("HTTP 404");
   });
 });

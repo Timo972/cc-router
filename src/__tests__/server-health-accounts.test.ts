@@ -465,6 +465,7 @@ describe("createOperationalStatus", () => {
         accounts: "/cc-router/accounts",
         allowance: "/cc-router/allowance",
         refresh: "/cc-router/refresh",
+        accountRefresh: "/cc-router/accounts/:id/refresh",
         messages: "/v1/messages",
         responses: "/v1/responses",
         models: "/v1/models",

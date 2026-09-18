@@ -8,7 +8,8 @@ import type { IncomingMessage } from "http";
 import type { Socket } from "net";
 import type { Request, Response } from "express";
 import { EmptyPoolError, NoEligibleAccountError, TokenPool } from "./token-pool.js";
-import { needsRefresh, refreshAccountIfCurrent, refreshAccountsOnce, saveAccounts, startRefreshLoop } from "./token-refresher.js";
+import { expireTokenOnlyAccount, needsRefresh, refreshAccountIfCurrent, refreshAccountsOnce, saveAccounts, startRefreshLoop } from "./token-refresher.js";
+import { createAccountRefreshRunner, type AccountRefreshResult } from "./account-refresh.js";
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
 import { createRefreshAllRunner, describeRefreshAll, refreshAllAccounts } from "./pool-refresh.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
@@ -32,12 +33,14 @@ import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
 import { loadGrokHealthSnapshots, type GrokAccountSnapshot } from "../providers/xai/overview.js";
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
+import { isTokenOnly } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
 import { validateAccountPostBody } from "./account-post-validation.js";
 import { AccountRenameConflictError, renameAccountTransaction } from "./account-rename.js";
 import {
   hasPendingCredentialWrite,
   markOpenAICredentialsPersisted,
+  needsOpenAIRefresh,
   prepareOpenAIAccountForRequest,
   refreshOpenAIAccountsOnce,
   refreshAndPersistOpenAIAccount,
@@ -250,6 +253,7 @@ export interface OperationalStatus {
     accounts: string;
     allowance: string;
     refresh: string;
+    accountRefresh: string;
     messages: string;
     responses: string;
     models: string;
@@ -302,6 +306,7 @@ export function createOperationalStatus(opts: {
       accounts: "/cc-router/accounts",
       allowance: "/cc-router/allowance",
       refresh: "/cc-router/refresh",
+      accountRefresh: "/cc-router/accounts/:id/refresh",
       messages: "/v1/messages",
       responses: "/v1/responses",
       models: "/v1/models",
@@ -968,6 +973,54 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     captureReset: account => openAIPool.captureUsageReset(account),
     refresh: account => openAIUsageRefresher.refreshAfterCurrent(account),
   }));
+
+  // ─── Per-account refresh (authenticated) ──────────────────────────────────
+  // The whole-pool reload above, narrowed to one row: the operator who just
+  // re-authenticated a single account should not have to pay for every other
+  // account's upstream calls to see the result.
+  const runAccountRefresh = createAccountRefreshRunner({
+    findAnthropic: id => pool.findById(id),
+    findOpenAI: id => openAIAccounts.find(account => account.id === id),
+    // A long-lived `claude setup-token` credential has nothing to POST, so
+    // `needsRefresh` excludes it. Past its expiry it still needs the flip to
+    // `authExpired`, which is what the refresh step below does for it — and
+    // it stays "due" afterwards so every press reports the same unrefreshable
+    // token rather than a first `false` and a silent `null` after that.
+    anthropicTokenDue: account => needsRefresh(account)
+      || (isTokenOnly(account.tokens) && account.tokens.expiresAt <= Date.now()),
+    refreshAnthropicToken: async account => {
+      if (isTokenOnly(account.tokens)) {
+        // Nothing to refresh — mark it re-auth required once and persist, so
+        // the dashboard sees the same terminal state a restart would derive.
+        if (expireTokenOnlyAccount(account)) persistAnthropicAccounts(pool.getAll());
+        return false;
+      }
+      return refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts });
+    },
+    refreshAnthropicUsage: account => usageRefresher.refreshNow(account),
+    openAITokenDue: account => needsOpenAIRefresh(account),
+    refreshOpenAIToken: account => refreshAndPersistOpenAIAccount(account, openAIAccounts, persistOpenAIAccounts),
+    refreshOpenAIUsage: account => openAIUsageRefresher.refreshNow(account),
+    refreshIdentity: () => accountInfoCache.refresh(true),
+  });
+  accountsRouter.post("/:id/refresh", async (req, res) => {
+    const id = req.params.id;
+    let result: AccountRefreshResult | null;
+    try {
+      result = await runAccountRefresh(id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError("refresh", 0, `manual refresh of ${id} failed: ${message}`);
+      res.status(500).json({ error: `Refresh failed: ${message}` });
+      return;
+    }
+    if (!result) { res.status(404).json({ error: `Account "${id}" not found` }); return; }
+    stats.addLog({
+      ts: Date.now(), accountId: id, model: "-", type: "refresh",
+      details: `manual refresh ${id} — ${result.usageRefreshed ? "usage fresh" : "usage fetch failed"}${result.tokenRefreshed === false ? ", token refresh failed" : ""}`,
+    });
+    res.json({ refresh: result });
+  });
 
   // Shape returned to clients — NEVER includes access/refresh tokens.
   accountsRouter.get("/", (_req, res) => {
