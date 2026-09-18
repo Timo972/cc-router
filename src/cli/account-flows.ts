@@ -31,6 +31,7 @@ import { loginXaiWithDeviceCode } from "../providers/xai/device-oauth.js";
 import {
   createSetupAttempt,
   failAttemptFromError,
+  SetupDiagnosticError,
   type SetupAttempt,
   type SetupFailureOutcome,
 } from "../telemetry/setup-diagnostics.js";
@@ -107,8 +108,19 @@ export async function collectClaudeAccount(
     return await collectAnthropicAccount(options, method, current, stage => { reached = stage; });
   } catch (error) {
     // A thrown prompt or extraction error must still close the funnel record.
+    // `failAttemptFromError` is terminal-guarded, so the attempt ends exactly
+    // once here, and `printDiagnosticId` stays silent for an expected failure.
     const outcome = failAttemptFromError(current.attempt, error, reached);
     if (outcome) printDiagnosticId(outcome);
+    // An expected failure — `claude` missing, or a browser sign-in the operator
+    // closed — is this one account declined, not a dead run. Returning null
+    // puts it on the same footing as the import methods, which already do, so
+    // the setup wizard prints "Skipped account N" and keeps the accounts it
+    // collected before this one instead of losing them to a stack trace.
+    if (error instanceof SetupDiagnosticError && error.classification.expected) {
+      console.log(chalk.yellow(`\n  ✗ ${error.message}\n`));
+      return { account: null, attempt: current.attempt };
+    }
     throw error;
   }
 }

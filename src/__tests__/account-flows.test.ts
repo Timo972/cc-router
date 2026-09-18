@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClaudeMethod } from "../cli/account-flows.js";
 import type { SetupMethod } from "../telemetry/contracts.js";
 
@@ -113,6 +113,60 @@ describe("collectClaudeAccount", () => {
     const { account } = await collectClaudeAccount({ index: 1, method: "cli_login", fixedId: "max-dead" });
     expect(prompts.input).not.toHaveBeenCalled();
     expect(account?.id).toBe("max-dead");
+  });
+});
+
+/**
+ * A cancelled browser sign-in is one account the operator chose not to add, not
+ * a reason to lose the accounts collected before it — the wizard persists only
+ * after its loop, so a throw here would take the whole run down with it.
+ */
+describe("collectClaudeAccount — an expected sign-in failure skips the account", () => {
+  beforeEach(() => { vi.spyOn(console, "log").mockImplementation(() => {}); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("cli_login: a cancelled login resolves to no account instead of throwing", async () => {
+    cli.loginWithClaudeCli.mockRejectedValue(new SetupDiagnosticError(
+      "claude auth login was cancelled or failed",
+      { stage: "credential_read", reason: "user_cancelled", expected: true },
+    ));
+
+    const { account } = await collectClaudeAccount({ index: 1, method: "cli_login", fixedId: "max-1" });
+
+    expect(account).toBeNull();
+  });
+
+  it("setup_token: a missing claude CLI resolves to no account instead of throwing", async () => {
+    cli.createLongLivedTokenWithClaudeCli.mockRejectedValue(new SetupDiagnosticError(
+      "Claude Code CLI not found on PATH.",
+      { stage: "credential_read", reason: "not_found", expected: true },
+    ));
+
+    const { account } = await collectClaudeAccount({ index: 1, method: "setup_token", fixedId: "max-1" });
+
+    expect(account).toBeNull();
+  });
+
+  it("prints the reason in the clear and never a diagnostic ID", async () => {
+    cli.loginWithClaudeCli.mockRejectedValue(new SetupDiagnosticError(
+      "claude auth login was cancelled or failed",
+      { stage: "credential_read", reason: "user_cancelled", expected: true },
+    ));
+
+    await collectClaudeAccount({ index: 1, method: "cli_login", fixedId: "max-1" });
+
+    const printed = (console.log as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .map(call => String(call[0]))
+      .join("\n");
+    expect(printed).toContain("claude auth login was cancelled or failed");
+    expect(printed).not.toContain("Diagnostic ID");
+  });
+
+  it("an unexpected failure still propagates", async () => {
+    cli.loginWithClaudeCli.mockRejectedValue(new Error("socket hang up"));
+
+    await expect(collectClaudeAccount({ index: 1, method: "cli_login", fixedId: "max-1" }))
+      .rejects.toThrow("socket hang up");
   });
 });
 

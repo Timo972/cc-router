@@ -30,6 +30,7 @@ vi.mock("../proxy/token-refresher.js", async importOriginal => ({
 vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("no proxy"); }));
 
 import { registerAccounts, resolveReauthTarget, parseProviderArg } from "../cli/cmd-accounts.js";
+import { CliUsageError } from "../cli/cli-errors.js";
 
 const attempt = { stageCompleted: vi.fn(), succeeded: vi.fn(), failed: vi.fn(), cancelled: vi.fn() };
 function program() { const p = new Command(); p.exitOverride(); registerAccounts(p); return p; }
@@ -68,7 +69,8 @@ describe("accounts login", () => {
     await program().parseAsync(["accounts", "login"], { from: "user" });
     expect(flows.loginGrokAccount).toHaveBeenCalled();
   });
-  it("rejects an unknown provider", () => {
+  it("rejects an unknown provider as a usage error, not a crash", () => {
+    expect(() => parseProviderArg("bing")).toThrow(CliUsageError);
     expect(() => parseProviderArg("bing")).toThrow(/claude, openai or grok/);
   });
 });

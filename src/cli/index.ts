@@ -16,6 +16,7 @@ import { registerCliTargets } from "./cmd-cli-targets.js";
 import { getCurrentVersion, checkForUpdate, printUpdateBanner } from "../utils/self-update.js";
 import { recordApplicationStart, shutdownTelemetryWithin } from "../telemetry/facade.js";
 import { isTelemetryTracingActive } from "../telemetry/runtime.js";
+import { describeExpectedCliError } from "./cli-errors.js";
 
 const program = new Command();
 
@@ -81,7 +82,17 @@ program.hook("preAction", () => { recordApplicationStart(); });
 // that call process.exit() early simply lose their in-flight telemetry. A
 // `start` that is serving requests keeps its runtime: startServer() resolves
 // once it is listening, and its signal handler owns telemetry shutdown.
-void program.parseAsync().finally(() => {
-  if (isTelemetryTracingActive()) return undefined;
-  return shutdownTelemetryWithin(500);
-});
+void program.parseAsync()
+  // A missing `claude` binary, a sign-in the operator closed, a mistyped
+  // provider or Ctrl+C at a prompt is news, not a crash: one line, no stack.
+  // Anything else is rethrown untouched so a real bug still surfaces in full.
+  .catch((error: unknown) => {
+    const expected = describeExpectedCliError(error);
+    if (!expected) throw error;
+    console.error(expected.message);
+    process.exitCode = expected.exitCode;
+  })
+  .finally(() => {
+    if (isTelemetryTracingActive()) return undefined;
+    return shutdownTelemetryWithin(500);
+  });

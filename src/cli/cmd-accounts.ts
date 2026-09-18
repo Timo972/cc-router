@@ -17,6 +17,7 @@ import type { OpenAISubscriptionAccount } from "../providers/openai/token-refres
 import type { ReauthTarget } from "./account-flows.js";
 import { sanitizeAccountInfo, formatAccountInfo, type AccountInfo } from "../providers/account-info.js";
 import { needsReauthentication } from "../providers/auth-state.js";
+import { CliUsageError } from "./cli-errors.js";
 
 export function registerAccounts(program: Command): void {
   const accounts = program
@@ -434,7 +435,7 @@ export type ProviderArg = "claude" | "openai" | "grok";
 export function parseProviderArg(value: string | undefined): ProviderArg | undefined {
   if (value === undefined) return undefined;
   if (value === "claude" || value === "openai" || value === "grok") return value;
-  throw new Error(`Unknown provider "${value}" — use claude, openai or grok`);
+  throw new CliUsageError(`Unknown provider "${value}" — use claude, openai or grok`);
 }
 
 async function chooseProvider(given: string | undefined): Promise<ProviderArg> {
