@@ -8,6 +8,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.12.4] — 2026-09-18
+
 ### Added
 
 - Accounts whose refresh token the provider rejected permanently are now
@@ -833,6 +837,7 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
+[0.12.4]: https://github.com/Timo972/cc-router/releases/tag/v0.12.4
 [0.12.3]: https://github.com/Timo972/cc-router/releases/tag/v0.12.3
 [0.12.2]: https://github.com/Timo972/cc-router/releases/tag/v0.12.2
 [0.12.1]: https://github.com/Timo972/cc-router/releases/tag/v0.12.1
