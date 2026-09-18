@@ -94,6 +94,28 @@ describe("createAccountRefreshRunner", () => {
     expect(h.refreshAnthropicUsage).toHaveBeenCalledTimes(1);
   });
 
+  it("reports a joined pass exactly once, not once per caller", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const onComplete = vi.fn();
+    const h = hooks({ onComplete, refreshAnthropicUsage: vi.fn(async () => { await gate; return { ok: true }; }) });
+    const run = createAccountRefreshRunner(h);
+    const first = run("a"); const second = run("a"); const third = run("a");
+    release();
+    await Promise.all([first, second, third]);
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(onComplete).toHaveBeenCalledWith({ id: "a", tokenRefreshed: null, usageRefreshed: true, durationMs: 0 });
+  });
+
+  it("does not report an unknown id, and survives a throwing reporter", async () => {
+    const onComplete = vi.fn(() => { throw new Error("boom"); });
+    const run = createAccountRefreshRunner(hooks({ onComplete }));
+    await expect(run("nope")).resolves.toBeNull();
+    expect(onComplete).not.toHaveBeenCalled();
+    await expect(run("a")).resolves.toMatchObject({ usageRefreshed: true });
+    expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
   it("starts a fresh pass once the previous one settled", async () => {
     const h = hooks();
     const run = createAccountRefreshRunner(h);

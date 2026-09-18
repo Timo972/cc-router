@@ -1002,6 +1002,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     refreshOpenAIToken: account => refreshAndPersistOpenAIAccount(account, openAIAccounts, persistOpenAIAccounts),
     refreshOpenAIUsage: account => openAIUsageRefresher.refreshNow(account),
     refreshIdentity: () => accountInfoCache.refresh(true),
+    // Logged from here, not from the route: concurrent requests for one id
+    // share a single pass, and a per-request write would record it twice.
+    onComplete: result => stats.addLog({
+      ts: Date.now(), accountId: result.id, model: "-", type: "refresh",
+      details: `manual refresh ${result.id} — ${result.usageRefreshed ? "usage fresh" : "usage fetch failed"}${result.tokenRefreshed === false ? ", token refresh failed" : ""}`,
+    }),
   });
   accountsRouter.post("/:id/refresh", async (req, res) => {
     const id = req.params.id;
@@ -1015,10 +1021,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       return;
     }
     if (!result) { res.status(404).json({ error: `Account "${id}" not found` }); return; }
-    stats.addLog({
-      ts: Date.now(), accountId: id, model: "-", type: "refresh",
-      details: `manual refresh ${id} — ${result.usageRefreshed ? "usage fresh" : "usage fetch failed"}${result.tokenRefreshed === false ? ", token refresh failed" : ""}`,
-    });
     res.json({ refresh: result });
   });
 
