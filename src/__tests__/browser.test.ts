@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { browserCommandFor, openInBrowser } from "../utils/browser.js";
 
@@ -9,22 +10,40 @@ describe("browserCommandFor", () => {
   });
 });
 
+/** A fake child: emits `event` on the next tick and never exits. */
+function fakeSpawn(event: "spawn" | "error") {
+  const calls: Array<{ command: string; args: string[]; options: unknown }> = [];
+  const spawn = vi.fn((command: string, args: string[], options: unknown) => {
+    calls.push({ command, args, options });
+    const child = Object.assign(new EventEmitter(), { unref: vi.fn() });
+    setImmediate(() => child.emit(event, event === "error" ? new Error("ENOENT") : undefined));
+    return child;
+  }) as never;
+  return { spawn, calls };
+}
+
 describe("openInBrowser", () => {
-  it("resolves true when the opener exits cleanly", async () => {
-    const execFile = vi.fn((_c: string, _a: string[], cb: (err: Error | null) => void) => cb(null)) as never;
-    await expect(openInBrowser("https://x", { execFile, platform: "linux", env: {} })).resolves.toBe(true);
+  it("resolves true once the opener has launched, without waiting for it to exit", async () => {
+    const { spawn, calls } = fakeSpawn("spawn");
+    await expect(openInBrowser("https://x", { spawn, platform: "linux", env: {} })).resolves.toBe(true);
+    expect(calls[0]).toMatchObject({ command: "xdg-open", args: ["https://x"], options: { detached: true, stdio: "ignore" } });
   });
 
-  it("resolves false instead of throwing when the opener fails", async () => {
-    const execFile = vi.fn((_c: string, _a: string[], cb: (err: Error | null) => void) => cb(new Error("ENOENT"))) as never;
-    await expect(openInBrowser("https://x", { execFile, platform: "linux", env: {} })).resolves.toBe(false);
+  it("resolves false instead of throwing when the opener cannot be spawned", async () => {
+    const { spawn } = fakeSpawn("error");
+    await expect(openInBrowser("https://x", { spawn, platform: "linux", env: {} })).resolves.toBe(false);
+  });
+
+  it("resolves false when spawn itself throws", async () => {
+    const spawn = vi.fn(() => { throw new Error("boom"); }) as never;
+    await expect(openInBrowser("https://x", { spawn, platform: "darwin", env: {} })).resolves.toBe(false);
   });
 
   it("does nothing when CC_ROUTER_NO_BROWSER=1", async () => {
-    const execFile = vi.fn() as never;
+    const spawn = vi.fn() as never;
     await expect(
-      openInBrowser("https://x", { execFile, platform: "darwin", env: { CC_ROUTER_NO_BROWSER: "1" } }),
+      openInBrowser("https://x", { spawn, platform: "darwin", env: { CC_ROUTER_NO_BROWSER: "1" } }),
     ).resolves.toBe(false);
-    expect(execFile).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
   });
 });

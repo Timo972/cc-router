@@ -96,7 +96,11 @@ export function writeAnthropicAccountsPreservingOtherProviders(
 export function upsertAccountRecord(record: AccountRecord): void {
   ensureConfigDir();
   const existing = readAccountsRaw() as AccountRecord[];
-  const sameAccount = (a: AccountRecord) => a.id === record.id && a.provider === record.provider;
+  // Compare normalised providers: a Claude record written before provider
+  // tags existed has none, and a strict comparison appended a tagged
+  // duplicate next to it instead of replacing it.
+  const sameAccount = (a: AccountRecord) =>
+    a.id === record.id && normalizeAccountProvider(a) === normalizeAccountProvider(record);
   const previous = existing.find(sameAccount);
   const next = [
     ...existing.filter(a => !sameAccount(a)),

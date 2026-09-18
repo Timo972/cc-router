@@ -285,6 +285,25 @@ describe("upsertAccountRecord settings", () => {
     });
   });
 
+  it("replaces a legacy untagged Claude record when the new record is tagged anthropic", () => {
+    writeAccountsAtomic([{ ...sampleRecord, enabled: false, sessionLimitPercent: 40 }]);
+
+    upsertAccountRecord({
+      id: "max-account-1",
+      provider: "anthropic_subscription",
+      accessToken: "sk-ant-oat01-fresh",
+      refreshToken: "sk-ant-ort01-fresh",
+      expiresAt: 1999999999000,
+      scopes: ["user:inference", "user:profile"],
+    });
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]).toMatchObject({
+      id: "max-account-1", accessToken: "sk-ant-oat01-fresh", enabled: false, sessionLimitPercent: 40,
+    });
+  });
+
   it("lets an explicit setting on the new record win", () => {
     writeAccountsAtomic([{ ...sampleRecord, enabled: false, sessionLimitPercent: 40 }]);
 
