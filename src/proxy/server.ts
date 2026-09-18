@@ -33,6 +33,7 @@ import { loadGrokHealthSnapshots, type GrokAccountSnapshot } from "../providers/
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
+import { validateAccountPostBody } from "./account-post-validation.js";
 import { AccountRenameConflictError, renameAccountTransaction } from "./account-rename.js";
 import {
   hasPendingCredentialWrite,
@@ -141,6 +142,10 @@ export interface HealthAccountView {
    *  what separates "needs the operator to re-authenticate" from an ordinary
    *  expired access token that the next refresh tick will replace. */
   authExpired?: boolean;
+  /** True for an Anthropic account whose credential has no refresh token (a
+   *  `claude setup-token` credential). It can never be refreshed, so when it
+   *  expires the only recovery is re-authentication. */
+  tokenOnly?: true;
   /** Safe runtime-only OAuth routing state; no provider response details or
    * credentials are exposed through health. */
   authState?: "ok" | "quarantined";
@@ -370,6 +375,7 @@ function publicAnthropicAccountView(
     // of `authState === "quarantined"`.
     healthy: a.enabled !== false && a.healthy && a.authExpired !== true,
     ...(a.authExpired ? { authExpired: true as const } : {}),
+    ...(a.tokens.refreshToken ? {} : { tokenOnly: true as const }),
     busy: a.busy || metrics.coolingDown,
     cooldownUntilMs: metrics.cooldownUntilMs ?? 0,
     globalCooldownUntilMs: metrics.globalCooldownUntilMs ?? 0,
@@ -1222,24 +1228,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   });
 
   accountsRouter.post("/", async (req, res) => {
-    const body = (req.body ?? {}) as Partial<AccountRecord>;
     // Opt-in upsert. Re-authenticating an existing id is the only recovery for
     // a terminally rejected refresh token, and refusing it here discarded the
     // OAuth login the operator had just completed. It stays opt-in so an
     // accidental id collision from any other API client still gets its 409.
-    const wantsReplace = (req.body as { replace?: unknown } | undefined)?.replace === true;
-    const required: (keyof AccountRecord)[] = ["id", "accessToken", "refreshToken", "expiresAt"];
-    for (const k of required) {
-      if (body[k] === undefined || body[k] === null || body[k] === "") {
-        res.status(400).json({ error: `Missing required field: ${k}` });
-        return;
-      }
-    }
-    if (typeof body.id !== "string" || typeof body.accessToken !== "string" ||
-        typeof body.refreshToken !== "string" || typeof body.expiresAt !== "number") {
-      res.status(400).json({ error: "Invalid field types on account record" });
-      return;
-    }
+    const validated = validateAccountPostBody(req.body);
+    if (!validated.ok) { res.status(validated.status).json({ error: validated.error }); return; }
+    const { replace: wantsReplace, ...body } = validated.body;
     // Same cap validation the PATCH endpoint applies, so the two writers of
     // these fields agree instead of POST silently clamping a bad value to 100.
     const capValidation = validateAccountPatchBody({
@@ -1271,7 +1266,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             record: {
               id: body.id,
               accessToken: body.accessToken,
-              refreshToken: body.refreshToken,
+              refreshToken: body.refreshToken!,
               expiresAt: body.expiresAt,
               enabled: body.enabled,
               sessionLimitPercent: body.sessionLimitPercent,
@@ -1360,7 +1355,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           record: {
             id: body.id,
             accessToken: body.accessToken,
-            refreshToken: body.refreshToken,
+            refreshToken: body.refreshToken!,
             expiresAt: body.expiresAt,
             enabled: body.enabled,
             sessionLimitPercent: body.sessionLimitPercent,
