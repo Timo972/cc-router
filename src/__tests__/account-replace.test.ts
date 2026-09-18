@@ -160,6 +160,42 @@ describe("replaceAnthropicAccountTransaction", () => {
     expect(pool.getStats()[0].coolingDown).toBe(false);
   });
 
+  it("keeps the previous account's enabled state and caps when the record omits them", async () => {
+    const { pool, dead } = deadPool("max-a");
+    dead.enabled = false;
+    dead.sessionLimitPercent = 40;
+    dead.weeklyLimitPercent = 60;
+    const { enabled: _enabled, ...credentialsOnly } = anthropicRecord("max-a", "fresh");
+
+    const added = await replaceAnthropicAccountTransaction({
+      record: credentialsOnly,
+      pool,
+      sessionRouter: noopRouter,
+      persist: vi.fn(),
+    });
+
+    expect(added.enabled).toBe(false);
+    expect(added.sessionLimitPercent).toBe(40);
+    expect(added.weeklyLimitPercent).toBe(60);
+  });
+
+  it("lets an explicit setting on the record override the previous account", async () => {
+    const { pool, dead } = deadPool("max-a");
+    dead.enabled = false;
+    dead.sessionLimitPercent = 40;
+
+    const added = await replaceAnthropicAccountTransaction({
+      record: { ...anthropicRecord("max-a", "fresh"), enabled: true, sessionLimitPercent: 80 },
+      pool,
+      sessionRouter: noopRouter,
+      persist: vi.fn(),
+    });
+
+    expect(added.enabled).toBe(true);
+    expect(added.sessionLimitPercent).toBe(80);
+    expect(added.weeklyLimitPercent).toBe(100);
+  });
+
   it("rejects when the account is not in the pool", async () => {
     const { pool } = deadPool("max-g");
 
@@ -221,6 +257,25 @@ describe("replaceOpenAIAccountTransaction", () => {
 
     expect(accounts).toEqual([first, added, last]);
     expect(added.refreshToken).toBe("refresh-fresh");
+  });
+
+  it("keeps the previous account's enabled state and caps when the record omits them", () => {
+    const dead = createOpenAIAccount({
+      id: "openai-b", provider: "openai_subscription",
+      accessToken: "access-dead", refreshToken: "refresh-dead", expiresAt: Date.now() + 60_000,
+      enabled: false, sessionLimitPercent: 40, weeklyLimitPercent: 60,
+    });
+    const accounts = [dead];
+
+    const added = replaceOpenAIAccountTransaction({
+      record: { id: "openai-b", accessToken: "access-fresh", refreshToken: "refresh-fresh", expiresAt: Date.now() + 60_000 },
+      accounts,
+      persist: vi.fn(),
+    });
+
+    expect(added.enabled).toBe(false);
+    expect(added.sessionLimitPercent).toBe(40);
+    expect(added.weeklyLimitPercent).toBe(60);
   });
 
   it("clears a persisted terminal rejection", () => {

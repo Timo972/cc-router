@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFil
 import { randomBytes } from "crypto";
 import { CONFIG_DIR, ACCOUNTS_PATH, CONFIG_PATH } from "./paths.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
-import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "../proxy/types.js";
+import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent, withInheritedSettings } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 
@@ -96,9 +96,12 @@ export function writeAnthropicAccountsPreservingOtherProviders(
 export function upsertAccountRecord(record: AccountRecord): void {
   ensureConfigDir();
   const existing = readAccountsRaw() as AccountRecord[];
+  const sameAccount = (a: AccountRecord) => a.id === record.id && a.provider === record.provider;
+  const previous = existing.find(sameAccount);
   const next = [
-    ...existing.filter(a => !(a.id === record.id && a.provider === record.provider)),
-    record,
+    ...existing.filter(a => !sameAccount(a)),
+    // A re-authentication replaces credentials, not the operator's settings.
+    previous ? withInheritedSettings(record, previous) : record,
   ];
   writeAccountsAtomicToPath(ACCOUNTS_PATH, next);
 }

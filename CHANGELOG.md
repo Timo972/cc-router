@@ -36,6 +36,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dashboard's `R` uses it when an account is selected and reloads the whole
   pool otherwise.
 
+### Fixed
+
+- Re-authenticating an account replaces its credentials only. Previously the
+  replacement was built from the freshly collected record, so a disabled
+  account came back enabled and custom session/weekly caps reset to 100 —
+  both on the live pool and in `accounts.json`.
+
 ---
 
 ## [0.12.4] — 2026-09-18

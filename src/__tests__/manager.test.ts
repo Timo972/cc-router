@@ -267,6 +267,35 @@ describe("upsertAccountRecord", () => {
   });
 });
 
+describe("upsertAccountRecord settings", () => {
+  it("keeps enabled and caps from the existing record when the new record omits them", () => {
+    writeAccountsAtomic([{ ...sampleRecord, enabled: false, sessionLimitPercent: 40, weeklyLimitPercent: 60 }]);
+
+    upsertAccountRecord({
+      id: "max-account-1",
+      accessToken: "sk-ant-oat01-fresh",
+      refreshToken: "sk-ant-ort01-fresh",
+      expiresAt: 1999999999000,
+      scopes: ["user:inference", "user:profile"],
+    });
+
+    const [record] = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(record).toMatchObject({
+      accessToken: "sk-ant-oat01-fresh", enabled: false, sessionLimitPercent: 40, weeklyLimitPercent: 60,
+    });
+  });
+
+  it("lets an explicit setting on the new record win", () => {
+    writeAccountsAtomic([{ ...sampleRecord, enabled: false, sessionLimitPercent: 40 }]);
+
+    upsertAccountRecord({ ...sampleRecord, enabled: true });
+
+    const [record] = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(record.enabled).toBe(true);
+    expect(record.sessionLimitPercent).toBe(40);
+  });
+});
+
 describe("removeAccountRecordById", () => {
   it("removes an OpenAI subscription record while preserving Anthropic accounts", () => {
     writeAccountsAtomic([

@@ -475,7 +475,7 @@ export async function collectReauthRecord(
       accountId: target.id,
       ...(target.email ? { email: target.email } : {}),
     });
-    return { record, attempt };
+    return { record: credentialsOnly(record), attempt };
   }
   const { account, attempt } = await collectClaudeAccount({
     index: 1,
@@ -484,7 +484,18 @@ export async function collectReauthRecord(
     offer: "login",
     ...(options.longLived ? { method: "setup_token" as const } : {}),
   });
-  return account ? { record: accountToRecord(account), attempt } : null;
+  return account ? { record: credentialsOnly(accountToRecord(account)), attempt } : null;
+}
+
+/**
+ * A re-authentication hands over new credentials and nothing else: the
+ * replaced account's enabled state and caps are the operator's, and both the
+ * live replace and the on-disk upsert carry them over when the record omits
+ * them. A freshly collected account would otherwise ship the defaults.
+ */
+function credentialsOnly(record: AccountRecord): AccountRecord {
+  const { enabled: _enabled, sessionLimitPercent: _session, weeklyLimitPercent: _weekly, ...credentials } = record;
+  return credentials;
 }
 
 /** The on-disk form of a collected Claude account. */

@@ -11,6 +11,28 @@ export function isTokenOnly(tokens: { refreshToken?: string }): boolean {
   return !tokens.refreshToken;
 }
 
+export interface AccountUserSettings {
+  enabled?: boolean;
+  sessionLimitPercent?: number;
+  weeklyLimitPercent?: number;
+}
+
+/**
+ * Fill the operator-controlled settings a record omits from the account it
+ * replaces. Re-authentication hands over credentials only; without this a
+ * disabled account came back enabled and custom caps reset to 100.
+ */
+export function withInheritedSettings<T extends AccountUserSettings>(record: T, previous: AccountUserSettings): T {
+  return {
+    ...record,
+    ...(record.enabled === undefined && previous.enabled !== undefined ? { enabled: previous.enabled } : {}),
+    ...(record.sessionLimitPercent === undefined && previous.sessionLimitPercent !== undefined
+      ? { sessionLimitPercent: previous.sessionLimitPercent } : {}),
+    ...(record.weeklyLimitPercent === undefined && previous.weeklyLimitPercent !== undefined
+      ? { weeklyLimitPercent: previous.weeklyLimitPercent } : {}),
+  };
+}
+
 export interface AccountRateLimits {
   status: "allowed" | "rate_limited" | "unknown";
   fiveHourUtil: number;      // 0.0 – 1.0

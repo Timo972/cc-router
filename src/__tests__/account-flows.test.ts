@@ -225,6 +225,15 @@ describe("collectReauthRecord", () => {
     expect(cli.loginWithClaudeCli).toHaveBeenCalledWith({ email: "me@example.com" }, undefined);
   });
 
+  it("returns credentials only, so re-authentication cannot reset enabled or the caps", async () => {
+    prompts.select.mockResolvedValue("cli_login");
+    cli.loginWithClaudeCli.mockResolvedValue({ accessToken: "sk-ant-oat01-c", refreshToken: "sk-ant-ort01-c", expiresAt: 5, scopes: [] });
+    const result = await collectReauthRecord({ id: "max-dead", provider: "anthropic_subscription" });
+    expect(result?.record).not.toHaveProperty("enabled");
+    expect(result?.record).not.toHaveProperty("sessionLimitPercent");
+    expect(result?.record).not.toHaveProperty("weeklyLimitPercent");
+  });
+
   it("longLived pins the setup-token method, so no browser login runs and no refresh token is stored", async () => {
     cli.createLongLivedTokenWithClaudeCli.mockResolvedValue({ accessToken: "sk-ant-oat01-long" });
     prompts.confirm.mockResolvedValue(true);
