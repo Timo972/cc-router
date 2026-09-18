@@ -252,4 +252,17 @@ describe("loginOpenAIWithDeviceCode browser opening", () => {
 
     expect(record.id).toBe("o");
   });
+
+  it("completes the login even when the opener rejects", async () => {
+    const record = await loginOpenAIWithDeviceCode({
+      accountId: "o",
+      fetchImpl: deviceFlowFetch(),
+      openBrowser: async () => {
+        throw new Error("spawn xdg-open ENOENT");
+      },
+      sleep: async () => {},
+    });
+
+    expect(record.id).toBe("o");
+  });
 });

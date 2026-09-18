@@ -113,4 +113,34 @@ describe("xAI device OAuth", () => {
 
     expect(calls).toEqual(["printed", "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"]);
   });
+
+  it("completes the login even when the opener rejects", async () => {
+    const accessToken = jwtWithExp(2_000_000_000);
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          device_code: "dev-1",
+          user_code: "ABCD-1234",
+          verification_uri: "https://accounts.x.ai/oauth2/device",
+          interval: 1,
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ access_token: accessToken, refresh_token: "refresh" }),
+      } as Response);
+
+    const record = await loginXaiWithDeviceCode({
+      accountId: "grok",
+      fetchImpl,
+      sleep: async () => {},
+      openBrowser: async () => {
+        throw new Error("spawn xdg-open ENOENT");
+      },
+    });
+
+    expect(record.id).toBe("grok");
+  });
 });

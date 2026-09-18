@@ -285,8 +285,12 @@ export async function loginOpenAIWithDeviceCode(
   opts.onStageCompleted?.("device_code_request");
   opts.onDeviceCode?.(deviceCode);
   // Best effort, and only after the URL and code have been printed: a failed
-  // open must never abort a sign-in the person can still finish by hand.
-  await (opts.openBrowser ?? openInBrowser)(deviceCode.verificationUrl);
+  // open must never abort a sign-in the person can still finish by hand. The
+  // catch covers an injected opener too, since only the default one promises
+  // not to throw.
+  try {
+    await (opts.openBrowser ?? openInBrowser)(deviceCode.verificationUrl);
+  } catch { /* the URL and code are already on screen */ }
   const tokens = await exchangeOpenAIDeviceCodeForTokens({ ...opts, deviceCode });
   return createOpenAIAccountRecord({
     id: opts.accountId,
