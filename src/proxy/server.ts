@@ -8,7 +8,8 @@ import type { IncomingMessage } from "http";
 import type { Socket } from "net";
 import type { Request, Response } from "express";
 import { EmptyPoolError, NoEligibleAccountError, TokenPool } from "./token-pool.js";
-import { needsRefresh, refreshAccountIfCurrent, refreshAccountsOnce, saveAccounts, startRefreshLoop } from "./token-refresher.js";
+import { expireTokenOnlyAccount, needsRefresh, refreshAccountIfCurrent, refreshAccountsOnce, saveAccounts, startRefreshLoop } from "./token-refresher.js";
+import { createAccountRefreshRunner, type AccountRefreshResult } from "./account-refresh.js";
 import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
 import { createRefreshAllRunner, describeRefreshAll, refreshAllAccounts } from "./pool-refresh.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
@@ -32,11 +33,14 @@ import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
 import { loadGrokHealthSnapshots, type GrokAccountSnapshot } from "../providers/xai/overview.js";
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
+import { isTokenOnly } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
+import { validateAccountPostBody } from "./account-post-validation.js";
 import { AccountRenameConflictError, renameAccountTransaction } from "./account-rename.js";
 import {
   hasPendingCredentialWrite,
   markOpenAICredentialsPersisted,
+  needsOpenAIRefresh,
   prepareOpenAIAccountForRequest,
   refreshOpenAIAccountsOnce,
   refreshAndPersistOpenAIAccount,
@@ -141,6 +145,10 @@ export interface HealthAccountView {
    *  what separates "needs the operator to re-authenticate" from an ordinary
    *  expired access token that the next refresh tick will replace. */
   authExpired?: boolean;
+  /** True for an Anthropic account whose credential has no refresh token (a
+   *  `claude setup-token` credential). It can never be refreshed, so when it
+   *  expires the only recovery is re-authentication. */
+  tokenOnly?: true;
   /** Safe runtime-only OAuth routing state; no provider response details or
    * credentials are exposed through health. */
   authState?: "ok" | "quarantined";
@@ -245,6 +253,7 @@ export interface OperationalStatus {
     accounts: string;
     allowance: string;
     refresh: string;
+    accountRefresh: string;
     messages: string;
     responses: string;
     models: string;
@@ -297,6 +306,7 @@ export function createOperationalStatus(opts: {
       accounts: "/cc-router/accounts",
       allowance: "/cc-router/allowance",
       refresh: "/cc-router/refresh",
+      accountRefresh: "/cc-router/accounts/:id/refresh",
       messages: "/v1/messages",
       responses: "/v1/responses",
       models: "/v1/models",
@@ -370,6 +380,7 @@ function publicAnthropicAccountView(
     // of `authState === "quarantined"`.
     healthy: a.enabled !== false && a.healthy && a.authExpired !== true,
     ...(a.authExpired ? { authExpired: true as const } : {}),
+    ...(a.tokens.refreshToken ? {} : { tokenOnly: true as const }),
     busy: a.busy || metrics.coolingDown,
     cooldownUntilMs: metrics.cooldownUntilMs ?? 0,
     globalCooldownUntilMs: metrics.globalCooldownUntilMs ?? 0,
@@ -747,6 +758,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     ...pool.getAll().map(account => ({
       id: account.id, provider: "anthropic_subscription" as const,
       accessToken: account.tokens.accessToken, expiresAt: account.tokens.expiresAt, enabled: account.enabled,
+      scopes: account.tokens.scopes,
     })),
     ...openAIAccounts.map(account => ({
       id: account.id, provider: "openai_subscription" as const,
@@ -961,6 +973,56 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     captureReset: account => openAIPool.captureUsageReset(account),
     refresh: account => openAIUsageRefresher.refreshAfterCurrent(account),
   }));
+
+  // ─── Per-account refresh (authenticated) ──────────────────────────────────
+  // The whole-pool reload above, narrowed to one row: the operator who just
+  // re-authenticated a single account should not have to pay for every other
+  // account's upstream calls to see the result.
+  const runAccountRefresh = createAccountRefreshRunner({
+    findAnthropic: id => pool.findById(id),
+    findOpenAI: id => openAIAccounts.find(account => account.id === id),
+    // A long-lived `claude setup-token` credential has nothing to POST, so
+    // `needsRefresh` excludes it. Past its expiry it still needs the flip to
+    // `authExpired`, which is what the refresh step below does for it — and
+    // it stays "due" afterwards so every press reports the same unrefreshable
+    // token rather than a first `false` and a silent `null` after that.
+    anthropicTokenDue: account => needsRefresh(account)
+      || (isTokenOnly(account.tokens) && account.tokens.expiresAt <= Date.now()),
+    refreshAnthropicToken: async account => {
+      if (isTokenOnly(account.tokens)) {
+        // Nothing to refresh — mark it re-auth required once and persist, so
+        // the dashboard sees the same terminal state a restart would derive.
+        if (expireTokenOnlyAccount(account)) persistAnthropicAccounts(pool.getAll());
+        return false;
+      }
+      return refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts });
+    },
+    refreshAnthropicUsage: account => usageRefresher.refreshNow(account),
+    openAITokenDue: account => needsOpenAIRefresh(account),
+    refreshOpenAIToken: account => refreshAndPersistOpenAIAccount(account, openAIAccounts, persistOpenAIAccounts),
+    refreshOpenAIUsage: account => openAIUsageRefresher.refreshNow(account),
+    refreshIdentity: target => accountInfoCache.refreshOne(target),
+    // Logged from here, not from the route: concurrent requests for one id
+    // share a single pass, and a per-request write would record it twice.
+    onComplete: result => stats.addLog({
+      ts: Date.now(), accountId: result.id, model: "-", type: "refresh",
+      details: `manual refresh ${result.id} — ${result.usageRefreshed ? "usage fresh" : "usage fetch failed"}${result.tokenRefreshed === false ? ", token refresh failed" : ""}`,
+    }),
+  });
+  accountsRouter.post("/:id/refresh", async (req, res) => {
+    const id = req.params.id;
+    let result: AccountRefreshResult | null;
+    try {
+      result = await runAccountRefresh(id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError("refresh", 0, `manual refresh of ${id} failed: ${message}`);
+      res.status(500).json({ error: `Refresh failed: ${message}` });
+      return;
+    }
+    if (!result) { res.status(404).json({ error: `Account "${id}" not found` }); return; }
+    res.json({ refresh: result });
+  });
 
   // Shape returned to clients — NEVER includes access/refresh tokens.
   accountsRouter.get("/", (_req, res) => {
@@ -1222,24 +1284,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   });
 
   accountsRouter.post("/", async (req, res) => {
-    const body = (req.body ?? {}) as Partial<AccountRecord>;
     // Opt-in upsert. Re-authenticating an existing id is the only recovery for
     // a terminally rejected refresh token, and refusing it here discarded the
     // OAuth login the operator had just completed. It stays opt-in so an
     // accidental id collision from any other API client still gets its 409.
-    const wantsReplace = (req.body as { replace?: unknown } | undefined)?.replace === true;
-    const required: (keyof AccountRecord)[] = ["id", "accessToken", "refreshToken", "expiresAt"];
-    for (const k of required) {
-      if (body[k] === undefined || body[k] === null || body[k] === "") {
-        res.status(400).json({ error: `Missing required field: ${k}` });
-        return;
-      }
-    }
-    if (typeof body.id !== "string" || typeof body.accessToken !== "string" ||
-        typeof body.refreshToken !== "string" || typeof body.expiresAt !== "number") {
-      res.status(400).json({ error: "Invalid field types on account record" });
-      return;
-    }
+    const validated = validateAccountPostBody(req.body);
+    if (!validated.ok) { res.status(validated.status).json({ error: validated.error }); return; }
+    const { replace: wantsReplace, ...body } = validated.body;
     // Same cap validation the PATCH endpoint applies, so the two writers of
     // these fields agree instead of POST silently clamping a bad value to 100.
     const capValidation = validateAccountPatchBody({
@@ -1271,7 +1322,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             record: {
               id: body.id,
               accessToken: body.accessToken,
-              refreshToken: body.refreshToken,
+              refreshToken: body.refreshToken!,
               expiresAt: body.expiresAt,
               enabled: body.enabled,
               sessionLimitPercent: body.sessionLimitPercent,
@@ -1360,7 +1411,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           record: {
             id: body.id,
             accessToken: body.accessToken,
-            refreshToken: body.refreshToken,
+            refreshToken: body.refreshToken!,
             expiresAt: body.expiresAt,
             enabled: body.enabled,
             sessionLimitPercent: body.sessionLimitPercent,

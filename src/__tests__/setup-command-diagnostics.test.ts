@@ -56,7 +56,8 @@ vi.mock("../utils/claude-config.js", async importOriginal => ({
 const saveAccounts = vi.hoisted(() => vi.fn());
 vi.mock("../proxy/token-refresher.js", () => ({ saveAccounts }));
 
-const { runSetupWizard, setupSingleAccountWithAttempt } = await import("../cli/cmd-setup.js");
+const { runSetupWizard } = await import("../cli/cmd-setup.js");
+const { collectClaudeAccount } = await import("../cli/account-flows.js");
 const prompts = await import("@inquirer/prompts");
 
 const PRIVATE_ACCESS = "sk-ant-oat01-PRIVATE-access";
@@ -136,7 +137,7 @@ describe("anthropic manual-token setup", () => {
     answers.confirms = [true, false]; // default expiry, then decline saving anyway
     stubValidation({ ok: false, status: 401 });
 
-    const { account } = await setupSingleAccountWithAttempt(1);
+    const { account } = await collectClaudeAccount({ index: 1 });
 
     expect(account).toBeNull();
     expect(recorded.stages.map(stage => stage["stage"])).toEqual([
@@ -161,7 +162,7 @@ describe("anthropic manual-token setup", () => {
     answers.confirms = [true, false];
     stubValidation({ ok: false, status: 302 });
 
-    const { account, attempt } = await setupSingleAccountWithAttempt(1);
+    const { account, attempt } = await collectClaudeAccount({ index: 1 });
 
     expect(account).toBeNull();
     expect(recorded.stageFailures).toEqual([expect.objectContaining({
@@ -201,7 +202,7 @@ describe("anthropic manual-token setup", () => {
     answerManualTokenSetup();
     vi.mocked(prompts.input).mockRejectedValueOnce(Object.assign(new Error("aborted"), { name: "ExitPromptError" }));
 
-    await expect(setupSingleAccountWithAttempt(1)).rejects.toThrow("aborted");
+    await expect(collectClaudeAccount({ index: 1 })).rejects.toThrow("aborted");
 
     expect(recorded.stages.map(stage => stage["stage"])).toEqual([
       "attempt_start",
@@ -221,7 +222,7 @@ describe("anthropic manual-token setup", () => {
     answers.inputs = [PRIVATE_ACCOUNT];
     stubValidation({ ok: true, status: 200 });
 
-    const { account, attempt } = await setupSingleAccountWithAttempt(1);
+    const { account, attempt } = await collectClaudeAccount({ index: 1 });
 
     expect(account?.id).toBe(PRIVATE_ACCOUNT);
     expect(attempt.method).toBe("manual_token");

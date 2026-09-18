@@ -1,4 +1,5 @@
 import { createOpenAIAccountRecord, type OpenAIAccountRecord } from "./account-record.js";
+import { openInBrowser } from "../../utils/browser.js";
 import type { SetupStage } from "../../telemetry/contracts.js";
 import {
   SetupDiagnosticError,
@@ -37,6 +38,18 @@ export interface OpenAIDeviceOAuthOptions {
   issuer?: string;
   clientId?: string;
   fetchImpl?: FetchImpl;
+  /** Email of the account being signed in, passed to the device page as `login_hint`. */
+  loginHint?: string;
+}
+
+/**
+ * The device page accepts the code (and the account to sign in as) in the query
+ * string, so the person only has to confirm rather than retype anything.
+ */
+export function buildOpenAIDeviceVerificationUrl(issuer: string, userCode: string, loginHint?: string): string {
+  const params = new URLSearchParams({ user_code: userCode });
+  if (loginHint) params.set("login_hint", loginHint);
+  return `${issuer.replace(/\/+$/, "")}/codex/device?${params.toString()}`;
 }
 
 interface RequestDeviceCodeResponse {
@@ -69,6 +82,8 @@ export interface ExchangeOpenAIDeviceCodeOptions extends OpenAIDeviceOAuthOption
 export interface LoginOpenAIWithDeviceCodeOptions extends OpenAIDeviceOAuthOptions {
   accountId: string;
   onDeviceCode?: (code: OpenAIDeviceCode) => void;
+  /** Injection seam for tests; defaults to the best-effort `openInBrowser`. */
+  openBrowser?: (url: string) => Promise<boolean>;
   sleep?: (ms: number) => Promise<void>;
   timeoutMs?: number;
   now?: () => number;
@@ -170,7 +185,7 @@ export async function requestOpenAIDeviceCode(opts: OpenAIDeviceOAuthOptions = {
   }
 
   return {
-    verificationUrl: `${issuer}/codex/device`,
+    verificationUrl: buildOpenAIDeviceVerificationUrl(issuer, userCode, opts.loginHint),
     userCode,
     deviceAuthId: body.device_auth_id,
     intervalSeconds: Number(body.interval ?? 5),
@@ -269,6 +284,13 @@ export async function loginOpenAIWithDeviceCode(
   const deviceCode = await requestOpenAIDeviceCode(opts);
   opts.onStageCompleted?.("device_code_request");
   opts.onDeviceCode?.(deviceCode);
+  // Best effort, and only after the URL and code have been printed: a failed
+  // open must never abort a sign-in the person can still finish by hand. The
+  // catch covers an injected opener too, since only the default one promises
+  // not to throw.
+  try {
+    await (opts.openBrowser ?? openInBrowser)(deviceCode.verificationUrl);
+  } catch { /* the URL and code are already on screen */ }
   const tokens = await exchangeOpenAIDeviceCodeForTokens({ ...opts, deviceCode });
   return createOpenAIAccountRecord({
     id: opts.accountId,

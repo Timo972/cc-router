@@ -1,4 +1,5 @@
 import type { Account, RefreshResponse } from "./types.js";
+import { isTokenOnly } from "./types.js";
 import { writeAnthropicAccountsPreservingOtherProviders, serialize } from "../config/manager.js";
 import { logRefresh } from "./logger.js";
 import { stats } from "./stats.js";
@@ -70,12 +71,35 @@ export function needsRefresh(account: Account): boolean {
   // A token the server rejected as terminally expired can never succeed; keep
   // it out of the loop so it is not POSTed to the OAuth endpoint forever.
   if (account.authExpired) return false;
+  // A setup-token credential has nothing to POST; expiry is handled by
+  // expireTokenOnlyAccount instead of the refresh loop.
+  if (isTokenOnly(account.tokens)) return false;
   return ownedRefreshLocks.has(account) ||
     pendingDurability.has(account) ||
     (account.tokens.expiresAt - Date.now()) < REFRESH_BUFFER_MS;
 }
 
+/**
+ * A long-lived token cannot be refreshed, so passing its expiry is the same
+ * terminal state as a rejected refresh token: only a new sign-in restores it.
+ * Returns true only on the tick that flips the account, so the caller can
+ * persist and log exactly once.
+ */
+export function expireTokenOnlyAccount(account: Account, now: number = Date.now()): boolean {
+  if (!isTokenOnly(account.tokens) || account.authExpired || account.tokens.expiresAt > now) return false;
+  account.authExpired = true;
+  account.healthy = false;
+  console.error(
+    `  Account ${account.id} needs re-authentication: its long-lived token has expired. Run: cc-router accounts reauth ${account.id}`,
+  );
+  return true;
+}
+
 export async function refreshAccountToken(account: Account): Promise<boolean> {
+  // Nothing to POST: a setup-token credential has no refresh token, so the
+  // OAuth token endpoint must never be contacted for it.
+  if (isTokenOnly(account.tokens)) return false;
+
   // A deletion reservation rejects every new caller, including callers that
   // would otherwise attach themselves to already-running raw refresh work.
   if (isReservedForDeletion(account)) return false;
@@ -196,10 +220,13 @@ export function refreshAccountIfCurrent(
 }
 
 async function _doRefresh(account: Account, span: ActiveTelemetrySpan): Promise<boolean> {
+  const refreshToken = account.tokens.refreshToken;
+  if (!refreshToken) return false;
+
   try {
     const body = new URLSearchParams({
       grant_type: "refresh_token",
-      refresh_token: account.tokens.refreshToken,
+      refresh_token: refreshToken,
       client_id: CLAUDE_CODE_CLIENT_ID,
     });
 
@@ -283,6 +310,10 @@ export async function refreshAccountsOnce(
   };
 
   for (const account of [...accounts]) {
+    if (expireTokenOnlyAccount(account)) {
+      try { options.persist?.(accounts); } catch (error) { (options.onError ?? console.error)(error); }
+      continue;
+    }
     if (!needsRefresh(account)) continue;
     try {
       await refreshAccountIfCurrent(account, ownershipView, {

@@ -85,7 +85,7 @@ describe("accounts list — accounts needing re-authentication", () => {
     // Replacement by id works now, so the hint must not tell the operator to
     // delete first: removing a lone Claude account is refused outright by the
     // running proxy, and deleting is destructive where replacing is not.
-    expect(output).toContain("cc-router accounts add");
+    expect(output).toContain("cc-router accounts reauth max-dead");
     expect(output).not.toContain("accounts remove");
   });
 
@@ -104,7 +104,7 @@ describe("accounts list — accounts needing re-authentication", () => {
     expect(output).toContain("re-auth required");
   });
 
-  it("names the OpenAI sign-in command for a dead OpenAI account, not the Claude one", async () => {
+  it("names the id-addressed re-auth command for a dead OpenAI account", async () => {
     storedOpenAI = [{ id: "team-dead", expiresAt: Date.now() - 60_000, enabled: true }];
     vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
       accounts: [{
@@ -116,13 +116,14 @@ describe("accounts list — accounts needing re-authentication", () => {
 
     const output = await runList();
 
-    // `accounts add` runs the Claude Max flow. Pointing an OpenAI operator at
-    // it would re-add the id under the wrong provider entirely.
-    expect(output).toContain("cc-router accounts login-openai");
-    expect(output).not.toMatch(/cc-router accounts add\b/);
+    // `accounts reauth` looks the provider up from the id, so one hint is
+    // right for every provider — and it cannot re-add the id under the wrong
+    // one, which a bare `accounts add` used to do to an OpenAI operator.
+    expect(output).toContain("cc-router accounts reauth team-dead");
+    expect(output).not.toMatch(/cc-router accounts (add|login)\b/);
   });
 
-  it("names each provider's own command when both need re-auth", async () => {
+  it("names every dead id when more than one needs re-auth", async () => {
     storedAnthropic = [makeStoredAccount("max-dead", true)];
     storedOpenAI = [{ id: "team-dead", expiresAt: Date.now() - 60_000, enabled: true }];
     vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
@@ -141,8 +142,8 @@ describe("accounts list — accounts needing re-authentication", () => {
 
     const output = await runList();
 
-    expect(output).toContain("cc-router accounts add");
-    expect(output).toContain("cc-router accounts login-openai");
+    expect(output).toContain("cc-router accounts reauth max-dead");
+    expect(output).toContain("cc-router accounts reauth team-dead");
   });
 
   it("leaves a merely-stale live account reported as unhealthy, not as needing re-auth", async () => {
@@ -221,6 +222,30 @@ describe("accounts list — accounts needing re-authentication", () => {
       provider: "openai_subscription",
       authExpired: true,
     });
+  });
+
+  it("labels a live token-only account instead of leaving its permanent expiry unexplained", async () => {
+    storedAnthropic = [makeStoredAccount("max-long-lived", false)];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
+      accounts: [{
+        id: "max-long-lived", provider: "anthropic_subscription", healthy: true, busy: false,
+        requestCount: 0, errorCount: 0, expiresInMs: 1_000, tokenOnly: true,
+      }],
+    }));
+
+    expect(await runList()).toContain("token-only");
+  });
+
+  it("prints token-only in place of the scopes for a stored refresh-less account", async () => {
+    const account = makeStoredAccount("max-long-lived", false);
+    delete account.tokens.refreshToken;
+    storedAnthropic = [account];
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const output = await runList();
+
+    expect(output).toContain("token-only");
+    expect(output).not.toContain("scopes:");
   });
 
   it("does not flag a stored account that only has an expired access token", async () => {

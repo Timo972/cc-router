@@ -8,6 +8,41 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### ⚠️ Breaking
+
+- `cc-router accounts add-openai`, `login-openai`, `add-grok` and `login-grok`
+  are gone. Use `accounts login openai`, `accounts add openai`,
+  `accounts login grok` and `accounts add grok`. `accounts add` now takes the
+  provider as its first argument (`accounts add claude` for the old behaviour)
+  and only imports existing credentials; browser sign-in is `accounts login`.
+- The dashboard's `onIntent` callback receives an object (`{ kind: "quit" }`,
+  `{ kind: "addAccount" }`, `{ kind: "reauth", ... }`) instead of a string.
+
+### Added
+
+- `cc-router accounts login claude` drives `claude auth login --claudeai`
+  (with `--email` prefill) and imports the new credentials; `--long-lived`
+  drives `claude setup-token` for a one-year, refresh-less token.
+- `cc-router accounts reauth <id>` re-signs an account in under the same id,
+  looking up its provider and cached email. The dashboard does the same on
+  `l` with an account selected.
+- Device-code sign-ins (OpenAI, Grok) open the verification page in the
+  browser; the OpenAI page receives the code and, on re-auth, the email.
+  `CC_ROUTER_NO_BROWSER=1` keeps the browser closed and prints the URL only.
+- Claude accounts without a refresh token (`claude setup-token`) are
+  accepted, never refreshed, skipped by the usage and identity fetchers, and
+  marked `token-only`; they flip to `re-auth required` when they expire.
+- `POST /cc-router/accounts/:id/refresh` refreshes one account. The
+  dashboard's `R` uses it when an account is selected and reloads the whole
+  pool otherwise.
+
+### Fixed
+
+- Re-authenticating an account replaces its credentials only. Previously the
+  replacement was built from the freshly collected record, so a disabled
+  account came back enabled and custom session/weekly caps reset to 100 —
+  both on the live pool and in `accounts.json`.
+
 ---
 
 ## [0.12.4] — 2026-09-18

@@ -25,6 +25,17 @@ describe("buildStoredAccountsJson", () => {
         scopes: ["user:inference"],
       },
       enabled: true,
+    } as Account, {
+      // `claude setup-token` mints an access token with no refresh token. A
+      // consumer cannot infer that from the metadata otherwise, and the
+      // account is deliberately never refreshed.
+      id: "max-long-lived",
+      tokens: {
+        accessToken: "ant-long-lived",
+        expiresAt: 1999999996000,
+        scopes: ["user:inference"],
+      },
+      enabled: true,
     } as Account];
     const openAI: OpenAISubscriptionAccount[] = [{
       id: "openai-primary",
@@ -48,6 +59,14 @@ describe("buildStoredAccountsJson", () => {
         enabled: true,
         expiresAt: 1999999999000,
         scopes: ["user:inference"],
+      },
+      {
+        id: "max-long-lived",
+        provider: "anthropic_subscription",
+        enabled: true,
+        expiresAt: 1999999996000,
+        scopes: ["user:inference"],
+        tokenOnly: true,
       },
       {
         id: "openai-primary",

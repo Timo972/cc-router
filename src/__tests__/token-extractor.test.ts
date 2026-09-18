@@ -111,6 +111,35 @@ describe("extractFromCredentialsFile", () => {
 
     expect(extractFromCredentialsFile()).toBeNull();
   });
+
+  it("accepts a long-lived token with no refreshToken", () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "sk-ant-oat01-longlived",
+        expiresAt: 1_900_000_000_000,
+        scopes: ["user:inference"],
+      },
+    }));
+
+    const tokens = extractFromCredentialsFile();
+    expect(tokens).toEqual({
+      accessToken: "sk-ant-oat01-longlived",
+      refreshToken: undefined,
+      expiresAt: 1_900_000_000_000,
+      scopes: ["user:inference"],
+    });
+  });
+
+  it("still rejects a missing accessToken even when a refreshToken is present", () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({
+      refreshToken: "sk-ant-ort01-x",
+      expiresAt: 1,
+    }));
+
+    expect(extractFromCredentialsFile()).toBeNull();
+  });
 });
 
 // ─── formatExpiry ──────────────────────────────────────────────────────────────

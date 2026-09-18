@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFil
 import { randomBytes } from "crypto";
 import { CONFIG_DIR, ACCOUNTS_PATH, CONFIG_PATH } from "./paths.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
-import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "../proxy/types.js";
+import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent, withInheritedSettings } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 
@@ -96,9 +96,16 @@ export function writeAnthropicAccountsPreservingOtherProviders(
 export function upsertAccountRecord(record: AccountRecord): void {
   ensureConfigDir();
   const existing = readAccountsRaw() as AccountRecord[];
+  // Compare normalised providers: a Claude record written before provider
+  // tags existed has none, and a strict comparison appended a tagged
+  // duplicate next to it instead of replacing it.
+  const sameAccount = (a: AccountRecord) =>
+    a.id === record.id && normalizeAccountProvider(a) === normalizeAccountProvider(record);
+  const previous = existing.find(sameAccount);
   const next = [
-    ...existing.filter(a => !(a.id === record.id && a.provider === record.provider)),
-    record,
+    ...existing.filter(a => !sameAccount(a)),
+    // A re-authentication replaces credentials, not the operator's settings.
+    previous ? withInheritedSettings(record, previous) : record,
   ];
   writeAccountsAtomicToPath(ACCOUNTS_PATH, next);
 }
@@ -183,7 +190,9 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
       id: a.id,
       provider: "openai_subscription" as const,
       accessToken: a.accessToken,
-      refreshToken: a.refreshToken,
+      // Refresh tokens are optional on the record only for Anthropic
+      // `setup-token` credentials; OpenAI records always carry one.
+      refreshToken: a.refreshToken ?? "",
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
       // Without this the flag is lost on restart and the dead refresh token is
@@ -239,7 +248,8 @@ export function loadXaiAccounts(path?: string): XaiSubscriptionAccount[] {
       id: a.id,
       provider: "xai_subscription" as const,
       accessToken: a.accessToken,
-      refreshToken: a.refreshToken,
+      // See loadOpenAIAccounts: xAI records always carry a refresh token.
+      refreshToken: a.refreshToken ?? "",
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
       ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
@@ -389,7 +399,7 @@ export function generateProxySecret(): string {
 
 // ─── Accounts ─────────────────────────────────────────────────────────────────
 
-function deserialize(records: AccountRecord[]): Account[] {
+export function deserialize(records: AccountRecord[]): Account[] {
   return records.filter(a => a.provider === undefined || a.provider === "anthropic_subscription").map(a => ({
     id: a.id,
     tokens: {
@@ -427,7 +437,7 @@ export function serialize(accounts: Account[]): AccountRecord[] {
     id: a.id,
     provider: "anthropic_subscription",
     accessToken: a.tokens.accessToken,
-    refreshToken: a.tokens.refreshToken,
+    ...(a.tokens.refreshToken ? { refreshToken: a.tokens.refreshToken } : {}),
     expiresAt: a.tokens.expiresAt,
     scopes: a.tokens.scopes,
     enabled: a.enabled,

@@ -16,7 +16,7 @@ Claude Code supports two types of credentials:
 | Token | Lifetime | What happens when it expires |
 |-------|----------|------------------------------|
 | Access token | ~8 hours | Must be refreshed using the refresh token |
-| Refresh token | Weeks/months | Requires full re-login (`claude login`) |
+| Refresh token | Weeks/months | Requires a full re-login (`cc-router accounts reauth <id>`) |
 
 **Critical:** refresh tokens **rotate** on every use. Each time cc-router refreshes an access token, the old refresh token is invalidated and replaced with a new one. If the new refresh token is not saved immediately, you lose access permanently.
 
@@ -60,25 +60,36 @@ Output:
 
 ## Adding multiple accounts
 
-To add a second Claude Max account on macOS:
+To add a second Claude Max account, sign it in from cc-router:
 
 ```bash
-# 1. Log out of your current account
-claude logout
-
-# 2. Log in with the second account
-claude login
-
-# 3. Extract the tokens
-security find-generic-password -s 'Claude Code-credentials' -w
-
-# 4. Paste them when prompted by: cc-router setup --add
-
-# 5. Log back in with your primary account
-claude logout && claude login
+cc-router accounts login claude --id max-2
 ```
 
-On Linux/Windows, the flow is identical — `~/.claude/.credentials.json` will contain the credentials of whichever account is currently logged in.
+cc-router drives the sign-in, reads the resulting credentials out of the
+Keychain (macOS) or `~/.claude/.credentials.json` (Linux/Windows) and stores
+them under the id you gave. Repeat it per account; there is no need to log out
+and back in between them. If you already hold credentials elsewhere — a running
+Claude Code login, or tokens you can paste — `cc-router accounts add claude`
+imports those instead of starting a new sign-in.
+
+## Signing in from cc-router
+
+`cc-router accounts login claude` runs `claude auth login --claudeai` for you and
+imports the result. Claude Code on this machine ends up logged in as the last
+account you signed in; Claude Code routed through cc-router does not use that
+login, so nothing breaks, but `claude` run directly will act as that account.
+
+`cc-router accounts login claude --long-lived` runs `claude setup-token` instead.
+The resulting token is valid for one year, has no refresh token and carries the
+`user:inference` scope only. Such an account routes normally, shows as
+`token-only`, gets no usage snapshot or identity metadata (rate limiting falls
+back to response headers), and needs a new sign-in when it expires — cc-router
+marks it `re-auth required` at that point.
+
+`cc-router accounts reauth <id>` looks up the account's provider and cached
+email and runs the matching sign-in with the email prefilled. In the dashboard,
+select the account and press `l`.
 
 ## Token scopes
 
@@ -120,7 +131,7 @@ These records are not loaded into the Anthropic token pool. They are used by the
 Recommended login:
 
 ```bash
-cc-router accounts login-openai
+cc-router accounts login openai
 ```
 
 This uses the Codex device-code flow documented by OpenAI's Codex app-server auth surface: CC-Router requests a one-time code from `https://auth.openai.com/api/accounts/deviceauth/usercode`, polls for authorization, exchanges the authorization code at `https://auth.openai.com/oauth/token`, and saves the resulting OpenAI subscription tokens.
@@ -128,7 +139,7 @@ This uses the Codex device-code flow documented by OpenAI's Codex app-server aut
 To add one manually for debugging:
 
 ```bash
-cc-router accounts add-openai
+cc-router accounts add openai
 ```
 
 The command validates the record shape and appends or replaces only the matching OpenAI account. Anthropic token refreshes preserve OpenAI records in `accounts.json`.

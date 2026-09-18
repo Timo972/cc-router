@@ -141,13 +141,8 @@ function parseCredentialJson(raw: unknown): OAuthTokens | null {
     const refreshToken = obj["refreshToken"];
     const expiresAt = obj["expiresAt"];
 
-    if (
-      typeof accessToken !== "string" ||
-      typeof refreshToken !== "string" ||
-      !accessToken.startsWith("sk-ant-")
-    ) {
-      return null;
-    }
+    if (typeof accessToken !== "string" || !accessToken.startsWith("sk-ant-")) return null;
+    if (refreshToken !== undefined && typeof refreshToken !== "string") return null;
 
     const scopes = Array.isArray(obj["scopes"])
       ? (obj["scopes"] as string[])
@@ -163,7 +158,12 @@ function parseCredentialJson(raw: unknown): OAuthTokens | null {
       expiresAtMs = Date.now() + 8 * 60 * 60 * 1000;
     }
 
-    return { accessToken, refreshToken, expiresAt: expiresAtMs, scopes };
+    return {
+      accessToken,
+      refreshToken: typeof refreshToken === "string" ? refreshToken : undefined,
+      expiresAt: expiresAtMs,
+      scopes,
+    };
   } catch {
     return null;
   }

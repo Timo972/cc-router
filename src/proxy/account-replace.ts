@@ -1,5 +1,5 @@
 import type { TokenPool } from "./token-pool.js";
-import type { Account, AccountRecord } from "./types.js";
+import { withInheritedSettings, type Account, type AccountRecord } from "./types.js";
 import { reserveAccountForDeletion } from "./token-refresher.js";
 import { createOpenAIAccount, type OpenAIAccount } from "../providers/openai/account-state.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
@@ -69,7 +69,9 @@ export async function replaceAnthropicAccountTransaction(
     // old incarnation's in-flight count and cooldowns (the replacement must
     // not inherit a bench it never earned) and hands back a rollback that
     // restores every bit of it if the write below fails.
-    const { added, rollback } = options.pool.replaceAccount(options.record);
+    // Credentials come from the sign-in; enabled and the caps stay the
+    // operator's unless the record sets them explicitly.
+    const { added, rollback } = options.pool.replaceAccount(withInheritedSettings(options.record, previous));
     try {
       options.persist(options.pool.getAll());
     } catch (error) {
@@ -118,20 +120,17 @@ export function replaceOpenAIAccountTransaction(
   const index = options.accounts.findIndex(candidate => candidate.id === options.record.id);
   if (index < 0) throw new Error(`Account "${options.record.id}" not found`);
   const previous = options.accounts[index]!;
+  const record = withInheritedSettings(options.record, previous);
 
   const account = createOpenAIAccount({
-    id: options.record.id,
+    id: record.id,
     provider: "openai_subscription",
-    accessToken: options.record.accessToken,
-    refreshToken: options.record.refreshToken,
-    expiresAt: options.record.expiresAt,
-    enabled: options.record.enabled !== false,
-    ...(options.record.sessionLimitPercent !== undefined
-      ? { sessionLimitPercent: options.record.sessionLimitPercent }
-      : {}),
-    ...(options.record.weeklyLimitPercent !== undefined
-      ? { weeklyLimitPercent: options.record.weeklyLimitPercent }
-      : {}),
+    accessToken: record.accessToken,
+    refreshToken: record.refreshToken,
+    expiresAt: record.expiresAt,
+    enabled: record.enabled !== false,
+    ...(record.sessionLimitPercent !== undefined ? { sessionLimitPercent: record.sessionLimitPercent } : {}),
+    ...(record.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: record.weeklyLimitPercent } : {}),
   });
 
   // Splice in place so the replacement keeps the old account's position; the

@@ -94,6 +94,16 @@ describe("createHealthAccountViews", () => {
     expect(views[1].rateLimits).toBeUndefined();
   });
 
+  it("flags an Anthropic account with no refresh token as token-only", () => {
+    const tokenOnly = makeAnthropicAccount();
+    delete tokenOnly.tokens.refreshToken;
+
+    const views = createHealthAccountViews([tokenOnly], []);
+
+    expect(views[0]!.tokenOnly).toBe(true);
+    expect(createHealthAccountViews([makeAnthropicAccount()], [])[0]!.tokenOnly).toBeUndefined();
+  });
+
   it("includes safe routing counters without exposing session identifiers", () => {
     const openAIAccount: OpenAISubscriptionAccount = {
       id: "openai-primary",
@@ -455,6 +465,7 @@ describe("createOperationalStatus", () => {
         accounts: "/cc-router/accounts",
         allowance: "/cc-router/allowance",
         refresh: "/cc-router/refresh",
+        accountRefresh: "/cc-router/accounts/:id/refresh",
         messages: "/v1/messages",
         responses: "/v1/responses",
         models: "/v1/models",

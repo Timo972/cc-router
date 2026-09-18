@@ -111,6 +111,8 @@ interface AccountStat {
   modelCooldowns?: Array<{ modelFamily: string; untilMs: number }>;
   codexRateLimits?: CodexRateLimitsView;
   credentialsPendingWrite?: boolean;
+  /** No refresh token on disk — the session ends when this token expires. */
+  tokenOnly?: boolean;
   xai?: { tier?: number; subscriptionTier?: string; hasCodeAccess?: boolean };
 }
 
@@ -750,13 +752,19 @@ type Mode = "view" | "editSession" | "editWeekly" | "confirmDelete" | "confirmRe
 
 // ─── Dashboard component ──────────────────────────────────────────────────────
 
+/** What the dashboard wants the outer shell to do once Ink has unmounted. */
+export type DashboardIntent =
+  | { kind: "quit" }
+  | { kind: "addAccount" }
+  | { kind: "reauth"; id: string; provider: "anthropic_subscription" | "openai_subscription"; email?: string };
+
 export interface DashboardProps {
   port: number;
   baseUrl?: string;
   authToken?: string;
   /** Callback fired when the dashboard wants the outer shell to perform an
    *  action that can't run while Ink is rendering (e.g. OAuth flow). */
-  onIntent?: (intent: "quit" | "addAccount") => void;
+  onIntent?: (intent: DashboardIntent) => void;
 }
 
 export function Dashboard({ port, baseUrl, authToken, onIntent }: DashboardProps) {
@@ -902,7 +910,7 @@ function LiveDashboard({
   data, port, baseUrl, lastUpdate, api, modelsApi, onIntent, onRefreshAll, resetSession,
 }: {
   data: HealthData; port: number; baseUrl: string; lastUpdate: number;
-  api: AccountsApi; modelsApi: ModelsApi; onIntent?: (intent: "quit" | "addAccount") => void;
+  api: AccountsApi; modelsApi: ModelsApi; onIntent?: (intent: DashboardIntent) => void;
   /** Re-read dashboard-side state (Grok snapshots, health) after a server reload. */
   onRefreshAll?: () => Promise<void>;
   resetSession: ResetSession;
@@ -1071,6 +1079,12 @@ function LiveDashboard({
     ? Math.max(0, orderedAccounts.findIndex(a => a.id === selectedAccountId))
     : 0;
   const selectedAccount = orderedAccounts[selectedAccountIndex] ?? null;
+  // Identity for the selected row: health never carries it, so it comes from
+  // the authenticated /cc-router/accounts poll above. The detail line and the
+  // re-auth intent must agree on which email they mean, so both read this.
+  const selectedAccountInfo = selectedAccount
+    ? accountInfo[`${selectedAccount.provider ?? "anthropic_subscription"}:${selectedAccount.id}`]
+    : undefined;
 
   // Same follow-scroll for the accounts window: when the fitting controller
   // shrinks the list below the fleet size, the selected account must stay on
@@ -1239,6 +1253,40 @@ function LiveDashboard({
     }
   }, [api, modelsApi, modelsStatus, onRefreshAll, refreshCliRouting, showBanner]);
 
+  // ── Reload one account ───────────────────────────────────────────────────
+  // R with ACCOUNTS focused narrows the whole-pool reload to the selection, so
+  // a single stale account can be refreshed without paying for every provider.
+  // Its own in-flight guard: the pool reload and this one are separate calls.
+  const refreshOneInFlightRef = useRef(false);
+  const doRefreshSelected = useCallback(async () => {
+    if (!selectedAccount) return;
+    if (refreshOneInFlightRef.current) { showBanner("Refresh already running…", "gray"); return; }
+    refreshOneInFlightRef.current = true;
+    showBanner(`Refreshing ${selectedAccount.id}…`, "cyan", REFRESH_ALL_BANNER_MS);
+    try {
+      // Grok has no server-side account record to refresh — its snapshot is
+      // read locally from ~/.grok, so re-read that instead of POSTing.
+      if (isXaiAccount(selectedAccount)) {
+        await onRefreshAll?.();
+        showBanner(`Refreshed ${selectedAccount.id}`, "green");
+        return;
+      }
+      const result = await api.refreshAccount(selectedAccount.id);
+      const problems = [
+        result.usageRefreshed ? "" : "usage fetch failed",
+        result.tokenRefreshed === false ? "token refresh failed" : "",
+      ].filter(Boolean);
+      showBanner(
+        `Refreshed ${result.id} — ${problems.length ? problems.join(", ") : "usage fresh"}`,
+        problems.length ? "yellow" : "green",
+      );
+    } catch (err) {
+      showBanner(`Refresh error: ${errMsg(err)}`, "red");
+    } finally {
+      refreshOneInFlightRef.current = false;
+    }
+  }, [api, onRefreshAll, selectedAccount, showBanner]);
+
   const doToggleCli = useCallback((target: "claude" | "codex") => {
     const current = target === "claude" ? cliRouting.claude.enabled : cliRouting.codex.enabled;
     const result = target === "claude"
@@ -1364,10 +1412,10 @@ function LiveDashboard({
     // ── Normal view mode ────────────────────────────────────────────────
     // Always call exit() so Ink fully unmounts and releases stdin.
     // The outer dashboardLoop reads `pendingIntent` after waitUntilExit().
-    if (input === "q") { onIntent?.("quit"); exit(); return; }
+    if (input === "q") { onIntent?.({ kind: "quit" }); exit(); return; }
     if (key.escape) {
       if (focus === "accounts" || focus === "models") { setFocus("logs"); return; }
-      onIntent?.("quit"); exit();
+      onIntent?.({ kind: "quit" }); exit();
       return;
     }
 
@@ -1387,7 +1435,11 @@ function LiveDashboard({
       return;
     }
 
-    if (input === "R") { void doRefreshAll(); return; }
+    if (input === "R") {
+      if (focus === "accounts" && selectedAccount) void doRefreshSelected();
+      else void doRefreshAll();
+      return;
+    }
 
     if (key.tab) {
       // Compact view hides the activity list, so skip "logs" in the cycle.
@@ -1453,6 +1505,25 @@ function LiveDashboard({
         }
         setMode("confirmDelete"); return;
       }
+      // l = re-authenticate the selection. Like `n`, the sign-in flow runs in
+      // the outer loop after Ink unmounts, so without a handler this is a no-op.
+      if (input === "l") {
+        if (!selectedAccount) return;
+        if (isXaiAccount(selectedAccount)) {
+          showBanner("Grok credentials live in ~/.grok — run grok login, then cc-router accounts add grok", "yellow");
+          return;
+        }
+        if (!onIntent) return;
+        const provider = selectedAccount.provider === "openai_subscription" ? "openai_subscription" : "anthropic_subscription";
+        onIntent({
+          kind: "reauth",
+          id: selectedAccount.id,
+          provider,
+          ...(selectedAccountInfo?.email ? { email: selectedAccountInfo.email } : {}),
+        });
+        exit();
+        return;
+      }
     }
 
     if (focus === "models") {
@@ -1493,7 +1564,7 @@ function LiveDashboard({
     // Requires an onIntent handler because the outer loop runs the OAuth
     // flow after Ink unmounts; if none is wired, this key is a no-op.
     if (input === "n") {
-      if (onIntent) { onIntent("addAccount"); exit(); }
+      if (onIntent) { onIntent({ kind: "addAccount" }); exit(); }
       return;
     }
   });
@@ -1642,7 +1713,7 @@ function LiveDashboard({
         </Box>
         {focus === "accounts" && selectedAccount && (
           <Text color="gray" wrap="truncate-end">
-            {"  "}{formatAccountInfo(accountInfo[`${selectedAccount.provider ?? "anthropic_subscription"}:${selectedAccount.id}`])}
+            {"  "}{[selectedAccount.tokenOnly ? "token-only" : "", formatAccountInfo(selectedAccountInfo)].filter(Boolean).join(" · ")}
           </Text>
         )}
       </Box>
@@ -1716,7 +1787,7 @@ function LiveDashboard({
       <Box marginTop={1}>
         <Text color="gray">
           {focus === "accounts"
-            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [d] delete  [w] 7d  [s] 5h  [Ctrl+R] reset  [R] reload  [z] compact  [q]"
+            ? " [Tab]  [e] toggle  [a]/[o]/[g] provider  [n] add  [l] re-auth  [d] delete  [w] 7d  [s] 5h  [Ctrl+R] reset  [R] reload  [z] compact  [q]"
             : focus === "models"
               ? " [Tab]  [m/r] refresh  [c]/[o] default  [R] reload all  [Esc] logs  [z] compact  [q]"
               : " [Tab]  [m] models  [R] reload  [z] compact  [q] quit"}
