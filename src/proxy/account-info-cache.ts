@@ -14,6 +14,10 @@ const unavailable = (): AccountInfo => ({ accountType: "unknown", fetchStatus: "
 export class AccountInfoCache {
   private entries = new Map<string, Entry>();
   private inFlight?: Promise<void>;
+  /** One upstream request per account at a time: a dashboard `refreshOne`
+   *  landing while the scheduled pass is on the same account joins it, so
+   *  no second request is sent and no older response can land last. */
+  private fetching = new Map<string, Promise<void>>();
   private pendingForced?: Promise<void>;
   private controller = new AbortController();
   private timer?: ReturnType<typeof setInterval>;
@@ -115,7 +119,17 @@ export class AccountInfoCache {
       && (account.provider !== "anthropic_subscription" || canReadProfile(account.scopes));
   }
 
-  private async fetchOne(account: AccountInfoSource): Promise<void> {
+  private fetchOne(account: AccountInfoSource): Promise<void> {
+    const id = key(account);
+    const active = this.fetching.get(id);
+    if (active) return active;
+    const operation = this.fetchOneUnguarded(account)
+      .finally(() => { if (this.fetching.get(id) === operation) this.fetching.delete(id); });
+    this.fetching.set(id, operation);
+    return operation;
+  }
+
+  private async fetchOneUnguarded(account: AccountInfoSource): Promise<void> {
     // Re-check presence/credentials before network I/O after time spent queued.
     const current = this.accounts().find(row => key(row) === key(account));
     if (!current || current.enabled === false || current.expiresAt <= this.now() || fingerprint(current) !== fingerprint(account)) return;

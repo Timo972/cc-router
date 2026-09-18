@@ -40,6 +40,27 @@ describe("AccountInfoCache.refreshOne", () => {
     cache.stop();
   });
 
+  it("joins an in-flight fetch for the same account instead of issuing a second request", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const fetchInfo = vi.fn(async () => {
+      await gate;
+      return { accountType: "personal" as const, email: "a@example.com", fetchStatus: "fresh" as const, fetchedAt: 1 };
+    });
+    const cache = new AccountInfoCache(sources, { now: () => 1, fetchInfo });
+
+    const pass = cache.refresh(true);
+    await new Promise(resolve => setImmediate(resolve));
+    const one = cache.refreshOne({ id: "a", provider: "anthropic_subscription" });
+    const again = cache.refreshOne({ id: "a", provider: "anthropic_subscription" });
+    release();
+    await Promise.all([pass, one, again]);
+
+    expect(fetchInfo.mock.calls.filter(([source]) => source.id === "a")).toHaveLength(1);
+    expect(cache.get(sources()[0]!)).toMatchObject({ email: "a@example.com", fetchStatus: "fresh" });
+    cache.stop();
+  });
+
   it("ignores an unknown account and an inference-only Claude token", async () => {
     const fetchInfo = vi.fn(async () => ({ accountType: "personal" as const, fetchStatus: "fresh" as const, fetchedAt: 1 }));
     const cache = new AccountInfoCache(() => [
