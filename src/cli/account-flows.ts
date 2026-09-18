@@ -435,7 +435,7 @@ export async function importGrokAccount(options: { accountId?: string } = {}): P
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.log(chalk.red(`\n✗ ${message}\n`));
-    console.log(chalk.gray("  Or sign in here: cc-router accounts login-grok\n"));
+    console.log(chalk.gray("  Or sign in here: cc-router accounts login grok\n"));
     process.exit(1);
   }
 

@@ -36,8 +36,8 @@ Examples:
   $ cc-router models list        # List dynamically discovered provider models
   $ cc-router logs               # View proxy logs (background mode)
   $ cc-router accounts list      # Show Claude, ChatGPT, and Grok accounts
-  $ cc-router accounts add-grok  # Import the Grok CLI login
-  $ cc-router accounts login-grok# Sign in to Grok with device code
+  $ cc-router accounts login     # Sign in to a Claude, OpenAI or Grok account
+  $ cc-router accounts reauth <id>   # Sign an existing account in again, same id
   $ cc-router revert             # Restore Claude Code to normal (remove all proxy config)
   $ cc-router docker up          # Full stack: cc-router + LiteLLM in Docker
   $ cc-router client connect <url>   # Route Claude Code through a remote CC-Router

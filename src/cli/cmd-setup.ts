@@ -102,14 +102,9 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
     }
   }
 
-  if (!addMode && isMacos()) {
-    console.log(chalk.cyan("  Tip: to add multiple accounts, you need to:"));
-    console.log(chalk.gray("  1. Log in to Claude Code with account 1 (already done if you use CC normally)"));
-    console.log(chalk.gray("  2. Extract tokens → log out → log in with account 2 → extract → repeat\n"));
-  }
-
   let numAccounts = 1;
   if (!addMode) {
+    console.log(chalk.gray("  Tip: each account can be signed in directly with the browser method — no logging Claude Code out between them.\n"));
     const { number } = await import("@inquirer/prompts");
     numAccounts = await number({
       message: "How many accounts do you want to configure now?",
@@ -125,15 +120,6 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
   for (let i = 0; i < numAccounts; i++) {
     const label = numAccounts > 1 ? `${i + 1}/${numAccounts}` : "";
     console.log(chalk.bold(`\n${"━".repeat(40)}\n  Account ${label}\n${"━".repeat(40)}\n`));
-
-    if (i > 0 && isMacos()) {
-      console.log(chalk.yellow(
-        `  Before extracting account ${i + 1}:\n` +
-        `  1. Run: ${chalk.white("claude logout")}\n` +
-        `  2. Run: ${chalk.white("claude login")}  (log in with your next Max account)\n`
-      ));
-      await confirm({ message: "Ready?", default: true });
-    }
 
     const existingCount = hasExisting ? loadAccounts().length : 0;
     const { account, attempt } = await collectClaudeAccount({ index: i + 1 + existingCount });
@@ -283,7 +269,7 @@ async function runPostSetupFlow(accountCount: number): Promise<void> {
 function printDone(accountCount: number): void {
   console.log(chalk.bold(`\n${"━".repeat(40)}\n  All done — ${accountCount} account(s) ready\n${"━".repeat(40)}\n`));
   console.log(`  Start the proxy:   ${chalk.cyan("cc-router start")}`);
-  console.log(`  Add more accounts: ${chalk.cyan("cc-router setup --add")}`);
+  console.log(`  Add more accounts: ${chalk.cyan("cc-router accounts login")} or ${chalk.cyan("cc-router setup --add")}`);
   console.log(`  Dashboard:         ${chalk.cyan("cc-router status")}\n`);
 }
 

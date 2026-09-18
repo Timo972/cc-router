@@ -5,7 +5,7 @@ import type { Account } from "../proxy/types.js";
 import { DEFAULT_RATE_LIMITS } from "../proxy/types.js";
 
 /**
- * `accounts add` is the Claude re-authentication path — the one an operator
+ * `accounts add claude` is the Claude import path — the one an operator
  * reaches for after a refresh token is rejected permanently. It has to ask the
  * running proxy to *replace* the existing id, or the proxy answers 409, the
  * CLI throws, and the refresh token the OAuth login just minted is discarded.
@@ -71,7 +71,7 @@ vi.mock("../config/manager.js", async importOriginal => ({
 
 afterEach(() => vi.restoreAllMocks());
 
-describe("accounts add — re-authenticating an existing id", () => {
+describe("accounts add claude — re-authenticating an existing id", () => {
   it("asks the running proxy to replace the account rather than taking a 409", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       Response.json({ account: { id: "max-dead" } }, { status: 200 }),
@@ -80,7 +80,7 @@ describe("accounts add — re-authenticating an existing id", () => {
 
     const program = new Command();
     registerAccounts(program);
-    await program.parseAsync(["accounts", "add"], { from: "user" });
+    await program.parseAsync(["accounts", "add", "claude"], { from: "user" });
 
     const post = fetchMock.mock.calls.find(
       ([url, init]) => String(url).endsWith("/cc-router/accounts") && (init as RequestInit)?.method === "POST",
