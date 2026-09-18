@@ -1,24 +1,23 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { loadAccounts, loadOpenAIAccounts, loadXaiAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById, renameAccountRecordById, readConfig, serialize } from "../config/manager.js";
+import { loadAccounts, loadOpenAIAccounts, loadXaiAccounts, accountsFileExists, upsertAccountRecord, removeAccountRecordById, renameAccountRecordById, readConfig } from "../config/manager.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
 import { formatExpiry, redactToken } from "../utils/token-extractor.js";
 import { PROXY_PORT } from "../config/paths.js";
-import { createOpenAIAccountRecord } from "../providers/openai/account-record.js";
-import { loginOpenAIWithDeviceCode } from "../providers/openai/device-oauth.js";
-import { importGrokCliAuth } from "../providers/xai/import-auth.js";
-import { loginXaiWithDeviceCode } from "../providers/xai/device-oauth.js";
 import { isValidAccountId } from "../proxy/account-rename.js";
 import {
-  createSetupAttempt,
   failAttemptFromError,
   withSetupTelemetryFlush,
   type SetupAttempt,
 } from "../telemetry/setup-diagnostics.js";
 import type { SetupStage } from "../telemetry/contracts.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
+import { isTokenOnly } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
+import type { ReauthTarget } from "./account-flows.js";
 import { sanitizeAccountInfo, formatAccountInfo, type AccountInfo } from "../providers/account-info.js";
+import { needsReauthentication } from "../providers/auth-state.js";
+import { CliUsageError } from "./cli-errors.js";
 
 export function registerAccounts(program: Command): void {
   const accounts = program
@@ -61,6 +60,14 @@ export function registerAccounts(program: Command): void {
           : `\n  Accounts (${stored.length + openAIStored.length + xaiStored.length} configured)\n`,
       ));
 
+      /**
+       * Accounts only re-authentication can restore. Just the ids: `accounts
+       * reauth <id>` resolves the provider itself, so the hint no longer has
+       * to pick a per-provider sign-in command — getting that wrong re-added
+       * the id under the wrong provider entirely.
+       */
+      const reauthNeeded: string[] = [];
+
       if (liveStats) {
         console.log(chalk.green("  ● Proxy is running — showing live stats\n"));
         for (const s of liveStats) {
@@ -69,17 +76,27 @@ export function registerAccounts(program: Command): void {
             : s.provider === "xai_subscription"
               ? chalk.magenta("grok".padEnd(9))
               : chalk.gray("claude".padEnd(9));
-          const status = s.healthy
-            ? chalk.green("✓ healthy")
-            : chalk.red("✗ unhealthy");
+          // "unhealthy" covers everything from a five-minute network blip to a
+          // permanently rejected refresh token. Only the latter needs the
+          // operator, so it gets its own label rather than hiding in the crowd.
+          if (needsReauthentication(s)) reauthNeeded.push(s.id);
+          const status = needsReauthentication(s)
+            ? chalk.red("✗ re-auth required")
+            : s.healthy
+              ? chalk.green("✓ healthy")
+              : chalk.red("✗ unhealthy");
           const busy = s.busy ? chalk.yellow(" [busy]") : "";
+          // A `claude setup-token` account has no refresh token, so it never
+          // refreshes and carries the inference scope only. Saying so here is
+          // what stops "expires" reading as a bug rather than a deadline.
+          const tokenOnly = s.tokenOnly ? chalk.gray(" token-only") : "";
           const exp = s.expiresInMs > 0
             ? chalk.yellow(formatMs(s.expiresInMs))
             : chalk.red("EXPIRED");
           console.log(
             `  ${chalk.bold(s.id.padEnd(24))}` +
             `  ${provider}` +
-            `  ${status}${busy}` +
+            `  ${status}${busy}${tokenOnly}` +
             `  requests: ${chalk.cyan(String(s.requestCount).padStart(5))}` +
             `  errors: ${chalk.red(String(s.errorCount).padStart(3))}` +
             `  expires: ${exp}`
@@ -120,22 +137,30 @@ export function registerAccounts(program: Command): void {
           const expColor = a.tokens.expiresAt > Date.now()
             ? chalk.yellow(exp)
             : chalk.red(exp);
+          // `authExpired` is persisted, so the dead state is knowable without
+          // the proxy running — and this is exactly when an operator looks.
+          if (needsReauthentication(a)) reauthNeeded.push(a.id);
           console.log(
             `  ${chalk.bold(a.id.padEnd(24))}` +
             `  ${redactToken(a.tokens.accessToken).padEnd(26)}` +
             `  expires: ${expColor}` +
-            `  scopes: ${chalk.gray(a.tokens.scopes.join(" "))}`
+            (isTokenOnly(a.tokens)
+              ? `  ${chalk.gray("token-only")}`
+              : `  scopes: ${chalk.gray(a.tokens.scopes.join(" "))}`) +
+            (needsReauthentication(a) ? `  ${chalk.red("✗ re-auth required")}` : "")
           );
         }
         for (const a of openAIStored) {
           const exp = a.expiresAt > Date.now()
             ? chalk.yellow(formatExpiry(a.expiresAt))
             : chalk.red("EXPIRED");
+          if (needsReauthentication(a)) reauthNeeded.push(a.id);
           console.log(
             `  ${chalk.bold(a.id.padEnd(24))}` +
             `  ${chalk.magenta("openai".padEnd(10))}` +
             `  ${redactToken(a.accessToken).padEnd(26)}` +
-            `  expires: ${exp}`
+            `  expires: ${exp}` +
+            (needsReauthentication(a) ? `  ${chalk.red("✗ re-auth required")}` : "")
           );
         }
         for (const a of xaiStored) {
@@ -151,214 +176,147 @@ export function registerAccounts(program: Command): void {
         }
       }
 
+      // A dead refresh token is the one failure the router cannot work its way
+      // out of: the refresh loop has deliberately stopped retrying, so nothing
+      // changes until someone re-authenticates. Say so, and say how.
+      if (reauthNeeded.length > 0) {
+        console.log(chalk.red(
+          `\n  ⚠ Needs re-authentication: ${reauthNeeded.join(", ")}`,
+        ));
+        console.log(chalk.gray(
+          "    The provider rejected these refresh tokens permanently; they cannot\n"
+          + "    be recovered and the refresh loop has stopped retrying them. Sign in\n"
+          + "    again under the same account id to resume routing — the existing\n"
+          + "    account is replaced, so there is nothing to remove first:",
+        ));
+        for (const id of reauthNeeded) {
+          console.log(chalk.gray(`      ${reauthCommand(id)}`));
+        }
+      }
+
       console.log();
     });
 
+  // ── accounts login ───────────────────────────────────────────────────────
+  accounts
+    .command("login [provider]")
+    .description("Sign in to a Claude, OpenAI or Grok account in the browser (provider: claude | openai | grok)")
+    .option("--id <id>", "Account id to store the credentials under")
+    .option("--email <email>", "Email to prefill on the sign-in page")
+    .option("--long-lived", "Claude only: create a long-lived token with claude setup-token instead of a full sign-in")
+    .action(async (providerArg: string | undefined, opts: { id?: string; email?: string; longLived?: boolean }) =>
+      withSetupTelemetryFlush(async () => {
+        const provider = await chooseProvider(providerArg);
+        const flows = await import("./account-flows.js");
+
+        if (provider === "claude") {
+          const { account, attempt } = await flows.collectClaudeAccount({
+            index: (accountsFileExists() ? loadAccounts().length : 0) + 1,
+            fixedId: opts.id,
+            email: opts.email,
+            offer: "login",
+            ...(opts.longLived ? { method: "setup_token" as const } : {}),
+          });
+          if (!account) { console.log(chalk.yellow("\nNo account added.\n")); return; }
+          await persistClaude(account, attempt);
+          return;
+        }
+
+        if (provider === "openai") {
+          // The id prompt (with its `openai-account-N` default) lives in the
+          // flow, so an absent --id is a prompt rather than a guessed name.
+          const { record, attempt } = await flows.loginOpenAIAccount({ accountId: opts.id, email: opts.email });
+          await persistRecord(record, attempt, "OpenAI account");
+          return;
+        }
+
+        const record = await flows.loginGrokAccount({ accountId: opts.id });
+        const { mode } = await addAccountRuntimeAware(record);
+        console.log(chalk.green(`\n✓ Grok account "${record.id}" saved via device login.\n`));
+        printAddOutcome(mode);
+      }));
+
   // ── accounts add ─────────────────────────────────────────────────────────
   accounts
-    .command("add")
-    .description("Add a new Claude Max account interactively")
-    .action(async () => {
-      const { setupSingleAccountWithAttempt } = await import("./cmd-setup.js");
+    .command("add [provider]")
+    .description("Import credentials that already exist: Claude Keychain / credentials file / pasted tokens, OpenAI tokens, or ~/.grok")
+    .option("--id <id>", "Account id to store the credentials under")
+    .action(async (providerArg: string | undefined, opts: { id?: string }) =>
+      withSetupTelemetryFlush(async () => {
+        const provider = await chooseProvider(providerArg);
+        const flows = await import("./account-flows.js");
 
-      const existing = accountsFileExists() ? loadAccounts() : [];
-      const { account, attempt } = await setupSingleAccountWithAttempt(existing.length + 1);
+        if (provider === "claude") {
+          const { account, attempt } = await flows.collectClaudeAccount({
+            index: (accountsFileExists() ? loadAccounts().length : 0) + 1,
+            fixedId: opts.id,
+            offer: "import",
+          });
+          if (!account) { console.log(chalk.yellow("\nNo account added.\n")); return; }
+          await persistClaude(account, attempt);
+          return;
+        }
 
-      if (!account) {
-        console.log(chalk.yellow("\nNo account added.\n"));
-        return;
-      }
+        if (provider === "openai") {
+          const { record, attempt } = await flows.importOpenAIAccount({ accountId: opts.id });
+          await persistRecord(record, attempt, "OpenAI account");
+          return;
+        }
 
-      // Merge: replace by ID if already exists, otherwise append
-      const merged = [
-        ...existing.filter(a => a.id !== account.id),
-        account,
-      ];
-
-      let mode: "live" | "stored";
-      try {
-        ({ mode } = await addAccountRuntimeAware(serialize([account])[0], {
-          tryAddLive: tryAddAccountToRunningProxy,
-          addStored: () => saveAccounts(merged),
-        }));
-      } catch (error) {
-        endFailedAttempt(attempt, error, "persistence");
-        throw error;
-      }
-      attempt.stageCompleted("persistence");
-      attempt.succeeded();
-
-      console.log(chalk.green(`\n✓ Account "${account.id}" added (${merged.length} total).\n`));
-      printAddOutcome(mode);
-    });
-
-  // ── accounts add-openai ──────────────────────────────────────────────────
-  accounts
-    .command("add-openai")
-    .description("Add an OpenAI ChatGPT/Codex subscription account manually")
-    .action(async () => withSetupTelemetryFlush(async () => {
-      const { input, password } = await import("@inquirer/prompts");
-
-      const attempt = createSetupAttempt({ provider: "openai", method: "manual_token" });
-      attempt.stageCompleted("credential_source_selection");
-      let reached: SetupStage = "credential_read";
-
-      try {
-        const id = await input({
-          message: "OpenAI account ID:",
-          default: `openai-account-${loadOpenAIAccounts().length + 1}`,
-          validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-        });
-        const accessToken = await password({
-          message: "OpenAI access token:",
-          mask: "*",
-          validate: (v) => v.trim().length > 0 || "Access token is required",
-        });
-        const refreshToken = await password({
-          message: "OpenAI refresh token:",
-          mask: "*",
-          validate: (v) => v.trim().length > 0 || "Refresh token is required",
-        });
-        const expiresAt = await input({
-          message: "Access token expiry (Unix ms):",
-          default: String(Date.now() + 60 * 60 * 1000),
-          validate: (v) => Number.isFinite(Number(v)) && Number(v) > 0 || "Enter a positive Unix timestamp in milliseconds",
-        });
-        const scopes = await input({
-          message: "Scopes:",
-          default: "openid profile email offline_access",
-        });
-        attempt.stageCompleted("credential_read");
-
-        reached = "credential_parse";
-        const record = createOpenAIAccountRecord({
-          id,
-          accessToken,
-          refreshToken,
-          expiresAt,
-          scopes,
-        });
-        attempt.stageCompleted("credential_parse");
-
-        reached = "persistence";
+        const record = await flows.importGrokAccount({ accountId: opts.id });
         const { mode } = await addAccountRuntimeAware(record);
-        attempt.stageCompleted("persistence");
-        attempt.succeeded();
-
-        console.log(chalk.green(`\n✓ OpenAI account "${record.id}" saved.\n`));
+        console.log(chalk.green(`\n✓ Grok account "${record.id}" imported from ~/.grok.\n`));
         printAddOutcome(mode);
-        console.log(chalk.yellow("  Treat this as experimental until the OAuth login wizard lands.\n"));
-      } catch (error) {
-        endFailedAttempt(attempt, error, reached);
-        throw error;
-      }
-    }));
+      }));
 
-  // ── accounts login-openai ────────────────────────────────────────────────
+  // ── accounts reauth ──────────────────────────────────────────────────────
   accounts
-    .command("login-openai")
-    .description("Sign in to an OpenAI ChatGPT/Codex subscription account with device code")
-    .action(async () => withSetupTelemetryFlush(async () => {
-      const { input } = await import("@inquirer/prompts");
-
-      const attempt = createSetupAttempt({ provider: "openai", method: "device_oauth" });
-      let reached: SetupStage = "device_code_request";
-
-      try {
-        const accountId = await input({
-          message: "OpenAI account ID:",
-          default: `openai-account-${loadOpenAIAccounts().length + 1}`,
-          validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
+    .command("reauth <id>")
+    .description("Sign an existing account in again under the same id (its provider and email are looked up for you)")
+    .option("--email <email>", "Override the email to prefill on the sign-in page")
+    .option("--long-lived", "Claude only: use claude setup-token")
+    .action(async (id: string, opts: { email?: string; longLived?: boolean }) =>
+      withSetupTelemetryFlush(async () => {
+        const live = await fetchLiveStats();
+        const target = resolveReauthTarget(id, live, {
+          anthropic: accountsFileExists() ? loadAccounts() : [],
+          openai: loadOpenAIAccounts(),
+          xai: loadXaiAccounts(),
         });
 
-        console.log(chalk.cyan("\nOpenAI Codex device login"));
-        console.log(chalk.gray("This will open no local callback server. You will approve the login in your browser.\n"));
+        if (!target) {
+          const { ids } = mergeAccountInventory(
+            loadAccounts().map(a => a.id),
+            loadOpenAIAccounts().map(a => a.id),
+            live,
+            loadXaiAccounts().map(a => a.id),
+          );
+          console.log(chalk.red(`✗ Account "${id}" not found.`));
+          console.log(chalk.gray(`  Available: ${ids.join(", ")}`));
+          process.exit(1);
+        }
 
-        const record = await loginOpenAIWithDeviceCode({
-          accountId,
-          onDeviceCode: (code) => {
-            console.log(chalk.bold("1. Open this URL:"));
-            console.log(`   ${chalk.cyan(code.verificationUrl)}`);
-            console.log(chalk.bold("2. Enter this code:"));
-            console.log(`   ${chalk.cyan(code.userCode)}\n`);
-            console.log(chalk.gray("Waiting for authorization..."));
-          },
-          onStageCompleted: (stage) => {
-            attempt.stageCompleted(stage);
-            reached = stage;
-          },
-        });
+        // Grok credentials are minted by the Grok CLI and read back out of
+        // ~/.grok; there is no id-preserving sign-in to re-run here.
+        if ("grok" in target) {
+          console.log(chalk.yellow(
+            `Grok credentials live in ~/.grok. Run ${chalk.white("grok login")}, then ${chalk.white("cc-router accounts add grok")}.`,
+          ));
+          process.exit(1);
+        }
 
-        reached = "persistence";
-        const { mode } = await addAccountRuntimeAware(record);
-        attempt.stageCompleted("persistence");
-        attempt.succeeded();
-
-        console.log(chalk.green(`\n✓ OpenAI account "${record.id}" saved via device login.\n`));
-        printAddOutcome(mode);
-      } catch (error) {
-        endFailedAttempt(attempt, error, reached);
-        throw error;
-      }
-    }));
-
-  // ── accounts add-grok ────────────────────────────────────────────────────
-  accounts
-    .command("add-grok")
-    .description("Import the Grok CLI login from ~/.grok/auth.json")
-    .action(async () => {
-      const { input } = await import("@inquirer/prompts");
-      let imported;
-      try {
-        imported = importGrokCliAuth();
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.log(chalk.red(`\n✗ ${message}\n`));
-        console.log(chalk.gray("  Or sign in here: cc-router accounts login-grok\n"));
-        process.exit(1);
-      }
-
-      const id = await input({
-        message: "Grok account ID:",
-        default: imported.id,
-        validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-      });
-      const record = { ...imported, id };
-      const { mode } = await addAccountRuntimeAware(record);
-      console.log(chalk.green(`\n✓ Grok account "${record.id}" imported from ~/.grok.\n`));
-      printAddOutcome(mode);
-    });
-
-  // ── accounts login-grok ──────────────────────────────────────────────────
-  accounts
-    .command("login-grok")
-    .description("Sign in to a Grok / xAI account with device code")
-    .action(async () => {
-      const { input } = await import("@inquirer/prompts");
-      const accountId = await input({
-        message: "Grok account ID:",
-        default: loadXaiAccounts().length === 0 ? "grok" : `grok-${loadXaiAccounts().length + 1}`,
-        validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-      });
-
-      console.log(chalk.cyan("\nGrok device login"));
-      console.log(chalk.gray("Approve the login in your browser. No local callback server is used.\n"));
-
-      const record = await loginXaiWithDeviceCode({
-        accountId,
-        onDeviceCode: (code) => {
-          console.log(chalk.bold("1. Open this URL:"));
-          console.log(`   ${chalk.cyan(code.verificationUrl)}`);
-          console.log(chalk.bold("2. Enter this code if the page does not fill it in:"));
-          console.log(`   ${chalk.cyan(code.userCode)}\n`);
-          console.log(chalk.gray("Waiting for authorization..."));
-        },
-      });
-
-      const { mode } = await addAccountRuntimeAware(record);
-      console.log(chalk.green(`\n✓ Grok account "${record.id}" saved via device login.\n`));
-      printAddOutcome(mode);
-    });
+        const flows = await import("./account-flows.js");
+        const result = await flows.collectReauthRecord(
+          { ...target, ...(opts.email ? { email: opts.email } : {}) },
+          { longLived: opts.longLived },
+        );
+        if (!result) { console.log(chalk.yellow("\nNo account re-authenticated.\n")); return; }
+        await persistRecord(
+          result.record,
+          result.attempt,
+          target.provider === "openai_subscription" ? "OpenAI account" : "Account",
+        );
+      }));
 
   // ── accounts remove ───────────────────────────────────────────────────────
   accounts
@@ -465,6 +423,110 @@ export function registerAccounts(program: Command): void {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+export type ProviderArg = "claude" | "openai" | "grok";
+
+/**
+ * The provider named on the command line, if one was.
+ *
+ * Unknown values throw rather than falling back to a picker: silently asking
+ * again would let `accounts login clade` sign the operator into whatever they
+ * then clicked, under a command they did not mean to run.
+ */
+export function parseProviderArg(value: string | undefined): ProviderArg | undefined {
+  if (value === undefined) return undefined;
+  if (value === "claude" || value === "openai" || value === "grok") return value;
+  throw new CliUsageError(`Unknown provider "${value}" — use claude, openai or grok`);
+}
+
+async function chooseProvider(given: string | undefined): Promise<ProviderArg> {
+  const parsed = parseProviderArg(given);
+  if (parsed) return parsed;
+  const { select } = await import("@inquirer/prompts");
+  return select<ProviderArg>({
+    message: "Which provider?",
+    choices: [
+      { name: "Claude (Claude Max / Pro subscription)", value: "claude" },
+      { name: "OpenAI (ChatGPT / Codex subscription)", value: "openai" },
+      { name: "Grok (xAI)", value: "grok" },
+    ],
+  });
+}
+
+/**
+ * Persist a collected Claude account, replacing any account already holding
+ * its id. The merge is by id across the whole Claude pool, so only `addStored`
+ * is overridden — `tryAddLive` must stay the default, which asks the running
+ * proxy to replace rather than reject the id.
+ */
+async function persistClaude(account: Account, attempt: SetupAttempt): Promise<void> {
+  const { accountToRecord } = await import("./account-flows.js");
+  const existing = accountsFileExists() ? loadAccounts() : [];
+  const merged = [...existing.filter(a => a.id !== account.id), account];
+
+  let mode: "live" | "stored";
+  try {
+    ({ mode } = await addAccountRuntimeAware(accountToRecord(account), {
+      addStored: () => saveAccounts(merged),
+    }));
+  } catch (error) {
+    endFailedAttempt(attempt, error, "persistence");
+    throw error;
+  }
+  attempt.stageCompleted("persistence");
+  attempt.succeeded();
+
+  console.log(chalk.green(`\n✓ Account "${account.id}" saved (${merged.length} Claude accounts).\n`));
+  printAddOutcome(mode);
+}
+
+/** Persist any already-serialized record (OpenAI, or a re-authenticated account). */
+async function persistRecord(record: AccountRecord, attempt: SetupAttempt | undefined, label: string): Promise<void> {
+  let mode: "live" | "stored";
+  try {
+    ({ mode } = await addAccountRuntimeAware(record));
+  } catch (error) {
+    if (attempt) endFailedAttempt(attempt, error, "persistence");
+    throw error;
+  }
+  attempt?.stageCompleted("persistence");
+  attempt?.succeeded();
+
+  console.log(chalk.green(`\n✓ ${label} "${record.id}" saved.\n`));
+  printAddOutcome(mode);
+}
+
+/**
+ * Which account `accounts reauth <id>` should sign in again, and as whom.
+ *
+ * The live pool wins: it is the only source that carries the fetched account
+ * metadata, and its email is what makes the sign-in page land on the right
+ * account instead of whichever one the browser is already holding. Disk is the
+ * fallback for a proxy that is not running, and knows no email.
+ */
+export function resolveReauthTarget(
+  id: string,
+  live: Array<LiveAccountSummary & { accountInfo?: { email?: string } }> | null,
+  stored: {
+    anthropic: Array<{ id: string }>;
+    openai: Array<{ id: string }>;
+    xai: Array<{ id: string }>;
+  },
+): ReauthTarget | { grok: true } | null {
+  const liveMatch = live?.find(a => a.id === id);
+  if (liveMatch) {
+    if (liveMatch.provider === "xai_subscription") return { grok: true };
+    return {
+      id,
+      provider: liveMatch.provider === "openai_subscription" ? "openai_subscription" : "anthropic_subscription",
+      ...(liveMatch.accountInfo?.email ? { email: liveMatch.accountInfo.email } : {}),
+    };
+  }
+  if (stored.xai.some(a => a.id === id)) return { grok: true };
+  if (stored.openai.some(a => a.id === id)) return { id, provider: "openai_subscription" };
+  if (stored.anthropic.some(a => a.id === id)) return { id, provider: "anthropic_subscription" };
+  return null;
+}
+
 /**
  * Close a setup attempt that ended in a thrown error. A cancelled prompt is a
  * user decision, not a failure, and only an unexpected failure gets a
@@ -552,6 +614,16 @@ export function buildStoredAccountsJson(
   enabled: boolean;
   expiresAt: number;
   scopes?: string[];
+  /** Present only when true: this account's refresh token was rejected
+   *  permanently and only re-authentication restores it. A JSON consumer
+   *  cannot otherwise tell it apart from an ordinarily expired access token,
+   *  since both simply read as a past `expiresAt`. A boolean, so nothing
+   *  credential-bearing is added to the output. */
+  authExpired?: true;
+  /** Present only when true: a `claude setup-token` credential, which has no
+   *  refresh token, never refreshes and carries the inference scope only. A
+   *  boolean, so nothing credential-bearing is added to the output. */
+  tokenOnly?: true;
 }> {
   return [
     ...anthropicAccounts.map(a => ({
@@ -560,12 +632,15 @@ export function buildStoredAccountsJson(
       enabled: a.enabled,
       expiresAt: a.tokens.expiresAt,
       scopes: a.tokens.scopes,
+      ...(needsReauthentication(a) ? { authExpired: true as const } : {}),
+      ...(isTokenOnly(a.tokens) ? { tokenOnly: true as const } : {}),
     })),
     ...openAIAccounts.map(a => ({
       id: a.id,
       provider: "openai_subscription" as const,
       enabled: a.enabled !== false,
       expiresAt: a.expiresAt,
+      ...(needsReauthentication(a) ? { authExpired: true as const } : {}),
     })),
     ...xaiAccounts.map(a => ({
       id: a.id,
@@ -704,10 +779,18 @@ export interface LiveAccountAddOptions {
   baseUrl?: string;
   authToken?: string;
   fetch?: typeof globalThis.fetch;
+  /**
+   * Ask the proxy to replace an account already holding this id rather than
+   * refusing the add. This is what re-authenticating means: `accounts add`
+   * already replaces by id on disk, and without the same intent on the live
+   * pool the proxy answered 409 and the freshly minted refresh token was
+   * thrown away. Off by default so the endpoint still protects any other
+   * client from an accidental id collision.
+   */
+  replace?: boolean;
 }
 
-/** Read-only probe used before operations that cannot be represented by the
- * live account API, such as replacing the complete account inventory. */
+/** Read-only probe for commands that cannot be represented as a live mutation. */
 export async function isAccountApiReachable(
   options: LiveAccountAddOptions = {},
 ): Promise<boolean> {
@@ -748,7 +831,7 @@ export async function tryAddAccountToRunningProxy(
         "content-type": "application/json",
         ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
       },
-      body: JSON.stringify(record),
+      body: JSON.stringify(options.replace ? { ...record, replace: true } : record),
       signal: AbortSignal.timeout(3_000),
     });
   } catch {
@@ -777,19 +860,44 @@ export interface RuntimeAwareAddDependencies {
  */
 export async function addAccountRuntimeAware(
   record: AccountRecord,
-  dependencies: RuntimeAwareAddDependencies = {
-    tryAddLive: tryAddAccountToRunningProxy,
-    addStored: upsertAccountRecord,
-  },
+  dependencies: Partial<RuntimeAwareAddDependencies> = {},
 ): Promise<{ mode: "live" } | { mode: "stored" }> {
-  if (await dependencies.tryAddLive(record)) return { mode: "live" };
-  dependencies.addStored(record);
+  // Each dependency defaults independently. Taking the whole object as one
+  // default meant a caller that only needed its own `addStored` — the Claude
+  // `accounts add` flow does, to merge by id — had to restate `tryAddLive`
+  // too, and that restatement silently dropped the replacement request. The
+  // path that most needs replacement was the one path not asking for it.
+  const tryAddLive = dependencies.tryAddLive
+    // `upsertAccountRecord` already replaces by id on disk; asking the live
+    // pool for the same thing is what keeps the two halves of an `accounts
+    // add` in agreement instead of failing on the account that most needs it.
+    ?? (live => tryAddAccountToRunningProxy(live, { replace: true }));
+  const addStored = dependencies.addStored ?? upsertAccountRecord;
+
+  if (await tryAddLive(record)) return { mode: "live" };
+  addStored(record);
   return { mode: "stored" };
+}
+
+/**
+ * The command that recovers this account, whatever its provider.
+ *
+ * One command for every provider, because it resolves the provider from the id
+ * itself — the previous per-provider hints had to guess, and guessing wrong
+ * re-added the id under the wrong provider. It re-registers under the id the
+ * operator already has, and the live pool replaces rather than rejects it, so
+ * no deletion step is needed — which also avoids the running proxy refusing to
+ * delete a lone Claude account.
+ */
+function reauthCommand(id: string): string {
+  return `cc-router accounts reauth ${id}`;
 }
 
 async function fetchLiveStats(): Promise<null | Array<{
   id: string; provider?: string; healthy: boolean; busy: boolean;
   requestCount: number; errorCount: number; expiresInMs: number;
+  authExpired?: boolean; authFailure?: string; authState?: string;
+  tokenOnly?: boolean;
   accountInfo?: AccountInfo;
 }>> {
   try {
@@ -803,6 +911,8 @@ async function fetchLiveStats(): Promise<null | Array<{
       accounts: Array<{
         id: string; provider?: string; healthy: boolean; busy: boolean;
         requestCount: number; errorCount: number; expiresInMs: number;
+        authExpired?: boolean; authFailure?: string; authState?: string;
+        tokenOnly?: boolean;
         accountInfo?: AccountInfo;
       }>;
       operational?: {

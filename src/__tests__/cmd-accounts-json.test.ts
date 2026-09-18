@@ -26,6 +26,17 @@ describe("buildStoredAccountsJson", () => {
         scopes: ["user:inference"],
       },
       enabled: true,
+    } as Account, {
+      // `claude setup-token` mints an access token with no refresh token. A
+      // consumer cannot infer that from the metadata otherwise, and the
+      // account is deliberately never refreshed.
+      id: "max-long-lived",
+      tokens: {
+        accessToken: "ant-long-lived",
+        expiresAt: 1999999996000,
+        scopes: ["user:inference"],
+      },
+      enabled: true,
     } as Account];
     const openAI: OpenAISubscriptionAccount[] = [{
       id: "openai-primary",
@@ -49,6 +60,14 @@ describe("buildStoredAccountsJson", () => {
         enabled: true,
         expiresAt: 1999999999000,
         scopes: ["user:inference"],
+      },
+      {
+        id: "max-long-lived",
+        provider: "anthropic_subscription",
+        enabled: true,
+        expiresAt: 1999999996000,
+        scopes: ["user:inference"],
+        tokenOnly: true,
       },
       {
         id: "openai-primary",
@@ -189,6 +208,37 @@ describe("runtime-aware account add", () => {
         signal: expect.any(AbortSignal),
       }),
     );
+  });
+
+  it("asks the proxy to replace an existing id when re-authenticating", async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ account: { id: "openai-1" } }), { status: 200 }));
+
+    await expect(tryAddAccountToRunningProxy(record, { fetch, replace: true })).resolves.toBe(true);
+
+    const body = JSON.parse(String((fetch.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body).toMatchObject({ ...record, replace: true });
+  });
+
+  it("does not ask for replacement unless the caller opts in", async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ account: { id: "openai-1" } }), { status: 201 }));
+
+    await tryAddAccountToRunningProxy(record, { fetch });
+
+    const body = JSON.parse(String((fetch.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body).not.toHaveProperty("replace");
+  });
+
+  it("re-authenticates an existing account through the running proxy instead of losing the token", async () => {
+    // The live add used to reject a known id, and the CLI rethrew before it
+    // wrote anything — discarding the refresh token the OAuth login had just
+    // minted. Replacement has to be requested for that to be recoverable.
+    const tryAddLive = vi.fn(async () => true);
+    const addStored = vi.fn();
+
+    await expect(addAccountRuntimeAware(record, { tryAddLive, addStored }))
+      .resolves.toEqual({ mode: "live" });
+
+    expect(addStored).not.toHaveBeenCalled();
   });
 
   it("reports no reachable proxy when the POST connection fails", async () => {

@@ -7,6 +7,7 @@ import {
   failAttemptFromError,
   type SetupAttempt,
 } from "../telemetry/setup-diagnostics.js";
+import type { DashboardIntent } from "../ui/Dashboard.js";
 
 /**
  * Resolves where the proxy's HTTP API lives and which bearer token to use.
@@ -135,14 +136,17 @@ async function dashboardLoop(port: number): Promise<void> {
     // `pendingIntent` is set by the Dashboard component via `onIntent`;
     // it defaults to "quit" so Ctrl+C (exitOnCtrlC) does the right thing
     // without the Dashboard ever firing onIntent.
-    let pendingIntent: "quit" | "addAccount" = "quit";
+    // Kept at the full union rather than narrowed to its initializer: the
+    // real value is written from inside `onIntent`, which control-flow
+    // analysis can't see, so without the cast every later branch is `never`.
+    let pendingIntent = { kind: "quit" } as DashboardIntent;
 
     const instance = render(
       createElement(Dashboard, {
         port,
         baseUrl: target.baseUrl,
         authToken: target.authToken,
-        onIntent: (i: "quit" | "addAccount") => { pendingIntent = i; },
+        onIntent: (i: DashboardIntent) => { pendingIntent = i; },
       }),
       { exitOnCtrlC: true },
     );
@@ -166,35 +170,100 @@ async function dashboardLoop(port: number): Promise<void> {
     // Ink may have paused stdin — resume it so inquirer can read input.
     process.stdin.resume();
 
-    if (pendingIntent === "quit") return;
+    if (pendingIntent.kind === "quit") return;
 
-    // Intent: addAccount — run the OAuth flow, then POST the resulting
-    // tokens to the server we're connected to (local or remote).
-    console.log();
-    console.log(chalk.cyan("→ Adding a new account..."));
-    console.log();
+    if (pendingIntent.kind === "addAccount") {
+      // Intent: addAccount — run the OAuth flow, then POST the resulting
+      // tokens to the server we're connected to (local or remote).
+      console.log();
+      console.log(chalk.cyan("→ Adding a new account..."));
+      console.log();
 
-    const added = await runAddAccountFlow(target);
-    if (added) {
-      console.log(chalk.green(`\n✓ Account "${added}" added. Returning to dashboard...\n`));
-    } else {
-      console.log(chalk.yellow("\n  No account added. Returning to dashboard...\n"));
+      const added = await runAddAccountFlow(target);
+      if (added) {
+        console.log(chalk.green(`\n✓ Account "${added}" added. Returning to dashboard...\n`));
+      } else {
+        console.log(chalk.yellow("\n  No account added. Returning to dashboard...\n"));
+      }
+      // Fall through → loop re-renders the dashboard
+      continue;
     }
-    // Fall through → loop re-renders the dashboard
+
+    // Intent: reauth — sign in again under the existing id and replace the
+    // stored credentials in place, keeping the account's caps and settings.
+    console.log();
+    console.log(chalk.cyan(`→ Re-authenticating ${pendingIntent.id}...`));
+
+    const reauthed = await runReauthFlow(target, pendingIntent);
+    console.log(reauthed
+      ? chalk.green(`\n✓ Account "${reauthed}" re-authenticated. Returning to dashboard...\n`)
+      : chalk.yellow("\n  No account re-authenticated. Returning to dashboard...\n"));
   }
 }
 
 /**
- * Runs the existing setupSingleAccount() OAuth flow, then POSTs the resulting
- * tokens to /cc-router/accounts on the active target. Returns the new id on
- * success, or null if the user aborted / an error occurred.
+ * Runs the provider's sign-in with the id fixed, then POSTs the replacement
+ * record to /cc-router/accounts. Returns the id on success, or null if the
+ * operator aborted / an error occurred.
+ */
+async function runReauthFlow(
+  target: StatusTarget,
+  intent: Extract<DashboardIntent, { kind: "reauth" }>,
+): Promise<string | null> {
+  let attempt: SetupAttempt | undefined;
+  try {
+    const { collectReauthRecord } = await import("./account-flows.js");
+    const result = await collectReauthRecord({
+      id: intent.id,
+      provider: intent.provider,
+      ...(intent.email ? { email: intent.email } : {}),
+    });
+    if (!result) return null;
+    attempt = result.attempt;
+
+    const res = await fetch(`${target.baseUrl}/cc-router/accounts`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...target.headers,
+      },
+      // `replace: true` is what makes this an in-place re-auth rather than a
+      // duplicate-id rejection.
+      body: JSON.stringify({ ...result.record, replace: true }),
+      signal: AbortSignal.timeout(5_000),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error(chalk.red(`\n✗ Server rejected the replacement: HTTP ${res.status}`));
+      if (text) console.error(chalk.gray(`  ${text}`));
+      attempt.failed(classifyHttpSetupFailure("persistence", res.status, "dashboard re-auth rejected"), "persistence");
+      return null;
+    }
+    attempt.stageCompleted("persistence");
+    attempt.succeeded();
+    return result.record.id;
+  } catch (err) {
+    console.error(chalk.red(`\n✗ Re-authentication failed: ${(err as Error).message}`));
+    if (attempt) {
+      const outcome = failAttemptFromError(attempt, err, "persistence");
+      if (outcome?.unexpected) console.error(chalk.gray(`  Diagnostic ID: ${outcome.diagnosticId}`));
+    }
+    return null;
+  }
+}
+
+/**
+ * Runs the shared Claude sign-in flow, then POSTs the resulting record to
+ * /cc-router/accounts on the active target. Returns the new id on success, or
+ * null if the user aborted / an error occurred.
  */
 async function runAddAccountFlow(target: StatusTarget): Promise<string | null> {
   let attempt: SetupAttempt | undefined;
   try {
-    const { setupSingleAccountWithAttempt } = await import("./cmd-setup.js");
+    const { collectClaudeAccount, accountToRecord } = await import("./account-flows.js");
     // The index shown in the flow is just for display, pick something neutral.
-    const setup = await setupSingleAccountWithAttempt(1);
+    const setup = await collectClaudeAccount({ index: 1 });
     attempt = setup.attempt;
     const account = setup.account;
     if (!account) return null;
@@ -205,13 +274,10 @@ async function runAddAccountFlow(target: StatusTarget): Promise<string | null> {
         "content-type": "application/json",
         ...target.headers,
       },
-      body: JSON.stringify({
-        id: account.id,
-        accessToken: account.tokens.accessToken,
-        refreshToken: account.tokens.refreshToken,
-        expiresAt: account.tokens.expiresAt,
-        scopes: account.tokens.scopes,
-      }),
+      // The record form is what the endpoint stores, and it is the only shape
+      // that survives a `setup-token` credential: a hand-built body would have
+      // to invent a refresh token that account does not have.
+      body: JSON.stringify({ ...accountToRecord(account) }),
       signal: AbortSignal.timeout(5_000),
     });
 

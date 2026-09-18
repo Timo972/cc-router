@@ -28,11 +28,10 @@ cc-router logs --lines 100   Show last 100 lines
 
 cc-router accounts list      List Claude, ChatGPT and Grok accounts (live stats and metadata when running)
 cc-router accounts list --json  Same, as JSON
-cc-router accounts add       Add a Claude account interactively
-cc-router accounts login-openai  Sign in to OpenAI subscription auth with device code
-cc-router accounts add-openai  Add an OpenAI ChatGPT/Codex subscription account manually
-cc-router accounts login-grok  Sign in to a Grok / xAI account with device code
-cc-router accounts add-grok  Import the Grok CLI login from ~/.grok/auth.json
+cc-router accounts login [claude|openai|grok]  Sign in in the browser (Claude: claude auth login, or --long-lived for claude setup-token)
+cc-router accounts login claude --email you@example.com --id max-2
+cc-router accounts add [claude|openai|grok]    Import credentials that already exist (Keychain, ~/.claude/.credentials.json, pasted tokens, OpenAI tokens, ~/.grok)
+cc-router accounts reauth <id>  Sign an existing account in again under the same id, email prefilled
 cc-router accounts rename <id> <new-id>  Rename an account
 cc-router accounts remove <id>  Remove a Claude, OpenAI or Grok account
 
@@ -71,6 +70,29 @@ cc-router docker logs        Tail all Docker logs
 cc-router docker ps          Show container status
 cc-router docker restart [service]  Restart a service
 ```
+
+## Signing in
+
+`cc-router accounts login` runs the provider's sign-in for you. For Claude it
+hands the terminal to `claude auth login --claudeai`, which opens the browser
+itself (`--long-lived` runs `claude setup-token` instead, for a one-year token
+without a refresh token). For OpenAI and Grok it runs the device-code flow and
+opens the verification page — with the one-time code already filled in for
+OpenAI, plus the email on a re-auth. `cc-router accounts add` never opens
+anything; it only imports credentials that already exist on the machine or that
+you paste in.
+
+`cc-router accounts reauth <id>` signs an existing account in again under the
+same id, looking up its provider and cached email. The dashboard does the same
+on `l` with an account selected — see [Status dashboard](dashboard.md).
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `CC_ROUTER_NO_BROWSER=1` | Do not open a browser for the OpenAI and Grok device-code sign-ins. The verification URL and code are still printed, so you can open them yourself — useful over SSH or on a headless box. It does not reach `claude auth login`, which opens its own browser |
+| `CC_ROUTER_TELEMETRY=0` | Disable anonymous telemetry (`DO_NOT_TRACK=1` does the same) — see [Telemetry](telemetry.md) |
+| `CC_ROUTER_TOKEN` | Proxy secret used by the Codex CLI's managed config — see [Codex CLI & OpenAI](codex.md) |
 
 ## Toggling a CLI while the proxy stays up
 

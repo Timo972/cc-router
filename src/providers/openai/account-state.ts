@@ -99,7 +99,11 @@ export function createOpenAIAccount(record: OpenAISubscriptionAccount): OpenAIAc
     weeklyLimitPercent: record.weeklyLimitPercent !== undefined
       ? clampPercent(record.weeklyLimitPercent)
       : ACCOUNT_USER_DEFAULTS.weeklyLimitPercent,
-    healthy: true,
+    // A record persisted as authExpired must come back out of rotation. The
+    // refresh path deliberately never retries it, so defaulting to healthy
+    // would route live traffic at a token already known to be dead and spend
+    // a request discovering it. Mirrors `deserialize()` on the Anthropic side.
+    healthy: record.authExpired !== true,
     requestCount: 0,
     errorCount: 0,
     consecutiveErrors: 0,
@@ -107,7 +111,9 @@ export function createOpenAIAccount(record: OpenAISubscriptionAccount): OpenAIAc
     lastRefresh: 0,
     rateLimits,
     modelBuckets: new Map(),
-    authState: "ok",
+    ...(record.authExpired === true
+      ? { authState: "quarantined" as const, authFailure: "permanent" as const }
+      : { authState: "ok" as const }),
   };
 }
 

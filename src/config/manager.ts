@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFil
 import { randomBytes } from "crypto";
 import { CONFIG_DIR, ACCOUNTS_PATH, CONFIG_PATH } from "./paths.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
-import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent } from "../proxy/types.js";
+import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS, clampPercent, withInheritedSettings } from "../proxy/types.js";
 import type { OpenAISubscriptionAccount } from "../providers/openai/token-refresher.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 
@@ -37,26 +37,15 @@ function writeFileSecureSync(path: string, data: string): void {
   const fd = openSync(tmp, "r");
   try { fsyncFileBestEffort(fd); } finally { closeSync(fd); }
   renameSync(tmp, path);
-  if (process.platform !== "win32") {
-    const parent = openSync(dirname(path), "r");
-    try { fsyncSync(parent); } finally { closeSync(parent); }
-  }
   try { chmodSync(path, SECRET_FILE_MODE); } catch { /* best effort */ }
 }
 
-/**
- * Some supported Windows filesystems reject fsync on ordinary file handles
- * with EPERM/EINVAL. The atomic rename still protects readers from partial
- * JSON, and Windows does not offer the directory-fsync durability guarantee
- * used on POSIX. Preserve the previous cross-platform write behavior there.
- */
 export function fsyncFileBestEffort(
   fd: number,
   sync: (fd: number) => void = fsyncSync,
 ): void {
-  try {
-    sync(fd);
-  } catch (error) {
+  try { sync(fd); }
+  catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (process.platform === "win32" && (code === "EPERM" || code === "EINVAL")) return;
     throw error;
@@ -92,12 +81,31 @@ export function writeAccountsAtomic(data: unknown[]): void {
 }
 
 function writeAccountsAtomicToPath(path: string, data: unknown[]): void {
-  // Only aliases/providers enter usage metadata; credentials remain in their own file.
-  coordinateAccountWrite(path, readRawFromPath(path) as AccountRecord[], data as AccountRecord[], () => writeFileSecureSync(path, JSON.stringify(data, null, 2)));
+  coordinateAccountWrite(
+    path,
+    readRawFromPath(path) as AccountRecord[],
+    data as AccountRecord[],
+    () => writeFileSecureSync(path, JSON.stringify(data, null, 2)),
+  );
 }
 
-export function writeAnthropicAccountsPreservingOtherProviders(data: AccountRecord[], path = ACCOUNTS_PATH): void {
+/**
+ * Replace the Anthropic records in an accounts file, leaving every other
+ * provider's records in it untouched.
+ *
+ * `path` defaults to `ACCOUNTS_PATH`, but a server started with
+ * `--accounts <path>` must write back to the file it read: sending rotated
+ * refresh tokens to the default file instead loses them on the next restart
+ * *and* overwrites a file describing a different pool. Mirrors
+ * `saveOpenAIAccountsToPath`, which has always taken the path.
+ */
+export function writeAnthropicAccountsPreservingOtherProviders(
+  data: AccountRecord[],
+  path: string = ACCOUNTS_PATH,
+): void {
   mkdirSync(dirname(path), { recursive: true, mode: SECRET_DIR_MODE });
+  // Read from the same file being written, or the merge would carry another
+  // file's non-Anthropic records into this one.
   const existing = readRawFromPath(path) as AccountRecord[];
   const nonAnthropic = existing.filter(a =>
     a.provider !== undefined && a.provider !== "anthropic_subscription"
@@ -108,9 +116,16 @@ export function writeAnthropicAccountsPreservingOtherProviders(data: AccountReco
 export function upsertAccountRecord(record: AccountRecord, path = ACCOUNTS_PATH): void {
   mkdirSync(dirname(path), { recursive: true, mode: SECRET_DIR_MODE });
   const existing = readRawFromPath(path) as AccountRecord[];
+  // Compare normalised providers: a Claude record written before provider
+  // tags existed has none, and a strict comparison appended a tagged
+  // duplicate next to it instead of replacing it.
+  const sameAccount = (a: AccountRecord) =>
+    a.id === record.id && normalizeAccountProvider(a) === normalizeAccountProvider(record);
+  const previous = existing.find(sameAccount);
   const next = [
-    ...existing.filter(a => !(a.id === record.id && a.provider === record.provider)),
-    record,
+    ...existing.filter(a => !sameAccount(a)),
+    // A re-authentication replaces credentials, not the operator's settings.
+    previous ? withInheritedSettings(record, previous) : record,
   ];
   writeAccountsAtomicToPath(path, next);
 }
@@ -195,9 +210,14 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
       id: a.id,
       provider: "openai_subscription" as const,
       accessToken: a.accessToken,
-      refreshToken: a.refreshToken,
+      // Refresh tokens are optional on the record only for Anthropic
+      // `setup-token` credentials; OpenAI records always carry one.
+      refreshToken: a.refreshToken ?? "",
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
+      // Without this the flag is lost on restart and the dead refresh token is
+      // POSTed again from scratch — the whole point of persisting it.
+      ...(a.authExpired === true ? { authExpired: true as const } : {}),
       ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
       ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
       ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
@@ -208,7 +228,7 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
  *  every other provider's records already in that file. Shared by `saveOpenAIAccounts`
  *  (default path) and any caller bound to a custom `--accounts <path>`. */
 export function saveOpenAIAccountsToPath(accounts: OpenAISubscriptionAccount[], path: string): void {
-  mkdirSync(dirname(path), { recursive: true, mode: SECRET_DIR_MODE });
+  ensureConfigDir();
   const existing = readRawFromPath(path) as AccountRecord[];
   const nonOpenAI = existing.filter(a => a.provider !== "openai_subscription");
   const records: AccountRecord[] = accounts.map(a => ({
@@ -219,6 +239,7 @@ export function saveOpenAIAccountsToPath(accounts: OpenAISubscriptionAccount[], 
     expiresAt: a.expiresAt,
     scopes: a.scopes ?? ["openid", "profile", "email", "offline_access"],
     enabled: a.enabled,
+    ...(a.authExpired ? { authExpired: true as const } : {}),
     ...(a.sessionLimitPercent !== undefined ? { sessionLimitPercent: a.sessionLimitPercent } : {}),
     ...(a.weeklyLimitPercent !== undefined ? { weeklyLimitPercent: a.weeklyLimitPercent } : {}),
   }));
@@ -247,7 +268,8 @@ export function loadXaiAccounts(path?: string): XaiSubscriptionAccount[] {
       id: a.id,
       provider: "xai_subscription" as const,
       accessToken: a.accessToken,
-      refreshToken: a.refreshToken,
+      // See loadOpenAIAccounts: xAI records always carry a refresh token.
+      refreshToken: a.refreshToken ?? "",
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
       ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
@@ -397,7 +419,7 @@ export function generateProxySecret(): string {
 
 // ─── Accounts ─────────────────────────────────────────────────────────────────
 
-function deserialize(records: AccountRecord[]): Account[] {
+export function deserialize(records: AccountRecord[]): Account[] {
   return records.filter(a => a.provider === undefined || a.provider === "anthropic_subscription").map(a => ({
     id: a.id,
     tokens: {
@@ -435,7 +457,7 @@ export function serialize(accounts: Account[]): AccountRecord[] {
     id: a.id,
     provider: "anthropic_subscription",
     accessToken: a.tokens.accessToken,
-    refreshToken: a.tokens.refreshToken,
+    ...(a.tokens.refreshToken ? { refreshToken: a.tokens.refreshToken } : {}),
     expiresAt: a.tokens.expiresAt,
     scopes: a.tokens.scopes,
     enabled: a.enabled,

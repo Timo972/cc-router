@@ -48,15 +48,15 @@ afterEach(() => {
 });
 
 it.each([
-  ["add-grok", imported],
-  ["login-grok", loggedIn],
+  ["add grok", imported],
+  ["login grok", loggedIn],
 ] as const)("%s sends the acquired account to the running daemon", async (command, record) => {
   const fetch = vi.fn(async () => Response.json({ account: { id: record.id } }, { status: 201 }));
   vi.stubGlobal("fetch", fetch);
   const program = new Command();
   registerAccounts(program);
 
-  await program.parseAsync(["accounts", command], { from: "user" });
+  await program.parseAsync(["accounts", ...command.split(" ")], { from: "user" });
 
   expect(fetch).toHaveBeenCalledWith(
     "http://localhost:3456/cc-router/accounts",
@@ -66,7 +66,7 @@ it.each([
         authorization: "Bearer router-secret",
         "content-type": "application/json",
       }),
-      body: JSON.stringify(record),
+      body: JSON.stringify({ ...record, replace: true }),
     }),
   );
   expect(upsertAccountRecord).not.toHaveBeenCalled();

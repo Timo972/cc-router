@@ -59,6 +59,17 @@ it("serves metadata only through authenticated accounts, never health, and suppo
     expect(refreshed.status).toBe(200);
     const after = await (await fetch(`${base}/cc-router/accounts`, { headers })).json();
     expect(after.accounts[0].accountInfo.workspaceName).toBe("Workspace 2");
+    // The fixture answers the usage endpoint with `{}`, which
+    // `parseAnthropicUsage` rejects as an invalid schema — so a working
+    // per-account refresh reports `usageRefreshed: false` here, and the
+    // identity fetch it also runs is what moves the workspace on again.
+    const one = await fetch(`${base}/cc-router/accounts/fixture/refresh`, { method: "POST", headers });
+    expect(one.status).toBe(200);
+    expect(await one.json()).toMatchObject({ refresh: { id: "fixture", usageRefreshed: false } });
+    const afterOne = await (await fetch(`${base}/cc-router/accounts`, { headers })).json();
+    expect(afterOne.accounts[0].accountInfo.workspaceName).toBe("Workspace 3");
+    expect((await fetch(`${base}/cc-router/accounts/nope/refresh`, { method: "POST", headers })).status).toBe(404);
+    expect((await fetch(`${base}/cc-router/accounts/fixture/refresh`, { method: "POST" })).status).toBe(401);
     expect(output).not.toContain("fixture@example.com");
   } finally {
     child.kill("SIGTERM");

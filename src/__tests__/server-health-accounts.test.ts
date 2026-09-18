@@ -94,6 +94,16 @@ describe("createHealthAccountViews", () => {
     expect(views[1].rateLimits).toBeUndefined();
   });
 
+  it("flags an Anthropic account with no refresh token as token-only", () => {
+    const tokenOnly = makeAnthropicAccount();
+    delete tokenOnly.tokens.refreshToken;
+
+    const views = createHealthAccountViews([tokenOnly], []);
+
+    expect(views[0]!.tokenOnly).toBe(true);
+    expect(createHealthAccountViews([makeAnthropicAccount()], [])[0]!.tokenOnly).toBeUndefined();
+  });
+
   it("includes safe routing counters without exposing session identifiers", () => {
     const openAIAccount: OpenAISubscriptionAccount = {
       id: "openai-primary",
@@ -133,6 +143,33 @@ describe("createHealthAccountViews", () => {
       enabled: false,
       healthy: false,
     });
+  });
+
+  it("reports an Anthropic account whose refresh token was terminally rejected as authExpired", () => {
+    const dead = { ...makeAnthropicAccount(), authExpired: true, healthy: false };
+
+    const views = createHealthAccountViews([dead], []);
+
+    expect(views[0]).toMatchObject({
+      authExpired: true,
+      healthy: false,
+    });
+  });
+
+  it("never reports an authExpired Anthropic account as healthy, even if healthy was left set", () => {
+    // A refresh that fails clears `healthy`, but nothing re-clears it if the
+    // flag is restored by a later code path; health must not depend on that.
+    const dead = { ...makeAnthropicAccount(), authExpired: true, healthy: true };
+
+    const views = createHealthAccountViews([dead], []);
+
+    expect(views[0].healthy).toBe(false);
+  });
+
+  it("omits authExpired for an account with working credentials", () => {
+    const views = createHealthAccountViews([makeAnthropicAccount()], []);
+
+    expect(views[0]).not.toHaveProperty("authExpired");
   });
 
   it("redacts arbitrary representative claims to bounded public categories", () => {
@@ -428,6 +465,7 @@ describe("createOperationalStatus", () => {
         accounts: "/cc-router/accounts",
         allowance: "/cc-router/allowance",
         refresh: "/cc-router/refresh",
+        accountRefresh: "/cc-router/accounts/:id/refresh",
         messages: "/v1/messages",
         responses: "/v1/responses",
         models: "/v1/models",

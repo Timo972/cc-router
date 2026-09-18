@@ -103,8 +103,8 @@ claude
 
 That's it. On first `start` you're asked how to run the router (background, foreground, or
 auto-start on boot) and the choice is remembered; `cc-router start --reconfigure` changes
-it later. Adding more accounts is `cc-router setup --add`, and `cc-router status` opens the
-dashboard.
+it later. Adding more accounts is `cc-router accounts login`, re-signing one in is
+`cc-router accounts reauth <id>`, and `cc-router status` opens the dashboard.
 
 Per-platform token extraction, Codex CLI, Docker and everything else lives in
 [the docs](docs/).

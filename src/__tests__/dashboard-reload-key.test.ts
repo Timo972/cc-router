@@ -152,6 +152,31 @@ describe("dashboard reload key", () => {
     }
   });
 
+  it("R with an account focused refreshes only that account", async () => {
+    const dash = renderDashboard(health(), {}, { rows: 40, columns: 220 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      const fetchMock = vi.mocked(globalThis.fetch);
+      const posted: string[] = [];
+      fetchMock.mockImplementation((input, init) => {
+        const url = String(input);
+        if (init?.method === "POST") {
+          posted.push(url);
+          return Promise.resolve(Response.json({
+            refresh: { id: "max-account-1", tokenRefreshed: null, usageRefreshed: true, durationMs: 5 },
+          }));
+        }
+        return Promise.resolve(Response.json(health()));
+      });
+      await dash.press("\t");
+      await dash.press("R");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Refreshed max-account-1"));
+      expect(posted).toEqual([expect.stringMatching(/\/cc-router\/accounts\/max-account-1\/refresh$/)]);
+    } finally {
+      await dash.cleanup();
+    }
+  });
+
   it("surfaces a failed reload as an error banner", async () => {
     const dash = renderDashboard(health(), {}, { rows: 40, columns: 220 });
     try {

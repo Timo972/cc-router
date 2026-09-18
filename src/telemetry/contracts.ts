@@ -20,6 +20,8 @@ export const SETUP_METHODS = [
   "claude_credentials_file",
   "manual_token",
   "device_oauth",
+  "claude_cli_login",
+  "claude_setup_token",
 ] as const;
 
 export const SETUP_STAGES = [

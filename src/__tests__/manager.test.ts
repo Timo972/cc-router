@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { isTokenOnly } from "../proxy/types.js";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -31,6 +32,7 @@ import {
   migrateLegacyAccountProviders,
   setProviderAccountsEnabled,
   serialize,
+  deserialize,
   loadAccounts,
   loadOpenAIAccounts,
   readAccountsFromPath,
@@ -263,6 +265,54 @@ describe("upsertAccountRecord", () => {
     expect(parsed).toHaveLength(2);
     expect(parsed[0].id).toBe("max-account-1");
     expect(parsed[1].accessToken).toBe("openai-access-updated");
+  });
+});
+
+describe("upsertAccountRecord settings", () => {
+  it("keeps enabled and caps from the existing record when the new record omits them", () => {
+    writeAccountsAtomic([{ ...sampleRecord, enabled: false, sessionLimitPercent: 40, weeklyLimitPercent: 60 }]);
+
+    upsertAccountRecord({
+      id: "max-account-1",
+      accessToken: "sk-ant-oat01-fresh",
+      refreshToken: "sk-ant-ort01-fresh",
+      expiresAt: 1999999999000,
+      scopes: ["user:inference", "user:profile"],
+    });
+
+    const [record] = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(record).toMatchObject({
+      accessToken: "sk-ant-oat01-fresh", enabled: false, sessionLimitPercent: 40, weeklyLimitPercent: 60,
+    });
+  });
+
+  it("replaces a legacy untagged Claude record when the new record is tagged anthropic", () => {
+    writeAccountsAtomic([{ ...sampleRecord, enabled: false, sessionLimitPercent: 40 }]);
+
+    upsertAccountRecord({
+      id: "max-account-1",
+      provider: "anthropic_subscription",
+      accessToken: "sk-ant-oat01-fresh",
+      refreshToken: "sk-ant-ort01-fresh",
+      expiresAt: 1999999999000,
+      scopes: ["user:inference", "user:profile"],
+    });
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]).toMatchObject({
+      id: "max-account-1", accessToken: "sk-ant-oat01-fresh", enabled: false, sessionLimitPercent: 40,
+    });
+  });
+
+  it("lets an explicit setting on the new record win", () => {
+    writeAccountsAtomic([{ ...sampleRecord, enabled: false, sessionLimitPercent: 40 }]);
+
+    upsertAccountRecord({ ...sampleRecord, enabled: true });
+
+    const [record] = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(record.enabled).toBe(true);
+    expect(record.sessionLimitPercent).toBe(40);
   });
 });
 
@@ -538,6 +588,47 @@ describe("serialize", () => {
   });
 });
 
+describe("OpenAI terminal auth state persistence", () => {
+  it("round-trips authExpired so a dead refresh token is not re-tried after a restart", () => {
+    writeAccountsAtomic([]);
+
+    saveOpenAIAccounts([
+      {
+        id: "openai-dead",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "revoked",
+        expiresAt: 1999999999000,
+        enabled: true,
+        authExpired: true,
+      },
+    ]);
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0]).toMatchObject({ id: "openai-dead", authExpired: true });
+    expect(loadOpenAIAccounts()[0]).toMatchObject({ authExpired: true });
+  });
+
+  it("omits authExpired for a healthy OpenAI account", () => {
+    writeAccountsAtomic([]);
+
+    saveOpenAIAccounts([
+      {
+        id: "openai-live",
+        provider: "openai_subscription",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: 1999999999000,
+        enabled: true,
+      },
+    ]);
+
+    const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
+    expect(parsed[0]).not.toHaveProperty("authExpired");
+    expect(loadOpenAIAccounts()[0]).not.toHaveProperty("authExpired");
+  });
+});
+
 describe("loadOpenAIAccounts", () => {
   it("loads OpenAI subscription records separately from Anthropic accounts", () => {
     writeAccountsAtomic([
@@ -755,5 +846,21 @@ describe("renameAccountRecordById", () => {
       .toThrow(/already exists/);
     const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
     expect(parsed[0].id).toBe("max-account-1");
+  });
+});
+
+describe("refresh-less accounts", () => {
+  it("round-trips an anthropic account without a refreshToken and omits the key on disk", () => {
+    const account = deserialize([{
+      id: "long",
+      provider: "anthropic_subscription",
+      accessToken: "sk-ant-oat01-long",
+      expiresAt: 1_900_000_000_000,
+      scopes: ["user:inference"],
+    }]);
+    expect(account[0]!.tokens.refreshToken).toBeUndefined();
+    expect(isTokenOnly(account[0]!.tokens)).toBe(true);
+    const records = serialize(account);
+    expect("refreshToken" in records[0]!).toBe(false);
   });
 });

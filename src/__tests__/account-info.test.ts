@@ -8,6 +8,7 @@ const jwt = (claims: object) => `header.${Buffer.from(JSON.stringify(claims)).to
 const account = {
   id: "claude", provider: "anthropic_subscription" as const,
   accessToken: "token", expiresAt: now + 100_000,
+  scopes: ["user:inference", "user:profile"],
 };
 const response = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
 

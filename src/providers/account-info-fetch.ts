@@ -7,6 +7,8 @@ export interface AccountInfoSource {
   accessToken: string;
   expiresAt: number;
   enabled?: boolean;
+  /** Anthropic only: the profile endpoint needs `user:profile`. */
+  scopes?: string[];
 }
 
 export interface AccountInfoFetchOptions {

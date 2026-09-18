@@ -8,14 +8,120 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### ⚠️ Breaking
+
+- `cc-router accounts add-openai`, `login-openai`, `add-grok` and `login-grok`
+  are gone. Use `accounts login openai`, `accounts add openai`,
+  `accounts login grok` and `accounts add grok`. `accounts add` now takes the
+  provider as its first argument (`accounts add claude` for the old behaviour)
+  and only imports existing credentials; browser sign-in is `accounts login`.
+- The dashboard's `onIntent` callback receives an object (`{ kind: "quit" }`,
+  `{ kind: "addAccount" }`, `{ kind: "reauth", ... }`) instead of a string.
+
 ### Added
 
-- Account identity and plan details in live account listings and the dashboard's
-  selected-account details: email and workspace information for Claude and
-  ChatGPT, Claude subscription status/start date, and plans for stored Grok
-  accounts. Metadata refreshes in the background and with **R**; unavailable
-  renewal dates remain unknown. Billing interval is not supported. Private identity details
-  are excluded from health responses and telemetry.
+- `cc-router accounts login claude` drives `claude auth login --claudeai`
+  (with `--email` prefill) and imports the new credentials; `--long-lived`
+  drives `claude setup-token` for a one-year, refresh-less token.
+- `cc-router accounts reauth <id>` re-signs an account in under the same id,
+  looking up its provider and cached email. The dashboard does the same on
+  `l` with an account selected.
+- Device-code sign-ins (OpenAI, Grok) open the verification page in the
+  browser; the OpenAI page receives the code and, on re-auth, the email.
+  `CC_ROUTER_NO_BROWSER=1` keeps the browser closed and prints the URL only.
+- Claude accounts without a refresh token (`claude setup-token`) are
+  accepted, never refreshed, skipped by the usage and identity fetchers, and
+  marked `token-only`; they flip to `re-auth required` when they expire.
+- `POST /cc-router/accounts/:id/refresh` refreshes one account. The
+  dashboard's `R` uses it when an account is selected and reloads the whole
+  pool otherwise.
+
+### Fixed
+
+- Re-authenticating an account replaces its credentials only. Previously the
+  replacement was built from the freshly collected record, so a disabled
+  account came back enabled and custom session/weekly caps reset to 100 —
+  both on the live pool and in `accounts.json`.
+
+---
+
+## [0.12.4] — 2026-09-18
+
+### Added
+
+- Accounts whose refresh token the provider rejected permanently are now
+  reported as `re-auth required` in `cc-router accounts list` — in both the
+  live and the stored view — and named once with the command that recovers
+  them. Previously they were indistinguishable from an account holding a
+  merely stale access token, which the next refresh tick replaces on its own.
+  `authExpired` is exposed through the health endpoint and in
+  `cc-router accounts list --json` — with and without a running proxy — for
+  the same reason: both states otherwise read as nothing but a past
+  `expiresAt`.
+
+### Changed
+
+- A permanently rejected OpenAI account is no longer retried on the same
+  credentials. `authExpired` now persists for OpenAI as it already did for
+  Claude, so the rejection survives a restart, and such an account loads
+  quarantined rather than being handed live traffic. Recovery is by
+  re-authentication rather than by a retry that can only fail again.
+
+### Fixed
+
+- Re-authenticating an existing account id while the proxy is running no
+  longer discards the new credentials. `cc-router accounts add` already
+  replaced by id on disk, but the live pool refused the id and the CLI
+  aborted before writing anything — so the OAuth login that had just
+  completed, and the refresh token it minted, were lost. This was the
+  documented recovery for an account needing re-authentication.
+  `POST /cc-router/accounts` accepts an opt-in `replace` flag; without it the
+  endpoint still answers 409, and replacement is refused across providers.
+- A dead OpenAI refresh token no longer generates an OAuth request every five
+  minutes indefinitely. One account produced 1754 identical 401 diagnostics
+  over four days and dominated the proxy log.
+- `cc-router start --accounts <path>` now writes Claude accounts back to that
+  file. Every Anthropic write — token rotation, re-authentication, add, patch,
+  rename, delete, and the shutdown save — targeted the default
+  `~/.cc-router/accounts.json` regardless of the file the pool was loaded from.
+  Rotated refresh tokens therefore never reached the selected file and were
+  lost on the next restart, while the default file was overwritten with a pool
+  it does not describe. OpenAI accounts were already persisted correctly.
+
+---
+
+## [0.12.3] — 2026-09-17
+
+### Added
+
+- Account identity and plan details in the dashboard's selected-account line and
+  in `cc-router accounts list` while the proxy is running: email, personal or
+  workspace type, workspace name, and plan for Claude and ChatGPT accounts,
+  Claude subscription status and start date, and plans for stored Grok accounts.
+  Claude's start date is when the subscription was created, not the start of the
+  current billing period; billing interval is not supported, and renewal dates
+  are left unknown rather than guessed from token expiry or usage resets.
+- `GET /cc-router/accounts` returns an optional `accountInfo` object per account,
+  with a `fetchStatus` of `fresh`, `stale`, or `unavailable`. Metadata is cached
+  in memory for five minutes, refreshed in the background with one-minute retries
+  after a failure, and refreshed on demand by `POST /cc-router/refresh` or the
+  dashboard's **R**. Listings never block on a provider request; a failed lookup
+  keeps the last successful data and marks it stale.
+
+### Changed
+
+- `cc-router accounts list` reads live stats from the authenticated
+  `/cc-router/accounts` endpoint instead of `/cc-router/health`, sending the
+  configured proxy secret.
+
+### Security
+
+- Identity metadata is memory-only: it is never written to `accounts.json`,
+  never included in health responses — including authenticated health — and
+  never sent to telemetry. Provider responses are rebuilt field by field from an
+  allowlist with bounded, control-character-free strings and strict timestamps,
+  metadata requests refuse redirects so credentials cannot follow one, and
+  decoded token claims are used for display only, never to authorize a request.
 
 ---
 
@@ -766,6 +872,8 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
+[0.12.4]: https://github.com/Timo972/cc-router/releases/tag/v0.12.4
+[0.12.3]: https://github.com/Timo972/cc-router/releases/tag/v0.12.3
 [0.12.2]: https://github.com/Timo972/cc-router/releases/tag/v0.12.2
 [0.12.1]: https://github.com/Timo972/cc-router/releases/tag/v0.12.1
 [0.12.0]: https://github.com/Timo972/cc-router/releases/tag/v0.12.0

@@ -41,6 +41,7 @@ Claude Desktop ─[mitmproxy]─┐  (optional — intercepts api.anthropic.com)
 | `GET /v1/models` | OpenAI-compatible model list, discovered live from both providers |
 | `GET /cc-router/health` | Operational health; detail requires the proxy secret |
 | `GET /cc-router/accounts` | Account inventory, live stats, and cached identity/subscription metadata (authenticated) |
+| `POST /cc-router/accounts/:id/refresh` | Refresh one account's credentials and usage; answers `{ refresh: { id, tokenRefreshed, usageRefreshed, durationMs } }` (authenticated) |
 
 Account listings include an optional `accountInfo` object with `email`, `accountId`,
 `accountType` (`personal`, `workspace`, or `unknown`), `workspaceId`,
@@ -52,8 +53,10 @@ renewal fields remain absent unless confirmed by provider data.
 
 Metadata is memory-only, refreshed in the background with a five-minute cache
 and one-minute failure retries. Listing does not wait for provider requests.
-`POST /cc-router/refresh` also refreshes metadata. The account endpoint uses the
-proxy's existing authentication rules (loopback-only when no secret is set) and
+`POST /cc-router/refresh` also refreshes metadata, for the whole pool;
+`POST /cc-router/accounts/:id/refresh` does the same for one account, which is
+what the dashboard's `R` uses when an account is selected. The account endpoint
+uses the proxy's existing authentication rules (loopback-only when no secret is set) and
 returns `Cache-Control: no-store`. Metadata is excluded from all health responses,
 including authenticated health, and is not sent to telemetry.
 

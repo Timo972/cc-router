@@ -12,8 +12,9 @@ import type { IncomingMessage } from "http";
 import type { Socket } from "net";
 import type { Request, Response } from "express";
 import { EmptyPoolError, NoEligibleAccountError, TokenPool } from "./token-pool.js";
-import { needsRefresh, refreshAccountIfCurrent, refreshAccountsOnce, startRefreshLoop } from "./token-refresher.js";
-import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById, writeAnthropicAccountsPreservingOtherProviders, serialize } from "../config/manager.js";
+import { expireTokenOnlyAccount, needsRefresh, refreshAccountIfCurrent, refreshAccountsOnce, saveAccounts, startRefreshLoop } from "./token-refresher.js";
+import { createAccountRefreshRunner, type AccountRefreshResult } from "./account-refresh.js";
+import { loadAccounts, loadOpenAIAccounts, saveOpenAIAccountsToPath, accountsFileExists, readAccountsFromPath, readConfig, writeConfig, getAutoFailoverEnabled, getProxyRequestTimeoutMs, migrateLegacyAccountProviders, setProviderAccountsEnabled, upsertAccountRecord, removeAccountRecordById } from "../config/manager.js";
 import { createRefreshAllRunner, describeRefreshAll, refreshAllAccounts } from "./pool-refresh.js";
 import { checkForUpdate, performUpdate, restartSelf, printUpdateBanner, getCurrentVersion } from "../utils/self-update.js";
 import {
@@ -36,11 +37,14 @@ import { PROXY_PORT, LITELLM_URL, ACCOUNTS_PATH } from "../config/paths.js";
 import { loadGrokHealthSnapshots, type GrokAccountSnapshot } from "../providers/xai/overview.js";
 import { writePid, removePid, managesPidFile } from "../daemon/pid.js";
 import type { Account, AccountRateLimits, AccountRecord } from "./types.js";
+import { isTokenOnly } from "./types.js";
 import { applyOpenAIAccountPatch, validateAccountPatchBody } from "./account-patch.js";
+import { validateAccountPostBody } from "./account-post-validation.js";
 import { AccountRenameConflictError, renameAccountTransaction } from "./account-rename.js";
 import {
   hasPendingCredentialWrite,
   markOpenAICredentialsPersisted,
+  needsOpenAIRefresh,
   prepareOpenAIAccountForRequest,
   refreshOpenAIAccountsOnce,
   refreshAndPersistOpenAIAccount,
@@ -78,6 +82,11 @@ import {
   deleteOpenAIAccountTransaction,
 } from "./account-deletion.js";
 import { addOpenAIAccountTransaction } from "./account-add.js";
+import {
+  accountReplacementStatusCode,
+  replaceAnthropicAccountTransaction,
+  replaceOpenAIAccountTransaction,
+} from "./account-replace.js";
 import {
   createAnthropicRefreshMiddleware,
   createAnthropicRoutingMiddleware,
@@ -134,6 +143,16 @@ export interface HealthAccountView {
    *  the write lands would fall back to the old refresh token, which the
    *  provider already invalidated, and require re-authentication. */
   credentialsPendingWrite?: boolean;
+  /** True when this account's refresh token was terminally rejected by the
+   *  provider (Anthropic `invalid_grant`). The account can never recover on
+   *  its own — the refresh loop deliberately stops retrying it — so this is
+   *  what separates "needs the operator to re-authenticate" from an ordinary
+   *  expired access token that the next refresh tick will replace. */
+  authExpired?: boolean;
+  /** True for an Anthropic account whose credential has no refresh token (a
+   *  `claude setup-token` credential). It can never be refreshed, so when it
+   *  expires the only recovery is re-authentication. */
+  tokenOnly?: true;
   /** Safe runtime-only OAuth routing state; no provider response details or
    * credentials are exposed through health. */
   authState?: "ok" | "quarantined";
@@ -238,6 +257,7 @@ export interface OperationalStatus {
     accounts: string;
     allowance: string;
     refresh: string;
+    accountRefresh: string;
     messages: string;
     responses: string;
     models: string;
@@ -290,6 +310,7 @@ export function createOperationalStatus(opts: {
       accounts: "/cc-router/accounts",
       allowance: "/cc-router/allowance",
       refresh: "/cc-router/refresh",
+      accountRefresh: "/cc-router/accounts/:id/refresh",
       messages: "/v1/messages",
       responses: "/v1/responses",
       models: "/v1/models",
@@ -357,7 +378,13 @@ function publicAnthropicAccountView(
     enabled: a.enabled,
     sessionLimitPercent: a.sessionLimitPercent,
     weeklyLimitPercent: a.weeklyLimitPercent,
-    healthy: a.enabled !== false && a.healthy,
+    // `authExpired` is checked here rather than relying on `healthy` alone:
+    // a dead refresh token must never read as healthy regardless of which
+    // code path last touched the flag. Mirrors the OpenAI view's treatment
+    // of `authState === "quarantined"`.
+    healthy: a.enabled !== false && a.healthy && a.authExpired !== true,
+    ...(a.authExpired ? { authExpired: true as const } : {}),
+    ...(a.tokens.refreshToken ? {} : { tokenOnly: true as const }),
     busy: a.busy || metrics.coolingDown,
     cooldownUntilMs: metrics.cooldownUntilMs ?? 0,
     globalCooldownUntilMs: metrics.globalCooldownUntilMs ?? 0,
@@ -493,6 +520,7 @@ function publicOpenAIAccountView(
     lastRefreshMs: a.lastRefresh,
     codexRateLimits: publicCodexRateLimits(a, routing.cooldowns),
     ...(hasPendingCredentialWrite(a) ? { credentialsPendingWrite: true } : {}),
+    ...(a.authExpired ? { authExpired: true as const } : {}),
     ...(a.authState === "quarantined" ? { authState: "quarantined" as const } : {}),
     ...(a.authFailure ? { authFailure: a.authFailure } : {}),
   };
@@ -592,6 +620,21 @@ export { applyRateLimitHeaders } from "../providers/anthropic/rate-limit-headers
  * a rotation that failed to persist earlier on disk even though no refresh was
  * involved, and the pending-write bookkeeping has to clear with it.
  */
+/**
+ * Bind Anthropic persistence to the accounts file this server was started
+ * with. Every Anthropic write has to go through it: a server running on
+ * `--accounts <path>` that writes to the default file loses each rotated
+ * refresh token on restart and clobbers a file describing a different pool.
+ * The OpenAI side has always done this — see `createOpenAIPersister`.
+ */
+export function createAnthropicPersister(
+  accountsPath: string | undefined,
+): (accounts: Account[]) => void {
+  return (accountsToSave: Account[]): void => {
+    saveAccounts(accountsToSave, accountsPath ?? ACCOUNTS_PATH);
+  };
+}
+
 export function createOpenAIPersister(
   accountsPath: string | undefined,
 ): (accounts: OpenAISubscriptionAccount[]) => void {
@@ -615,8 +658,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   const accountsPath = opts.accountsPath;
   const accountsFile = accountsPath ?? ACCOUNTS_PATH;
-  const persistAnthropicAccounts = (accounts: Account[]) => writeAnthropicAccountsPreservingOtherProviders(serialize(accounts), accountsFile);
   const persistOpenAIAccounts = createOpenAIPersister(accountsPath);
+  // Every Anthropic write goes through this, never `saveAccounts` directly, so
+  // a server started with `--accounts <path>` writes back to the file it read.
+  const persistAnthropicAccounts = createAnthropicPersister(accountsPath);
 
   if (!accountsFileExists(accountsPath)) {
     console.error(chalk.red("\n✗ accounts.json not found."));
@@ -635,8 +680,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   const usageRuntime = startUsageRuntime(usageDirectoryForAccounts(accountsFile), [
     ...accounts.map(a => ({ id: a.id, provider: "anthropic_subscription" as const })),
-    ...openAIAccounts, ...loadXaiAccounts(accountsPath),
+    ...openAIAccounts,
+    ...loadXaiAccounts(accountsPath),
   ], { unmeasuredProviders: litellmUrl ? ["anthropic_subscription"] : [] });
+
   const pool = new TokenPool(accounts);
   const sessionRouter = new SessionRouter(pool);
   const createRoutingMetricsResolver = (): RoutingMetricsResolver => {
@@ -701,7 +748,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stats.addLog({ ts: Date.now(), accountId: a.id, model: "-", type: "route", details: `${a.id} cooldown expired — rate limit cleared` });
   };
 
-  startRefreshLoop(accounts, persistAnthropicAccounts);
+  // The loop rotates refresh tokens, so it is the write that matters most for
+  // a custom accounts file: without the bound persister every rotation lands
+  // in the default file and the selected one goes stale within hours.
+  startRefreshLoop(accounts, { persist: persistAnthropicAccounts });
   startOpenAIRefreshLoop(openAIAccounts, persistOpenAIAccounts);
   const usageRefresher = new AnthropicUsageRefresher(pool);
   usageRefresher.start();
@@ -719,6 +769,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     ...pool.getAll().map(account => ({
       id: account.id, provider: "anthropic_subscription" as const,
       accessToken: account.tokens.accessToken, expiresAt: account.tokens.expiresAt, enabled: account.enabled,
+      scopes: account.tokens.scopes,
     })),
     ...openAIAccounts.map(account => ({
       id: account.id, provider: "openai_subscription" as const,
@@ -879,7 +930,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         getAll: () => pool.getAll(),
         refreshTokens: async () => {
           let failed = 0;
-          await refreshAccountsOnce(pool.getAll(), { persist: persistAnthropicAccounts, onError: error => { failed++; onError("anthropic", error); } });
+          await refreshAccountsOnce(pool.getAll(), {
+            persist: persistAnthropicAccounts,
+            onError: error => { failed++; onError("anthropic", error); },
+          });
           return { failed };
         },
         refreshUsage: account => usageRefresher.refreshNow(account as Account),
@@ -932,6 +986,56 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     captureReset: account => openAIPool.captureUsageReset(account),
     refresh: account => openAIUsageRefresher.refreshAfterCurrent(account),
   }));
+
+  // ─── Per-account refresh (authenticated) ──────────────────────────────────
+  // The whole-pool reload above, narrowed to one row: the operator who just
+  // re-authenticated a single account should not have to pay for every other
+  // account's upstream calls to see the result.
+  const runAccountRefresh = createAccountRefreshRunner({
+    findAnthropic: id => pool.findById(id),
+    findOpenAI: id => openAIAccounts.find(account => account.id === id),
+    // A long-lived `claude setup-token` credential has nothing to POST, so
+    // `needsRefresh` excludes it. Past its expiry it still needs the flip to
+    // `authExpired`, which is what the refresh step below does for it — and
+    // it stays "due" afterwards so every press reports the same unrefreshable
+    // token rather than a first `false` and a silent `null` after that.
+    anthropicTokenDue: account => needsRefresh(account)
+      || (isTokenOnly(account.tokens) && account.tokens.expiresAt <= Date.now()),
+    refreshAnthropicToken: async account => {
+      if (isTokenOnly(account.tokens)) {
+        // Nothing to refresh — mark it re-auth required once and persist, so
+        // the dashboard sees the same terminal state a restart would derive.
+        if (expireTokenOnlyAccount(account)) persistAnthropicAccounts(pool.getAll());
+        return false;
+      }
+      return refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts });
+    },
+    refreshAnthropicUsage: account => usageRefresher.refreshNow(account),
+    openAITokenDue: account => needsOpenAIRefresh(account),
+    refreshOpenAIToken: account => refreshAndPersistOpenAIAccount(account, openAIAccounts, persistOpenAIAccounts),
+    refreshOpenAIUsage: account => openAIUsageRefresher.refreshNow(account),
+    refreshIdentity: target => accountInfoCache.refreshOne(target),
+    // Logged from here, not from the route: concurrent requests for one id
+    // share a single pass, and a per-request write would record it twice.
+    onComplete: result => stats.addLog({
+      ts: Date.now(), accountId: result.id, model: "-", type: "refresh",
+      details: `manual refresh ${result.id} — ${result.usageRefreshed ? "usage fresh" : "usage fetch failed"}${result.tokenRefreshed === false ? ", token refresh failed" : ""}`,
+    }),
+  });
+  accountsRouter.post("/:id/refresh", async (req, res) => {
+    const id = req.params.id;
+    let result: AccountRefreshResult | null;
+    try {
+      result = await runAccountRefresh(id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError("refresh", 0, `manual refresh of ${id} failed: ${message}`);
+      res.status(500).json({ error: `Refresh failed: ${message}` });
+      return;
+    }
+    if (!result) { res.status(404).json({ error: `Account "${id}" not found` }); return; }
+    res.json({ refresh: result });
+  });
 
   // Shape returned to clients — NEVER includes access/refresh tokens.
   accountsRouter.get("/", (_req, res) => {
@@ -1192,20 +1296,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     });
   });
 
-  accountsRouter.post("/", (req, res) => {
-    const body = (req.body ?? {}) as Partial<AccountRecord>;
-    const required: (keyof AccountRecord)[] = ["id", "accessToken", "refreshToken", "expiresAt"];
-    for (const k of required) {
-      if (body[k] === undefined || body[k] === null || body[k] === "") {
-        res.status(400).json({ error: `Missing required field: ${k}` });
-        return;
-      }
-    }
-    if (typeof body.id !== "string" || typeof body.accessToken !== "string" ||
-        typeof body.refreshToken !== "string" || typeof body.expiresAt !== "number") {
-      res.status(400).json({ error: "Invalid field types on account record" });
-      return;
-    }
+  accountsRouter.post("/", async (req, res) => {
+    // Opt-in upsert. Re-authenticating an existing id is the only recovery for
+    // a terminally rejected refresh token, and refusing it here discarded the
+    // OAuth login the operator had just completed. It stays opt-in so an
+    // accidental id collision from any other API client still gets its 409.
+    const validated = validateAccountPostBody(req.body);
+    if (!validated.ok) { res.status(validated.status).json({ error: validated.error }); return; }
+    const { replace: wantsReplace, ...body } = validated.body;
     // Same cap validation the PATCH endpoint applies, so the two writers of
     // these fields agree instead of POST silently clamping a bad value to 100.
     const capValidation = validateAccountPatchBody({
@@ -1218,9 +1316,69 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     }
     // IDs are unique across providers, so a new account may not collide with an
     // existing account in either the Claude pool or the OpenAI pool.
-    if (pool.findById(body.id) || openAIAccounts.some(a => a.id === body.id)) {
-      res.status(409).json({ error: `Account "${body.id}" already exists` });
-      return;
+    const existingAnthropic = pool.findById(body.id);
+    const existingOpenAI = openAIAccounts.find(a => a.id === body.id);
+    if (existingAnthropic || existingOpenAI) {
+      // Replacement is within a provider only: swapping a Claude account for
+      // an OpenAI one under the same id is an id collision, not a re-auth.
+      const sameProvider = body.provider === "openai_subscription"
+        ? existingOpenAI !== undefined
+        : body.provider !== "xai_subscription" && existingAnthropic !== null;
+      if (!wantsReplace || !sameProvider) {
+        res.status(409).json({ error: `Account "${body.id}" already exists` });
+        return;
+      }
+
+      try {
+        if (existingOpenAI) {
+          const replaced = replaceOpenAIAccountTransaction({
+            record: {
+              id: body.id,
+              accessToken: body.accessToken,
+              refreshToken: body.refreshToken!,
+              expiresAt: body.expiresAt,
+              enabled: body.enabled,
+              sessionLimitPercent: body.sessionLimitPercent,
+              weeklyLimitPercent: body.weeklyLimitPercent,
+            },
+            accounts: openAIAccounts,
+            persist: persistOpenAIAccounts,
+            forgetAccount: account => openAIPool.forgetAccount(account),
+            invalidateAccount: accountId => { openAIRouter.invalidateAccount(accountId); },
+          });
+          res.json({ account: publicOpenAIAccountView(replaced, resolveOpenAIRouting(replaced.id)) });
+          return;
+        }
+
+        const replaced = await replaceAnthropicAccountTransaction({
+          record: {
+            id: body.id,
+            provider: "anthropic_subscription",
+            accessToken: body.accessToken,
+            refreshToken: body.refreshToken,
+            expiresAt: body.expiresAt,
+            scopes: Array.isArray(body.scopes) ? body.scopes : ["user:inference", "user:profile"],
+            enabled: body.enabled,
+            sessionLimitPercent: body.sessionLimitPercent,
+            weeklyLimitPercent: body.weeklyLimitPercent,
+          },
+          pool,
+          sessionRouter,
+          persist: persistAnthropicAccounts,
+        });
+        res.json({ account: publicAnthropicAccountView(replaced, createRoutingMetricsResolver()(replaced.id)) });
+        return;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const status = accountReplacementStatusCode(err);
+        if (status === 409) {
+          res.status(409).json({ error: message });
+          return;
+        }
+        logError("accounts", 0, `Failed to replace account: ${message}`);
+        res.status(500).json({ error: `Failed to replace account: ${message}` });
+        return;
+      }
     }
 
     if (body.provider === "xai_subscription") {
@@ -1233,7 +1391,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           expiresAt: body.expiresAt,
           scopes: Array.isArray(body.scopes) ? body.scopes : [],
           enabled: body.enabled !== false,
-        }, accountsFile);
+        });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
@@ -1266,7 +1424,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           record: {
             id: body.id,
             accessToken: body.accessToken,
-            refreshToken: body.refreshToken,
+            refreshToken: body.refreshToken!,
             expiresAt: body.expiresAt,
             enabled: body.enabled,
             sessionLimitPercent: body.sessionLimitPercent,
@@ -1321,7 +1479,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     const existing = pool.findById(id);
     const openAIExisting = openAIAccounts.find(account => account.id === id);
     if (!existing && !openAIExisting) {
-      const removedXai = removeAccountRecordById(id, accountsFile);
+      const removedXai = removeAccountRecordById(id);
       if (removedXai?.provider === "xai_subscription") {
         res.json({ deleted: id, remaining: pool.getAll().length + openAIAccounts.length });
         return;
@@ -1411,9 +1569,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   app.use(telemetryRequestMiddleware());
 
   mountResponsesRoutes(app, {
-    usageRuntime,
     openAIRouter,
     openAIPool,
+    usageRuntime,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
@@ -1422,9 +1580,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   });
 
   mountMessagesCrossProviderRoute(app, {
-    usageRuntime,
     openAIRouter,
     openAIPool,
+    usageRuntime,
     prepareOpenAIAccount: (account) => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     modelRouting,
     onUpstreamAuthFailure: onOpenAIUpstreamAuthFailure,
@@ -1457,11 +1615,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // router-side 429 failover and 5xx retry; every other /v1 endpoint stays on
   // the generic byte-transparent proxy below.
   mountAnthropicMessagesRoute(app, {
-    usageRuntime,
     target,
     timeoutMs: proxyRequestTimeoutMs,
     pool,
     sessionRouter,
+    usageRuntime,
     ...upstreamAttempts,
     needsRefresh,
     refresh: account => refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts }),
@@ -1707,16 +1865,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       concurrency: pool.getInFlight(account.id),
     });
 
-    req._pendingLog = Object.assign(req._ccUsageEntry ?? {}, {
+    req._pendingLog = {
       ts: Date.now(),
       accountId: account.id,
       model: "-",
-      type: "route" as const,
+      type: "route",
       method: req.method,
       path: req.path,
       source,
       details: routeReasonDetails(route),
-    });
+    };
     stats.totalRequests++;
 
     logRoute(
@@ -1835,10 +1993,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   process.on("SIGTERM", () => { void shutdown(); });
   process.on("SIGINT", () => { void shutdown(); });
-
-  // Preserve Node's fatal handling for unexpected server errors after startup.
-  // The temporary startup listener above exists only long enough to reject
-  // startServer() cleanly on EADDRINUSE/EACCES.
 
   {
     // Write PID for daemon/service process management

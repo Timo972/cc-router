@@ -89,8 +89,10 @@ can also show subscription status and a **Since** date. This is the subscription
 creation date, not the start of its current billing period.
 
 Metadata is cached in memory and refreshed in the background. **R** requests an
-immediate refresh alongside usage and credentials. Failed lookups retain the last
-successful data with a stale marker; an initial lookup may show unavailable.
+immediate refresh alongside usage and credentials — for the selected account
+alone when ACCOUNTS is focused, for the whole pool otherwise. Failed lookups
+retain the last successful data with a stale marker; an initial lookup may show
+unavailable.
 Billing interval is not supported. Missing renewal dates are not guessed from
 token expiry or usage resets. Stored Grok accounts currently supply plan metadata only.
 
@@ -107,7 +109,7 @@ depend on which has focus.
 | `Esc` | Return to logs, or quit if logs already has focus |
 | `q` | Quit |
 | `z` | Compact view — hides TOTALS and RECENT ACTIVITY so more accounts fit |
-| `R` | Reload account metadata, usage, and due credentials without restarting the router |
+| `R` | Reload usage and credentials for the selected account when ACCOUNTS is focused; otherwise reload every account, metadata and models |
 | `m` | Load discovered provider models |
 | `n` | Add an account |
 | `c` | Toggle Claude Code routing — or set the Claude default when MODELS is focused |
@@ -121,6 +123,7 @@ With **ACCOUNTS** focused:
 | `a` / `o` / `g` | Enable/disable *every* Claude / ChatGPT / Grok account at once |
 | `w` / `s` | Set the selected account's 7-day / 5-hour cap |
 | `d` | Delete the selected account |
+| `l` | Re-authenticate the selected account (Claude or ChatGPT) — the dashboard hands over to the sign-in flow and returns afterwards |
 | `Ctrl+R` | Redeem one banked usage-limit reset (ChatGPT accounts only) |
 
 With **MODELS** focused:
@@ -131,10 +134,11 @@ With **MODELS** focused:
 | `c` | Set the selected model as the Claude default |
 | `o` | Set the selected `openai/*` model as the OpenAI default |
 
-Grok accounts accept none of the account actions. `e`, `w`, `s` and `d` each
+Grok accounts accept none of the account actions. `e`, `w`, `s`, `d` and `l` each
 explain why instead of acting: Grok is read-only here, caps do not apply to a
 provider that is never routed, and the credentials live in `~/.grok`, so adding
-or removing one means `grok login` / `grok logout`.
+or removing one means `grok login` / `grok logout`. `l` says the same: re-sign in
+with `grok login`, then import the result with `cc-router accounts add grok`.
 
 ## Redeeming a ChatGPT usage reset
 

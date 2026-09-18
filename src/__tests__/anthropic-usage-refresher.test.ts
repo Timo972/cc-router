@@ -13,14 +13,14 @@ import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.
 import { TokenPool } from "../proxy/token-pool.js";
 import { DEFAULT_RATE_LIMITS, type Account } from "../proxy/types.js";
 
-function account(id: string): Account {
+function account(id: string, scopes: string[] = ["user:inference", "user:profile"]): Account {
   return {
     id,
     tokens: {
       accessToken: `secret-access-${id}`,
       refreshToken: `secret-refresh-${id}`,
       expiresAt: 1_900_000_000_000,
-      scopes: ["user:inference"],
+      scopes,
     },
     healthy: true,
     busy: false,
@@ -290,6 +290,16 @@ describe("AnthropicUsageRefresher", () => {
     refresher.stop();
     await vi.advanceTimersByTimeAsync(20 * 60_000);
     expect(fetchUsage).toHaveBeenCalledTimes(calls);
+  });
+
+  it("does not fetch usage for an inference-only token and marks it unavailable", async () => {
+    const fetchUsage = vi.fn(async () => usageResult());
+    const pool = new TokenPool([account("inference-only", ["user:inference"])]);
+    const refresher = new AnthropicUsageRefresher(pool, { fetchUsage, now: () => 1_000 });
+    const result = await refresher.refreshNow(pool.getAll()[0]!);
+    expect(fetchUsage).not.toHaveBeenCalled();
+    expect(result.ok).toBe(false);
+    expect(pool.getAll()[0]!.rateLimits.usage).toMatchObject({ fetchStatus: "unavailable", modelLimits: [] });
   });
 
   it("prunes failure history when an account is removed", async () => {

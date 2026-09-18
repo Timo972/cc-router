@@ -26,6 +26,25 @@ function record(overrides: Partial<OpenAISubscriptionAccount> = {}): OpenAISubsc
 }
 
 describe("createOpenAIAccount", () => {
+  it("loads a persisted authExpired record as quarantined and unhealthy", () => {
+    // Defaulting to healthy would route live traffic at a token whose refresh
+    // is already known dead, and burn a request to discover it.
+    const account = createOpenAIAccount(record({ authExpired: true }));
+
+    expect(account.authExpired).toBe(true);
+    expect(account.authState).toBe("quarantined");
+    expect(account.authFailure).toBe("permanent");
+    expect(account.healthy).toBe(false);
+  });
+
+  it("loads an ordinary record as healthy and not quarantined", () => {
+    const account = createOpenAIAccount(record());
+
+    expect(account.authExpired).toBeUndefined();
+    expect(account.authState).toBe("ok");
+    expect(account.healthy).toBe(true);
+  });
+
   it("builds a runtime account with defaults and clamped caps", () => {
     const account = createOpenAIAccount(record({ sessionLimitPercent: 250, weeklyLimitPercent: -3 }));
     expect(account.healthy).toBe(true);

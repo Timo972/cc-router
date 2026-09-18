@@ -402,3 +402,46 @@ describe("refreshAccountToken", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 });
+
+// ─── token-only (setup-token) accounts ───────────────────────────────────────
+
+function tokenOnlyAccount(expiresAt: number): Account {
+  const account = makeAccount(expiresAt);
+  delete account.tokens.refreshToken;
+  return account;
+}
+
+describe("token-only accounts", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("needsRefresh is false even inside the refresh window", () => {
+    expect(needsRefresh(tokenOnlyAccount(Date.now() + 60_000))).toBe(false);
+  });
+
+  it("refreshAccountsOnce never calls the token endpoint for a token-only account", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const account = tokenOnlyAccount(Date.now() + 60_000);
+    await refreshAccountsOnce([account]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(account.authExpired).toBeUndefined();
+    expect(account.healthy).toBe(true);
+  });
+
+  it("refreshAccountsOnce marks an expired token-only account as needing re-auth, once", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const persist = vi.fn();
+    const account = tokenOnlyAccount(Date.now() - 1_000);
+    await refreshAccountsOnce([account], { persist });
+    expect(account.authExpired).toBe(true);
+    expect(account.healthy).toBe(false);
+    expect(persist).toHaveBeenCalledTimes(1);
+    await refreshAccountsOnce([account], { persist });
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

@@ -1,8 +1,36 @@
 export interface OAuthTokens {
   accessToken: string;   // sk-ant-oat01-...
-  refreshToken: string;  // sk-ant-ort01-...
+  /** Absent for a `claude setup-token` credential: long-lived, never refreshable. */
+  refreshToken?: string; // sk-ant-ort01-...
   expiresAt: number;     // Unix timestamp in ms
   scopes: string[];      // ["user:inference", "user:profile"]
+}
+
+/** A credential with no refresh token can only be replaced, never refreshed. */
+export function isTokenOnly(tokens: { refreshToken?: string }): boolean {
+  return !tokens.refreshToken;
+}
+
+export interface AccountUserSettings {
+  enabled?: boolean;
+  sessionLimitPercent?: number;
+  weeklyLimitPercent?: number;
+}
+
+/**
+ * Fill the operator-controlled settings a record omits from the account it
+ * replaces. Re-authentication hands over credentials only; without this a
+ * disabled account came back enabled and custom caps reset to 100.
+ */
+export function withInheritedSettings<T extends AccountUserSettings>(record: T, previous: AccountUserSettings): T {
+  return {
+    ...record,
+    ...(record.enabled === undefined && previous.enabled !== undefined ? { enabled: previous.enabled } : {}),
+    ...(record.sessionLimitPercent === undefined && previous.sessionLimitPercent !== undefined
+      ? { sessionLimitPercent: previous.sessionLimitPercent } : {}),
+    ...(record.weeklyLimitPercent === undefined && previous.weeklyLimitPercent !== undefined
+      ? { weeklyLimitPercent: previous.weeklyLimitPercent } : {}),
+  };
 }
 
 export interface AccountRateLimits {
@@ -132,7 +160,8 @@ export interface AccountRecord {
   id: string;
   provider?: "anthropic_subscription" | "openai_subscription" | "openai_api_key" | "xai_subscription";
   accessToken: string;
-  refreshToken: string;
+  /** Absent for a `claude setup-token` credential: long-lived, never refreshable. */
+  refreshToken?: string;
   expiresAt: number;
   scopes: string[];
   // The following three fields are optional for backwards compatibility with

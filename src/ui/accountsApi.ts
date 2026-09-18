@@ -14,6 +14,10 @@ const REQUEST_TIMEOUT_MS = 3_000;
 // 10s each. The server single-flights the pass, so a client that does give
 // up and presses again joins the running one rather than stacking another.
 const REFRESH_ALL_TIMEOUT_MS = 120_000;
+// One account only: a token refresh, one usage fetch and the identity fetch.
+// Far short of the whole-pool budget, but long enough that a slow upstream
+// still lands rather than the dashboard reporting a timeout it caused.
+const REFRESH_ONE_TIMEOUT_MS = 30_000;
 const MAX_PUBLIC_ROWS = 12;
 
 export interface AccountPatch {
@@ -67,6 +71,14 @@ export interface RefreshAllResult {
   durationMs: number;
 }
 
+export interface AccountRefreshResult {
+  id: string;
+  /** null when no token refresh was due — not a failure. */
+  tokenRefreshed: boolean | null;
+  usageRefreshed: boolean;
+  durationMs: number;
+}
+
 export interface UsageResetResult { code: CodexResetCode; usageRefreshed: boolean }
 
 export interface AccountsApi {
@@ -76,6 +88,8 @@ export interface AccountsApi {
   /** Ask the router to sweep cooldowns, re-try due tokens and re-fetch every
    *  account's usage — a restart's worth of freshness without a restart. */
   refreshAll(): Promise<RefreshAllResult>;
+  /** Refresh one account: its token if due, its usage, and identity metadata. */
+  refreshAccount(id: string): Promise<AccountRefreshResult>;
   /** Apply a partial update to an account. Throws on non-2xx or network error. */
   patch(id: string, patch: AccountPatch): Promise<void>;
   /** Enable or disable every configured account for a provider. */
@@ -129,6 +143,22 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
   return {
     list,
     refreshAll,
+    async refreshAccount(id) {
+      const res = await fetch(`${base}/${encodeURIComponent(id)}/refresh`, {
+        method: "POST",
+        headers: authHeaders,
+        signal: AbortSignal.timeout(REFRESH_ONE_TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const payload = await res.json() as { refresh?: unknown };
+      const r = isRecord(payload.refresh) ? payload.refresh : {};
+      return {
+        id: publicText(r.id, 128, id),
+        tokenRefreshed: r.tokenRefreshed === true ? true : r.tokenRefreshed === false ? false : null,
+        usageRefreshed: r.usageRefreshed === true,
+        durationMs: publicInteger(r.durationMs),
+      };
+    },
     async resetUsage(id, redeemRequestId) {
       const response = await fetch(`${base}/${encodeURIComponent(id)}/reset-usage`, {
         method: "POST",

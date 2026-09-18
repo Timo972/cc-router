@@ -2,19 +2,11 @@ import type { Command } from "commander";
 import { select, input, confirm, password } from "@inquirer/prompts";
 import chalk from "chalk";
 import { detectPlatform, isMacos } from "../utils/platform.js";
-import {
-  extractFromKeychainDetailed,
-  extractFromCredentialsFileDetailed,
-  formatExpiry,
-  redactToken,
-} from "../utils/token-extractor.js";
-import { validateToken } from "../utils/token-validator.js";
 import { writeClaudeSettings, readClaudeProxySettings } from "../utils/claude-config.js";
 import { saveAccounts } from "../proxy/token-refresher.js";
-import { loadAccounts, accountsFileExists, readConfig, writeConfig, generateProxySecret, serialize, type ClientConfig } from "../config/manager.js";
+import { loadAccounts, accountsFileExists, readConfig, writeConfig, generateProxySecret, type ClientConfig } from "../config/manager.js";
 import { PROXY_PORT } from "../config/paths.js";
-import type { Account, OAuthTokens } from "../proxy/types.js";
-import { DEFAULT_RATE_LIMITS, ACCOUNT_USER_DEFAULTS } from "../proxy/types.js";
+import type { Account } from "../proxy/types.js";
 import { existsSync } from "fs";
 import {
   checkMitmproxyInstalled,
@@ -26,19 +18,14 @@ import {
   openNetworkExtensionSettings,
 } from "../interceptor/mitmproxy-manager.js";
 import { printDesktopSupportExplainer, printNetworkExtensionInstructions } from "./cmd-client.js";
+import { collectClaudeAccount } from "./account-flows.js";
+import { accountToRecord } from "./account-flows.js";
+import { addAccountRuntimeAware, isAccountApiReachable, tryAddAccountToRunningProxy } from "./cmd-accounts.js";
 import {
-  createSetupAttempt,
-  failAttemptFromError,
   withSetupTelemetryFlush,
   type SetupAttempt,
   type SetupFailureOutcome,
 } from "../telemetry/setup-diagnostics.js";
-import type { SetupStage } from "../telemetry/contracts.js";
-import {
-  addAccountRuntimeAware,
-  isAccountApiReachable,
-  tryAddAccountToRunningProxy,
-} from "./cmd-accounts.js";
 
 // ─── Public registration ──────────────────────────────────────────────────────
 
@@ -56,159 +43,6 @@ export function registerSetup(program: Command): void {
 function printDiagnosticId(outcome: SetupFailureOutcome): void {
   if (!outcome.unexpected) return;
   console.log(chalk.gray(`  Diagnostic ID: ${outcome.diagnosticId}`));
-}
-
-// ─── Shared single-account setup (also used by `accounts add`) ───────────────
-
-/**
- * Same step, but also hands back the setup attempt so the caller can mark the
- * `persistence` stage and the final outcome once the account is written.
- */
-export async function setupSingleAccountWithAttempt(
-  index: number,
-): Promise<{ account: Account | null; attempt: SetupAttempt }> {
-  type ExtractionMethod = "keychain" | "credentials" | "manual";
-
-  const choices: { name: string; value: ExtractionMethod }[] = [];
-  if (isMacos()) {
-    choices.push({ name: "Extract automatically from macOS Keychain  (recommended)", value: "keychain" });
-  }
-  choices.push({ name: "Read from ~/.claude/.credentials.json", value: "credentials" });
-  choices.push({ name: "Paste tokens manually", value: "manual" });
-
-  const method = await select<ExtractionMethod>({
-    message: "How do you want to add the tokens?",
-    choices,
-  });
-
-  const attempt = createSetupAttempt({
-    provider: "anthropic",
-    method: method === "keychain"
-      ? "macos_keychain"
-      : method === "credentials" ? "claude_credentials_file" : "manual_token",
-  });
-  attempt.stageCompleted("credential_source_selection");
-  // Shared by reference: the file-extraction fallback swaps in a manual-token attempt.
-  const current = { attempt };
-  let reached: SetupStage = "credential_read";
-  try {
-    return await collectAnthropicAccount(index, method, current, stage => { reached = stage; });
-  } catch (error) {
-    // A thrown prompt or extraction error must still close the funnel record.
-    const outcome = failAttemptFromError(current.attempt, error, reached);
-    if (outcome) printDiagnosticId(outcome);
-    throw error;
-  }
-}
-
-async function collectAnthropicAccount(
-  index: number,
-  method: "keychain" | "credentials" | "manual",
-  current: { attempt: SetupAttempt },
-  reached: (stage: SetupStage) => void,
-): Promise<{ account: Account | null; attempt: SetupAttempt }> {
-  let attempt = current.attempt;
-  let tokens: OAuthTokens | null = null;
-
-  if (method === "keychain") {
-    process.stdout.write(chalk.gray("  Extracting from Keychain... "));
-    const extraction = await extractFromKeychainDetailed();
-    if (extraction.ok) {
-      tokens = extraction.tokens;
-      console.log(chalk.green("✓"));
-      console.log(chalk.gray(`  Token: ${redactToken(tokens.accessToken)}`));
-      console.log(chalk.gray(`  Expiry: ${formatExpiry(tokens.expiresAt)}`));
-    } else {
-      console.log(chalk.red("✗"));
-      console.log(chalk.yellow("  Could not find credentials in Keychain."));
-      console.log(chalk.gray("  Make sure Claude Code is logged in: run `claude login` first."));
-      printDiagnosticId(attempt.stageFailed(extraction.error, "credential_read"));
-      const retry = await confirm({ message: "Try another extraction method?", default: true });
-      attempt.cancelled();
-      if (!retry) return { account: null, attempt };
-      return setupSingleAccountWithAttempt(index);
-    }
-  }
-
-  if (method === "credentials") {
-    const extraction = extractFromCredentialsFileDetailed();
-    if (extraction.ok) {
-      tokens = extraction.tokens;
-      console.log(chalk.green(`  ✓ Found credentials in ~/.claude/.credentials.json`));
-      console.log(chalk.gray(`    Token: ${redactToken(tokens.accessToken)}`));
-      console.log(chalk.gray(`    Expiry: ${formatExpiry(tokens.expiresAt)}`));
-    } else {
-      console.log(chalk.red("  ✗ ~/.claude/.credentials.json not found or unreadable."));
-      console.log(chalk.gray("  Make sure Claude Code is installed and you've run `claude login`."));
-      const retry = await confirm({ message: "Paste tokens manually instead?", default: true });
-      if (!retry) {
-        printDiagnosticId(attempt.stageFailed(extraction.error, "credential_read"));
-        attempt.cancelled();
-        return { account: null, attempt };
-      }
-      // The file-based attempt failed; the pasted tokens are a manual-token setup.
-      printDiagnosticId(attempt.failed(extraction.error, "credential_read"));
-      attempt = createSetupAttempt({ provider: "anthropic", method: "manual_token" });
-      current.attempt = attempt;
-      attempt.stageCompleted("credential_source_selection");
-      tokens = await promptManualTokens();
-    }
-  }
-
-  if (method === "manual") {
-    tokens = await promptManualTokens();
-  }
-
-  if (!tokens) {
-    attempt.cancelled();
-    return { account: null, attempt };
-  }
-
-  attempt.stageCompleted("credential_read");
-  attempt.stageCompleted("credential_parse");
-  reached("token_validation");
-
-  const defaultId = `max-account-${index}`;
-  const accountId = await input({
-    message: "Account ID (press Enter to accept default):",
-    default: defaultId,
-    validate: (v) => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-  });
-
-  process.stdout.write(chalk.gray("  Validating tokens against Anthropic... "));
-  const validation = await validateToken(tokens.accessToken);
-
-  if (validation.valid) {
-    console.log(chalk.green("✓ Valid"));
-    attempt.stageCompleted("token_validation");
-  } else {
-    console.log(chalk.red("✗ Invalid"));
-    console.log(chalk.yellow(`  Reason: ${validation.reason}`));
-    printDiagnosticId(attempt.stageFailed(validation.diagnostic, "token_validation"));
-    console.log(chalk.gray("  The token will be saved but may not work until refreshed."));
-    const keepAnyway = await confirm({ message: "Save this account anyway?", default: false });
-    if (!keepAnyway) {
-      attempt.cancelled();
-      return { account: null, attempt };
-    }
-  }
-
-  return {
-    account: {
-      id: accountId,
-      tokens,
-      healthy: validation.valid,
-      busy: false,
-      requestCount: 0,
-      errorCount: 0,
-      lastUsed: 0,
-      lastRefresh: 0,
-      consecutiveErrors: 0,
-      rateLimits: { ...DEFAULT_RATE_LIMITS },
-      ...ACCOUNT_USER_DEFAULTS,
-    },
-    attempt,
-  };
 }
 
 // ─── Full wizard ──────────────────────────────────────────────────────────────
@@ -275,14 +109,9 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
     }
   }
 
-  if (!addMode && isMacos()) {
-    console.log(chalk.cyan("  Tip: to add multiple accounts, you need to:"));
-    console.log(chalk.gray("  1. Log in to Claude Code with account 1 (already done if you use CC normally)"));
-    console.log(chalk.gray("  2. Extract tokens → log out → log in with account 2 → extract → repeat\n"));
-  }
-
   let numAccounts = 1;
   if (!addMode) {
+    console.log(chalk.gray("  Tip: each account can be signed in directly with the browser method — no logging Claude Code out between them.\n"));
     const { number } = await import("@inquirer/prompts");
     numAccounts = await number({
       message: "How many accounts do you want to configure now?",
@@ -299,17 +128,8 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
     const label = numAccounts > 1 ? `${i + 1}/${numAccounts}` : "";
     console.log(chalk.bold(`\n${"━".repeat(40)}\n  Account ${label}\n${"━".repeat(40)}\n`));
 
-    if (i > 0 && isMacos()) {
-      console.log(chalk.yellow(
-        `  Before extracting account ${i + 1}:\n` +
-        `  1. Run: ${chalk.white("claude logout")}\n` +
-        `  2. Run: ${chalk.white("claude login")}  (log in with your next Max account)\n`
-      ));
-      await confirm({ message: "Ready?", default: true });
-    }
-
     const existingCount = hasExisting ? loadAccounts().length : 0;
-    const { account, attempt } = await setupSingleAccountWithAttempt(i + 1 + existingCount);
+    const { account, attempt } = await collectClaudeAccount({ index: i + 1 + existingCount });
     if (account) {
       newAccounts.push(account);
       savedAttempts.push(attempt);
@@ -361,21 +181,12 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
 
 export interface SetupAccountPersistenceDependencies {
   isLive(): Promise<boolean>;
-  tryAddLive(record: ReturnType<typeof serialize>[number]): Promise<boolean>;
+  tryAddLive(record: ReturnType<typeof accountToRecord>): Promise<boolean>;
   saveStored(accounts: Account[]): void;
 }
 
-/**
- * Additive setup can be applied through the daemon one account at a time.
- * Replacing the whole inventory has no live transaction endpoint, so it is
- * deliberately restricted to the exclusive offline writer path.
- */
 export async function persistSetupAccountsRuntimeAware(
-  input: {
-    newAccounts: Account[];
-    merged: Account[];
-    replaceExisting: boolean;
-  },
+  input: { newAccounts: Account[]; merged: Account[]; replaceExisting: boolean },
   dependencies: SetupAccountPersistenceDependencies = {
     isLive: isAccountApiReachable,
     tryAddLive: tryAddAccountToRunningProxy,
@@ -391,12 +202,9 @@ export async function persistSetupAccountsRuntimeAware(
     dependencies.saveStored(input.merged);
     return "stored";
   }
-
-  for (const record of serialize(input.newAccounts)) {
-    const { mode } = await addAccountRuntimeAware(record, {
+  for (const account of input.newAccounts) {
+    const { mode } = await addAccountRuntimeAware(accountToRecord(account), {
       tryAddLive: dependencies.tryAddLive,
-      // If the daemon is unreachable, publish the complete merged inventory
-      // once; the remaining records are already included in this write.
       addStored: () => dependencies.saveStored(input.merged),
     });
     if (mode === "stored") return "stored";
@@ -509,52 +317,8 @@ async function runPostSetupFlow(accountCount: number): Promise<void> {
 function printDone(accountCount: number): void {
   console.log(chalk.bold(`\n${"━".repeat(40)}\n  All done — ${accountCount} account(s) ready\n${"━".repeat(40)}\n`));
   console.log(`  Start the proxy:   ${chalk.cyan("cc-router start")}`);
-  console.log(`  Add more accounts: ${chalk.cyan("cc-router setup --add")}`);
+  console.log(`  Add more accounts: ${chalk.cyan("cc-router accounts login")} or ${chalk.cyan("cc-router setup --add")}`);
   console.log(`  Dashboard:         ${chalk.cyan("cc-router status")}\n`);
-}
-
-// ─── Manual token input ───────────────────────────────────────────────────────
-
-async function promptManualTokens(): Promise<OAuthTokens | null> {
-  console.log(chalk.gray(
-    "\n  You can find your tokens by running:\n" +
-    "    macOS:         security find-generic-password -s 'Claude Code-credentials' -w\n" +
-    "    Linux/Windows: cat ~/.claude/.credentials.json\n"
-  ));
-
-  const accessToken = await password({
-    message: "Paste accessToken (sk-ant-oat01-...):",
-    mask: "•",
-    validate: (v) =>
-      v.startsWith("sk-ant-oat01-") || v.startsWith("sk-ant-")
-        ? true
-        : "Must start with sk-ant-oat01-",
-  });
-
-  const refreshToken = await password({
-    message: "Paste refreshToken (sk-ant-ort01-...):",
-    mask: "•",
-    validate: (v) =>
-      v.startsWith("sk-ant-ort01-") || v.startsWith("sk-ant-")
-        ? true
-        : "Must start with sk-ant-ort01-",
-  });
-
-  const useDefaultExpiry = await confirm({
-    message: "Use default expiry (8 hours from now)?",
-    default: true,
-  });
-
-  const expiresAt = useDefaultExpiry
-    ? Date.now() + 8 * 60 * 60 * 1000
-    : new Date(await input({ message: "Paste expiresAt (ISO date or ms timestamp):" })).getTime();
-
-  return {
-    accessToken,
-    refreshToken,
-    expiresAt,
-    scopes: ["user:inference", "user:profile"],
-  };
 }
 
 // ─── Client-mode setup (from wizard) ─────────────────────────────────────────

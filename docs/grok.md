@@ -22,7 +22,7 @@ Two ways, both producing an `xai_subscription` account record in
 If you already run the Grok CLI, its OIDC login is at `~/.grok/auth.json`:
 
 ```bash
-cc-router accounts add-grok
+cc-router accounts add grok
 ```
 
 You're prompted for an account ID (defaults to the one derived from the import)
@@ -34,7 +34,7 @@ address.
 If you have no local Grok CLI login, sign in directly:
 
 ```bash
-cc-router accounts login-grok
+cc-router accounts login grok
 ```
 
 The CLI prints a verification URL and a one-time code, you approve it in your
