@@ -28,7 +28,18 @@ export function startUsageRuntime(directory: string, accounts: readonly Configur
     recoverAccountTransition(store, directory, accounts);
     reconcileUsageAccounts(store, accounts);
     unregister = registerUsageWriter(directory, store, () => { failed = true; });
-  } catch { failed = true; }
+  } catch {
+    // Initialization may fail after UsageStore.open() has claimed the journal
+    // and before the runtime becomes usable. Do not leave that partial owner
+    // alive: the server continues booting with a failed runtime, and later
+    // account mutations must still be able to recover/open the store.
+    try { unregister?.(); } finally {
+      unregister = undefined;
+      try { store?.close(); } catch { /* preserve the original init failure */ }
+      store = undefined;
+    }
+    failed = true;
+  }
   try { overrides = readPricingOverrides(join(directory, "pricing.json")); }
   catch { pricingInvalid = true; warnings.add("Invalid pricing overrides: observations remain unpriced until restart with valid configuration."); }
   const available = (): UsageStore => { if (!store || closed || failed) throw new UsageUnavailableError(); return store; };

@@ -12,6 +12,36 @@ const entry = (): LogEntry => ({ ts: Date.now(), accountId: "work", model: "requ
 function runtime(dir = directory(), options = {}) { const r = startUsageRuntime(dir, [{ id: "work", provider: "openai_subscription" }, { id: "claude", provider: "anthropic_subscription" }], options); runtimes.push(r); return r; }
 afterEach(() => { runtimes.splice(0).forEach(r => r.close()); dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })); vi.useRealTimers(); });
 describe("persistent usage runtime", () => {
+  it.each(["transition recovery", "account reconciliation"] as const)(
+    "releases the usage writer when %s fails during initialization",
+    failure => {
+      const dir = directory();
+      if (failure === "transition recovery") {
+        const seed = UsageStore.open(dir);
+        seed.account("openai_subscription", "old");
+        seed.close();
+        writeFileSync(join(dir, "account-transition.json"), JSON.stringify({
+          version: 1,
+          before: [{ id: "old", provider: "openai_subscription" }],
+          after: [{ id: "new", provider: "openai_subscription" }],
+          rename: { oldId: "old", newId: "new" },
+        }));
+      }
+      const accounts = failure === "transition recovery"
+        ? [{ id: "unexpected", provider: "openai_subscription" as const }]
+        : [{ id: "invalid\nalias", provider: "openai_subscription" as const }];
+
+      const failedRuntime = startUsageRuntime(dir, accounts);
+      runtimes.push(failedRuntime);
+      expect(() => failedRuntime.snapshot()).toThrow(/unavailable/i);
+
+      expect(() => {
+        const next = UsageStore.open(dir);
+        next.close();
+      }).not.toThrow();
+    },
+  );
+
   it("deduplicates cumulative OpenAI callbacks and finalizes only at settlement", () => {
     const r = runtime(); const e = entry(); r.bind(e, "openai_subscription"); setUsageModel(e, "gpt-5.2");
     applyCodexUsage(e, { inputTokens: 100, cachedInputTokens: 60, outputTokens: 8 });
