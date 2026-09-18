@@ -1,4 +1,5 @@
 import { createXaiAccountRecord, XAI_DEFAULT_SCOPES, type XaiAccountRecord } from "./account-record.js";
+import { openInBrowser } from "../../utils/browser.js";
 
 const DEFAULT_ISSUER = "https://auth.x.ai";
 const DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -29,6 +30,8 @@ export interface ExchangeXaiDeviceCodeOptions extends XaiDeviceOAuthOptions {
 export interface LoginXaiWithDeviceCodeOptions extends XaiDeviceOAuthOptions {
   accountId: string;
   onDeviceCode?: (code: XaiDeviceCode) => void;
+  /** Injection seam for tests; defaults to the best-effort `openInBrowser`. */
+  openBrowser?: (url: string) => Promise<boolean>;
   sleep?: (ms: number) => Promise<void>;
   timeoutMs?: number;
   now?: () => number;
@@ -167,6 +170,9 @@ export async function loginXaiWithDeviceCode(
 ): Promise<XaiAccountRecord> {
   const deviceCode = await requestXaiDeviceCode(opts);
   opts.onDeviceCode?.(deviceCode);
+  // Best effort, and only after the URL and code have been printed: a failed
+  // open must never abort a sign-in the person can still finish by hand.
+  await (opts.openBrowser ?? openInBrowser)(deviceCode.verificationUrl);
   const tokens = await exchangeXaiDeviceCodeForTokens({ ...opts, deviceCode });
   return createXaiAccountRecord({
     id: opts.accountId,

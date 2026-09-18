@@ -1,8 +1,17 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   exchangeXaiDeviceCodeForTokens,
+  loginXaiWithDeviceCode,
   requestXaiDeviceCode,
 } from "../providers/xai/device-oauth.js";
+
+// No test in this file may reach the real browser opener.
+beforeEach(() => {
+  vi.stubEnv("CC_ROUTER_NO_BROWSER", "1");
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 function jwtWithExp(exp: number): string {
   const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");
@@ -69,5 +78,39 @@ describe("xAI device OAuth", () => {
       refreshToken: "refresh",
       expiresAt: 2_000_000_000_000,
     });
+  });
+
+  it("opens the verification URL once, after reporting the device code", async () => {
+    const accessToken = jwtWithExp(2_000_000_000);
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          device_code: "dev-1",
+          user_code: "ABCD-1234",
+          verification_uri: "https://accounts.x.ai/oauth2/device",
+          verification_uri_complete: "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
+          interval: 1,
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ access_token: accessToken, refresh_token: "refresh" }),
+      } as Response);
+
+    const calls: string[] = [];
+    await loginXaiWithDeviceCode({
+      accountId: "grok",
+      fetchImpl,
+      sleep: async () => {},
+      onDeviceCode: () => calls.push("printed"),
+      openBrowser: async (url: string) => {
+        calls.push(url);
+        return true;
+      },
+    });
+
+    expect(calls).toEqual(["printed", "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"]);
   });
 });
