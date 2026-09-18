@@ -35,6 +35,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `POST /cc-router/accounts/:id/refresh` refreshes one account. The
   dashboard's `R` uses it when an account is selected and reloads the whole
   pool otherwise.
+
+---
+
+## [0.12.4] — 2026-09-18
+
+### Added
+
 - Accounts whose refresh token the provider rejected permanently are now
   reported as `re-auth required` in `cc-router accounts list` — in both the
   live and the stored view — and named once with the command that recovers
@@ -858,6 +865,7 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
+[0.12.4]: https://github.com/Timo972/cc-router/releases/tag/v0.12.4
 [0.12.3]: https://github.com/Timo972/cc-router/releases/tag/v0.12.3
 [0.12.2]: https://github.com/Timo972/cc-router/releases/tag/v0.12.2
 [0.12.1]: https://github.com/Timo972/cc-router/releases/tag/v0.12.1
