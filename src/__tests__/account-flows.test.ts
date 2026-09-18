@@ -1,18 +1,75 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ClaudeMethod } from "../cli/account-flows.js";
+import type { SetupMethod } from "../telemetry/contracts.js";
 
 const prompts = vi.hoisted(() => ({ select: vi.fn(), input: vi.fn(), confirm: vi.fn(), password: vi.fn() }));
 vi.mock("@inquirer/prompts", () => prompts);
 const cli = vi.hoisted(() => ({ loginWithClaudeCli: vi.fn(), createLongLivedTokenWithClaudeCli: vi.fn(), LONG_LIVED_TOKEN_TTL_MS: 365 * 86_400_000 }));
 vi.mock("../providers/anthropic/claude-cli.js", () => cli);
-vi.mock("../utils/token-validator.js", () => ({ validateToken: async () => ({ valid: true }) }));
-vi.mock("../telemetry/setup-diagnostics.js", async importOriginal => ({
-  ...await importOriginal<typeof import("../telemetry/setup-diagnostics.js")>(),
-  withSetupTelemetryFlush: (fn: () => Promise<unknown>) => fn(),
+
+/** Mutable so one test can make the token look rejected. */
+const validation = vi.hoisted(() => ({ result: { valid: true } as unknown }));
+vi.mock("../utils/token-validator.js", () => ({ validateToken: async () => validation.result }));
+
+/**
+ * The picker's import methods must not shell out to `security` or read the
+ * developer's own ~/.claude/.credentials.json, and the Keychain choice has to
+ * be present regardless of which machine runs the suite.
+ */
+const extraction = vi.hoisted(() => ({ keychain: vi.fn(), credentials: vi.fn() }));
+vi.mock("../utils/token-extractor.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../utils/token-extractor.js")>(),
+  extractFromKeychainDetailed: extraction.keychain,
+  extractFromCredentialsFileDetailed: extraction.credentials,
+}));
+vi.mock("../utils/platform.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../utils/platform.js")>(),
+  isMacos: () => true,
 }));
 
-import { collectClaudeAccount, collectReauthRecord } from "../cli/account-flows.js";
+const openai = vi.hoisted(() => ({ loginOpenAIWithDeviceCode: vi.fn() }));
+vi.mock("../providers/openai/device-oauth.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../providers/openai/device-oauth.js")>(),
+  loginOpenAIWithDeviceCode: openai.loginOpenAIWithDeviceCode,
+}));
 
-beforeEach(() => { vi.clearAllMocks(); });
+// The attempt itself stays real — only its construction is observed, so the
+// method name that reaches telemetry is the one the flow actually chose.
+const telemetry = vi.hoisted(() => ({ createSetupAttempt: vi.fn() }));
+vi.mock("../telemetry/setup-diagnostics.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../telemetry/setup-diagnostics.js")>();
+  return {
+    ...actual,
+    withSetupTelemetryFlush: (fn: () => Promise<unknown>) => fn(),
+    createSetupAttempt: (input: Parameters<typeof actual.createSetupAttempt>[0]) => {
+      telemetry.createSetupAttempt(input);
+      return actual.createSetupAttempt(input);
+    },
+  };
+});
+
+import { collectClaudeAccount, collectReauthRecord } from "../cli/account-flows.js";
+import { SetupDiagnosticError } from "../telemetry/setup-diagnostics.js";
+
+const TOKENS = {
+  accessToken: "sk-ant-oat01-extracted",
+  refreshToken: "sk-ant-ort01-extracted",
+  expiresAt: Date.now() + 3_600_000,
+  scopes: ["user:inference", "user:profile"],
+};
+
+/** The `choices` the picker was offered, in the order it offered them. */
+function offeredMethods(): ClaudeMethod[] {
+  const call = prompts.select.mock.calls[0]?.[0] as { choices: Array<{ value: ClaudeMethod }> };
+  return call.choices.map(choice => choice.value);
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  validation.result = { valid: true };
+  extraction.keychain.mockResolvedValue({ ok: true, tokens: { ...TOKENS } });
+  extraction.credentials.mockReturnValue({ ok: true, tokens: { ...TOKENS } });
+});
 
 describe("collectClaudeAccount", () => {
   it("cli_login passes the email through and keeps the returned refresh token", async () => {
@@ -43,11 +100,65 @@ describe("collectClaudeAccount", () => {
     expect(account?.tokens.accessToken).toBe("sk-ant-oat01-pasted");
   });
 
+  it("setup_token takes a typed expiry when the operator declines the one-year default", async () => {
+    cli.createLongLivedTokenWithClaudeCli.mockResolvedValue({ accessToken: "sk-ant-oat01-long" });
+    prompts.confirm.mockResolvedValue(false);
+    prompts.input.mockResolvedValue("2027-01-02T03:04:05.000Z");
+    const { account } = await collectClaudeAccount({ index: 1, method: "setup_token", fixedId: "long" });
+    expect(account?.tokens.expiresAt).toBe(Date.parse("2027-01-02T03:04:05.000Z"));
+  });
+
   it("fixedId skips the id prompt", async () => {
     cli.loginWithClaudeCli.mockResolvedValue({ accessToken: "sk-ant-oat01-b", refreshToken: "sk-ant-ort01-b", expiresAt: 5, scopes: [] });
     const { account } = await collectClaudeAccount({ index: 1, method: "cli_login", fixedId: "max-dead" });
     expect(prompts.input).not.toHaveBeenCalled();
     expect(account?.id).toBe("max-dead");
+  });
+});
+
+describe("collectClaudeAccount — which methods the picker offers", () => {
+  it('offer "login" lists only the two browser methods, sign-in first', async () => {
+    prompts.select.mockResolvedValue("cli_login");
+    cli.loginWithClaudeCli.mockResolvedValue({ ...TOKENS });
+    await collectClaudeAccount({ index: 1, fixedId: "x", offer: "login" });
+    expect(offeredMethods()).toEqual(["cli_login", "setup_token"]);
+  });
+
+  it('offer "import" lists only the three ways to reuse an existing login', async () => {
+    prompts.select.mockResolvedValue("manual");
+    prompts.password.mockResolvedValue("sk-ant-oat01-pasted");
+    prompts.confirm.mockResolvedValue(true);
+    await collectClaudeAccount({ index: 1, fixedId: "x", offer: "import" });
+    expect(offeredMethods()).toEqual(["keychain", "credentials", "manual"]);
+  });
+
+  it("the default picker leads with the login methods and follows with the imports", async () => {
+    prompts.select.mockResolvedValue("cli_login");
+    cli.loginWithClaudeCli.mockResolvedValue({ ...TOKENS });
+    await collectClaudeAccount({ index: 1, fixedId: "x" });
+    expect(offeredMethods()).toEqual(["cli_login", "setup_token", "keychain", "credentials", "manual"]);
+  });
+});
+
+describe("collectClaudeAccount — telemetry method names", () => {
+  const MAPPING: Array<[ClaudeMethod, SetupMethod]> = [
+    ["cli_login", "claude_cli_login"],
+    ["setup_token", "claude_setup_token"],
+    ["keychain", "macos_keychain"],
+    ["credentials", "claude_credentials_file"],
+    ["manual", "manual_token"],
+  ];
+
+  it.each(MAPPING)("reports %s as %s", async (method, expected) => {
+    cli.loginWithClaudeCli.mockResolvedValue({ ...TOKENS });
+    cli.createLongLivedTokenWithClaudeCli.mockResolvedValue({ accessToken: "sk-ant-oat01-long" });
+    prompts.password.mockResolvedValue("sk-ant-oat01-pasted");
+    prompts.confirm.mockResolvedValue(true);
+
+    const { account } = await collectClaudeAccount({ index: 1, method, fixedId: "mapped" });
+
+    expect(account).not.toBeNull();
+    expect(telemetry.createSetupAttempt).toHaveBeenCalledWith({ provider: "anthropic", method: expected });
   });
 });
 
@@ -58,5 +169,66 @@ describe("collectReauthRecord", () => {
     const result = await collectReauthRecord({ id: "max-dead", provider: "anthropic_subscription", email: "me@example.com" });
     expect(result?.record).toMatchObject({ id: "max-dead", provider: "anthropic_subscription", accessToken: "sk-ant-oat01-c" });
     expect(cli.loginWithClaudeCli).toHaveBeenCalledWith({ email: "me@example.com" }, undefined);
+  });
+
+  it("longLived pins the setup-token method, so no browser login runs and no refresh token is stored", async () => {
+    cli.createLongLivedTokenWithClaudeCli.mockResolvedValue({ accessToken: "sk-ant-oat01-long" });
+    prompts.confirm.mockResolvedValue(true);
+
+    const result = await collectReauthRecord(
+      { id: "max-dead", provider: "anthropic_subscription" },
+      { longLived: true },
+    );
+
+    expect(cli.createLongLivedTokenWithClaudeCli).toHaveBeenCalledTimes(1);
+    expect(cli.loginWithClaudeCli).not.toHaveBeenCalled();
+    expect(prompts.select).not.toHaveBeenCalled();
+    expect(result?.record).toMatchObject({ id: "max-dead", accessToken: "sk-ant-oat01-long", scopes: ["user:inference"] });
+    expect(result?.record.refreshToken).toBeUndefined();
+  });
+
+  it("an openai target signs in through the device flow with the id fixed and the email as the login hint", async () => {
+    openai.loginOpenAIWithDeviceCode.mockResolvedValue({
+      id: "codex-dead",
+      provider: "openai_subscription",
+      accessToken: "oai-access",
+      refreshToken: "oai-refresh",
+      expiresAt: 42,
+      scopes: ["openid"],
+      enabled: true,
+    });
+
+    const result = await collectReauthRecord({
+      id: "codex-dead",
+      provider: "openai_subscription",
+      email: "me@example.com",
+    });
+
+    expect(prompts.input).not.toHaveBeenCalled();
+    expect(openai.loginOpenAIWithDeviceCode).toHaveBeenCalledWith(expect.objectContaining({
+      accountId: "codex-dead",
+      loginHint: "me@example.com",
+    }));
+    expect(result?.record).toMatchObject({ id: "codex-dead", provider: "openai_subscription", accessToken: "oai-access" });
+  });
+
+  it("returns null when the operator declines to keep an account whose token was rejected", async () => {
+    prompts.select.mockResolvedValue("cli_login");
+    cli.loginWithClaudeCli.mockResolvedValue({ ...TOKENS });
+    validation.result = {
+      valid: false,
+      reason: "unauthorized",
+      diagnostic: new SetupDiagnosticError("rejected", {
+        stage: "token_validation",
+        reason: "unauthorized",
+        expected: true,
+        httpStatusCode: 401,
+      }),
+    };
+    prompts.confirm.mockResolvedValue(false); // "Save this account anyway?"
+
+    const result = await collectReauthRecord({ id: "max-dead", provider: "anthropic_subscription" });
+
+    expect(result).toBeNull();
   });
 });
