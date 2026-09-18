@@ -199,7 +199,10 @@ async function _doRefresh(account: Account, span: ActiveTelemetrySpan): Promise<
   try {
     const body = new URLSearchParams({
       grant_type: "refresh_token",
-      refresh_token: account.tokens.refreshToken,
+      // Non-null until the refresh loop learns to skip refresh-less
+      // (`claude setup-token`) credentials — callers never reach here without
+      // one today.
+      refresh_token: account.tokens.refreshToken!,
       client_id: CLAUDE_CODE_CLIENT_ID,
     });
 

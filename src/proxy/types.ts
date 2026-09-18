@@ -1,8 +1,14 @@
 export interface OAuthTokens {
   accessToken: string;   // sk-ant-oat01-...
-  refreshToken: string;  // sk-ant-ort01-...
+  /** Absent for a `claude setup-token` credential: long-lived, never refreshable. */
+  refreshToken?: string; // sk-ant-ort01-...
   expiresAt: number;     // Unix timestamp in ms
   scopes: string[];      // ["user:inference", "user:profile"]
+}
+
+/** A credential with no refresh token can only be replaced, never refreshed. */
+export function isTokenOnly(tokens: { refreshToken?: string }): boolean {
+  return !tokens.refreshToken;
 }
 
 export interface AccountRateLimits {
@@ -132,7 +138,8 @@ export interface AccountRecord {
   id: string;
   provider?: "anthropic_subscription" | "openai_subscription" | "openai_api_key" | "xai_subscription";
   accessToken: string;
-  refreshToken: string;
+  /** Absent for a `claude setup-token` credential: long-lived, never refreshable. */
+  refreshToken?: string;
   expiresAt: number;
   scopes: string[];
   // The following three fields are optional for backwards compatibility with

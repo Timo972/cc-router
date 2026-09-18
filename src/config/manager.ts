@@ -183,7 +183,9 @@ export function loadOpenAIAccounts(path?: string): OpenAISubscriptionAccount[] {
       id: a.id,
       provider: "openai_subscription" as const,
       accessToken: a.accessToken,
-      refreshToken: a.refreshToken,
+      // Refresh tokens are optional on the record only for Anthropic
+      // `setup-token` credentials; OpenAI records always carry one.
+      refreshToken: a.refreshToken ?? "",
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
       // Without this the flag is lost on restart and the dead refresh token is
@@ -239,7 +241,8 @@ export function loadXaiAccounts(path?: string): XaiSubscriptionAccount[] {
       id: a.id,
       provider: "xai_subscription" as const,
       accessToken: a.accessToken,
-      refreshToken: a.refreshToken,
+      // See loadOpenAIAccounts: xAI records always carry a refresh token.
+      refreshToken: a.refreshToken ?? "",
       expiresAt: a.expiresAt,
       enabled: a.enabled !== false,
       ...(Array.isArray(a.scopes) ? { scopes: a.scopes } : {}),
@@ -389,7 +392,7 @@ export function generateProxySecret(): string {
 
 // ─── Accounts ─────────────────────────────────────────────────────────────────
 
-function deserialize(records: AccountRecord[]): Account[] {
+export function deserialize(records: AccountRecord[]): Account[] {
   return records.filter(a => a.provider === undefined || a.provider === "anthropic_subscription").map(a => ({
     id: a.id,
     tokens: {
@@ -427,7 +430,7 @@ export function serialize(accounts: Account[]): AccountRecord[] {
     id: a.id,
     provider: "anthropic_subscription",
     accessToken: a.tokens.accessToken,
-    refreshToken: a.tokens.refreshToken,
+    ...(a.tokens.refreshToken ? { refreshToken: a.tokens.refreshToken } : {}),
     expiresAt: a.tokens.expiresAt,
     scopes: a.tokens.scopes,
     enabled: a.enabled,

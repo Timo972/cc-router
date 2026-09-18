@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { isTokenOnly } from "../proxy/types.js";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -31,6 +32,7 @@ import {
   migrateLegacyAccountProviders,
   setProviderAccountsEnabled,
   serialize,
+  deserialize,
   loadAccounts,
   loadOpenAIAccounts,
   readAccountsFromPath,
@@ -781,5 +783,21 @@ describe("renameAccountRecordById", () => {
       .toThrow(/already exists/);
     const parsed = JSON.parse(fs.readFileSync(accountsPath(), "utf-8"));
     expect(parsed[0].id).toBe("max-account-1");
+  });
+});
+
+describe("refresh-less accounts", () => {
+  it("round-trips an anthropic account without a refreshToken and omits the key on disk", () => {
+    const account = deserialize([{
+      id: "long",
+      provider: "anthropic_subscription",
+      accessToken: "sk-ant-oat01-long",
+      expiresAt: 1_900_000_000_000,
+      scopes: ["user:inference"],
+    }]);
+    expect(account[0]!.tokens.refreshToken).toBeUndefined();
+    expect(isTokenOnly(account[0]!.tokens)).toBe(true);
+    const records = serialize(account);
+    expect("refreshToken" in records[0]!).toBe(false);
   });
 });
