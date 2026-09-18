@@ -15,7 +15,7 @@ metered buckets, credits and plan. The user caps `sessionLimitPercent` and
 ## Adding an OpenAI account
 
 ```bash
-cc-router accounts login-openai
+cc-router accounts login openai
 ```
 
 This uses the Codex device-code auth flow: the CLI prints a verification URL and
@@ -28,7 +28,7 @@ scopes, validates the record shape, and saves it without touching Claude
 accounts:
 
 ```bash
-cc-router accounts add-openai
+cc-router accounts add openai
 ```
 
 OpenAI records are tagged with `provider: "openai_subscription"` so they never

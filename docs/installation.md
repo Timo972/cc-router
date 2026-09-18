@@ -34,17 +34,20 @@ cc-router setup
 # Select "Extract automatically from macOS Keychain"
 ```
 
-For multiple accounts, switch accounts in Claude Code between extractions:
+For multiple accounts, let cc-router run the sign-in — there is no log-out /
+log-in dance between extractions:
 
 ```bash
 # Account 1 is already logged in — run setup and extract
 cc-router setup
 
 # To add account 2:
-claude logout && claude login   # log in with account 2
-cc-router setup --add           # extract and merge
-claude logout && claude login   # log back in with account 1
+cc-router accounts login claude --id max-2
 ```
+
+The wizard's first option (`Sign in with the browser`) does the same thing from
+inside `cc-router setup --add`. To re-sign an account in later under the same
+id, use `cc-router accounts reauth <id>`.
 
 ### Linux
 
@@ -70,7 +73,7 @@ cc-router setup
 ChatGPT/Codex accounts use a device-code login rather than token extraction:
 
 ```bash
-cc-router accounts login-openai
+cc-router accounts login openai
 ```
 
 See [Codex CLI & OpenAI](codex.md).
@@ -82,8 +85,8 @@ Grok accounts are tracked for visibility rather than routed — see
 existing Grok CLI login or with a device-code sign-in:
 
 ```bash
-cc-router accounts add-grok     # import ~/.grok/auth.json
-cc-router accounts login-grok   # device-code sign-in
+cc-router accounts add grok     # import ~/.grok/auth.json
+cc-router accounts login grok   # device-code sign-in
 ```
 
 ## Run modes
