@@ -189,7 +189,10 @@ export async function persistSetupAccountsRuntimeAware(
   input: { newAccounts: Account[]; merged: Account[]; replaceExisting: boolean },
   dependencies: SetupAccountPersistenceDependencies = {
     isLive: isAccountApiReachable,
-    tryAddLive: tryAddAccountToRunningProxy,
+    // The wizard merges by id, so a re-collected account must upsert live the
+    // way `saveAccounts(merged)` upserts on disk; without `replace` the daemon
+    // answers 409 and discards the login the operator just completed.
+    tryAddLive: live => tryAddAccountToRunningProxy(live, { replace: true }),
     saveStored: saveAccounts,
   },
 ): Promise<"live" | "stored"> {

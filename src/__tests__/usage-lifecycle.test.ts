@@ -1,15 +1,15 @@
 vi.mock("node:fs", async importOriginal => {
   const fs = await importOriginal<typeof import("node:fs")>();
-  return { ...fs, renameSync: vi.fn(fs.renameSync) };
+  return { ...fs, renameSync: vi.fn(fs.renameSync), openSync: vi.fn(fs.openSync), unlinkSync: vi.fn(fs.unlinkSync) };
 });
 import { afterEach, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, renameSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, renameSync, statSync, openSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { UsageStore } from "../usage/store.js";
 import { coordinateAccountWrite, recoverAccountTransition, registerUsageWriter, usageDirectoryForAccounts, withUsageRename } from "../usage/account-lifecycle.js";
 const dirs: string[] = []; const closers: (() => void)[] = [];
-afterEach(() => { vi.restoreAllMocks(); closers.splice(0).reverse().forEach(f => f()); dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })); });
+afterEach(() => { vi.restoreAllMocks(); vi.mocked(openSync).mockRestore(); vi.mocked(unlinkSync).mockRestore(); closers.splice(0).reverse().forEach(f => f()); dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })); });
 const before = [{ id: "old", provider: "openai_subscription" as const }]; const after = [{ id: "new", provider: "openai_subscription" as const }];
 function fixture() { const dir = mkdtempSync(join(tmpdir(), "usage-lifecycle-")); dirs.push(dir); const file = join(dir, "accounts.json"); const usage = usageDirectoryForAccounts(file); const store = UsageStore.open(usage); closers.push(() => store.close()); store.account("openai_subscription", "old"); writeFileSync(file, JSON.stringify(before)); return { file, usage, store }; }
 it("renames offline without changing account key or subscription, with no secret sidecar", () => {
@@ -46,6 +46,27 @@ it("pending metadata publication failure never mutates credentials or aliases", 
   const persist = vi.fn(); vi.mocked(renameSync).mockImplementationOnce(() => { throw new Error("pending fs failure"); });
   expect(() => withUsageRename(file, "old", "new", () => coordinateAccountWrite(file, before, after, persist))).toThrow("pending fs failure");
   expect(persist).not.toHaveBeenCalled(); expect(store.snapshot().accounts[0]?.alias).toBe("old"); expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(before);
+});
+// Directory fsyncs are no-ops on Windows, so the publication ordering is only observable elsewhere.
+const posix = process.platform !== "win32";
+it.skipIf(!posix)("syncs the accounts directory after publication and before retiring the transition", () => {
+  // The rename in the journal is fsync'd, but a writer that only fsyncs the temp file leaves the
+  // accounts.json rename volatile. Retiring the sidecar before the directory is durable lets a
+  // power loss keep the new alias while accounts.json reverts, splitting the account from its history.
+  const { file, usage, store } = fixture(); store.close(); const events: string[] = []; const realOpen = vi.mocked(openSync).getMockImplementation()!; const realUnlink = vi.mocked(unlinkSync).getMockImplementation()!;
+  vi.mocked(openSync).mockImplementation(((path: Parameters<typeof openSync>[0], flags?: Parameters<typeof openSync>[1], mode?: Parameters<typeof openSync>[2]) => { if (path === dirname(file) && flags === "r") events.push("sync-accounts-dir"); return realOpen(path, flags, mode); }) as typeof openSync);
+  vi.mocked(unlinkSync).mockImplementation(path => { if (String(path).endsWith("account-transition.json")) events.push("clear-transition"); return realUnlink(path); });
+  withUsageRename(file, "old", "new", () => coordinateAccountWrite(file, before, after, () => { writeFileSync(file, JSON.stringify(after)); events.push("publish"); }));
+  expect(events).toEqual(["publish", "sync-accounts-dir", "clear-transition"]); expect(UsageStore.read(usage).accounts[0]?.alias).toBe("new"); expect(existsSync(join(usage, "account-transition.json"))).toBe(false);
+});
+it.skipIf(!posix)("rolls back when the accounts directory sync fails after publication", () => {
+  const { file, usage, store } = fixture(); store.close(); let published = false; const realOpen = vi.mocked(openSync).getMockImplementation()!;
+  vi.mocked(openSync).mockImplementation(((path: Parameters<typeof openSync>[0], flags?: Parameters<typeof openSync>[1], mode?: Parameters<typeof openSync>[2]) => {
+    if (published && path === dirname(file) && flags === "r") { published = false; throw new Error("directory sync failure"); }
+    return realOpen(path, flags, mode);
+  }) as typeof openSync);
+  expect(() => withUsageRename(file, "old", "new", () => coordinateAccountWrite(file, before, after, () => { writeFileSync(file, JSON.stringify(after)); published = true; }))).toThrow("directory sync failure");
+  expect(UsageStore.read(usage).accounts[0]?.alias).toBe("old"); expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(before); expect(existsSync(join(usage, "account-transition.json"))).toBe(false);
 });
 it("rolls back a credential writer that throws after it published", () => {
   const { file, usage, store } = fixture(); store.close();

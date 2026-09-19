@@ -104,8 +104,12 @@ export function coordinateAccountWrite(accountsPath: string, previous: readonly 
     try {
       applyRename(store, transition, true);
       persist();
+      // Writers fsync the credentials file, not its directory, so the rename that publishes it is
+      // still volatile. The alias journal below is fsync'd; retiring the sidecar before this sync
+      // let a power loss keep the new alias while accounts.json reverted to the old entry.
+      syncDirectory(dirname(accountsPath));
     } catch (error) {
-      // A writer can throw after publication (directory fsync). Restore credentials before the alias.
+      // A writer (or the directory fsync) can throw after publication. Restore credentials before the alias.
       try {
         if (existsSync(accountsPath) && equal(JSON.parse(readFileSync(accountsPath, "utf8")) as AccountAlias[], next)) {
           if (previousFileExisted) {

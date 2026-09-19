@@ -1,6 +1,17 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { persistSetupAccountsRuntimeAware } from "../cli/cmd-setup.js";
+import { saveAccounts } from "../config/manager.js";
 import type { Account } from "../proxy/types.js";
+
+// Setup's default wiring reaches the real daemon and the real accounts file.
+// Pin both: `saveAccounts` would otherwise write ~/.cc-router/accounts.json.
+vi.mock("../config/manager.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../config/manager.js")>(),
+  readConfig: () => ({ proxySecret: "router-secret" }),
+  saveAccounts: vi.fn(),
+}));
+
+afterEach(() => vi.restoreAllMocks());
 
 function account(id: string): Account {
   return {
@@ -88,5 +99,26 @@ describe("setup account persistence", () => {
     )).resolves.toBe("stored");
 
     expect(saveStored).toHaveBeenCalledWith(replacement);
+  });
+
+  it("asks the running daemon to replace an existing id instead of taking a 409", async () => {
+    // The wizard merges by id, so re-collecting credentials for an account that
+    // is already configured must upsert live exactly as the stored path does.
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({ account: { id: "existing" } }, { status: 200 }),
+    );
+    const reauthenticated = account("existing");
+
+    await expect(persistSetupAccountsRuntimeAware(
+      { newAccounts: [reauthenticated], merged: [reauthenticated], replaceExisting: false },
+    )).resolves.toBe("live");
+
+    const post = fetchMock.mock.calls.find(
+      ([url, init]) => String(url).endsWith("/cc-router/accounts") && (init as RequestInit)?.method === "POST",
+    );
+    expect(post, "expected a POST to the live accounts endpoint").toBeDefined();
+    const body = JSON.parse(String((post![1] as RequestInit).body));
+    expect(body).toMatchObject({ id: "existing", replace: true });
+    expect(saveAccounts).not.toHaveBeenCalled();
   });
 });
