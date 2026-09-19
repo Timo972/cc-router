@@ -11,7 +11,8 @@ import type { UsageReport } from "../usage/types.js";
 it("persists native/cross-protocol usage and subscription identity through a real service restart", async () => {
   const home = mkdtempSync(join(tmpdir(), "usage-acceptance-"));
   const configDir = join(home, ".cc-router"); mkdirSync(configDir);
-  const accountsPath = join(configDir, "accounts.json"), configPath = join(configDir, "config.json"), usageDir = join(configDir, "usage");
+  const selectedDir = join(home, "selected"); mkdirSync(selectedDir);
+  const accountsPath = join(selectedDir, "accounts.json"), configPath = join(configDir, "config.json"), usageDir = join(configDir, "usage");
   const claims = { "https://api.openai.com/auth": { chatgpt_account_id: "fixture-workspace", chatgpt_user_id: "fixture-user", chatgpt_plan_type: "plus" }, "https://api.openai.com/profile": { email: "private-fixture@example.com" } };
   writeFileSync(accountsPath, JSON.stringify([{ id: "personal", provider: "openai_subscription", accessToken: `fixture.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.secret`, refreshToken: "fixture-refresh-secret", expiresAt: Date.now() + 86_400_000 }]));
   writeFileSync(configPath, JSON.stringify({ proxySecret: "fixture-router-secret" }));
@@ -35,6 +36,9 @@ it("persists native/cross-protocol usage and subscription identity through a rea
     expect((await fetch(`${service.base}/cc-router/usage`)).status).toBe(401);
     const subscription = await fetch(`${service.base}/cc-router/usage/subscriptions`, { method: "POST", headers, body: JSON.stringify({ account: "personal", monthlyUsd: 20, from: new Date().toISOString().slice(0, 7) + "-01" }) });
     expect(subscription.status).toBe(200);
+    const grok = await fetch(`${service.base}/cc-router/accounts`, { method: "POST", headers, body: JSON.stringify({ id: "grok", provider: "xai_subscription", accessToken: "grok-access", refreshToken: "grok-refresh", expiresAt: Date.now() + 86_400_000, scopes: [] }) });
+    expect(grok.status).toBe(201);
+    expect(JSON.parse(readFileSync(accountsPath, "utf8"))).toEqual(expect.arrayContaining([expect.objectContaining({ id: "grok", provider: "xai_subscription" })]));
     const native = await fetch(`${service.base}/v1/responses`, { method: "POST", headers, body: JSON.stringify({ model: "openai/gpt-5.4", stream: true, input: [{ role: "user", content: "fixture prompt must not be persisted" }] }) });
     expect(native.status).toBe(200); expect(await native.text()).toContain("response.completed");
     const translated = await fetch(`${service.base}/v1/messages`, { method: "POST", headers, body: JSON.stringify({ model: "openai/gpt-5.4", max_tokens: 10, messages: [{ role: "user", content: "fixture prompt must not be persisted" }] }) });
@@ -47,6 +51,7 @@ it("persists native/cross-protocol usage and subscription identity through a rea
     await expect.poll(async () => (await read()).totals.output).toBe(50);
     const before = await read();
     expect(before.totals).toMatchObject({ input: 80, output: 50, cacheRead: 120, cacheWrite: 0 });
+    expect(before.warnings).not.toContain("A usage observation was rejected; affected attempts remain incomplete.");
     expect(before.costs.pricedApiUsd).toBeCloseTo((80 * 2.5 + 50 * 15 + 120 * 0.25) / 1e6);
     const key = before.accounts[0].key;
     const rename = await fetch(`${service.base}/cc-router/accounts/personal`, { method: "PATCH", headers, body: JSON.stringify({ id: "renamed" }) });

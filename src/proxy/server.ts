@@ -1391,7 +1391,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           expiresAt: body.expiresAt,
           scopes: Array.isArray(body.scopes) ? body.scopes : [],
           enabled: body.enabled !== false,
-        });
+        }, accountsFile);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         res.status(500).json({ error: `Failed to persist accounts.json: ${message}` });
