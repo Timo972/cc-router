@@ -172,6 +172,15 @@ async function dashboardLoop(port: number): Promise<void> {
 
     if (pendingIntent.kind === "quit") return;
 
+    // Ink unref()s stdin when it unmounts, and neither resume() nor
+    // readline ref it again. With nothing else keeping the event loop
+    // alive, the process exits while inquirer is still waiting for a key —
+    // inquirer reports it as "User force closed the prompt with 0 null" and
+    // the sign-in never runs. Ref it for the interactive flow; the next
+    // dashboard mount takes ownership again, and the quit path above never
+    // reaches this line, so a plain quit still exits.
+    process.stdin.ref();
+
     if (pendingIntent.kind === "addAccount") {
       // Intent: addAccount — run the OAuth flow, then POST the resulting
       // tokens to the server we're connected to (local or remote).

@@ -38,6 +38,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Pressing `n` (and now `l`) in the dashboard no longer kills the process
+  before the sign-in prompt can take input. Ink unrefs stdin when it
+  unmounts and nothing ref'd it again, so with no other work pending the
+  process exited while inquirer was still waiting — reported as
+  `User force closed the prompt with 0 null`. The dashboard now refs stdin
+  for the duration of the interactive flow.
 - Re-authenticating an account replaces its credentials only. Previously the
   replacement was built from the freshly collected record, so a disabled
   account came back enabled and custom session/weekly caps reset to 100 —
