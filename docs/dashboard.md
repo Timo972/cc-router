@@ -111,7 +111,7 @@ depend on which has focus.
 | `z` | Compact view — hides TOTALS and RECENT ACTIVITY so more accounts fit |
 | `R` | Reload usage and credentials for the selected account when ACCOUNTS is focused; otherwise reload every account, metadata and models |
 | `m` | Load discovered provider models |
-| `n` | Add an account |
+| `n` | Add an account (Esc or Ctrl-C at any prompt returns to the dashboard) |
 | `c` | Toggle Claude Code routing — or set the Claude default when MODELS is focused |
 | `x` | Toggle Codex CLI routing (proxy stays up) |
 

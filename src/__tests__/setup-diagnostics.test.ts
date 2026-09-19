@@ -232,6 +232,9 @@ describe("typed failure classification", () => {
   it("detects prompt cancellation by its own name only", () => {
     expect(isPromptCancellation(Object.assign(new Error("x"), { name: "ExitPromptError" })))
       .toBe(true);
+    // An aborted signal (Escape in the dashboard) is the same operator decision.
+    expect(isPromptCancellation(Object.assign(new Error("x"), { name: "AbortPromptError" })))
+      .toBe(true);
     expect(isPromptCancellation(new Error("ExitPromptError"))).toBe(false);
   });
 });
