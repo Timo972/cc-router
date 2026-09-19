@@ -101,29 +101,70 @@ export const stats = new ProxyStats();
  * entry that is typically already stored — the dashboard picks the values up
  * on its next poll.
  */
-export function applyAnthropicInputUsage(entry: LogEntry, usage: Record<string, number>): void {
-  entry.cacheReadTokens = usage["cache_read_input_tokens"] ?? 0;
-  entry.cacheCreationTokens = usage["cache_creation_input_tokens"] ?? 0;
-  entry.inputTokens = usage["input_tokens"] ?? 0;
-
-  stats.totalCacheReadTokens += entry.cacheReadTokens;
-  stats.totalCacheCreationTokens += entry.cacheCreationTokens;
-  stats.totalInputTokens += entry.inputTokens;
+function applyCumulativeAnthropicCount(
+  entry: LogEntry,
+  field: "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheCreationTokens",
+  total: "totalInputTokens" | "totalOutputTokens" | "totalCacheReadTokens" | "totalCacheCreationTokens",
+  value: unknown,
+): void {
+  // Usage snapshots are cumulative. Absent or malformed fields are not new zeroes.
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return;
+  const previous = entry[field] ?? 0;
+  if (value < previous) return;
+  stats[total] += value - previous;
+  entry[field] = value;
 }
 
-/** Record Anthropic output-side usage (message_delta) — see input counterpart. */
-export function applyAnthropicOutputUsage(entry: LogEntry, usage: Record<string, number>): void {
-  entry.outputTokens = usage["output_tokens"] ?? 0;
-  stats.totalOutputTokens += entry.outputTokens;
+function applyAnthropicUsageSnapshot(entry: LogEntry, usage: AnthropicUsage): void {
+  applyCumulativeAnthropicCount(entry, "inputTokens", "totalInputTokens", usage.input_tokens);
+  applyCumulativeAnthropicCount(entry, "cacheReadTokens", "totalCacheReadTokens", usage.cache_read_input_tokens);
+  applyCumulativeAnthropicCount(entry, "cacheCreationTokens", "totalCacheCreationTokens", usage.cache_creation_input_tokens);
+  applyCumulativeAnthropicCount(entry, "outputTokens", "totalOutputTokens", usage.output_tokens);
+}
+
+export function applyAnthropicInputUsage(entry: LogEntry, usage: AnthropicUsage): void {
+  notifyUsage(entry, { kind: "input", usage });
+  applyAnthropicUsageSnapshot(entry, usage);
+}
+
+/** Record the positive difference from the preceding cumulative output snapshot. */
+export function applyAnthropicOutputUsage(entry: LogEntry, usage: AnthropicUsage): void {
+  notifyUsage(entry, { kind: "output", usage });
+  applyAnthropicUsageSnapshot(entry, usage);
 }
 
 /** Record Codex token usage on both the request's log entry and the running totals. */
 export function applyCodexUsage(entry: LogEntry, usage: CodexUsageTotals | undefined): void {
   if (!usage) return;
+  notifyUsage(entry, { kind: "codex", usage });
   entry.inputTokens = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
   entry.outputTokens = usage.outputTokens;
   entry.cacheReadTokens = usage.cachedInputTokens;
   stats.totalInputTokens += entry.inputTokens;
   stats.totalOutputTokens += usage.outputTokens;
   stats.totalCacheReadTokens += usage.cachedInputTokens;
+}
+
+/** Per-attempt passive hooks. Never serialize identity or persistence state into /health. */
+export type AnthropicUsage = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number; cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number } };
+export type UsageCaptureEvent =
+  | { kind: "model"; model: unknown }
+  | { kind: "input" | "output"; usage: AnthropicUsage }
+  | { kind: "codex"; usage: CodexUsageTotals }
+  | { kind: "codex-response"; body: unknown }
+  | { kind: "finish"; complete: boolean }
+  | { kind: "discard" };
+const usageObservers = new WeakMap<LogEntry, (event: UsageCaptureEvent) => void>();
+export function observeEntryUsage(entry: LogEntry, observer: (event: UsageCaptureEvent) => void): void { usageObservers.set(entry, observer); }
+function notifyUsage(entry: LogEntry, event: UsageCaptureEvent): void {
+  try { usageObservers.get(entry)?.(event); } catch { /* Persistence must never change routing/response bytes. */ }
+}
+export function setUsageModel(entry: LogEntry, model: unknown): void { notifyUsage(entry, { kind: "model", model }); }
+export function captureCodexResponse(entry: LogEntry, body: unknown): void { notifyUsage(entry, { kind: "codex-response", body }); }
+export function finishUsageAttempt(entry: LogEntry, complete: boolean): void { notifyUsage(entry, { kind: "finish", complete }); }
+
+/** A bound candidate was never forwarded: release capture without inventing missing usage. */
+export function discardUsageAttempt(entry: LogEntry): void {
+  notifyUsage(entry, { kind: "discard" });
+  usageObservers.delete(entry);
 }

@@ -32,3 +32,6 @@ export const PID_PATH = path.join(CONFIG_DIR, "cc-router.pid");
 
 // Log file — daemon stdout/stderr redirect here
 export const LOG_PATH = path.join(CONFIG_DIR, "cc-router.log");
+
+/** Durable usage history follows an explicit accounts file unless overridden. */
+export const USAGE_DIR = process.env["USAGE_DIR"] ?? path.join(path.dirname(ACCOUNTS_PATH), "usage");

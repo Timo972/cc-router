@@ -1,3 +1,5 @@
+import { StringDecoder } from "node:string_decoder";
+import type { AnthropicUsage } from "./stats.js";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import { MAX_RETAINED_SSE_LINE_BYTES } from "./stream-lifecycle.js";
 import type { Transform } from "node:stream";
@@ -22,14 +24,16 @@ export interface AnthropicUsageCaptureOptions {
   contentEncoding: string;
   /** message_start usage (input/cache tokens), or the sole usage object of a
    *  non-streaming JSON body. */
-  onInputUsage(usage: Record<string, number>): void;
+  onInputUsage(usage: AnthropicUsage): void;
   /** message_delta usage (output tokens), or the sole usage object of a
    *  non-streaming JSON body. */
-  onOutputUsage(usage: Record<string, number>): void;
+  onOutputUsage(usage: AnthropicUsage): void;
   /** Fired once when the capture has seen everything it will see (end,
    *  size cap, or decoder error). Compressed bodies decode asynchronously,
    *  so this can trail the relayed response's own close event. */
   onSettled?(): void;
+  onModel?(model: unknown): void;
+  onJSONComplete?(): void;
   /** Fired when the decoded SSE copy carries the `message_stop` terminal event.
    *  Providing it keeps the passive decoder running to the end of the stream
    *  (instead of stopping after both usage events) so a compressed stream's
@@ -40,6 +44,7 @@ export interface AnthropicUsageCaptureOptions {
 export interface AnthropicUsageCapture {
   write(chunk: Buffer): void;
   end(): void;
+  abort(): void;
 }
 
 /** Non-streaming bodies are buffered for one parse at end-of-stream; a body
@@ -68,6 +73,7 @@ export function createAnthropicUsageCapture(
   const decoder = createDecoder(options.contentEncoding);
   if (decoder === undefined) return null;
 
+  const textDecoder = new StringDecoder("utf8");
   let dead = false;
   const die = () => {
     if (dead) return;
@@ -109,18 +115,19 @@ export function createAnthropicUsageCapture(
     }
     for (const line of lines) {
       if (dead) return;
-      if (!line.startsWith("data: ")) continue;
+      if (line.length > MAX_RETAINED_SSE_LINE_BYTES || !line.startsWith("data:")) continue;
       try {
-        const evt = JSON.parse(line.slice(6)) as {
+        const evt = JSON.parse(line.slice(5).trimStart()) as {
           type?: string;
-          message?: { usage?: Record<string, number> };
-          usage?: Record<string, number>;
+          message?: { model?: unknown; usage?: AnthropicUsage };
+          usage?: AnthropicUsage;
         };
+        if (evt.type === "message_start") options.onModel?.(evt.message?.model);
         if (!gotInput && evt.type === "message_start" && evt.message?.usage) {
           options.onInputUsage(evt.message.usage);
           gotInput = true;
         }
-        if (!gotOutput && evt.type === "message_delta" && evt.usage) {
+        if ((!gotOutput || options.onMessageStop) && evt.type === "message_delta" && evt.usage) {
           options.onOutputUsage(evt.usage);
           gotOutput = true;
         }
@@ -142,10 +149,12 @@ export function createAnthropicUsageCapture(
   let jsonBuf = "";
   const parseJSONBody = (): void => {
     try {
-      const body = JSON.parse(jsonBuf) as { usage?: Record<string, number> };
+      const body = JSON.parse(jsonBuf) as { model?: unknown; usage?: AnthropicUsage };
+      options.onModel?.(body.model);
       if (body.usage) {
         options.onInputUsage(body.usage);
         options.onOutputUsage(body.usage);
+        options.onJSONComplete?.();
       }
     } catch { /* not a JSON body after all */ }
   };
@@ -153,18 +162,20 @@ export function createAnthropicUsageCapture(
   const consume = (chunk: Buffer): void => {
     if (dead) return;
     if (isSSE) {
-      parseSSEChunk(chunk.toString("utf8"));
+      parseSSEChunk(textDecoder.write(chunk));
       return;
     }
     if (jsonBuf.length + chunk.length > MAX_JSON_BODY_BYTES) {
       die();
       return;
     }
-    jsonBuf += chunk.toString("utf8");
+    jsonBuf += textDecoder.write(chunk);
   };
   const finish = (): void => {
     if (dead) return;
-    if (isJSON) parseJSONBody();
+    if (isJSON) { jsonBuf += textDecoder.end(); parseJSONBody(); }
+    else parseSSEChunk(textDecoder.end() + "\n");
+    if (dead) return;
     dead = true;
     options.onSettled?.();
   };
@@ -173,6 +184,7 @@ export function createAnthropicUsageCapture(
     return {
       write: (chunk) => consume(chunk),
       end: () => finish(),
+      abort: die,
     };
   }
 
@@ -181,14 +193,15 @@ export function createAnthropicUsageCapture(
   // Corrupt or truncated compressed data — the capture just stops; the
   // proxied bytes were never ours to begin with.
   decoder.on("error", () => die());
+  let ending = false;
+  const endDecoder = () => { if (dead || ending) return; ending = true; decoder.end(); };
   return {
+    // Flush already received compressed input even when its gzip trailer never arrived.
+    abort: endDecoder,
     write: (chunk) => {
-      if (dead) return;
+      if (dead || ending) return;
       decoder.write(chunk);
     },
-    end: () => {
-      if (dead) return;
-      decoder.end();
-    },
+    end: endDecoder,
   };
 }

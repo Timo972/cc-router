@@ -39,6 +39,7 @@ import {
   writeConfig,
   getAutoFailoverEnabled,
   getProxyRequestTimeoutMs,
+  fsyncFileBestEffort,
 } from "../config/manager.js";
 
 const accountsPath = () => `${MOCK_DIR}/accounts.json`;
@@ -778,6 +779,20 @@ describe("getProxyRequestTimeoutMs", () => {
       anthropicAliases: { "claude/sonnet": "claude-sonnet-4-6" },
       openAIAliases: { codex: "gpt-5-codex" },
     });
+  });
+});
+
+describe("cross-platform durable writes", () => {
+  it("keeps Windows writes usable when the filesystem rejects fsync", () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    try {
+      expect(() => fsyncFileBestEffort(1, () => {
+        throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+      })).not.toThrow();
+    } finally {
+      Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+    }
   });
 });
 

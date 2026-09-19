@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { registerSetup } from "./cmd-setup.js";
 import { registerStart } from "./cmd-start.js";
 import { registerStop, registerRevert } from "./cmd-stop.js";
+import { registerUsage } from "./cmd-usage.js";
 import { registerStatus } from "./cmd-status.js";
 import { registerAccounts } from "./cmd-accounts.js";
 import { registerConfigure } from "./cmd-configure.js";
@@ -34,6 +35,7 @@ Examples:
   $ cc-router start --reconfigure# Re-ask run preferences
   $ cc-router stop               # Stop proxy (offers to remove auto-start / config)
   $ cc-router status             # Live dashboard with account stats
+  $ cc-router usage              # Persistent token usage and subscription savings
   $ cc-router models list        # List dynamically discovered provider models
   $ cc-router logs               # View proxy logs (background mode)
   $ cc-router accounts list      # Show Claude, ChatGPT, and Grok accounts
@@ -53,6 +55,7 @@ registerStart(program);
 registerStop(program);
 registerRevert(program);
 registerStatus(program);
+registerUsage(program);
 registerModels(program);
 registerAccounts(program);
 registerConfigure(program);

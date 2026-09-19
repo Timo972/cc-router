@@ -1,4 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, chmodSync } from "fs";
+import { coordinateAccountWrite, withUsageRename } from "../usage/account-lifecycle.js";
+import { dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, chmodSync, openSync, fsyncSync, closeSync } from "fs";
 import { randomBytes } from "crypto";
 import { CONFIG_DIR, ACCOUNTS_PATH, CONFIG_PATH } from "./paths.js";
 import type { Account, AccountRecord } from "../proxy/types.js";
@@ -32,8 +34,22 @@ function writeFileSecureSync(path: string, data: string): void {
   const tmp = path + ".tmp";
   writeFileSync(tmp, data, { encoding: "utf-8", mode: SECRET_FILE_MODE });
   try { chmodSync(tmp, SECRET_FILE_MODE); } catch { /* best effort */ }
+  const fd = openSync(tmp, "r");
+  try { fsyncFileBestEffort(fd); } finally { closeSync(fd); }
   renameSync(tmp, path);
   try { chmodSync(path, SECRET_FILE_MODE); } catch { /* best effort */ }
+}
+
+export function fsyncFileBestEffort(
+  fd: number,
+  sync: (fd: number) => void = fsyncSync,
+): void {
+  try { sync(fd); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform === "win32" && (code === "EPERM" || code === "EINVAL")) return;
+    throw error;
+  }
 }
 
 export function accountsFileExists(path?: string): boolean {
@@ -65,8 +81,12 @@ export function writeAccountsAtomic(data: unknown[]): void {
 }
 
 function writeAccountsAtomicToPath(path: string, data: unknown[]): void {
-  // accounts.json holds plaintext OAuth access + refresh tokens — owner-only.
-  writeFileSecureSync(path, JSON.stringify(data, null, 2));
+  coordinateAccountWrite(
+    path,
+    readRawFromPath(path) as AccountRecord[],
+    data as AccountRecord[],
+    () => writeFileSecureSync(path, JSON.stringify(data, null, 2)),
+  );
 }
 
 /**
@@ -83,7 +103,7 @@ export function writeAnthropicAccountsPreservingOtherProviders(
   data: AccountRecord[],
   path: string = ACCOUNTS_PATH,
 ): void {
-  ensureConfigDir();
+  mkdirSync(dirname(path), { recursive: true, mode: SECRET_DIR_MODE });
   // Read from the same file being written, or the merge would carry another
   // file's non-Anthropic records into this one.
   const existing = readRawFromPath(path) as AccountRecord[];
@@ -93,9 +113,9 @@ export function writeAnthropicAccountsPreservingOtherProviders(
   writeAccountsAtomicToPath(path, [...data, ...nonAnthropic]);
 }
 
-export function upsertAccountRecord(record: AccountRecord): void {
-  ensureConfigDir();
-  const existing = readAccountsRaw() as AccountRecord[];
+export function upsertAccountRecord(record: AccountRecord, path = ACCOUNTS_PATH): void {
+  mkdirSync(dirname(path), { recursive: true, mode: SECRET_DIR_MODE });
+  const existing = readRawFromPath(path) as AccountRecord[];
   // Compare normalised providers: a Claude record written before provider
   // tags existed has none, and a strict comparison appended a tagged
   // duplicate next to it instead of replacing it.
@@ -107,16 +127,16 @@ export function upsertAccountRecord(record: AccountRecord): void {
     // A re-authentication replaces credentials, not the operator's settings.
     previous ? withInheritedSettings(record, previous) : record,
   ];
-  writeAccountsAtomicToPath(ACCOUNTS_PATH, next);
+  writeAccountsAtomicToPath(path, next);
 }
 
-export function removeAccountRecordById(id: string): AccountRecord | null {
-  ensureConfigDir();
-  const existing = readAccountsRaw() as AccountRecord[];
+export function removeAccountRecordById(id: string, path = ACCOUNTS_PATH): AccountRecord | null {
+  mkdirSync(dirname(path), { recursive: true, mode: SECRET_DIR_MODE });
+  const existing = readRawFromPath(path) as AccountRecord[];
   const removed = existing.find(a => a.id === id) ?? null;
   if (!removed) return null;
 
-  writeAccountsAtomicToPath(ACCOUNTS_PATH, existing.filter(a => a.id !== id));
+  writeAccountsAtomicToPath(path, existing.filter(a => a.id !== id));
   return removed;
 }
 
@@ -136,7 +156,7 @@ export function renameAccountRecordById(oldId: string, newId: string): AccountRe
   }
 
   target.id = newId;
-  writeAccountsAtomicToPath(ACCOUNTS_PATH, existing);
+  withUsageRename(ACCOUNTS_PATH, oldId, newId, () => writeAccountsAtomicToPath(ACCOUNTS_PATH, existing));
   return target;
 }
 

@@ -19,6 +19,8 @@ import {
 } from "../interceptor/mitmproxy-manager.js";
 import { printDesktopSupportExplainer, printNetworkExtensionInstructions } from "./cmd-client.js";
 import { collectClaudeAccount } from "./account-flows.js";
+import { accountToRecord } from "./account-flows.js";
+import { addAccountRuntimeAware, isAccountApiReachable, tryAddAccountToRunningProxy } from "./cmd-accounts.js";
 import {
   withSetupTelemetryFlush,
   type SetupAttempt,
@@ -78,6 +80,8 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
     }
   }
 
+  let replaceExisting = false;
+  let includeExisting = addMode;
   if (hasExisting && !addMode) {
     const existing = loadAccounts();
     console.log(chalk.yellow(`  Found ${existing.length} existing account(s).\n`));
@@ -99,6 +103,9 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
         default: false,
       });
       if (!sure) { console.log(chalk.gray("\nCancelled.\n")); return; }
+      replaceExisting = true;
+    } else {
+      includeExisting = true;
     }
   }
 
@@ -138,7 +145,7 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
   }
 
   // Merge: existing accounts minus any overwritten by ID, plus new ones
-  const existingAccounts = (hasExisting && !addMode) ? [] : (hasExisting ? loadAccounts() : []);
+  const existingAccounts = hasExisting && includeExisting ? loadAccounts() : [];
   const merged = [
     ...existingAccounts.filter(a => !newAccounts.some(n => n.id === a.id)),
     ...newAccounts,
@@ -146,14 +153,22 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
 
   console.log(chalk.bold(`\n${"━".repeat(40)}\n  Saving\n${"━".repeat(40)}\n`));
 
+  let persistenceMode: "live" | "stored";
   try {
-    saveAccounts(merged);
+    persistenceMode = await persistSetupAccountsRuntimeAware({
+      newAccounts,
+      merged,
+      replaceExisting,
+    });
   } catch (error) {
     const outcomes = savedAttempts.map(attempt => attempt.failed(error, "persistence"));
     if (outcomes[0]) printDiagnosticId(outcomes[0]);
     throw error;
   }
   console.log(chalk.green(`  ✓ ${merged.length} account(s) saved to ~/.cc-router/accounts.json`));
+  if (persistenceMode === "live") {
+    console.log(chalk.gray("  Loaded into the running proxy — available now, no restart needed."));
+  }
 
   for (const attempt of savedAttempts) {
     attempt.stageCompleted("persistence");
@@ -162,6 +177,42 @@ export async function runSetupWizard({ addMode }: { addMode: boolean }): Promise
 
   // ─── Post-setup interactive flow ─────────────────────────────────────────
   await runPostSetupFlow(merged.length);
+}
+
+export interface SetupAccountPersistenceDependencies {
+  isLive(): Promise<boolean>;
+  tryAddLive(record: ReturnType<typeof accountToRecord>): Promise<boolean>;
+  saveStored(accounts: Account[]): void;
+}
+
+export async function persistSetupAccountsRuntimeAware(
+  input: { newAccounts: Account[]; merged: Account[]; replaceExisting: boolean },
+  dependencies: SetupAccountPersistenceDependencies = {
+    isLive: isAccountApiReachable,
+    // The wizard merges by id, so a re-collected account must upsert live the
+    // way `saveAccounts(merged)` upserts on disk; without `replace` the daemon
+    // answers 409 and discards the login the operator just completed.
+    tryAddLive: live => tryAddAccountToRunningProxy(live, { replace: true }),
+    saveStored: saveAccounts,
+  },
+): Promise<"live" | "stored"> {
+  if (input.replaceExisting) {
+    if (await dependencies.isLive()) {
+      throw new Error(
+        "Cannot replace all accounts while the proxy is running. Stop it first: cc-router stop --keep-config",
+      );
+    }
+    dependencies.saveStored(input.merged);
+    return "stored";
+  }
+  for (const account of input.newAccounts) {
+    const { mode } = await addAccountRuntimeAware(accountToRecord(account), {
+      tryAddLive: dependencies.tryAddLive,
+      addStored: () => dependencies.saveStored(input.merged),
+    });
+    if (mode === "stored") return "stored";
+  }
+  return "live";
 }
 
 // ─── Post-setup interactive flow ─────────────────────────────────────────────

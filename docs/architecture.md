@@ -111,3 +111,24 @@ with LiteLLM Claude Code → cc-router:3456 → LiteLLM:4000 → api.anthropic.c
 ```
 
 See [Installation & deployment](installation.md).
+
+## Persistent usage history
+
+`src/usage/` separates the durable journal and account aliases, frozen API
+pricing, UTC calendar queries, subscription intervals, and authenticated HTTP
+access. `cc-router usage` uses those queries through the service, or a read-only
+local snapshot while stopped. It does not change the lifetime of the existing
+process-local health counters.
+
+Capture is passive: native Anthropic, native OpenAI Responses and translated
+Messages usage feed cumulative observations without changing forwarded response
+bytes. Attempt identities prevent duplicate terminal callbacks from counting
+tokens twice. OpenAI cached input is separated from its inclusive input total;
+Anthropic input, cache-read and cache-write counts are already disjoint.
+
+Only the service (or an exclusively locked offline mutation) writes history.
+Compaction publishes immutable hourly aggregate generations through an atomic
+manifest. Offline reads never repair or truncate journals. Corruption and
+missing coverage are explicit rather than silently replaced with zero totals.
+Account profile metadata remains in the existing ephemeral `AccountInfoCache`;
+the usage ledger must not copy that private object into persisted history.

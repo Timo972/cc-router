@@ -1,3 +1,6 @@
+import type { UsageRuntime } from "../usage/runtime.js";
+import { boundModelId, discardUsageAttempt, type LogEntry } from "./stats.js";
+declare module "express-serve-static-core" { interface Request { _ccUsageEntry?: LogEntry } }
 import type { IncomingMessage } from "node:http";
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { acquireRequestRoute } from "./lease-lifecycle.js";
@@ -48,6 +51,7 @@ export function extractClaudeSessionId(request: IncomingMessage): string | undef
 }
 
 export interface AnthropicRoutingMiddlewareOptions {
+  usageRuntime?: UsageRuntime;
   sessionRouter: SessionRouter;
   onEmptyPool?: (error: EmptyPoolError, request: Request, response: Response) => void;
   onNoEligibleAccount?: (
@@ -106,6 +110,13 @@ export function createAnthropicRoutingMiddleware(
       routedRequest._ccRoute = selected.route;
       routedRequest._ccReleaseLease = selected.release;
       routedRequest._ccAccount = selected.route.account;
+      // The generic /v1 transport also handles token-count preflights. They are
+      // not inference attempts, even though they borrow an account/lease.
+      if (options.usageRuntime && request.method === "POST" && /^\/v1\/messages\/?(?:\?|$)/i.test(request.originalUrl)) {
+        const entry: LogEntry = { ts: Date.now(), accountId: selected.route.account.id, model: boundModelId(request._ccRouteContext?.requestedModel ?? "-"), type: "route" };
+        options.usageRuntime.bind(entry, "anthropic_subscription");
+        request._ccUsageEntry = entry;
+      }
       next();
     } catch (error) {
       if (error instanceof EmptyPoolError && options.onEmptyPool) {
@@ -150,10 +161,12 @@ export function createAnthropicRefreshMiddleware(
       if (options.needsRefresh(account)) {
         const ok = await options.refresh(account);
         if (requestTerminated(request, response)) {
+          if (request._ccUsageEntry) discardUsageAttempt(request._ccUsageEntry);
           release();
           return;
         }
         if (!ok) {
+          if (request._ccUsageEntry) discardUsageAttempt(request._ccUsageEntry);
           release();
           options.onRefreshFailure(account);
           response.status(401).json({
@@ -168,11 +181,13 @@ export function createAnthropicRefreshMiddleware(
       }
 
       if (requestTerminated(request, response)) {
+        if (request._ccUsageEntry) discardUsageAttempt(request._ccUsageEntry);
         release();
         return;
       }
       next();
     } catch (error) {
+      if (request._ccUsageEntry) discardUsageAttempt(request._ccUsageEntry);
       release();
       if (requestTerminated(request, response)) return;
       next(error);

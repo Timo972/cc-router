@@ -1,3 +1,4 @@
+import type { UsageRuntime } from "../usage/runtime.js";
 import express from "express";
 import type { Express, Request, Response } from "express";
 import { selectRoute } from "../providers/route-selector.js";
@@ -9,7 +10,7 @@ import {
   usageFromResponseBody,
 } from "../protocol/openai-responses-collect.js";
 import type { ModelRoutingConfig } from "../protocol/model-ref.js";
-import { stats, applyCodexUsage, boundModelId } from "./stats.js";
+import { stats, applyCodexUsage, boundModelId, captureCodexResponse } from "./stats.js";
 import type { LogEntry } from "./stats.js";
 import { logWarn } from "./logger.js";
 import type { SessionRouter } from "./session-router.js";
@@ -25,6 +26,7 @@ import {
 import { waitForWritable } from "./transport-timing.js";
 
 export interface ResponsesRoutesOptions {
+  usageRuntime?: UsageRuntime;
   openAIRouter: SessionRouter<OpenAIAccount>;
   openAIPool: OpenAITokenPool;
   prepareOpenAIAccount?: (account: OpenAIAccount) => Promise<boolean>;
@@ -198,6 +200,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
       source: "codex",
       openAIRouter: opts.openAIRouter,
       openAIPool: opts.openAIPool,
+      usageRuntime: opts.usageRuntime,
       prepareOpenAIAccount,
       forwardOpenAI,
       forwardBody: body,
@@ -215,7 +218,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
         : {}),
       relay: async (upstream, res, entry, report) => {
         if (body.stream === true) {
-          const observer = createCodexUsageObserver();
+          const observer = createCodexUsageObserver(body => captureCodexResponse(entry, body), upstream.headers.get("content-type") ?? "");
           // Only an upstream that actually promised a successful event stream
           // can be judged on whether that stream completed. A non-OK response
           // (a plain 401/429/5xx body) has no SSE events to observe, so
@@ -228,12 +231,11 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
           // Reported per chunk, not once at the end: this relay can throw
           // (or be cut short) after upstream has already announced a failure,
           // and the verdict has to survive that.
-          await sendUpstreamResponse(upstream, res, chunk => {
+          try { await sendUpstreamResponse(upstream, res, chunk => {
             if (entry.firstByteDurationMs === undefined) entry.firstByteDurationMs = now() - entry.ts;
             observer.push(chunk);
             if (observer.explicitFailure() !== undefined) report.upstreamReportedFailure = true;
-          });
-          applyCodexUsage(entry, observer.finish());
+          }); } finally { applyCodexUsage(entry, observer.finish()); }
           // Bytes already written to the client are untouched — this only
           // changes the REPORTED status (used for stats/activity/cooldown),
           // matching a stream that upstream answered `200` but that ended in
@@ -247,7 +249,7 @@ export function mountResponsesRoutes(app: Express, opts: ResponsesRoutesOptions)
 
         const collected = await collectCodexResponseStream(upstream, () => {
           report.upstreamReportedFailure = true;
-        });
+        }, body => captureCodexResponse(entry, body));
         // Mirror upstream headers (e.g. Retry-After, x-codex-*) before sending the
         // collected body, so failure responses reach the client unchanged per the
         // same contract the streaming path already honors via sendUpstreamResponse.
