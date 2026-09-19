@@ -38,6 +38,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Escape or Ctrl-C at any prompt of the dashboard's `n` / `l` flows returns
+  to the dashboard with a quiet "Cancelled." instead of a red failure line.
 - Pressing `n` (and now `l`) in the dashboard no longer kills the process
   before the sign-in prompt can take input. Ink unrefs stdin when it
   unmounts and nothing ref'd it again, so with no other work pending the

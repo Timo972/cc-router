@@ -5,8 +5,10 @@ import { readConfig } from "../config/manager.js";
 import {
   classifyHttpSetupFailure,
   failAttemptFromError,
+  isPromptCancellation,
   type SetupAttempt,
 } from "../telemetry/setup-diagnostics.js";
+import { withEscapeCancel } from "./prompt-cancel.js";
 import type { DashboardIntent } from "../ui/Dashboard.js";
 
 /**
@@ -222,11 +224,12 @@ async function runReauthFlow(
   let attempt: SetupAttempt | undefined;
   try {
     const { collectReauthRecord } = await import("./account-flows.js");
-    const result = await collectReauthRecord({
+    console.log(chalk.gray("  Esc or Ctrl-C returns to the dashboard.\n"));
+    const result = await withEscapeCancel(signal => collectReauthRecord({
       id: intent.id,
       provider: intent.provider,
       ...(intent.email ? { email: intent.email } : {}),
-    });
+    }, { signal }));
     if (!result) return null;
     attempt = result.attempt;
 
@@ -253,6 +256,10 @@ async function runReauthFlow(
     attempt.succeeded();
     return result.record.id;
   } catch (err) {
+    if (isPromptCancellation(err)) {
+      console.log(chalk.gray("\n  Cancelled."));
+      return null;
+    }
     console.error(chalk.red(`\n✗ Re-authentication failed: ${(err as Error).message}`));
     if (attempt) {
       const outcome = failAttemptFromError(attempt, err, "persistence");
@@ -271,8 +278,9 @@ async function runAddAccountFlow(target: StatusTarget): Promise<string | null> {
   let attempt: SetupAttempt | undefined;
   try {
     const { collectClaudeAccount, accountToRecord } = await import("./account-flows.js");
+    console.log(chalk.gray("  Esc or Ctrl-C returns to the dashboard.\n"));
     // The index shown in the flow is just for display, pick something neutral.
-    const setup = await collectClaudeAccount({ index: 1 });
+    const setup = await withEscapeCancel(signal => collectClaudeAccount({ index: 1, signal }));
     attempt = setup.attempt;
     const account = setup.account;
     if (!account) return null;
@@ -301,6 +309,10 @@ async function runAddAccountFlow(target: StatusTarget): Promise<string | null> {
     attempt.succeeded();
     return account.id;
   } catch (err) {
+    if (isPromptCancellation(err)) {
+      console.log(chalk.gray("\n  Cancelled."));
+      return null;
+    }
     console.error(chalk.red(`\n✗ Failed to add account: ${(err as Error).message}`));
     if (attempt) {
       const outcome = failAttemptFromError(attempt, err, "persistence");

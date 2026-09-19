@@ -269,7 +269,10 @@ export async function withSetupTelemetryFlush<T>(operation: () => Promise<T>): P
 }
 
 export function isPromptCancellation(error: unknown): boolean {
-  return ownStringProperty(error, "name") === "ExitPromptError";
+  const name = ownStringProperty(error, "name");
+  // ExitPromptError: Ctrl-C or the process leaving. AbortPromptError: the
+  // prompt's AbortSignal fired — the dashboard's Escape key.
+  return name === "ExitPromptError" || name === "AbortPromptError";
 }
 
 /**

@@ -216,6 +216,25 @@ describe("collectClaudeAccount — telemetry method names", () => {
   });
 });
 
+describe("collectClaudeAccount cancellation signal", () => {
+  it("hands the signal to every prompt it shows", async () => {
+    const signal = new AbortController().signal;
+    prompts.select.mockResolvedValue("cli_login");
+    cli.loginWithClaudeCli.mockResolvedValue({ accessToken: "sk-ant-oat01-a", refreshToken: "sk-ant-ort01-a", expiresAt: 5, scopes: [] });
+    prompts.input.mockResolvedValue("max-account-1");
+    await collectClaudeAccount({ index: 1, signal });
+    expect(prompts.select).toHaveBeenCalledWith(expect.anything(), { signal });
+    expect(prompts.input).toHaveBeenCalledWith(expect.anything(), { signal });
+  });
+
+  it("lets an aborted prompt propagate as a cancellation, not an expected failure", async () => {
+    prompts.select.mockRejectedValue(Object.assign(new Error("Prompt was aborted"), { name: "AbortPromptError" }));
+    await expect(collectClaudeAccount({ index: 1, signal: new AbortController().signal }))
+      .rejects.toMatchObject({ name: "AbortPromptError" });
+    expect(cli.loginWithClaudeCli).not.toHaveBeenCalled();
+  });
+});
+
 describe("collectReauthRecord", () => {
   it("re-signs a Claude account under the same id with the email prefilled", async () => {
     prompts.select.mockResolvedValue("cli_login");
