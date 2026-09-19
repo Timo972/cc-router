@@ -53,6 +53,9 @@ export interface ClaudeFlowOptions {
   method?: ClaudeMethod;
   /** Which methods the picker offers. Default "all". */
   offer?: "login" | "import" | "all";
+  /** Aborting this rejects whichever prompt is open with an AbortPromptError
+   *  (the dashboard's Escape key). Prompts that already returned are unaffected. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -98,7 +101,7 @@ export async function collectClaudeAccount(
   const method = options.method ?? await select<ClaudeMethod>({
     message: "How do you want to add the account?",
     choices: claudeMethodChoices(options.offer ?? "all"),
-  });
+  }, { signal: options.signal });
 
   const attempt = createSetupAttempt({ provider: "anthropic", method: CLAUDE_METHOD_TELEMETRY[method] });
   attempt.stageCompleted("credential_source_selection");
@@ -152,12 +155,12 @@ async function collectAnthropicAccount(
         message: "Paste the token (sk-ant-oat01-...):",
         mask: "•",
         validate: v => v.startsWith("sk-ant-oat01-") || "Must start with sk-ant-oat01-",
-      });
+      }, { signal: options.signal });
     }
-    const useDefaultExpiry = await confirm({ message: "Token valid for 1 year (default)?", default: true });
+    const useDefaultExpiry = await confirm({ message: "Token valid for 1 year (default)?", default: true }, { signal: options.signal });
     const expiresAt = useDefaultExpiry
       ? Date.now() + LONG_LIVED_TOKEN_TTL_MS
-      : await promptExpiry();
+      : await promptExpiry(options.signal);
     tokens = { accessToken, refreshToken: undefined, expiresAt, scopes: ["user:inference"] };
     console.log(chalk.gray("  This token has no refresh token and the inference scope only: usage and identity metadata are unavailable for it."));
   }
@@ -175,7 +178,7 @@ async function collectAnthropicAccount(
       console.log(chalk.yellow("  Could not find credentials in Keychain."));
       console.log(chalk.gray("  Make sure Claude Code is logged in: run `claude login` first."));
       printDiagnosticId(attempt.stageFailed(extraction.error, "credential_read"));
-      const retry = await confirm({ message: "Try another extraction method?", default: true });
+      const retry = await confirm({ message: "Try another extraction method?", default: true }, { signal: options.signal });
       attempt.cancelled();
       if (!retry) return { account: null, attempt };
       return collectClaudeAccount({ ...options, method: undefined });
@@ -192,7 +195,7 @@ async function collectAnthropicAccount(
     } else {
       console.log(chalk.red("  ✗ ~/.claude/.credentials.json not found or unreadable."));
       console.log(chalk.gray("  Make sure Claude Code is installed and you've run `claude login`."));
-      const retry = await confirm({ message: "Paste tokens manually instead?", default: true });
+      const retry = await confirm({ message: "Paste tokens manually instead?", default: true }, { signal: options.signal });
       if (!retry) {
         printDiagnosticId(attempt.stageFailed(extraction.error, "credential_read"));
         attempt.cancelled();
@@ -203,12 +206,12 @@ async function collectAnthropicAccount(
       attempt = createSetupAttempt({ provider: "anthropic", method: "manual_token" });
       current.attempt = attempt;
       attempt.stageCompleted("credential_source_selection");
-      tokens = await promptManualTokens();
+      tokens = await promptManualTokens(options.signal);
     }
   }
 
   if (method === "manual") {
-    tokens = await promptManualTokens();
+    tokens = await promptManualTokens(options.signal);
   }
 
   if (!tokens) {
@@ -224,7 +227,7 @@ async function collectAnthropicAccount(
     message: "Account ID (press Enter to accept default):",
     default: `max-account-${options.index}`,
     validate: v => /^[a-zA-Z0-9_-]+$/.test(v) || "Only letters, numbers, _ and - allowed",
-  });
+  }, { signal: options.signal });
 
   process.stdout.write(chalk.gray("  Validating tokens against Anthropic... "));
   const validation = await validateToken(tokens.accessToken);
@@ -237,7 +240,7 @@ async function collectAnthropicAccount(
     console.log(chalk.yellow(`  Reason: ${validation.reason}`));
     printDiagnosticId(attempt.stageFailed(validation.diagnostic, "token_validation"));
     console.log(chalk.gray("  The token will be saved but may not work until refreshed."));
-    const keepAnyway = await confirm({ message: "Save this account anyway?", default: false });
+    const keepAnyway = await confirm({ message: "Save this account anyway?", default: false }, { signal: options.signal });
     if (!keepAnyway) {
       attempt.cancelled();
       return { account: null, attempt };
@@ -268,7 +271,7 @@ async function collectAnthropicAccount(
  * The refresh token stays required here: a pasted long-lived `setup-token`
  * credential has none, and it has its own method rather than this one.
  */
-async function promptManualTokens(): Promise<OAuthTokens | null> {
+async function promptManualTokens(signal?: AbortSignal): Promise<OAuthTokens | null> {
   console.log(chalk.gray(
     "\n  You can find your tokens by running:\n" +
     "    macOS:         security find-generic-password -s 'Claude Code-credentials' -w\n" +
@@ -282,7 +285,7 @@ async function promptManualTokens(): Promise<OAuthTokens | null> {
       v.startsWith("sk-ant-oat01-") || v.startsWith("sk-ant-")
         ? true
         : "Must start with sk-ant-oat01-",
-  });
+  }, { signal });
 
   const refreshToken = await password({
     message: "Paste refreshToken (sk-ant-ort01-...):",
@@ -291,16 +294,16 @@ async function promptManualTokens(): Promise<OAuthTokens | null> {
       v.startsWith("sk-ant-ort01-") || v.startsWith("sk-ant-")
         ? true
         : "Must start with sk-ant-ort01-",
-  });
+  }, { signal });
 
   const useDefaultExpiry = await confirm({
     message: "Use default expiry (8 hours from now)?",
     default: true,
-  });
+  }, { signal });
 
   const expiresAt = useDefaultExpiry
     ? Date.now() + 8 * 60 * 60 * 1000
-    : await promptExpiry();
+    : await promptExpiry(signal);
 
   return {
     accessToken,
@@ -467,7 +470,7 @@ export interface ReauthTarget {
 /** Runs the provider's login with the id fixed. Returns null when the operator cancels. */
 export async function collectReauthRecord(
   target: ReauthTarget,
-  options: { longLived?: boolean } = {},
+  options: { longLived?: boolean; signal?: AbortSignal } = {},
 ): Promise<{ record: AccountRecord; attempt: SetupAttempt } | null> {
   console.log(chalk.cyan(`\nRe-authenticating "${target.id}" (${target.provider === "openai_subscription" ? "openai" : "claude"})`
     + (target.email ? ` — sign in as ${chalk.bold(target.email)}` : "") + "\n"));
@@ -484,16 +487,17 @@ export async function collectReauthRecord(
     ...(target.email ? { email: target.email } : {}),
     offer: "login",
     ...(options.longLived ? { method: "setup_token" as const } : {}),
+    ...(options.signal ? { signal: options.signal } : {}),
   });
   return account ? { record: credentialsOnly(accountToRecord(account)), attempt } : null;
 }
 
 /** An explicit expiry: ISO date or Unix milliseconds, validated as typed. */
-async function promptExpiry(): Promise<number> {
+async function promptExpiry(signal?: AbortSignal): Promise<number> {
   const raw = await input({
     message: "Paste expiresAt (ISO date or ms timestamp):",
     validate: v => parseExpiryInput(v) !== null || "Enter an ISO date (2027-01-01) or a Unix timestamp in milliseconds",
-  });
+  }, { signal });
   return parseExpiryInput(raw)!;
 }
 
