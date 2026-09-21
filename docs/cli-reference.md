@@ -145,6 +145,16 @@ non-JSON output is a plain-text summary. When the local service is stopped,
 reports can read local history; local subscription updates take an exclusive
 writer lock. Authentication failures do not trigger an offline fallback.
 
+### Dashboard controls
+
+`Tab` cycles the period, `←`/`→` move through periods and `t` returns to the
+current one. `1`/`2`/`3` toggle Claude, OpenAI and Grok. `m` stacks bars by
+model instead of provider, and `l` lists each model's input, output, cache and
+spend for the period. `s` switches the bar chart and daily grid between tokens
+and frozen-rate API spend; `i` narrows either view to input only, output only,
+or everything. `g` focuses the daily grid for arrow-key inspection. `?` shows
+this list in the terminal.
+
 ### Subscription costs
 
 Enter your own **monthly USD cost**, not a plan name. An annual subscription

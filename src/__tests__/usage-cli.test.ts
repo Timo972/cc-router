@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
 import { parseUsageOptions, registerUsage } from "../cli/cmd-usage.js";
-import { createUsageClient } from "../usage/client.js";
+import { createUsageClient, validateUsageReport } from "../usage/client.js";
+import { zeroSpend, zeroTokens } from "../usage/types.js";
 
 describe("usage command", () => {
   it("validates calendar dates, periods and provider selectors", () => {
@@ -83,4 +84,21 @@ it("refuses read-only offline history while an account transition needs recovery
     await expect(api.subscriptions()).rejects.toThrow(/transition.*recover/i);
     expect(readFileSync(file, "utf8")).toBe(pending);
   } finally { rmSync(directory, { recursive: true, force: true }); }
+
+});
+
+it("defaults missing bucket spend from an older router and rejects invalid spend", () => {
+  const tokens = zeroTokens(); const start = "2026-09-01T00:00:00.000Z"; const end = "2026-10-01T00:00:00.000Z";
+  const report = () => ({ period: "month", start, end, now: "2026-09-17T00:00:00.000Z",
+    buckets: [{ start, end, tokens, series: { a: { provider: "anthropic_subscription", model: "sonnet", tokens } } }],
+    days: [{ date: "2026-09-01", start, end, tokens, selected: true, coverage: "complete", series: {} }],
+    totals: tokens, accounts: [], warnings: [], costs: { pricedApiUsd: 0, subscriptionUsd: 0, savingsUsd: null, savingsPercent: null,
+      coverage: { pricedTokens: 0, unpricedTokens: 0, pricingComplete: true, configuredAccounts: 0, unconfiguredAccounts: 0, subscriptionComplete: true, trackingComplete: true, persistenceHealthy: true } } }) as unknown as Record<string, unknown>;
+  const validated = validateUsageReport(report());
+  expect(validated.buckets[0].usd).toEqual(zeroSpend()); expect(validated.days[0].usd).toEqual(zeroSpend());
+  expect(Object.values(validated.buckets[0].series)[0].usd).toEqual(zeroSpend());
+  const negative = report(); (negative.buckets as Array<Record<string, unknown>>)[0].usd = { ...zeroSpend(), input: -1 };
+  expect(() => validateUsageReport(negative)).toThrow(/spend/i);
+  const nan = report(); ((nan.buckets as Array<Record<string, unknown>>)[0].series as Record<string, Record<string, unknown>>).a.usd = { ...zeroSpend(), output: Number.NaN };
+  expect(() => validateUsageReport(nan)).toThrow(/spend/i);
 });

@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { UsageStore } from "./store.js";
 import { queryRuntimeUsage } from "./runtime.js";
-import { utcTimestamp, usageProvider, validateAccount, validateTokens, type UsageQuery, type UsageReport, type Subscription, type UsageAccount } from "./types.js";
+import { utcTimestamp, usageProvider, validateAccount, validateSpend, validateTokens, zeroSpend, type UsageQuery, type UsageReport, type Subscription, type UsageAccount } from "./types.js";
 
 export interface SubscriptionListing { accounts: UsageAccount[]; subscriptions: Subscription[] }
 export interface UsageClientOptions {
@@ -25,10 +25,12 @@ export function validateUsageReport(value: unknown): UsageReport {
   validateTokens(r.totals);
   if (!Array.isArray(r.buckets) || r.buckets.length > 366 || !Array.isArray(r.days) || r.days.length > 366
     || !Array.isArray(r.accounts) || r.accounts.length > 10_000 || !Array.isArray(r.warnings) || r.warnings.length > 100) throw new Error("Invalid usage report size");
+  // A router from before per-bucket spend omits `usd`; treat that as zero rather than refusing its history.
+  const spend = (value: unknown) => value === undefined ? zeroSpend() : validateSpend(value);
   for (const b of [...r.buckets, ...r.days]) {
-    utcTimestamp(b.start); utcTimestamp(b.end); validateTokens(b.tokens);
+    utcTimestamp(b.start); utcTimestamp(b.end); validateTokens(b.tokens); b.usd = spend(b.usd);
     if (!b.series || typeof b.series !== "object" || Object.keys(b.series).length > 100) throw new Error("Invalid usage series");
-    for (const s of Object.values(b.series)) { usageProvider(s.provider); clean(s.model); validateTokens(s.tokens); }
+    for (const s of Object.values(b.series)) { usageProvider(s.provider); clean(s.model); validateTokens(s.tokens); s.usd = spend(s.usd); }
   }
   for (const d of r.days) {
     utcTimestamp(d.date);
