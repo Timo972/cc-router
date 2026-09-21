@@ -186,3 +186,40 @@ cc-router models set --openai-model openai/gpt-5-codex
 When the proxy is running, `models set` updates the live router and persists the
 new defaults. If the proxy is offline, it writes the configuration for the next
 start.
+
+## Usage dashboard
+
+`cc-router usage` opens a separate history view. Unlike the status dashboard's
+process-local counters, its journal survives service restarts.
+
+- **Day / Week / Month / Year tabs:** hourly bars for a day, daily bars for a
+  week/month, and monthly bars for a year. The default is the current month.
+- **Stacked bars:** provider-colored token totals. Model mode splits those
+  stacks by served model; excess legend entries are combined as Other. Patterns
+  distinguish segments even without color. Press `l` to inspect full model names.
+- **Daily grid:** Monday-first week columns with brighter active days. Muted
+  zero days differ from untracked question marks and future dots; partial days use a patterned
+  marker. The grid shows the selected calendar year and narrows around the
+  focused day on smaller terminals.
+- **Cost summary:** standard API-equivalent value, configured subscription
+  cost, net savings and percentage. Missing information is explicitly partial.
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | Next / previous period tab |
+| `←` / `→` | Previous / next calendar period |
+| `t` | Return to the current date |
+| `1` / `2` / `3` | Toggle Claude / OpenAI / Grok |
+| `m` | Toggle provider/model stacks |
+| `l` | Inspect full model names; up/down browses, `l` returns |
+| `g` | Toggle day-grid focus; on short terminals switch chart/grid |
+| Arrow keys in day-grid focus | Move a day vertically or a week horizontally |
+| `?` | Show all keyboard controls, including in narrow terminals |
+| `q` | Quit and restore terminal input |
+
+All filters update the same report, including costs. The view polls every five
+seconds without overlapping requests. Small terminals show a compact summary
+and keep quit/navigation controls visible. Use `--json` for full numerical
+precision and all report warnings, or redirect output for a plain-text summary.
+
+See [usage commands and cost configuration](cli-reference.md#persistent-token-usage-and-savings).

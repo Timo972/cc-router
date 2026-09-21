@@ -55,6 +55,21 @@ vi.mock("../utils/claude-config.js", async importOriginal => ({
 
 const saveAccounts = vi.hoisted(() => vi.fn());
 vi.mock("../proxy/token-refresher.js", () => ({ saveAccounts }));
+vi.mock("../cli/cmd-accounts.js", () => ({
+  isAccountApiReachable: vi.fn(async () => false),
+  tryAddAccountToRunningProxy: vi.fn(async () => false),
+  addAccountRuntimeAware: vi.fn(async (
+    record: unknown,
+    dependencies: {
+      tryAddLive(value: unknown): Promise<boolean>;
+      addStored(value: unknown): void;
+    },
+  ) => {
+    if (await dependencies.tryAddLive(record)) return { mode: "live" as const };
+    dependencies.addStored(record);
+    return { mode: "stored" as const };
+  }),
+}));
 
 const { runSetupWizard } = await import("../cli/cmd-setup.js");
 const { collectClaudeAccount } = await import("../cli/account-flows.js");

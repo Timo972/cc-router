@@ -1,3 +1,5 @@
+import { finishUsageAttempt, discardUsageAttempt } from "./stats.js";
+import type { UsageRuntime } from "../usage/runtime.js";
 import { request as httpRequest, type ClientRequest, type IncomingMessage, type OutgoingHttpHeaders } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { Express, Request, RequestHandler, Response } from "express";
@@ -61,6 +63,7 @@ export function withOAuthBeta(existing: unknown): string {
 }
 
 export interface AnthropicMessagesRouteOptions {
+  usageRuntime?: UsageRuntime;
   /** Upstream base URL — https://api.anthropic.com or a LiteLLM endpoint. */
   target: string;
   /** Applies only until upstream response headers arrive, exactly like the
@@ -309,7 +312,19 @@ export function mountAnthropicMessagesRoute(
     // long-lived stream is never cut (see anthropic-proxy.ts).
     req.socket.setTimeout(opts.timeoutMs);
 
+    const attemptEntries = new WeakMap<object, LogEntry>();
+    if (req._ccUsageEntry) attemptEntries.set(route, req._ccUsageEntry);
+    const entryFor = (lease: RoutedAccountLease): LogEntry => {
+      let entry = attemptEntries.get(lease);
+      if (!entry) {
+        entry = { ts: now(), accountId: lease.account.id, model, type: "route" };
+        opts.usageRuntime?.bind(entry, "anthropic_subscription");
+        attemptEntries.set(lease, entry);
+      }
+      return entry;
+    };
     for (let attempt = 1; ; attempt++) {
+      const entry = entryFor(route);
       const account = route.account;
       const attemptStartedAt = now();
       const attemptSpan = startTelemetrySpan("provider.inference", {
@@ -321,6 +336,7 @@ export function mountAnthropicMessagesRoute(
       });
       /** Close this attempt's span exactly once, on the outcome it ended with. */
       const endAttempt = (outcome: Outcome, extra: SafeSpanAttributes = {}): void => {
+        finishUsageAttempt(entry, false);
         attemptSpan.annotate({
           ...extra,
           outcome,
@@ -350,6 +366,7 @@ export function mountAnthropicMessagesRoute(
       try {
         upstream = await forwarded.response;
       } catch (error) {
+        finishUsageAttempt(entry, false);
         release();
         // A hung-up client rejects this await through the abort above. That
         // is a cancellation, not an upstream failure — there is no client
@@ -415,7 +432,7 @@ export function mountAnthropicMessagesRoute(
         now,
       );
 
-      const entry: LogEntry = {
+      Object.assign(entry, {
         ts: attemptStartedAt,
         accountId: account.id,
         model,
@@ -426,7 +443,7 @@ export function mountAnthropicMessagesRoute(
         source,
         details: routeReasonDetails(route),
         durationMs: now() - attemptStartedAt,
-      };
+      });
 
       if (status === 401) {
         // Token invalid or expired mid-request. Forward the 401 to the client
@@ -478,6 +495,7 @@ export function mountAnthropicMessagesRoute(
         let next: { route: RoutedAccountLease; release: () => void } | undefined;
         try {
           next = acquireRequestRoute(sessionHeader, res, opts.sessionRouter, context);
+          entryFor(next.route);
         } catch (error) {
           // Nothing eligible to fail over to — pass the failure through.
           // Only routing-level rejections are expected here; anything else is
@@ -492,6 +510,7 @@ export function mountAnthropicMessagesRoute(
           // Re-sending a 429 to the account that produced it would only
           // reproduce the rate limit. The cooldown normally guarantees a
           // different account here; if it ever does not, pass through.
+          discardUsageAttempt(entryFor(next.route));
           next.release();
           next = undefined;
         }
@@ -533,11 +552,13 @@ export function mountAnthropicMessagesRoute(
             );
           }
           if (outcome !== "refreshed") {
+            discardUsageAttempt(entryFor(next.route));
             next.release();
             next = undefined;
           }
         }
         if (clientGone.signal.aborted || res.writableEnded) {
+          if (next) discardUsageAttempt(entryFor(next.route));
           next?.release();
           release();
           upstream.destroy();
@@ -552,6 +573,7 @@ export function mountAnthropicMessagesRoute(
             streamOutcome: "upstream_error",
           });
           entry.details = `${entry.details}:will-retry`;
+          finishUsageAttempt(entry, false);
           recordActivity(entry);
           upstream.destroy();
           release();
@@ -566,6 +588,7 @@ export function mountAnthropicMessagesRoute(
           if (sameAccount) {
             await retryDelay(sameAccountDelayMs, clientGone.signal);
             if (clientGone.signal.aborted || res.writableEnded) {
+              discardUsageAttempt(entryFor(route));
               release();
               return;
             }
@@ -612,6 +635,7 @@ export function mountAnthropicMessagesRoute(
         entry.type = "error";
         entry.statusCode = 502;
         entry.details = `${entry.details}:held-response-lost`;
+        finishUsageAttempt(entry, false);
         recordActivity(entry);
         release();
         endAttempt("upstream_error", { httpStatusCode: 502, streamOutcome: "upstream_error" });
@@ -709,6 +733,7 @@ export function mountAnthropicMessagesRoute(
     requireBufferedBody,
     createAnthropicRoutingMiddleware({
       sessionRouter: opts.sessionRouter,
+      usageRuntime: opts.usageRuntime,
       ...(opts.onEmptyPool ? { onEmptyPool: opts.onEmptyPool } : {}),
       ...(opts.onNoEligibleAccount ? { onNoEligibleAccount: opts.onNoEligibleAccount } : {}),
       ...(opts.now ? { now: opts.now } : {}),
@@ -719,7 +744,7 @@ export function mountAnthropicMessagesRoute(
       onRefreshFailure: opts.onRefreshFailure,
     }),
     (req, res, next) => {
-      void handler(req, res).catch(next);
+      void handler(req, res).catch(error => { if (req._ccUsageEntry) finishUsageAttempt(req._ccUsageEntry, false); next(error); });
     },
   );
 }

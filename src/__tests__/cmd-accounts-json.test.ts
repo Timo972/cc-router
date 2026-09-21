@@ -3,6 +3,7 @@ import {
   accountDrift,
   addAccountRuntimeAware,
   buildStoredAccountsJson,
+  isAccountApiReachable,
   mergeAccountInventory,
   removeAccountRuntimeAware,
   renameAccountRuntimeAware,
@@ -251,6 +252,25 @@ describe("runtime-aware account add", () => {
 
     await expect(tryAddAccountToRunningProxy(record, { fetch }))
       .rejects.toThrow("HTTP 409: Account \"openai-1\" already exists");
+  });
+
+  it("probes the authenticated account API without mutating it", async () => {
+    const fetch = vi.fn(async () => Response.json({ accounts: [] }));
+
+    await expect(isAccountApiReachable({
+      baseUrl: "http://router.local/",
+      authToken: "secret",
+      fetch,
+    })).resolves.toBe(true);
+
+    expect(fetch).toHaveBeenCalledWith(
+      "http://router.local/cc-router/accounts",
+      expect.objectContaining({
+        headers: { authorization: "Bearer secret" },
+        signal: expect.any(AbortSignal),
+      }),
+    );
+    expect(fetch.mock.calls[0]?.[1]).not.toHaveProperty("method", "POST");
   });
 });
 
