@@ -84,3 +84,18 @@ it("refuses read-only offline history while an account transition needs recovery
     expect(readFileSync(file, "utf8")).toBe(pending);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+it("prints input as the sum of uncached, cache read and cache write, and only the API-equivalent cost", async () => {
+  const { formatUsageText } = await import("../cli/cmd-usage.js");
+  const { zeroTokens } = await import("../usage/types.js");
+  const totals = { ...zeroTokens(), input: 1_800, output: 83_000, cacheRead: 11_900_000, cacheWrite: 45_000 };
+  const text = formatUsageText({
+    period: "month", start: "2026-09-01T00:00:00.000Z", end: "2026-10-01T00:00:00.000Z", now: "2026-09-21T00:00:00.000Z",
+    buckets: [], days: [], totals, accounts: [], warnings: [],
+    costs: { pricedApiUsd: 12.5, subscriptionUsd: 200, savingsUsd: -187.5, savingsPercent: -1500,
+      coverage: { pricedTokens: 1, unpricedTokens: 0, pricingComplete: true, configuredAccounts: 1, unconfiguredAccounts: 0, subscriptionComplete: true, trackingComplete: true, persistenceHealthy: true } },
+  });
+  expect(text).toContain("input 11946800 (1800 uncached, 11900000 cache read, 45000 cache write) | output 83000");
+  expect(text).toContain("API equivalent: $12.50");
+  expect(text).not.toMatch(/Subscription:|Net savings/);
+});

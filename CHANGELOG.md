@@ -8,6 +8,18 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `cc-router usage` now shows input as the sum of uncached, cache-read and
+  cache-write tokens, with the three listed beside it, so the line reconciles
+  with the total (cache reads usually dominate). Token kinds and the
+  API-equivalent cost are coloured like the status dashboard's TOTALS line,
+  the view is indented by one column, and the week chart labels every other
+  day and names the axis unit instead of running the day numbers together.
+- Subscription cost and net savings are no longer displayed in the usage
+  dashboard or the plain-text summary; the API-equivalent value stands alone.
+  Both remain in `--json` output and `usage subscription` still records costs.
+
 ### ⚠️ Breaking
 
 - `cc-router accounts add-openai`, `login-openai`, `add-grok` and `login-grok`

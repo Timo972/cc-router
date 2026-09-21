@@ -160,14 +160,17 @@ days, and stop at the current time for an ongoing period. Provider filters
 apply to both usage and costs. Model differentiation is visual only; it does
 not allocate a subscription's cost between models.
 
-### How savings are estimated
+### How the API-equivalent cost is estimated
 
-**Net savings = estimated standard API token cost − configured subscription
-cost**, for the same period. Cached input and cache-write durations use their
-own rates. Negative savings remain negative; a zero API baseline has no savings
-percentage. These are token-cost comparisons, not invoices: tool charges,
-taxes, negotiated discounts, regional processing and fast-mode surcharges are
-not included.
+The report prices every recorded token at the standard API rate frozen when it
+was observed. Cached input and cache-write durations use their own rates.
+These are token-cost estimates, not invoices: tool charges, taxes, negotiated
+discounts, regional processing and fast-mode surcharges are not included.
+
+Subscription costs and **net savings (API-equivalent cost − configured
+subscription cost)** are still computed and returned in `--json` output
+(`costs.subscriptionUsd`, `costs.savingsUsd`), but the dashboard and the
+plain-text summary show only the API-equivalent value for now.
 
 Missing model rates or subscription costs are marked partial/unconfigured, not
 silently priced at zero. Incomplete tracking suppresses an authoritative net

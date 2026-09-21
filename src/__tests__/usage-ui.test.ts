@@ -26,8 +26,13 @@ describe("UsageDashboard", () => {
     });
     const exited = instance.waitUntilExit();
     try {
-      await vi.waitFor(() => expect(frames.at(-1)).toContain("API equivalent"));
-      expect(frames.at(-1)).toContain("-$1.00");
+      await vi.waitFor(() => expect(frames.at(-1)).toContain("API equivalent $1.00"));
+      // Subscription cost and savings are hidden for now.
+      expect(frames.at(-1)).not.toContain("Sub ");
+      expect(frames.at(-1)).not.toContain("Savings");
+      expect(frames.at(-1)).not.toContain("-$1.00");
+      // Input reconciles with the total: uncached + cache read + cache write.
+      expect(frames.at(-1)).toMatch(/1K tokens\s+Input 1K \(1K uncached · 0 cache read · 0 cache write\)\s+Output 0/);
       stdin.push("\t");
       await vi.waitFor(() => expect(load.mock.calls.at(-1)?.[0].period).toBe("year"));
       stdin.push("1");
@@ -53,7 +58,7 @@ function mountUsage(load: (query: UsageQuery) => Promise<UsageReport>, columns: 
 it("keeps compact day inspection visible at 48 by 16", async () => {
   const ui = mountUsage(async q => report(q), 48, 16);
   try {
-    await vi.waitFor(() => expect(ui.last()).toContain("Savings"));
+    await vi.waitFor(() => expect(ui.last()).toContain("API $1.00"));
     ui.key("g");
     await vi.waitFor(() => expect(ui.last()).toContain("day focus"));
     expect(ui.last()).toContain("2026-09-01");
@@ -81,6 +86,41 @@ it("keeps Other visible and distinguishes future from untracked days", async () 
     await vi.waitFor(() => expect(ui.last()).toContain("claude-long-model-label-number-0"));
     ui.key("\u001b[B");
     await vi.waitFor(() => expect(ui.last()).toContain("claude-long-model-label-number-1"));
+  } finally { await ui.close(); }
+});
+it("labels every other week column so day numbers do not run together, and names the unit", async () => {
+  const ui = mountUsage(async q => {
+    const r = report({ ...q, period: "week" });
+    const tokens = { ...zeroTokens(), input: 100 };
+    r.buckets = Array.from({ length: 7 }, (_, i) => {
+      const start = `2026-09-${21 + i}T00:00:00.000Z`, end = `2026-09-${22 + i}T00:00:00.000Z`;
+      return { start, end, tokens, series: { a: { provider: "anthropic_subscription" as const, model: "sonnet", tokens } } };
+    });
+    return r;
+  }, 100, 32);
+  try {
+    await vi.waitFor(() => expect(ui.last()).toMatch(/└21 {2}23 {2}25 {2}27 {2}day/));
+    expect(ui.last()).not.toContain("2122");
+  } finally { await ui.close(); }
+});
+it("moves the input breakdown to its own line on narrow terminals instead of truncating it", async () => {
+  const ui = mountUsage(async q => report(q), 80, 32);
+  try {
+    await vi.waitFor(() => expect(ui.last()).toContain("API equivalent"));
+    expect(ui.last()).toMatch(/1K tokens\s+Input 1K\s+Output 0\n/);
+    expect(ui.last()).toContain("input = 1K uncached · 0 cache read · 0 cache write");
+    const tokenLines = ui.last().split("\n").filter(row => / tokens {2}Input |^\s+input = /.test(row));
+    expect(tokenLines).toHaveLength(2);
+    for (const row of tokenLines) expect(row).not.toContain("…");
+  } finally { await ui.close(); }
+});
+it("indents every line by one column like the status dashboard", async () => {
+  const ui = mountUsage(async q => report(q), 100, 32);
+  try {
+    await vi.waitFor(() => expect(ui.last()).toContain("API equivalent"));
+    const rows = ui.last().split("\n").filter(row => row.trim().length > 0);
+    expect(rows.length).toBeGreaterThan(3);
+    for (const row of rows) expect(row.replace(/\x1b\[[0-9;]*m/g, "")).toMatch(/^ /);
   } finally { await ui.close(); }
 });
 it.each([80, 70, 48, 30])("makes all controls discoverable at width %s", async width => {

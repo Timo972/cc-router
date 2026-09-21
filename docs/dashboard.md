@@ -201,8 +201,13 @@ process-local counters, its journal survives service restarts.
   zero days differ from untracked question marks and future dots; partial days use a patterned
   marker. The grid shows the selected calendar year and narrows around the
   focused day on smaller terminals.
-- **Cost summary:** standard API-equivalent value, configured subscription
-  cost, net savings and percentage. Missing information is explicitly partial.
+- **Token summary:** the grand total, then input broken down into uncached,
+  cache read and cache write tokens (input is the sum of the three), then
+  output. Cache reads usually dominate, which is why the uncached figure alone
+  looks small next to the total.
+- **Cost summary:** the standard API-equivalent value of those tokens. Missing
+  prices are explicitly partial. Configured subscription costs and net savings
+  are recorded but not displayed for now.
 
 | Key | Action |
 |---|---|

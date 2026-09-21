@@ -87,7 +87,9 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
   const width = Math.max(12, size.width - 2);
   const height = Math.max(4, size.height - 1);
   const line = (content: React.ReactNode, key: string) => <Text key={key} wrap="truncate-end">{content}</Text>;
-  if (helpOpen) return <Box width={width} flexDirection="column">{[
+  // One column of left padding, like the status dashboard; `width` already
+  // leaves room for it.
+  if (helpOpen) return <Box width={width} paddingLeft={1} flexDirection="column">{[
     "Usage controls (UTC)", "Tab / Shift+Tab  Period tab", "← →  Previous / next period", "t  Current period", "1/2/3  Claude/OpenAI/Grok", "m  Model stacks", "l  Full model names", "g  Day focus / chart", "↑ ↓  Inspect day (grid)", "← →  Inspect week (grid)", "?  Return to usage", "q quit",
   ].slice(0, height).map((text, i) => line(text, `help${i}`))}</Box>;
   if (modelInspector) {
@@ -101,10 +103,36 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
   lines.push(line(<>{PERIODS.map(period => <Text key={period} bold={period === query.period} inverse={period === query.period}> {period[0].toUpperCase() + period.slice(1)} </Text>)}</>, "tabs"));
   if (report) {
     const { totals, costs } = report;
-    lines.push(line(<><Text bold>{formatTokens(totalTokens(totals))}</Text> tokens  Input {formatTokens(totals.input)}  Output {formatTokens(totals.output)}  Cache {formatTokens(totals.cacheRead)} read / {formatTokens(totals.cacheWrite)} write</>, "tokens"));
-    const saved = <><Text color={costs.savingsUsd !== null && costs.savingsUsd < 0 ? "red" : "green"}>{money(costs.savingsUsd)}</Text>{costs.savingsPercent === null ? "" : ` (${costs.savingsPercent.toFixed(1)}%)`}</>;
-    lines.push(line(<>{width < 68 ? "API" : "API equivalent"} {money(costs.pricedApiUsd)}{costs.coverage.pricingComplete ? "" : " (partial)"}  Sub {money(costs.subscriptionUsd)}{costs.coverage.subscriptionComplete ? "" : " (partial)"}{width >= 68 ? <>  Savings {saved}</> : null}</>, "costs"));
-    if (width < 68) lines.push(line(<>Savings {saved}</>, "savings"));
+    // Input is everything the model read: the uncached part plus cache reads
+    // and writes. Listing the uncached part alone as "Input" next to a total
+    // dominated by cache reads made the line look like it did not add up.
+    const input = totals.input + totals.cacheRead + totals.cacheWrite;
+    // Same palette as the status dashboard's TOTALS line: cache reads green,
+    // cache writes yellow, uncached white, the grand total cyan.
+    const breakdown = <>
+      <Text color="white">{formatTokens(totals.input)}</Text><Text color="gray"> uncached · </Text>
+      <Text color="green">{formatTokens(totals.cacheRead)}</Text><Text color="gray"> cache read · </Text>
+      <Text color="yellow">{formatTokens(totals.cacheWrite)}</Text><Text color="gray"> cache write</Text>
+    </>;
+    const headline = <>
+      <Text bold color="cyan">{formatTokens(totalTokens(totals))}</Text><Text> tokens  </Text>
+      <Text color="gray">Input </Text><Text color="white">{formatTokens(input)}</Text>
+    </>;
+    // The full line is ~90 characters; below 96 columns the breakdown moves to
+    // its own line rather than being truncated mid-word.
+    if (width >= 96) {
+      lines.push(line(<>{headline}<Text color="gray"> (</Text>{breakdown}<Text color="gray">)  Output </Text><Text color="white">{formatTokens(totals.output)}</Text></>, "tokens"));
+    } else {
+      lines.push(line(<>{headline}<Text color="gray">  Output </Text><Text color="white">{formatTokens(totals.output)}</Text></>, "tokens"));
+      lines.push(line(<><Text color="gray">  input = </Text>{breakdown}</>, "tokens-breakdown"));
+    }
+    // Subscription cost and savings are hidden for now: the API-equivalent
+    // value is the figure that stands on its own.
+    lines.push(line(<>
+      <Text color="gray">{width < 68 ? "API" : "API equivalent"} </Text>
+      <Text bold color="green">{money(costs.pricedApiUsd)}</Text>
+      {costs.coverage.pricingComplete ? null : <Text color="yellow"> (partial)</Text>}
+    </>, "costs"));
   }
   lines.push(line(<>{USAGE_PROVIDERS.map((provider, i) => <Text key={provider} color={PROVIDER_COLORS[provider]} dimColor={query.providers !== undefined && !query.providers.includes(provider)}>{i + 1} {query.providers === undefined || query.providers.includes(provider) ? "■" : "□"} {PROVIDER_LABELS[provider]}  </Text>)}<Text dimColor>{models ? "Models" : "Providers"}</Text></>, "providers"));
   const warning = error ?? report?.warnings[0];
@@ -122,7 +150,12 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
       const colors = new Map(chart.legend.map((s, i) => [s.key, legendColor(s, i, models)]));
       const glyphs = new Map(chart.legend.map((s, i) => [s.key, legendGlyph(s, i, models)]));
       for (let row = 0; row < chartHeight; row++) lines.push(line(<><Text dimColor>{(row === 0 ? formatTokens(chart.max) : row === chartHeight - 1 ? "0" : "").padStart(5)} │</Text>{chart.columns.map((col, i) => <Text key={i} color={col.cells[row] ? colors.get(col.cells[row]!) : undefined}>{col.cells[row] ? glyphs.get(col.cells[row]!)!.repeat(2) : "  "}</Text>)}</>, `bar${row}`));
-      lines.push(line(<Text dimColor>{"      └"}{chart.columns.map((col, i) => i % Math.max(1, Math.ceil(chart.columns.length / 8)) === 0 ? col.label.padStart(2).slice(-2) : "  ").join("")}</Text>, "axis"));
+      // Every bar is two cells wide and every label two characters, so
+      // labelling adjacent columns runs them together ("21222324"). Skip at
+      // least every other column, and say what the labels are.
+      const labelStride = Math.max(2, Math.ceil(chart.columns.length / 8));
+      const axisUnit = query.period === "day" ? "hour" : query.period === "year" ? "month" : "day";
+      lines.push(line(<Text dimColor>{"      └"}{chart.columns.map((col, i) => i % labelStride === 0 ? col.label.padStart(2).slice(-2) : "  ").join("")}  {axisUnit}</Text>, "axis"));
       const labelWidth = Math.max(5, Math.floor(width / Math.max(1, chart.legend.length)) - 4);
       lines.push(line(<>{chart.legend.map(s => <Text key={s.key} color={colors.get(s.key)}>{glyphs.get(s.key)} {s.label.length > labelWidth ? `${s.label.slice(0, Math.ceil((labelWidth - 1) / 2))}…${s.label.slice(-Math.floor((labelWidth - 1) / 2))}` : s.label}  </Text>)}</>, "legend"));
     }
@@ -158,5 +191,5 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
   if (!report && !loading && !error) lines.push(line("No usage history available.", "nohistory"));
   const help = width >= 76 ? "q quit · ? help · Tab period · ←→ move · t today · 1–3 · m models · g grid · l names" : width >= 38 ? "q quit · ? help · Tab ←→ t 1–3 m g l" : "q quit · ? help";
   // Explicit viewport budget prevents Ink from scrolling controls offscreen on resize.
-  return <Box width={width} flexDirection="column">{lines.slice(0, height - 1)}{line(<Text dimColor>{help}</Text>, "help")}</Box>;
+  return <Box width={width} paddingLeft={1} flexDirection="column">{lines.slice(0, height - 1)}{line(<Text dimColor>{help}</Text>, "help")}</Box>;
 }

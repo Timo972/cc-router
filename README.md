@@ -109,12 +109,12 @@ it later. Adding more accounts is `cc-router accounts login`, re-signing one in 
 Per-platform token extraction, Codex CLI, Docker and everything else lives in
 [the docs](docs/).
 
-## Usage history and savings
+## Usage history and API-equivalent cost
 
 Run `cc-router usage` for persistent token history, provider/model stacked bars,
-and a daily activity grid. Switch between day, week, month and year; history
-survives service restarts. Configure your monthly subscription costs to compare
-them with the estimated standard API token value:
+a daily activity grid, and what the recorded tokens would have cost at standard
+API rates. Switch between day, week, month and year; history survives service
+restarts. Monthly subscription costs can be recorded for later comparison:
 
 ```bash
 cc-router usage subscription set personal --monthly-usd 100 --from 2026-09-01
