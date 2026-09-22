@@ -43,6 +43,9 @@ describe("UsageDashboard", () => {
   });
 });
 
+function fullYearDays(r: UsageReport): UsageReport["days"] {
+  return Array.from({ length: 365 }, (_, i) => { const date = new Date(Date.UTC(2026, 0, 1 + i)).toISOString().slice(0, 10); return { ...r.days[0], date, selected: date.startsWith("2026-09"), coverage: date < "2026-09-17" ? "complete" as const : "future" as const }; });
+}
 function mountUsage(load: (query: UsageQuery) => Promise<UsageReport>, columns: number, rows: number) {
   const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: vi.fn(), ref: vi.fn(), unref: vi.fn() });
   const stdout = Object.assign(new PassThrough(), { columns, rows });
@@ -50,7 +53,7 @@ function mountUsage(load: (query: UsageQuery) => Promise<UsageReport>, columns: 
   const instance = render(React.createElement(UsageDashboard, { load, initialQuery: { period: "month" } }), { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream, debug: true, patchConsole: false, exitOnCtrlC: false });
   const exited = instance.waitUntilExit();
   const plain = () => (frames.at(-1) ?? "").replace(/\u001b\[[0-9;]*m/g, "");
-  return { last: () => frames.at(-1) ?? "", plain, key: (s: string) => stdin.push(s), close: async () => { instance.unmount(); await exited; } };
+  return { last: () => frames.at(-1) ?? "", plain, key: (s: string) => stdin.push(s), exited, close: async () => { instance.unmount(); await exited; } };
 }
 it("keeps compact day inspection visible at 48 by 16", async () => {
   const ui = mountUsage(async q => report(q), 48, 16);
@@ -167,6 +170,7 @@ it("widens week columns so the axis labels are not cramped", async () => {
     const r = report({ ...q, period: "week" });
     const day = (i: number) => `2026-09-${String(21 + i).padStart(2, "0")}T00:00:00.000Z`;
     r.buckets = Array.from({ length: 7 }, (_, i) => ({ ...r.buckets[0], start: day(i), end: day(i + 1) }));
+    r.days = fullYearDays(r);
     return r;
   }, 100, 32);
   try {
@@ -177,4 +181,40 @@ it("widens week columns so the axis labels are not cramped", async () => {
     // Seven buckets share the width: each column is many cells wide, not two.
     expect(bar.replace(/^.*│/, "").trim().length).toBeGreaterThan(40);
   } finally { await ui.close(); }
+});
+it("keeps the chart no wider than the grid on wide terminals", async () => {
+  const ui = mountUsage(async q => { const r = report(q); r.buckets = Array.from({ length: 30 }, (_, i) => ({ ...r.buckets[0], start: `2026-09-${String(i + 1).padStart(2, "0")}T00:00:00.000Z` })); r.days = fullYearDays(r); return r; }, 160, 40);
+  try {
+    await vi.waitFor(() => expect(ui.plain()).toContain("└"));
+    const rows = ui.plain().split("\n").map(r => r.trimEnd());
+    const chartWidth = Math.max(...rows.filter(r => r.includes("│") || r.includes("└")).map(r => r.length));
+    const gridWidth = Math.max(...rows.filter(r => /^(Mo|Tu|We|Th|Fr|Sa|Su)\s/.test(r)).map(r => r.length));
+    // Cells are "■ ", so the trimmed grid row is one short of 4 + 53 weeks * 2.
+    expect(gridWidth).toBeGreaterThanOrEqual(4 + 53 * 2 - 1);
+    expect(chartWidth).toBeLessThanOrEqual(gridWidth + 1);
+    expect(chartWidth).toBeGreaterThan(80);
+  } finally { await ui.close(); }
+});
+it("fills the terminal like status so earlier shell output scrolls away", async () => {
+  const ui = mountUsage(async q => report(q), 60, 24);
+  try {
+    await vi.waitFor(() => expect(ui.plain()).toContain("API cost"));
+    // One row of slack, exactly as the status dashboard leaves, even though the content is far shorter.
+    expect(ui.plain().split("\n").length).toBe(23);
+    expect(ui.plain().trimEnd().split("\n").at(-1)).toContain("q quit");
+  } finally { await ui.close(); }
+});
+it("exits on Escape, but Escape first backs out of help and the model inspector", async () => {
+  const ui = mountUsage(async q => report(q), 100, 32);
+  await vi.waitFor(() => expect(ui.plain()).toContain("API cost"));
+  ui.key("?");
+  await vi.waitFor(() => expect(ui.plain()).toContain("Usage controls"));
+  ui.key("\u001b");
+  await vi.waitFor(() => expect(ui.plain()).toContain("API cost"));
+  ui.key("l");
+  await vi.waitFor(() => expect(ui.plain()).toContain("↑↓ browse"));
+  ui.key("\u001b");
+  await vi.waitFor(() => expect(ui.plain()).toContain("API cost"));
+  ui.key("\u001b");
+  await expect(Promise.race([ui.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("did not exit")), 2000))])).resolves.toBeUndefined();
 });

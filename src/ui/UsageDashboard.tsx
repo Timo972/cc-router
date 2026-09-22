@@ -83,6 +83,13 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
   }, new Map<string, { provider: string; model: string; tokens: TokenCounts; usd: UsageSpend }>()).values()].sort((a, b) => `${a.provider}:${a.model}`.localeCompare(`${b.provider}:${b.model}`));
   useInput((input, key) => {
     if (input === "q" || (key.ctrl && input === "c")) { onExit?.(); exit(); return; }
+    // Escape mirrors status: it leaves an overlay first and only quits from the main view.
+    if (key.escape) {
+      if (helpOpen) setHelpOpen(false);
+      else if (modelInspector) setModelInspector(false);
+      else { onExit?.(); exit(); }
+      return;
+    }
     if (input === "?") { setHelpOpen(value => !value); return; }
     if (helpOpen) return;
     if (input === "l") { setModelInspector(value => !value); return; }
@@ -116,8 +123,10 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
   const formatMeasure = (value: number) => spend ? compactMoney(value) : formatTokens(value);
   const unit = `${facet === "sum" ? "" : `${facet} `}${spend ? "spend" : "tokens"}`;
   const describe = (value: number) => `${spend ? money(value) : value.toLocaleString("en-US")} ${unit}`;
-  if (helpOpen) return <Box width={width} flexDirection="column">{[
-    "Usage controls (UTC)", "Tab / Shift+Tab  Period tab", "← →  Previous / next period", "t  Current period", "1/2/3  Claude/OpenAI/Grok", "m  Model stacks", "s  Tokens / spend", "i  All / input / output", "l  Full model names", "g  Day focus / chart", "↑ ↓  Inspect day (grid)", "← →  Inspect week (grid)", "?  Return to usage", "q quit",
+  // A fixed frame height, as the status dashboard uses, so the view always fills the terminal
+  // and whatever was on screen before scrolls away instead of sitting above a short report.
+  if (helpOpen) return <Box width={width} height={height} flexDirection="column">{[
+    "Usage controls (UTC)", "Esc  Back / quit", "Tab / Shift+Tab  Period tab", "← →  Previous / next period", "t  Current period", "1/2/3  Claude/OpenAI/Grok", "m  Model stacks", "s  Tokens / spend", "i  All / input / output", "l  Full model names", "g  Day focus / chart", "↑ ↓  Inspect day (grid)", "← →  Inspect week (grid)", "?  Return to usage", "q quit",
   ].slice(0, height).map((text, i) => line(text, `help${i}`))}</Box>;
   if (modelInspector) {
     const selected = fullModels[modelIndex % Math.max(1, fullModels.length)];
@@ -129,7 +138,7 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
         ? line(<Text dimColor>Spend unavailable until the router restarts</Text>, "model-spend")
         : line(<><Text bold>Spend {money(totalSpend(selected.usd))}</Text> · <Text color={CATEGORY_COLORS.input}>Input {money(selected.usd.input)}</Text> · <Text color={CATEGORY_COLORS.output}>Output {money(selected.usd.output)}</Text> · <Text color={CATEGORY_COLORS.cache}>Cache {money(selected.usd.cacheRead + selected.usd.cacheWrite)}</Text></>, "model-spend"),
     ] : [];
-    return <Box width={width} flexDirection="column">{line(`Model ${fullModels.length ? modelIndex % fullModels.length + 1 : 0}/${fullModels.length} · ${selected ? PROVIDER_LABELS[selected.provider] : ""}`, "model-title")}{chunks.slice(0, Math.max(1, height - 3 - detail.length)).map((text, i) => line(text, `model-name${i}`))}{detail}{line("↑↓ browse · l back · q quit", "model-help")}</Box>;
+    return <Box width={width} height={height} flexDirection="column">{line(`Model ${fullModels.length ? modelIndex % fullModels.length + 1 : 0}/${fullModels.length} · ${selected ? PROVIDER_LABELS[selected.provider] : ""}`, "model-title")}{chunks.slice(0, Math.max(1, height - 3 - detail.length)).map((text, i) => line(text, `model-name${i}`))}{detail}{line("↑↓ browse · l back · q quit", "model-help")}</Box>;
   }
   // Spacer lines between sections whenever the viewport can afford them.
   const roomy = height >= 30;
@@ -165,10 +174,14 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
     // Everything that must still fit under the chart: axis, legend, grid, notice, help and the spacers between them.
     const reserved = 2 + (showGrid ? 9 + gapLines : 0) + gapLines + (notice ? 1 : 0) + 1;
     const chartHeight = Math.max(2, Math.min(8, height - lines.length - gapLines - reserved));
+    // The grid is at most a year of weeks wide; the chart shares that right edge so the two read as one block.
+    const weeks = heatmapWeeks(report.days.map(day => day.date));
+    const span = Math.max(1, Math.min(weeks.length, Math.floor((width - 4) / 2)));
+    const gridWidth = 4 + span * 2;
     if (showBoth || !gridFocus) {
       gap("gap-chart");
       // Few buckets (a week has seven) get wide columns so the bars fill the row and every label has room.
-      const plotWidth = Math.max(2, width - 8);
+      const plotWidth = Math.max(2, Math.min(width, gridWidth) - 8);
       const columnWidth = Math.max(2, Math.min(MAX_COLUMN_WIDTH, Math.floor(plotWidth / Math.max(1, report.buckets.length))));
       const chart = chartColumns(report.buckets.map(b => ({
         label: query.period === "day" ? b.start.slice(11, 13) : query.period === "year" ? b.start.slice(5, 7) : b.start.slice(8, 10),
@@ -187,8 +200,6 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
     if (showGrid && height - lines.length >= 10 + gapLines) {
       gap("gap-grid");
       const byDate = new Map(report.days.map(day => [day.date, day]));
-      const weeks = heatmapWeeks(report.days.map(day => day.date));
-      const span = Math.max(1, Math.floor((width - 4) / 2));
       const focusedWeek = weeks.findIndex(week => week.includes(focused));
       const firstWeek = Math.max(0, Math.min(weeks.length - span, focusedWeek - Math.floor(span / 2)));
       const visible = weeks.slice(firstWeek, firstWeek + span);
@@ -218,5 +229,5 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
   if (!report && !loading && !error) lines.push(line("No usage history available.", "nohistory"));
   const help = width >= 96 ? "q quit · ? help · Tab period · ←→ move · t today · 1–3 · m models · s spend · i in/out · g grid · l names" : width >= 38 ? "q quit · ? help · Tab ←→ t 1–3 m s i g l" : "q quit · ? help";
   // Explicit viewport budget prevents Ink from scrolling controls offscreen on resize.
-  return <Box width={width} flexDirection="column">{lines.slice(0, height - 1)}{line(<Text dimColor>{help}</Text>, "help")}</Box>;
+  return <Box width={width} height={height} flexDirection="column">{lines.slice(0, height - 1)}{line(<Text dimColor>{help}</Text>, "help")}</Box>;
 }
