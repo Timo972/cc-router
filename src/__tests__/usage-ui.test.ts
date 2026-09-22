@@ -150,3 +150,31 @@ it("places warnings below the grid and lets the layout breathe on tall terminals
     expect(totals - tabs).toBe(2); expect(rows[tabs + 1].trim()).toBe("");
   } finally { await ui.close(); }
 });
+it("says spend is unavailable rather than zero when the router predates per-category spend", async () => {
+  const ui = mountUsage(async q => ({ ...report(q), spendAvailable: false }), 100, 32);
+  try {
+    await vi.waitFor(() => expect(ui.plain()).toContain("API cost $1.00"));
+    expect(ui.plain()).toMatch(/API cost \$1\.00\s+Input \/ output \/ cache unavailable/);
+    expect(ui.plain()).not.toContain("Input $0.00");
+    ui.key("l");
+    await vi.waitFor(() => expect(ui.plain()).toContain("sonnet"));
+    expect(ui.plain()).toMatch(/Spend unavailable/);
+    expect(ui.plain()).not.toContain("Spend $0.00");
+  } finally { await ui.close(); }
+});
+it("widens week columns so the axis labels are not cramped", async () => {
+  const ui = mountUsage(async q => {
+    const r = report({ ...q, period: "week" });
+    const day = (i: number) => `2026-09-${String(21 + i).padStart(2, "0")}T00:00:00.000Z`;
+    r.buckets = Array.from({ length: 7 }, (_, i) => ({ ...r.buckets[0], start: day(i), end: day(i + 1) }));
+    return r;
+  }, 100, 32);
+  try {
+    await vi.waitFor(() => expect(ui.plain()).toContain("└"));
+    const axis = ui.plain().split("\n").find(row => row.includes("└"))!;
+    expect(axis).toMatch(/21\s+22\s+23\s+24\s+25\s+26\s+27/);
+    const bar = ui.plain().split("\n").find(row => /0 │/.test(row))!;
+    // Seven buckets share the width: each column is many cells wide, not two.
+    expect(bar.replace(/^.*│/, "").trim().length).toBeGreaterThan(40);
+  } finally { await ui.close(); }
+});

@@ -129,6 +129,8 @@ export interface UsageReport {
   costs: UsageCosts;
   accounts: UsageAccount[];
   warnings: string[];
+  /** Set to false by the client when a router omitted per-category spend, so zeros are shown as unavailable. */
+  spendAvailable?: false;
 }
 
 export const USAGE_PROVIDERS: readonly UsageProvider[] = ["anthropic_subscription", "openai_subscription", "xai_subscription"];

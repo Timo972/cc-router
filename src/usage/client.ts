@@ -25,8 +25,10 @@ export function validateUsageReport(value: unknown): UsageReport {
   validateTokens(r.totals);
   if (!Array.isArray(r.buckets) || r.buckets.length > 366 || !Array.isArray(r.days) || r.days.length > 366
     || !Array.isArray(r.accounts) || r.accounts.length > 10_000 || !Array.isArray(r.warnings) || r.warnings.length > 100) throw new Error("Invalid usage report size");
-  // A router from before per-bucket spend omits `usd`; treat that as zero rather than refusing its history.
-  const spend = (value: unknown) => value === undefined ? zeroSpend() : validateSpend(value);
+  // A router from before per-bucket spend omits `usd`; treat that as zero rather than refusing its history,
+  // but flag it so the dashboard shows "unavailable" instead of a false $0.00 split.
+  let spendMissing = false;
+  const spend = (value: unknown) => { if (value === undefined) { spendMissing = true; return zeroSpend(); } return validateSpend(value); };
   for (const b of [...r.buckets, ...r.days]) {
     utcTimestamp(b.start); utcTimestamp(b.end); validateTokens(b.tokens); b.usd = spend(b.usd);
     if (!b.series || typeof b.series !== "object" || Object.keys(b.series).length > 100) throw new Error("Invalid usage series");
@@ -41,6 +43,7 @@ export function validateUsageReport(value: unknown): UsageReport {
   for (const amount of [r.costs.pricedApiUsd, r.costs.subscriptionUsd]) if (!Number.isFinite(amount) || amount < 0) throw new Error("Invalid usage cost");
   for (const amount of [r.costs.savingsUsd, r.costs.savingsPercent]) if (amount !== null && !Number.isFinite(amount)) throw new Error("Invalid savings");
   for (const key of ["pricingComplete", "subscriptionComplete", "trackingComplete", "persistenceHealthy"] as const) if (typeof r.costs.coverage[key] !== "boolean") throw new Error("Invalid coverage");
+  if (spendMissing) { r.spendAvailable = false; r.warnings.push("This router predates per-category spend; restart it (cc-router start) to see input, output and cache costs."); }
   return r;
 }
 

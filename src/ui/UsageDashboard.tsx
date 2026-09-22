@@ -9,6 +9,9 @@ const HEAT = ["#42474e", "#466c50", "#5b9565", "#82c489", "#b7efba"];
 type Facet = "sum" | "input" | "output";
 const FACETS: Facet[] = ["sum", "input", "output"];
 const FACET_LABELS: Record<Facet, string> = { sum: "All", input: "Input", output: "Output" };
+/** One colour per token category, shared by the totals, the cost line, the mode indicator and the inspector. */
+const CATEGORY_COLORS = { input: "#8dcc9a", output: "#db9bac", cache: "#e1ce8a" } as const;
+const MAX_COLUMN_WIDTH = 12;
 const money = (n: number | null) => n === null ? "unavailable" : `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
 /** Axis-sized money: two decimals until the scale suffixes read better. */
 const compactMoney = (n: number) => n >= 1000 ? `$${formatTokens(n)}` : money(n);
@@ -121,8 +124,10 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
     const name = selected?.model ?? "No model usage in this period";
     const chunks = Array.from({ length: Math.ceil(name.length / width) }, (_, i) => name.slice(i * width, (i + 1) * width));
     const detail = selected ? [
-      line(<>Input {formatTokens(selected.tokens.input)} · Output {formatTokens(selected.tokens.output)} · Cache {formatTokens(selected.tokens.cacheRead)} read / {formatTokens(selected.tokens.cacheWrite)} write</>, "model-tokens"),
-      line(<>Spend {money(totalSpend(selected.usd))} · Input {money(selected.usd.input)} · Output {money(selected.usd.output)} · Cache {money(selected.usd.cacheRead + selected.usd.cacheWrite)}</>, "model-spend"),
+      line(<><Text color={CATEGORY_COLORS.input}>Input {formatTokens(selected.tokens.input)}</Text> · <Text color={CATEGORY_COLORS.output}>Output {formatTokens(selected.tokens.output)}</Text> · <Text color={CATEGORY_COLORS.cache}>Cache {formatTokens(selected.tokens.cacheRead)} read / {formatTokens(selected.tokens.cacheWrite)} write</Text></>, "model-tokens"),
+      report?.spendAvailable === false
+        ? line(<Text dimColor>Spend unavailable until the router restarts</Text>, "model-spend")
+        : line(<><Text bold>Spend {money(totalSpend(selected.usd))}</Text> · <Text color={CATEGORY_COLORS.input}>Input {money(selected.usd.input)}</Text> · <Text color={CATEGORY_COLORS.output}>Output {money(selected.usd.output)}</Text> · <Text color={CATEGORY_COLORS.cache}>Cache {money(selected.usd.cacheRead + selected.usd.cacheWrite)}</Text></>, "model-spend"),
     ] : [];
     return <Box width={width} flexDirection="column">{line(`Model ${fullModels.length ? modelIndex % fullModels.length + 1 : 0}/${fullModels.length} · ${selected ? PROVIDER_LABELS[selected.provider] : ""}`, "model-title")}{chunks.slice(0, Math.max(1, height - 3 - detail.length)).map((text, i) => line(text, `model-name${i}`))}{detail}{line("↑↓ browse · l back · q quit", "model-help")}</Box>;
   }
@@ -136,11 +141,17 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
   if (report) {
     const { totals, costs } = report;
     const spendTotals = report.buckets.reduce((acc, bucket) => { addSpend(acc, bucket.usd); return acc; }, zeroSpend());
-    lines.push(line(<><Text bold>{formatTokens(totalTokens(totals))}</Text> tokens  Input {formatTokens(totals.input)}  Output {formatTokens(totals.output)}  Cache {formatTokens(totals.cacheRead)} read / {formatTokens(totals.cacheWrite)} write</>, "tokens"));
-    lines.push(line(<><Text bold>API cost {money(costs.pricedApiUsd)}</Text>{costs.coverage.pricingComplete ? "" : " (partial)"}{width >= 68 ? <>  Input {money(spendTotals.input)}  Output {money(spendTotals.output)}  Cache {money(spendTotals.cacheRead + spendTotals.cacheWrite)}</> : null}</>, "costs"));
+    const spendKnown = report.spendAvailable !== false;
+    const cacheTokens = <Text color={CATEGORY_COLORS.cache}>Cache <Text bold>{formatTokens(totals.cacheRead)}</Text> read / <Text bold>{formatTokens(totals.cacheWrite)}</Text> write</Text>;
+    lines.push(line(<><Text bold>{formatTokens(totalTokens(totals))}</Text> tokens  <Text color={CATEGORY_COLORS.input}>Input <Text bold>{formatTokens(totals.input)}</Text></Text>  <Text color={CATEGORY_COLORS.output}>Output <Text bold>{formatTokens(totals.output)}</Text></Text>{width >= 68 ? <>  {cacheTokens}</> : null}</>, "tokens"));
+    // Narrow terminals truncated the cache figures off the end of the line; give them their own.
+    if (width < 68) lines.push(line(cacheTokens, "cache-tokens"));
+    lines.push(line(<><Text bold>API cost {money(costs.pricedApiUsd)}</Text>{costs.coverage.pricingComplete ? "" : <Text color="yellow"> (partial)</Text>}{width < 68 ? null : spendKnown
+      ? <>  <Text color={CATEGORY_COLORS.input}>Input <Text bold>{money(spendTotals.input)}</Text></Text>  <Text color={CATEGORY_COLORS.output}>Output <Text bold>{money(spendTotals.output)}</Text></Text>  <Text color={CATEGORY_COLORS.cache}>Cache <Text bold>{money(spendTotals.cacheRead + spendTotals.cacheWrite)}</Text></Text></>
+      : <Text dimColor>  Input / output / cache unavailable until the router restarts</Text>}</>, "costs"));
     gap("gap-totals");
   }
-  lines.push(line(<>{USAGE_PROVIDERS.map((provider, i) => <Text key={provider} color={PROVIDER_COLORS[provider]} dimColor={query.providers !== undefined && !query.providers.includes(provider)}>{i + 1} {query.providers === undefined || query.providers.includes(provider) ? "■" : "□"} {PROVIDER_LABELS[provider]}  </Text>)}<Text dimColor>{models ? "Models" : "Providers"} · {spend ? "Spend" : "Tokens"} · {FACET_LABELS[facet]}</Text></>, "providers"));
+  lines.push(line(<>{USAGE_PROVIDERS.map((provider, i) => <Text key={provider} color={PROVIDER_COLORS[provider]} dimColor={query.providers !== undefined && !query.providers.includes(provider)}>{i + 1} {query.providers === undefined || query.providers.includes(provider) ? "■" : "□"} {PROVIDER_LABELS[provider]}  </Text>)}<Text dimColor>{models ? "Models" : "Providers"} · </Text><Text color={spend ? "yellow" : "cyan"}>{spend ? "Spend" : "Tokens"}</Text><Text dimColor> · </Text><Text color={facet === "sum" ? undefined : CATEGORY_COLORS[facet]} dimColor={facet === "sum"}>{FACET_LABELS[facet]}</Text></>, "providers"));
   const warning = error ?? report?.warnings[0];
   const notice = warning
     ? line(<Text color="yellow">{error ? "Error" : "Partial"}: {warning}{report && report.warnings.length > 1 ? ` (+${report.warnings.length - 1})` : ""}</Text>, "warning")
@@ -156,14 +167,20 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
     const chartHeight = Math.max(2, Math.min(8, height - lines.length - gapLines - reserved));
     if (showBoth || !gridFocus) {
       gap("gap-chart");
+      // Few buckets (a week has seven) get wide columns so the bars fill the row and every label has room.
+      const plotWidth = Math.max(2, width - 8);
+      const columnWidth = Math.max(2, Math.min(MAX_COLUMN_WIDTH, Math.floor(plotWidth / Math.max(1, report.buckets.length))));
       const chart = chartColumns(report.buckets.map(b => ({
         label: query.period === "day" ? b.start.slice(11, 13) : query.period === "year" ? b.start.slice(5, 7) : b.start.slice(8, 10),
         series: Object.values(b.series).map(s => ({ ...s, tokens: measure(s.tokens, s.usd) })),
-      })), Math.max(1, Math.floor((width - 7) / 2)), chartHeight, models, models ? Math.max(2, Math.floor(width / 24)) : 3);
+      })), Math.max(1, Math.floor(plotWidth / columnWidth)), chartHeight, models, models ? Math.max(2, Math.floor(width / 24)) : 3);
       const colors = new Map(chart.legend.map((s, i) => [s.key, legendColor(s, i, models)]));
       const glyphs = new Map(chart.legend.map((s, i) => [s.key, legendGlyph(s, i, models)]));
-      for (let row = 0; row < chartHeight; row++) lines.push(line(<><Text dimColor>{(row === 0 ? formatMeasure(chart.max) : row === chartHeight - 1 ? "0" : "").padStart(6)} │</Text>{chart.columns.map((col, i) => <Text key={i} color={col.cells[row] ? colors.get(col.cells[row]!) : undefined}>{col.cells[row] ? glyphs.get(col.cells[row]!)!.repeat(2) : "  "}</Text>)}</>, `bar${row}`));
-      lines.push(line(<Text dimColor>{"       └"}{chart.columns.map((col, i) => i % Math.max(1, Math.ceil(chart.columns.length / 8)) === 0 ? col.label.padStart(2).slice(-2) : "  ").join("")}</Text>, "axis"));
+      // Wide columns keep one blank cell between bars; two-cell columns stay flush as before.
+      const fill = columnWidth >= 3 ? columnWidth - 1 : columnWidth;
+      for (let row = 0; row < chartHeight; row++) lines.push(line(<><Text dimColor>{(row === 0 ? formatMeasure(chart.max) : row === chartHeight - 1 ? "0" : "").padStart(6)} │</Text>{chart.columns.map((col, i) => <Text key={i} color={col.cells[row] ? colors.get(col.cells[row]!) : undefined}>{(col.cells[row] ? glyphs.get(col.cells[row]!)!.repeat(fill) : " ".repeat(fill)).padEnd(columnWidth)}</Text>)}</>, `bar${row}`));
+      const labelStride = columnWidth >= 3 ? 1 : Math.max(1, Math.ceil(chart.columns.length / 8));
+      lines.push(line(<Text dimColor>{"       └"}{chart.columns.map((col, i) => i % labelStride === 0 ? col.label.padStart(2).slice(-2).padEnd(columnWidth) : " ".repeat(columnWidth)).join("")}</Text>, "axis"));
       const labelWidth = Math.max(5, Math.floor(width / Math.max(1, chart.legend.length)) - 4);
       lines.push(line(<>{chart.legend.map(s => <Text key={s.key} color={colors.get(s.key)}>{glyphs.get(s.key)} {s.label.length > labelWidth ? `${s.label.slice(0, Math.ceil((labelWidth - 1) / 2))}…${s.label.slice(-Math.floor((labelWidth - 1) / 2))}` : s.label}  </Text>)}</>, "legend"));
     }

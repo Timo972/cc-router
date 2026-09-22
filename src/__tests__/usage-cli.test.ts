@@ -97,6 +97,12 @@ it("defaults missing bucket spend from an older router and rejects invalid spend
   const validated = validateUsageReport(report());
   expect(validated.buckets[0].usd).toEqual(zeroSpend()); expect(validated.days[0].usd).toEqual(zeroSpend());
   expect(Object.values(validated.buckets[0].series)[0].usd).toEqual(zeroSpend());
+  // Zero is a placeholder here, not a measurement: the dashboard must be told so it can say "unavailable".
+  expect(validated.spendAvailable).toBe(false);
+  expect(validated.warnings.at(-1)).toMatch(/restart/i);
+  const current = report(); (current.buckets as Array<Record<string, unknown>>)[0].usd = zeroSpend(); (current.days as Array<Record<string, unknown>>)[0].usd = zeroSpend();
+  (((current.buckets as Array<Record<string, unknown>>)[0].series as Record<string, Record<string, unknown>>).a).usd = zeroSpend();
+  expect(validateUsageReport(current).spendAvailable).toBeUndefined();
   const negative = report(); (negative.buckets as Array<Record<string, unknown>>)[0].usd = { ...zeroSpend(), input: -1 };
   expect(() => validateUsageReport(negative)).toThrow(/spend/i);
   const nan = report(); ((nan.buckets as Array<Record<string, unknown>>)[0].series as Record<string, Record<string, unknown>>).a.usd = { ...zeroSpend(), output: Number.NaN };
