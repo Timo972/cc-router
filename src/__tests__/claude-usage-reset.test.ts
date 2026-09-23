@@ -41,6 +41,40 @@ describe("Claude reset consumer", () => {
     expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-b", R2);
   });
 
+  it("replays the original grant on a re-authenticated Account object with the same id", async () => {
+    const consume = vi.fn().mockRejectedValueOnce(new Error("outcome unknown")).mockResolvedValue({ code: "already_used" });
+    const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
+    await expect(run(claude(state("grant-a")), R1)).rejects.toThrow();
+    const reauthed = claude(state("grant-b"));
+    await run(reauthed, R1);
+    expect(consume).toHaveBeenLastCalledWith(reauthed, ORG, "grant-a", R1);
+  });
+
+  it("keeps each interleaved redemption id on its own grant", async () => {
+    const consume = vi.fn().mockRejectedValue(new Error("outcome unknown"));
+    const a = claude(state("grant-a"));
+    const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
+    await expect(run(a, R1)).rejects.toThrow();
+    a.rateLimits.usage!.limitResets = state("grant-b");
+    await expect(run(a, R2)).rejects.toThrow();
+    expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-b", R2);
+    await expect(run(a, R1)).rejects.toThrow();
+    expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-a", R1);
+  });
+
+  it("forgets the oldest of more than 8 pinned ids per account", async () => {
+    const consume = vi.fn().mockRejectedValue(new Error("outcome unknown"));
+    const a = claude(state("grant-a"));
+    const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
+    const ids = Array.from({ length: 9 }, (_, i) => `12345678-1234-4234-8234-${String(i).padStart(12, "0")}`);
+    for (const id of ids) await expect(run(a, id)).rejects.toThrow();
+    a.rateLimits.usage!.limitResets = state("grant-b");
+    await expect(run(a, ids[1]!)).rejects.toThrow();
+    expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-a", ids[1]); // still pinned
+    await expect(run(a, ids[0]!)).rejects.toThrow();
+    expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-b", ids[0]); // evicted, re-derived
+  });
+
   it.each([
     ["no status", undefined],
     ["ineligible", { eligible: false, ineligibleReason: "surface", grants: [], cooldownUntil: 0 } as LimitResetState],
