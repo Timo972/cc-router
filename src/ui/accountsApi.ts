@@ -91,6 +91,9 @@ const CLAUDE_RESET_CODES: readonly string[] = ["reset", "already_used", "not_lim
 // "outcome unknown") stays a bare `HTTP <status>`.
 const NOT_SUBMITTED_STATUSES: ReadonlySet<number> = new Set([400, 404, 409, 503]);
 
+/** The Claude reset terms the operator saw when confirming. */
+export interface ResetOffer { useBy: number; clears: string[]; clearsOther: boolean }
+
 /** The router refused a redemption before submitting it (its error text is
  *  the message). Network failures, timeouts and bare `HTTP <status>` errors
  *  are never this type: their outcome is unknown. */
@@ -101,8 +104,8 @@ export class RouterRefusedResetError extends Error {
 }
 
 export interface AccountsApi {
-  /** `retry`: this id was already sent once and its outcome is unknown. */
-  resetUsage(id: string, redeemRequestId: string, attempt?: { retry?: boolean }): Promise<UsageResetResult>;
+  /** `retry`: this id was already sent once and its outcome is unknown. `offer`: the Claude terms confirmed. */
+  resetUsage(id: string, redeemRequestId: string, attempt?: { retry?: boolean; offer?: ResetOffer }): Promise<UsageResetResult>;
   /** Read the authenticated, disclosure-safe account status view. */
   list(): Promise<AccountSafeView[]>;
   /** Ask the router to sweep cooldowns, re-try due tokens and re-fetch every
@@ -183,7 +186,7 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
       const response = await fetch(`${base}/${encodeURIComponent(id)}/reset-usage`, {
         method: "POST",
         headers: { ...authHeaders, "content-type": "application/json" },
-        body: JSON.stringify({ redeemRequestId, retry: attempt.retry === true }),
+        body: JSON.stringify({ redeemRequestId, retry: attempt.retry === true, ...(attempt.offer ? { offer: attempt.offer } : {}) }),
         signal: AbortSignal.timeout(REFRESH_ALL_TIMEOUT_MS),
       });
       if (!response.ok) {

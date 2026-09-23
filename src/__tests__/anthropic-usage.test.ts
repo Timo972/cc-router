@@ -182,7 +182,7 @@ describe("parseLimitResets (cedar_ember)", () => {
       grants: [{
         id: grant.id, resetsLeft: 1, endsAt: 1_792_684_800,
         clears: ["five_hour", "seven_day", "seven_day_overage_included"],
-        usableNow: true, useRequiresLimit: false, paused: false,
+        clearsOther: false, usableNow: true, useRequiresLimit: false, paused: false,
       }],
       nextGrantId: grant.id,
       cooldownUntil: 0,
@@ -212,8 +212,25 @@ describe("parseLimitResets (cedar_ember)", () => {
       ],
       next_grant_id: grant.id, // points at the dropped grant
     });
-    expect(parsed?.grants).toEqual([expect.objectContaining({ id: "other", clears: ["five_hour"] })]);
+    expect(parsed?.grants).toEqual([expect.objectContaining({ id: "other", clears: ["five_hour"], clearsOther: true })]);
     expect(parsed?.nextGrantId).toBeUndefined();
+  });
+
+  it("marks a refill scope it cannot name instead of silently shrinking it", () => {
+    const only = (clears: unknown) => parseLimitResets({ ...block, grants: [{ ...grant, clears }] })?.grants[0];
+    expect(only(["brand_new_window"])).toMatchObject({ clears: [], clearsOther: true });
+    expect(only(undefined)).toMatchObject({ clears: [], clearsOther: true });
+    expect(only("five_hour")).toMatchObject({ clears: [], clearsOther: true });
+    expect(only(["five_hour"])).toMatchObject({ clears: ["five_hour"], clearsOther: false });
+  });
+
+  it("keeps an eligible block without a grant list unknown, but an explicit empty list is zero", () => {
+    const { grants: _omit, ...noGrants } = block;
+    expect(parseLimitResets(noGrants)).toBeUndefined();
+    expect(parseLimitResets({ ...block, grants: "none" })).toBeUndefined();
+    expect(parseLimitResets({ ...block, grants: [], next_grant_id: null })).toMatchObject({ eligible: true, grants: [] });
+    // Ineligible blocks carry no entitlement, so a missing list is fine there.
+    expect(parseLimitResets({ eligible: false, ineligible_reason: "surface" })).toMatchObject({ eligible: false, grants: [] });
   });
 
   it("defaults use_requires_limit to true when absent (the conservative reading)", () => {

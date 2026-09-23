@@ -71,7 +71,7 @@ interface AccountUsageView {
 /** Mirrors the router's public `PublicLimitResets`: counts, dates and flags only. */
 interface LimitResetsView {
   eligible: boolean; ineligibleReason?: string; available: number;
-  usableNow: boolean; requiresLimit: boolean; useBy: number; clears: string[];
+  usableNow: boolean; requiresLimit: boolean; useBy: number; clears: string[]; clearsOther: boolean;
 }
 
 interface AccountModelLimitView {
@@ -406,12 +406,15 @@ export function claudeResetBlocker(account: Pick<AccountStat, "rateLimits">): st
       : `Resets unavailable for this account (${resets.ineligibleReason ?? "unknown"})`;
   }
   if (resets.available <= 0) return "No resets available";
+  // Never spend a reset whose effect cannot be shown in the confirmation.
+  if (resets.clears.length === 0) return "Reset refill scope unknown — update cc-router";
   if (!resets.usableNow) return resets.requiresLimit ? "Reset only usable at a limit" : "Reset not usable right now";
   return undefined;
 }
 
 export function claudeResetConfirmText(id: string, resets: LimitResetsView): string {
   const windows = resets.clears.map(window => RESET_WINDOW_LABELS[window]).filter(Boolean);
+  if (resets.clearsOther) windows.push("other");
   const refills = windows.length > 0 ? `Refills ${windows.join(" + ")} limits` : "Refills your limits";
   const useBy = resets.useBy > 0 ? ` · use by ${new Date(resets.useBy * 1000).toISOString().slice(0, 10)}` : "";
   return `Redeem 1 reset for "${id}"? ${refills} · ${resets.available} left${useBy}`;
@@ -1382,7 +1385,7 @@ function LiveDashboard({
     }
   }, [modelsApi, selectedModel, showBanner]);
 
-  const doResetUsage = useCallback(async (id: string) => {
+  const doResetUsage = useCallback(async (id: string, shownOffer?: LimitResetsView) => {
     if (resetSession.inFlight) return;
     resetSession.inFlight = true;
     const pending = resetSession.pendingIds.get(id) ?? { requestId: randomUUID(), maybeSubmitted: false };
@@ -1391,7 +1394,10 @@ function LiveDashboard({
     try {
       // Only a retry of a possibly-sent id may reuse its grant; the router
       // refuses such a retry outright if it can no longer match it.
-      const result = await api.resetUsage(id, pending.requestId, { retry: pending.maybeSubmitted });
+      // The terms shown at confirmation: the router refuses if the grant it
+      // would spend no longer matches them.
+      const offer = shownOffer ? { useBy: shownOffer.useBy, clears: shownOffer.clears, clearsOther: shownOffer.clearsOther } : undefined;
+      const result = await api.resetUsage(id, pending.requestId, { retry: pending.maybeSubmitted, ...(offer ? { offer } : {}) });
       resetSession.pendingIds.delete(id);
       const text = result.provider === "anthropic"
         ? ({
@@ -1474,7 +1480,7 @@ function LiveDashboard({
     }
 
     if (mode === "confirmReset") {
-      if ((input === "y" || input === "Y") && resetTarget) void doResetUsage(resetTarget);
+      if ((input === "y" || input === "Y") && resetTarget) void doResetUsage(resetTarget, resetTargetClaudeResets);
       else showBanner("Reset cancelled", "gray");
       setResetTarget(null);
       setMode("view");

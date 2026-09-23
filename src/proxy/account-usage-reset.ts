@@ -6,8 +6,8 @@ export interface UsageResetOptions<A extends object, R extends { code: string }>
   provider: "openai" | "anthropic";
   findAccount(id: string): A | undefined;
   prepare(account: A): Promise<boolean>;
-  /** `retry` is the client's claim that it already sent this id without learning the outcome. */
-  consume(account: A, requestId: string, attempt: { retry: boolean }): Promise<R>;
+  /** `retry`: the client already sent this id without learning the outcome. `offer`: the terms it confirmed. */
+  consume(account: A, requestId: string, attempt: { retry: boolean; offer?: unknown }): Promise<R>;
   refresh(account: A): Promise<{ ok: boolean }>;
   /** Replay status from the provider's own id binding, when it outlives the account object. */
   isReplay?(account: A, requestId: string): boolean;
@@ -51,7 +51,7 @@ export function createUsageResetHandler<A extends object, R extends { code: stri
       const replay = options.isReplay ? options.isReplay(account, requestId) : sameSnapshot;
       const snapshot = sameSnapshot ? previous : { id: requestId, reconcile: options.captureReset?.(account) };
       snapshots.set(account, snapshot);
-      const result = await options.consume(account, requestId, { retry: req.body?.retry === true });
+      const result = await options.consume(account, requestId, { retry: req.body?.retry === true, offer: req.body?.offer });
       if (result.code === "already_redeemed" && !replay) {
         // This UUID predates our ownership. Repeated historical replays must
         // never promote its newly captured quota snapshot into trusted evidence.

@@ -31,7 +31,7 @@ async function setup(overrides: Partial<Parameters<typeof createUsageResetHandle
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify(retry === undefined ? { redeemRequestId } : { redeemRequestId, retry }),
   });
-  return { a, post, consume, refresh };
+  return { a, post, consume, refresh, port: address.port };
 }
 
 describe("account usage reset management route", () => {
@@ -126,6 +126,14 @@ describe("account usage reset management route", () => {
     expect(consume).toHaveBeenLastCalledWith(a, requestId, { retry: false });
     await post(a.id, requestId, true);
     expect(consume).toHaveBeenLastCalledWith(a, requestId, { retry: true });
+  });
+  it("forwards the confirmed offer untouched for the provider to check", async () => {
+    const { a, consume, port } = await setup();
+    await fetch(`http://127.0.0.1:${port}/${a.id}/reset-usage`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redeemRequestId: requestId, offer: { useBy: 5, clears: ["five_hour"], clearsOther: false } }),
+    });
+    expect(consume).toHaveBeenLastCalledWith(a, requestId, { retry: false, offer: { useBy: 5, clears: ["five_hour"], clearsOther: false } });
   });
   it("lets a provider decide replay from its own binding instead of the per-object snapshot", async () => {
     const isReplay = vi.fn().mockReturnValue(true);

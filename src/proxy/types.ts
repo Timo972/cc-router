@@ -108,6 +108,8 @@ export interface LimitResetGrant {
   resetsLeft: number;
   endsAt: number;
   clears: LimitResetWindow[];
+  /** The grant also clears windows cc-router cannot name (or reported no usable list). */
+  clearsOther: boolean;
   usableNow: boolean;
   useRequiresLimit: boolean;
   paused: boolean;

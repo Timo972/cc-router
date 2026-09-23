@@ -6,6 +6,8 @@ import { DEFAULT_RATE_LIMITS, type Account, type LimitResetState } from "../prox
 const ORG = "0f1e2d3c-4b5a-4968-8776-5a4b3c2d1e0f";
 const R1 = "12345678-1234-4234-8234-123456789abc";
 const R2 = "12345678-1234-4234-8234-123456789abd";
+/** The terms every state() grant shows, as the dashboard sends them back at confirmation. */
+const OFFER = { useBy: 0, clears: ["five_hour"], clearsOther: false };
 
 function claude(limitResets?: LimitResetState): Account {
   return {
@@ -18,14 +20,14 @@ function claude(limitResets?: LimitResetState): Account {
 }
 const state = (next: string): LimitResetState => ({
   eligible: true, nextGrantId: next, cooldownUntil: 0,
-  grants: [{ id: next, resetsLeft: 1, endsAt: 0, clears: ["five_hour"], usableNow: true, useRequiresLimit: false, paused: false }],
+  grants: [{ id: next, resetsLeft: 1, endsAt: 0, clears: ["five_hour"], clearsOther: false, usableNow: true, useRequiresLimit: false, paused: false }],
 });
 
 describe("Claude reset consumer", () => {
   it("claims the snapshot's next grant for the account's organization", async () => {
     const consume = vi.fn().mockResolvedValue({ code: "reset" });
     const a = claude(state("grant-a"));
-    await createClaudeResetConsumer({ orgUuid: async () => ORG, consume })(a, R1);
+    await createClaudeResetConsumer({ orgUuid: async () => ORG, consume })(a, R1, { offer: OFFER });
     expect(consume).toHaveBeenCalledWith(a, ORG, "grant-a", R1);
   });
 
@@ -33,20 +35,20 @@ describe("Claude reset consumer", () => {
     const consume = vi.fn().mockRejectedValueOnce(new Error("outcome unknown")).mockResolvedValue({ code: "already_used" });
     const a = claude(state("grant-a"));
     const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
-    await expect(run(a, R1)).rejects.toThrow();
+    await expect(run(a, R1, { offer: OFFER })).rejects.toThrow();
     a.rateLimits.usage!.limitResets = state("grant-b");
-    await run(a, R1);
+    await run(a, R1, { offer: OFFER });
     expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-a", R1);
-    await run(a, R2); // a new redemption picks the new grant
+    await run(a, R2, { offer: OFFER }); // a new redemption picks the new grant
     expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-b", R2);
   });
 
   it("replays the original grant on a re-authenticated Account object with the same id", async () => {
     const consume = vi.fn().mockRejectedValueOnce(new Error("outcome unknown")).mockResolvedValue({ code: "already_used" });
     const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
-    await expect(run(claude(state("grant-a")), R1)).rejects.toThrow();
+    await expect(run(claude(state("grant-a")), R1, { offer: OFFER })).rejects.toThrow();
     const reauthed = claude(state("grant-b"));
-    await run(reauthed, R1);
+    await run(reauthed, R1, { offer: OFFER });
     expect(consume).toHaveBeenLastCalledWith(reauthed, ORG, "grant-a", R1);
   });
 
@@ -54,11 +56,11 @@ describe("Claude reset consumer", () => {
     const consume = vi.fn().mockRejectedValue(new Error("outcome unknown"));
     const a = claude(state("grant-a"));
     const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
-    await expect(run(a, R1)).rejects.toThrow();
+    await expect(run(a, R1, { offer: OFFER })).rejects.toThrow();
     a.rateLimits.usage!.limitResets = state("grant-b");
-    await expect(run(a, R2)).rejects.toThrow();
+    await expect(run(a, R2, { offer: OFFER })).rejects.toThrow();
     expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-b", R2);
-    await expect(run(a, R1)).rejects.toThrow();
+    await expect(run(a, R1, { offer: OFFER })).rejects.toThrow();
     expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-a", R1);
   });
 
@@ -67,7 +69,7 @@ describe("Claude reset consumer", () => {
     const a = claude(state("grant-a"));
     const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
     const ids = Array.from({ length: 9 }, (_, i) => `12345678-1234-4234-8234-${String(i).padStart(12, "0")}`);
-    for (const id of ids) await expect(run(a, id)).rejects.toThrow();
+    for (const id of ids) await expect(run(a, id, { offer: OFFER })).rejects.toThrow();
     a.rateLimits.usage!.limitResets = state("grant-b");
     await expect(run(a, ids[1]!, { retry: true })).rejects.toThrow("outcome unknown");
     expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-a", ids[1]); // still pinned
@@ -84,7 +86,7 @@ describe("Claude reset consumer", () => {
     let org = ORG;
     const consume = vi.fn().mockRejectedValue(new Error("outcome unknown"));
     const run = createClaudeResetConsumer({ orgUuid: async () => org, consume });
-    await expect(run(claude(state("grant-a")), R1)).rejects.toThrow("outcome unknown");
+    await expect(run(claude(state("grant-a")), R1, { offer: OFFER })).rejects.toThrow("outcome unknown");
     org = OTHER_ORG; // same account id re-authenticated as another Anthropic account
     consume.mockClear();
     const error = await run(claude(state("grant-a")), R1, { retry: true }).catch(e => e);
@@ -95,6 +97,32 @@ describe("Claude reset consumer", () => {
     org = ORG; // back on the original organization, the retry goes through unchanged
     await expect(run(claude(state("grant-b")), R1, { retry: true })).rejects.toThrow("outcome unknown");
     expect(consume).toHaveBeenLastCalledWith(expect.anything(), ORG, "grant-a", R1);
+  });
+
+  it("spends only the offer the operator confirmed", async () => {
+    const consume = vi.fn().mockResolvedValue({ code: "reset" });
+    const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
+    const shown = { useBy: 0, clears: ["five_hour"], clearsOther: false };
+    await run(claude(state("grant-a")), R1, { offer: shown });
+    expect(consume).toHaveBeenCalledTimes(1);
+    const moved = claude({ ...state("grant-b"), grants: [{ ...state("grant-b").grants[0]!, endsAt: 1_792_684_800, clears: ["seven_day"] }] });
+    for (const offer of [shown, { ...shown, clears: ["seven_day"] }, undefined, "garbage"]) {
+      const error = await run(moved, R2, { offer }).catch(e => e);
+      expect(error).toBeInstanceOf(ResetNotSubmittedError);
+      expect(error.status).toBe(409);
+      expect(error.abandon).toBeFalsy();
+    }
+    expect(consume).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a grant whose refill scope it cannot name", async () => {
+    const consume = vi.fn();
+    const unknownScope = claude({ ...state("grant-a"), grants: [{ ...state("grant-a").grants[0]!, clears: [], clearsOther: true }] });
+    const error = await createClaudeResetConsumer({ orgUuid: async () => ORG, consume })(unknownScope, R1,
+      { offer: { useBy: 0, clears: [], clearsOther: true } }).catch(e => e);
+    expect(error).toBeInstanceOf(ResetNotSubmittedError);
+    expect(error.status).toBe(409);
+    expect(consume).not.toHaveBeenCalled();
   });
 
   it("fails a retry closed when the router lost its pins (restart)", async () => {
@@ -110,9 +138,9 @@ describe("Claude reset consumer", () => {
     const consume = vi.fn().mockRejectedValueOnce(new Error("outcome unknown")).mockResolvedValue({ code: "reset" });
     const a = claude(state("grant-a"));
     const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
-    await expect(run(a, R1)).rejects.toThrow();
+    await expect(run(a, R1, { offer: OFFER })).rejects.toThrow();
     a.rateLimits.usage!.fetchStatus = "stale";
-    const error = await run(a, R2).catch(e => e);
+    const error = await run(a, R2, { offer: OFFER }).catch(e => e);
     expect(error).toBeInstanceOf(ResetNotSubmittedError);
     expect(error.status).toBe(409);
     expect(error.abandon).toBeFalsy();
@@ -125,7 +153,7 @@ describe("Claude reset consumer", () => {
     const consume = vi.fn().mockRejectedValue(new Error("outcome unknown"));
     const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
     expect(run.isReplay(claude(state("grant-a")), R1)).toBe(false);
-    await expect(run(claude(state("grant-a")), R1)).rejects.toThrow();
+    await expect(run(claude(state("grant-a")), R1, { offer: OFFER })).rejects.toThrow();
     expect(run.isReplay(claude(state("grant-b")), R1)).toBe(true); // new object, same id
     expect(run.isReplay(claude(state("grant-b")), R2)).toBe(false);
   });
@@ -136,7 +164,7 @@ describe("Claude reset consumer", () => {
     ["no next grant", { eligible: true, grants: [], cooldownUntil: 0 } as LimitResetState],
   ])("refuses with 409 before sending when there is %s", async (_label, resets) => {
     const consume = vi.fn();
-    const error = await createClaudeResetConsumer({ orgUuid: async () => ORG, consume })(claude(resets), R1).catch(e => e);
+    const error = await createClaudeResetConsumer({ orgUuid: async () => ORG, consume })(claude(resets), R1, { offer: OFFER }).catch(e => e);
     expect(error).toBeInstanceOf(ResetNotSubmittedError);
     expect(error.status).toBe(409);
     expect(consume).not.toHaveBeenCalled();
@@ -144,7 +172,7 @@ describe("Claude reset consumer", () => {
 
   it("refuses with 503 before sending when the organization is unknown", async () => {
     const consume = vi.fn();
-    const error = await createClaudeResetConsumer({ orgUuid: async () => undefined, consume })(claude(state("grant-a")), R1).catch(e => e);
+    const error = await createClaudeResetConsumer({ orgUuid: async () => undefined, consume })(claude(state("grant-a")), R1, { offer: OFFER }).catch(e => e);
     expect(error).toBeInstanceOf(ResetNotSubmittedError);
     expect(error.status).toBe(503);
     expect(consume).not.toHaveBeenCalled();

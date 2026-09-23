@@ -8,6 +8,8 @@ export interface PublicLimitResets {
   requiresLimit: boolean;
   useBy: number;
   clears: string[];
+  /** The next grant also refills windows that cannot be named. */
+  clearsOther: boolean;
 }
 
 /** Disclosure-safe summary: counts, dates and flags only — grant ids stay in-process. */
@@ -22,5 +24,6 @@ export function publicLimitResets(state: LimitResetState): PublicLimitResets {
     requiresLimit: next?.useRequiresLimit !== false,
     useBy: next && next.endsAt > 0 ? next.endsAt : 0,
     clears: next ? [...next.clears] : [],
+    clearsOther: next?.clearsOther === true,
   };
 }

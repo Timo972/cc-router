@@ -221,7 +221,7 @@ describe("Claude limit resets in the dashboard", () => {
     ...claude("max-1"),
     rateLimits: { ...claude("max-1").rateLimits!, usage: { modelLimits: [], fetchedAt: 1, fetchStatus: "fresh" as const, limitResets } },
   });
-  const ok = { eligible: true, available: 1, usableNow: true, requiresLimit: false, useBy: 1_792_684_800, clears: ["five_hour", "seven_day", "seven_day_overage_included"] };
+  const ok = { eligible: true, available: 1, usableNow: true, requiresLimit: false, useBy: 1_792_684_800, clears: ["five_hour", "seven_day", "seven_day_overage_included"], clearsOther: false };
 
   it("shows the banked count, or an em dash when unknown or ineligible", () => {
     expect(resetCreditsColumnLabel(withResets(ok))).toBe("1");
@@ -240,6 +240,11 @@ describe("Claude limit resets in the dashboard", () => {
     expect(claudeResetBlocker(withResets({ ...ok, usableNow: false, requiresLimit: true }))).toBe("Reset only usable at a limit");
   });
 
+  it("refuses a grant whose refill scope cannot be named", () => {
+    expect(claudeResetBlocker(withResets({ ...ok, clears: [], clearsOther: true })))
+      .toBe("Reset refill scope unknown — update cc-router");
+  });
+
   it("refuses a new redemption on stale or unavailable reset status", () => {
     const at = (fetchStatus: "stale" | "unavailable") => ({
       ...claude("max-1"),
@@ -256,6 +261,8 @@ describe("Claude limit resets in the dashboard", () => {
       .toBe('Redeem 1 reset for "max-1"? Refills 7d Opus limits · 1 left · use by 2026-10-22');
     expect(claudeResetConfirmText("max-1", { ...ok, clears: ["five_hour", "seven_day_sonnet"] }))
       .toBe('Redeem 1 reset for "max-1"? Refills 5h + 7d Sonnet limits · 1 left · use by 2026-10-22');
+    expect(claudeResetConfirmText("max-1", { ...ok, clears: ["five_hour"], clearsOther: true }))
+      .toBe('Redeem 1 reset for "max-1"? Refills 5h + other limits · 1 left · use by 2026-10-22');
   });
 });
 

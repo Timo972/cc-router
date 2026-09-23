@@ -177,14 +177,16 @@ function parseResetGrant(value: unknown): LimitResetGrant | undefined {
   const id = typeof value.id === "string" && GRANT_ID.test(value.id) ? value.id : undefined;
   const left = value.resets_left;
   if (!id || typeof left !== "number" || !Number.isInteger(left) || left < 0) return undefined;
-  const clears = Array.isArray(value.clears)
-    ? RESET_WINDOWS.filter(window => (value.clears as unknown[]).includes(window))
-    : [];
+  const reported = Array.isArray(value.clears) ? value.clears : undefined;
+  const clears = reported ? RESET_WINDOWS.filter(window => reported.includes(window)) : [];
+  // Anything not named here would be refilled without the operator seeing it.
+  const clearsOther = !reported || reported.some(window => !RESET_WINDOWS.includes(window as LimitResetWindow));
   return {
     id,
     resetsLeft: left,
     endsAt: resetAt(value.ends_at),
     clears,
+    clearsOther,
     usableNow: value.usable_now === true,
     useRequiresLimit: value.use_requires_limit !== false,
     paused: value.paused === true,
@@ -194,6 +196,9 @@ function parseResetGrant(value: unknown): LimitResetGrant | undefined {
 /** Parse the cedar_ember block. Unknown or malformed → undefined, never "zero resets". */
 export function parseLimitResets(value: unknown): LimitResetState | undefined {
   if (!isRecord(value) || typeof value.eligible !== "boolean") return undefined;
+  // An eligible account's count is only established by an actual list; an
+  // explicit [] is a real zero. Ineligible blocks may omit it.
+  if (value.eligible && !Array.isArray(value.grants)) return undefined;
   const grants = (Array.isArray(value.grants) ? value.grants : [])
     .map(parseResetGrant)
     .filter((grant): grant is LimitResetGrant => grant !== undefined);

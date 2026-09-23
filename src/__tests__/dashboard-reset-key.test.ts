@@ -71,7 +71,7 @@ function health() {
 
 const OK_RESETS = {
   eligible: true, available: 1, usableNow: true, requiresLimit: false,
-  useBy: 1_792_684_800, clears: ["five_hour", "seven_day"],
+  useBy: 1_792_684_800, clears: ["five_hour", "seven_day"], clearsOther: false,
 };
 
 function claudeHealth(limitResets: object = OK_RESETS) {
@@ -144,6 +144,7 @@ describe("dashboard Ctrl+R account reset", () => {
       await dash.press("y");
       expect(requests).toHaveLength(1);
       expect(requests[0].method).toBe("POST");
+      expect(JSON.parse(requests[0].body as string).offer).toBeUndefined(); // ChatGPT has no grant terms
       expect(JSON.parse(requests[0].body as string).redeemRequestId).toMatch(/^[a-f0-9-]{36}$/);
       finish(Response.json({ reset: { provider: "openai", code: "reset", usageRefreshed: true } }));
       await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Usage reset redeemed for chatgpt-1"));
@@ -275,6 +276,9 @@ describe("dashboard Ctrl+R Claude limit reset", () => {
       await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Limits reset for claude-1 · 0 left"));
       expect(requests).toHaveLength(1);
       expect(requests[0].method).toBe("POST");
+      // The terms on screen at confirmation bind the spend to that offer.
+      expect(JSON.parse(requests[0].body as string).offer)
+        .toEqual({ useBy: 1_792_684_800, clears: ["five_hour", "seven_day"], clearsOther: false });
     } finally { await dash.cleanup(); }
   });
 

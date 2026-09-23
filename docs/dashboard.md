@@ -170,7 +170,10 @@ move your weekly reset day. Some resets can be used at any time; others only
 while the account is at a limit, and the dashboard says so instead of sending the
 request. Status comes from the same usage poll as the `5h`/`7d` columns: a new
 redemption needs a fresh poll, so if `Ctrl+R` says the status is out of date,
-press `R` first. If `rst` shows `—` and `Ctrl+R` reports an old Claude Code
+press `R` first. The router spends only the offer you confirmed: if the reset
+changed in between, it sends nothing and asks you to confirm again. A reset
+that refills limits cc-router cannot name is shown as "+ other limits"; one
+that refills none it can name is not offered until cc-router is updated. If `rst` shows `—` and `Ctrl+R` reports an old Claude Code
 version, update cc-router.
 
 A Claude retry after an unknown outcome is matched to the exact reset it first

@@ -50,7 +50,7 @@ async function run(kind: "quota" | "overload") {
   await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
   const { port } = server.address() as { port: number };
   const response = await fetch(`http://127.0.0.1:${port}/${a.id}/reset-usage`, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redeemRequestId: REQ }),
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redeemRequestId: REQ, offer: { useBy: 0, clears: ["five_hour", "seven_day"], clearsOther: false } }),
   });
   return { a, pool, clock, response, consume };
 }

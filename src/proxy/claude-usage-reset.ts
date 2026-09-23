@@ -1,4 +1,4 @@
-import type { Account } from "./types.js";
+import type { Account, LimitResetGrant } from "./types.js";
 import { ResetNotSubmittedError } from "./reset-errors.js";
 import { consumeClaudeLimitReset, type ClaudeResetResult } from "../providers/anthropic/usage-reset.js";
 
@@ -10,6 +10,21 @@ export interface ClaudeResetConsumerDeps {
 export interface ClaudeResetAttempt {
   /** The client already sent this id once and never learned the outcome. */
   retry?: boolean;
+  /**
+   * The terms the operator confirmed (use-by, refill windows), as shown from
+   * the public summary. Required for a new id: grant ids never leave the
+   * router, so the terms are what binds the spend to the confirmation.
+   */
+  offer?: unknown;
+}
+
+/** Whether the confirmed terms are exactly the next grant's, as publicLimitResets shows them. */
+function offerMatches(offer: unknown, grant: LimitResetGrant): boolean {
+  if (typeof offer !== "object" || offer === null) return false;
+  const { useBy, clears, clearsOther } = offer as Record<string, unknown>;
+  return useBy === (grant.endsAt > 0 ? grant.endsAt : 0)
+    && Array.isArray(clears) && clears.length === grant.clears.length && clears.every((w, i) => w === grant.clears[i])
+    && clearsOther === grant.clearsOther;
 }
 
 const MAX_PINNED_PER_ACCOUNT = 8;
@@ -41,8 +56,15 @@ export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
       const usage = account.rateLimits.usage;
       if (usage?.fetchStatus !== "fresh") throw new ResetNotSubmittedError(409, "Reset status is stale — reload with R; nothing sent");
       const resets = usage.limitResets;
-      grantId = resets?.eligible ? resets.nextGrantId : undefined;
-      if (!grantId) throw new ResetNotSubmittedError(409, "No reset available for this account");
+      const next = resets?.eligible ? resets.grants.find(grant => grant.id === resets.nextGrantId) : undefined;
+      if (!next) throw new ResetNotSubmittedError(409, "No reset available for this account");
+      if (next.clears.length === 0) {
+        throw new ResetNotSubmittedError(409, "Reset refill scope unknown — update cc-router; nothing sent");
+      }
+      if (!offerMatches(attempt.offer, next)) {
+        throw new ResetNotSubmittedError(409, "Reset offer changed since you confirmed — review it and confirm again; nothing sent");
+      }
+      grantId = next.id;
     }
     const org = await deps.orgUuid(account);
     if (!org) throw new ResetNotSubmittedError(503, "Organization unknown; reset not submitted");
