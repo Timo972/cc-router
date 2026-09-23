@@ -50,7 +50,7 @@ data; Grok rows are an overview only.
 | `5h` / `7d` | Utilisation of the 5-hour and 7-day windows |
 | `note` | Model-scoped allowance state, e.g. `Fable 23%`, plus `extra off` when paid extra exists but cannot be spent |
 | `↻5h` / `↻7d` | Time until each window resets |
-| `rst` | Banked usage-limit reset credits (ChatGPT only; `—` elsewhere) |
+| `rst` | Banked usage-limit resets (ChatGPT credits, Claude resets; `—` when unknown or ineligible) |
 
 Account IDs are truncated to 22 characters in this column.
 
@@ -124,7 +124,7 @@ With **ACCOUNTS** focused:
 | `w` / `s` | Set the selected account's 7-day / 5-hour cap |
 | `d` | Delete the selected account |
 | `l` | Re-authenticate the selected account (Claude or ChatGPT) — the dashboard hands over to the sign-in flow and returns afterwards |
-| `Ctrl+R` | Redeem one banked usage-limit reset (ChatGPT accounts only) |
+| `Ctrl+R` | Redeem one banked usage-limit reset (ChatGPT and Claude accounts) |
 
 With **MODELS** focused:
 
@@ -140,7 +140,7 @@ provider that is never routed, and the credentials live in `~/.grok`, so adding
 or removing one means `grok login` / `grok logout`. `l` says the same: re-sign in
 with `grok login`, then import the result with `cc-router accounts add grok`.
 
-## Redeeming a ChatGPT usage reset
+## Redeeming a usage reset
 
 Press `Tab` to focus accounts, select the account with the arrow keys, then press
 `Ctrl+R` and confirm with `y` (`n` or `Esc` cancels). The `rst` column shows
@@ -162,6 +162,18 @@ usage refresh is reported separately.
 
 Confirmed resets plus fresh usage clear only superseded quota cooldowns. Overload
 holds, unreported or exhausted limits, and newer quota signals are preserved.
+
+Claude Pro, Max and Team accounts can hold resets granted by Anthropic (for
+example the Opus 5.5 launch reset). A reset refills the windows it names — the
+confirmation lists them, with the count left and the use-by date — and does not
+move your weekly reset day. Some resets can be used at any time; others only
+while the account is at a limit, and the dashboard says so instead of sending the
+request. Status comes from the same usage poll as the `5h`/`7d` columns, so press
+`R` if the count looks stale. If `rst` shows `—` and `Ctrl+R` reports an old
+Claude Code version, update cc-router.
+
+> **⚠️ This uses the same undocumented endpoint as Claude Code's `/limit-reset`,
+> and may stop working if Anthropic changes it.**
 
 ## JSON output
 

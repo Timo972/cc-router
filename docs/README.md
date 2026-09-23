@@ -20,7 +20,7 @@ Start with the [README](../README.md) for what CC-Router is and a quickstart.
 |---|---|
 | [Architecture](architecture.md) | The request path and what each component does |
 | [Session routing](session-routing.md) | How an account is picked, failover behaviour, running it for a team |
-| [Dashboard](dashboard.md) | The live TUI, keybindings, model management, ChatGPT usage resets |
+| [Dashboard](dashboard.md) | The live TUI, keybindings, model management, usage resets |
 | [Troubleshooting](troubleshooting.md) | When something doesn't connect |
 
 ## Reference
