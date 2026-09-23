@@ -6,8 +6,11 @@ export interface UsageResetOptions<A extends object, R extends { code: string }>
   provider: "openai" | "anthropic";
   findAccount(id: string): A | undefined;
   prepare(account: A): Promise<boolean>;
-  consume(account: A, requestId: string): Promise<R>;
+  /** `retry` is the client's claim that it already sent this id without learning the outcome. */
+  consume(account: A, requestId: string, attempt: { retry: boolean }): Promise<R>;
   refresh(account: A): Promise<{ ok: boolean }>;
+  /** Replay status from the provider's own id binding, when it outlives the account object. */
+  isReplay?(account: A, requestId: string): boolean;
   /** OpenAI only: reconcile quota cooldowns from the evidence captured before the spend. */
   captureReset?(account: A): (update: CodexRateLimitsUpdate) => void;
 }
@@ -43,10 +46,12 @@ export function createUsageResetHandler<A extends object, R extends { code: stri
         return;
       }
       const previous = snapshots.get(account);
-      const replay = previous?.id === requestId;
-      const snapshot = replay ? previous : { id: requestId, reconcile: options.captureReset?.(account) };
+      const sameSnapshot = previous?.id === requestId;
+      // Read before consume: consuming is what records the id as sent.
+      const replay = options.isReplay ? options.isReplay(account, requestId) : sameSnapshot;
+      const snapshot = sameSnapshot ? previous : { id: requestId, reconcile: options.captureReset?.(account) };
       snapshots.set(account, snapshot);
-      const result = await options.consume(account, requestId);
+      const result = await options.consume(account, requestId, { retry: req.body?.retry === true });
       if (result.code === "already_redeemed" && !replay) {
         // This UUID predates our ownership. Repeated historical replays must
         // never promote its newly captured quota snapshot into trusted evidence.
@@ -67,7 +72,7 @@ export function createUsageResetHandler<A extends object, R extends { code: stri
       res.json({ reset: { provider: options.provider, ...result, usageRefreshed, replay } });
     } catch (error) {
       if (error instanceof ResetNotSubmittedError) {
-        res.status(error.status).json({ error: error.message });
+        res.status(error.status).json({ error: error.message, ...(error.abandon ? { abandon: true } : {}) });
         return;
       }
       res.status(502).json({ error: RESET_OUTCOME_UNKNOWN });

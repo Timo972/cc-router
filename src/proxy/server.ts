@@ -1004,6 +1004,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     const again = source();
     return again ? accountInfoCache.get(again).workspaceId : undefined;
   };
+  const claudeResetConsumer = createClaudeResetConsumer({ orgUuid: claudeOrgUuid });
   const claudeReset = createUsageResetHandler({
     provider: "anthropic",
     findAccount: id => pool.findById(id) ?? undefined,
@@ -1015,7 +1016,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       }
       return !account.authExpired && account.tokens.expiresAt > Date.now();
     },
-    consume: createClaudeResetConsumer({ orgUuid: claudeOrgUuid }),
+    consume: claudeResetConsumer,
+    // The grant pin, not the per-object snapshot, knows a replay across re-auth.
+    isReplay: claudeResetConsumer.isReplay,
     refresh: account => usageRefresher.refreshAfterCurrent(account),
   });
   accountsRouter.post("/:id/reset-usage", (req, res, next) => {

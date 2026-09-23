@@ -7,6 +7,11 @@ export interface ClaudeResetConsumerDeps {
   consume?: typeof consumeClaudeLimitReset;
 }
 
+export interface ClaudeResetAttempt {
+  /** The client already sent this id once and never learned the outcome. */
+  retry?: boolean;
+}
+
 const MAX_PINNED_PER_ACCOUNT = 8;
 
 /**
@@ -15,18 +20,26 @@ const MAX_PINNED_PER_ACCOUNT = 8;
  * turn "retry" into "spend a second reset".
  *
  * Pins are keyed by account id, not the Account object, so a re-auth that
- * replaces the object keeps them. Each account keeps its 8 most recent
- * request ids (oldest evicted first), so interleaved ids each keep their own
- * grant. A pin is written only right before the claim is sent: a refusal
+ * replaces the object keeps them. They live in memory only, and each account
+ * keeps its 8 most recent ids. A retry whose pin is gone (router restart,
+ * eviction) is refused before sending rather than re-derived: its original
+ * grant can no longer be named, and only fresh usage can tell whether it was
+ * spent. A pin is written only right before the claim is sent: a refusal
  * before submission (409/503) leaves nothing pinned.
  */
 export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
   const consume = deps.consume ?? consumeClaudeLimitReset;
   const pinned = new Map<string /* account.id */, Map<string /* requestId */, string /* grantId */>>();
-  return async (account: Account, requestId: string): Promise<ClaudeResetResult> => {
+  const run = async (account: Account, requestId: string, attempt: ClaudeResetAttempt = {}): Promise<ClaudeResetResult> => {
     let grantId = pinned.get(account.id)?.get(requestId);
     if (!grantId) {
-      const resets = account.rateLimits.usage?.limitResets;
+      if (attempt.retry) {
+        throw new ResetNotSubmittedError(409,
+          "Earlier reset attempt can't be matched any more (router restarted?) — check rst before redeeming again; nothing sent", true);
+      }
+      const usage = account.rateLimits.usage;
+      if (usage?.fetchStatus !== "fresh") throw new ResetNotSubmittedError(409, "Reset status is stale — reload with R; nothing sent");
+      const resets = usage.limitResets;
       grantId = resets?.eligible ? resets.nextGrantId : undefined;
       if (!grantId) throw new ResetNotSubmittedError(409, "No reset available for this account");
     }
@@ -40,4 +53,7 @@ export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
     }
     return consume(account, org, grantId, requestId);
   };
+  /** Whether this id was already sent for this account id — survives re-auth, unlike per-object state. */
+  const isReplay = (account: Account, requestId: string): boolean => pinned.get(account.id)?.has(requestId) === true;
+  return Object.assign(run, { isReplay });
 }

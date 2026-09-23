@@ -27,8 +27,9 @@ async function setup(overrides: Partial<Parameters<typeof createUsageResetHandle
   const server = createServer(app); servers.push(server);
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as { port: number };
-  const post = (id = a.id, redeemRequestId: unknown = requestId) => fetch(`http://127.0.0.1:${address.port}/${id}/reset-usage`, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redeemRequestId }),
+  const post = (id = a.id, redeemRequestId: unknown = requestId, retry?: boolean) => fetch(`http://127.0.0.1:${address.port}/${id}/reset-usage`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(retry === undefined ? { redeemRequestId } : { redeemRequestId, retry }),
   });
   return { a, post, consume, refresh };
 }
@@ -39,7 +40,7 @@ describe("account usage reset management route", () => {
     const response = await post();
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: true, replay: false } });
-    expect(consume).toHaveBeenCalledWith(a, requestId);
+    expect(consume).toHaveBeenCalledWith(a, requestId, { retry: false });
     expect(refresh).toHaveBeenCalledWith(a);
     expect(a.rateLimits.resetCredits?.available).toBe(2); // no guessed local decrement
   });
@@ -112,6 +113,25 @@ describe("account usage reset management route", () => {
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ error: "No reset available for this account" });
     expect(refresh).not.toHaveBeenCalled();
+  });
+  it("tells the client to abandon an unrecoverable redemption id", async () => {
+    const { post } = await setup({ consume: async () => { throw new ResetNotSubmittedError(409, "cannot match", true); } });
+    const response = await post();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "cannot match", abandon: true });
+  });
+  it("forwards the client's retry flag to the consumer", async () => {
+    const { post, consume, a } = await setup();
+    await post();
+    expect(consume).toHaveBeenLastCalledWith(a, requestId, { retry: false });
+    await post(a.id, requestId, true);
+    expect(consume).toHaveBeenLastCalledWith(a, requestId, { retry: true });
+  });
+  it("lets a provider decide replay from its own binding instead of the per-object snapshot", async () => {
+    const isReplay = vi.fn().mockReturnValue(true);
+    const { post } = await setup({ isReplay });
+    expect(await (await post()).json()).toMatchObject({ reset: { replay: true } }); // first post on this object
+    expect(isReplay).toHaveBeenCalledWith(expect.objectContaining({ id: "chatgpt-1" }), requestId);
   });
 });
 

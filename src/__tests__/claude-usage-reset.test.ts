@@ -62,17 +62,54 @@ describe("Claude reset consumer", () => {
     expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-a", R1);
   });
 
-  it("forgets the oldest of more than 8 pinned ids per account", async () => {
+  it("fails a retry closed once its pin is gone, instead of re-deriving a grant", async () => {
     const consume = vi.fn().mockRejectedValue(new Error("outcome unknown"));
     const a = claude(state("grant-a"));
     const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
     const ids = Array.from({ length: 9 }, (_, i) => `12345678-1234-4234-8234-${String(i).padStart(12, "0")}`);
     for (const id of ids) await expect(run(a, id)).rejects.toThrow();
     a.rateLimits.usage!.limitResets = state("grant-b");
-    await expect(run(a, ids[1]!)).rejects.toThrow();
+    await expect(run(a, ids[1]!, { retry: true })).rejects.toThrow("outcome unknown");
     expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-a", ids[1]); // still pinned
-    await expect(run(a, ids[0]!)).rejects.toThrow();
-    expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-b", ids[0]); // evicted, re-derived
+    consume.mockClear();
+    const error = await run(a, ids[0]!, { retry: true }).catch(e => e); // evicted
+    expect(error).toBeInstanceOf(ResetNotSubmittedError);
+    expect(error.status).toBe(409);
+    expect(error.abandon).toBe(true);
+    expect(consume).not.toHaveBeenCalled();
+  });
+
+  it("fails a retry closed when the router lost its pins (restart)", async () => {
+    const consume = vi.fn();
+    const restarted = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
+    const error = await restarted(claude(state("grant-b")), R1, { retry: true }).catch(e => e);
+    expect(error).toBeInstanceOf(ResetNotSubmittedError);
+    expect(error.abandon).toBe(true);
+    expect(consume).not.toHaveBeenCalled();
+  });
+
+  it("refuses a NEW redemption on stale reset status but still replays a pinned one", async () => {
+    const consume = vi.fn().mockRejectedValueOnce(new Error("outcome unknown")).mockResolvedValue({ code: "reset" });
+    const a = claude(state("grant-a"));
+    const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
+    await expect(run(a, R1)).rejects.toThrow();
+    a.rateLimits.usage!.fetchStatus = "stale";
+    const error = await run(a, R2).catch(e => e);
+    expect(error).toBeInstanceOf(ResetNotSubmittedError);
+    expect(error.status).toBe(409);
+    expect(error.abandon).toBeFalsy();
+    await run(a, R1, { retry: true });
+    expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-a", R1);
+    expect(consume).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a replay from the pin, across a re-authenticated Account object", async () => {
+    const consume = vi.fn().mockRejectedValue(new Error("outcome unknown"));
+    const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
+    expect(run.isReplay(claude(state("grant-a")), R1)).toBe(false);
+    await expect(run(claude(state("grant-a")), R1)).rejects.toThrow();
+    expect(run.isReplay(claude(state("grant-b")), R1)).toBe(true); // new object, same id
+    expect(run.isReplay(claude(state("grant-b")), R2)).toBe(false);
   });
 
   it.each([

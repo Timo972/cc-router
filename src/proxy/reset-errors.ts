@@ -1,6 +1,11 @@
 /** The redemption was provably never sent (or rejected before spending); safe to report as "nothing used". */
 export class ResetNotSubmittedError extends Error {
-  constructor(readonly status: 409 | 503, message: string) {
+  /**
+   * @param abandon The client's pending redemption id can never be retried
+   *   safely (its grant binding is gone); the client should drop it and look
+   *   at fresh usage before starting a new redemption.
+   */
+  constructor(readonly status: 409 | 503, message: string, readonly abandon = false) {
     super(message);
     this.name = "ResetNotSubmittedError";
   }
