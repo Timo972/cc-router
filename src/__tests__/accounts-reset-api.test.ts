@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { createAccountsApi, ResetNotSubmittedError } from "../ui/accountsApi.js";
+import { createAccountsApi, RouterRefusedResetError } from "../ui/accountsApi.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -67,14 +67,14 @@ it.each([400, 404, 409, 503])("surfaces the router's error text for HTTP %i", as
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "No reset available\u0007 for this account" }, { status })));
   const attempt = createAccountsApi("http://router.local").resetUsage("claude", "request-id");
   await expect(attempt).rejects.toThrow(/^No reset available for this account$/);
-  await expect(attempt).rejects.toBeInstanceOf(ResetNotSubmittedError);
+  await expect(attempt).rejects.toBeInstanceOf(RouterRefusedResetError);
 });
 
 it.each([500, 502, 504, 401])("keeps HTTP %i as a bare status even with an error body", async status => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "upstream said something" }, { status })));
   const attempt = createAccountsApi("http://router.local").resetUsage("claude", "request-id");
   await expect(attempt).rejects.toThrow(new RegExp(`^HTTP ${status}$`));
-  await expect(attempt).rejects.not.toBeInstanceOf(ResetNotSubmittedError);
+  await expect(attempt).rejects.not.toBeInstanceOf(RouterRefusedResetError);
 });
 
 it("falls back to the HTTP status when a 409 body is not JSON or has no error", async () => {

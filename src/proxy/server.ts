@@ -998,7 +998,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     if (!first) return undefined;
     const cached = accountInfoCache.get(first).workspaceId;
     if (cached) return cached;
-    await accountInfoCache.refreshOne({ id: account.id, provider: "anthropic_subscription" });
+    // Nothing is submitted yet: a failed profile fetch must read as "not
+    // submitted" (the consumer's 503), never as an unknown outcome.
+    try { await accountInfoCache.refreshOne({ id: account.id, provider: "anthropic_subscription" }); } catch { /* re-read below */ }
     const again = source();
     return again ? accountInfoCache.get(again).workspaceId : undefined;
   };
@@ -1007,7 +1009,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     findAccount: id => pool.findById(id) ?? undefined,
     prepare: async account => {
       if (account.authExpired) return false;
-      if (needsRefresh(account)) await refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts });
+      if (needsRefresh(account)) {
+        // A throw here would surface as "outcome unknown"; nothing was sent.
+        try { await refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts }); } catch { return false; }
+      }
       return !account.authExpired && account.tokens.expiresAt > Date.now();
     },
     consume: createClaudeResetConsumer({ orgUuid: claudeOrgUuid }),
@@ -1015,8 +1020,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   });
   accountsRouter.post("/:id/reset-usage", (req, res, next) => {
     const id = req.params.id;
-    if (openAIAccounts.some(account => account.id === id)) return openAIReset(req, res, next);
+    // Anthropic first, matching the /:id/refresh runner.
     if (pool.findById(id)) return claudeReset(req, res, next);
+    if (openAIAccounts.some(account => account.id === id)) return openAIReset(req, res, next);
     res.status(404).json({ error: "Account not found" });
   });
 

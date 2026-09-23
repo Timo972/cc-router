@@ -144,7 +144,7 @@ with `grok login`, then import the result with `cc-router accounts add grok`.
 
 Press `Tab` to focus accounts, select the account with the arrow keys, then press
 `Ctrl+R` and confirm with `y` (`n` or `Esc` cancels). The `rst` column shows
-banked reset credits. Accounts with zero or unknown credits cannot start a new
+banked resets. Accounts with zero or unknown credits cannot start a new
 redemption.
 
 > **This spends a real reset credit.** It is not the same as refreshing usage

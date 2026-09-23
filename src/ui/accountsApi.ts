@@ -94,8 +94,8 @@ const NOT_SUBMITTED_STATUSES: ReadonlySet<number> = new Set([400, 404, 409, 503]
 /** The router refused a redemption before submitting it (its error text is
  *  the message). Network failures, timeouts and bare `HTTP <status>` errors
  *  are never this type: their outcome is unknown. */
-export class ResetNotSubmittedError extends Error {
-  override name = "ResetNotSubmittedError";
+export class RouterRefusedResetError extends Error {
+  override name = "RouterRefusedResetError";
 }
 
 export interface AccountsApi {
@@ -188,7 +188,7 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
         if (!NOT_SUBMITTED_STATUSES.has(response.status)) throw new Error(fallback);
         const errorBody: unknown = await response.json().catch(() => undefined);
         const text = isRecord(errorBody) ? publicText(errorBody.error, 160, fallback) : fallback;
-        throw text === fallback ? new Error(fallback) : new ResetNotSubmittedError(text);
+        throw text === fallback ? new Error(fallback) : new RouterRefusedResetError(text);
       }
       const body: unknown = await response.json();
       const reset = isRecord(body) ? body.reset : undefined;

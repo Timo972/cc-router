@@ -3,7 +3,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Box, Text, useInput, useApp, useStdout, measureElement } from "ink";
 import type { DOMElement } from "ink";
 import type { LogEntry } from "../proxy/stats.js";
-import { createAccountsApi, ResetNotSubmittedError } from "./accountsApi.js";
+import { createAccountsApi, RouterRefusedResetError } from "./accountsApi.js";
 import type { AccountsApi } from "./accountsApi.js";
 import { createModelsApi } from "./modelsApi.js";
 import type { ModelEntry, ModelsApi, ModelsStatus } from "./modelsApi.js";
@@ -1412,7 +1412,7 @@ function LiveDashboard({
       // The pending id is kept even when the router refused before submitting:
       // an earlier attempt under the same id may still have an unknown outcome,
       // and a fresh id would let the next press spend a second reset.
-      if (error instanceof ResetNotSubmittedError) {
+      if (error instanceof RouterRefusedResetError) {
         showBanner(`${error.message} (${id})`, "yellow");
       } else {
         showBanner(`Reset outcome unknown for ${id}; Ctrl+R retries the same redemption (keep dashboard open)`, "red");

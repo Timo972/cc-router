@@ -74,6 +74,7 @@ describe("fetchAnthropicUsage", () => {
     expect(fetch).toHaveBeenCalledWith("https://api.anthropic.com/api/oauth/usage?cedar_ember=1", expect.objectContaining({
       method: "GET",
       headers: expect.objectContaining({
+        Authorization: "Bearer secret-access-a",
         "anthropic-beta": "oauth-2025-04-20",
         "user-agent": "claude-cli/2.1.280 (external, cli)",
       }),

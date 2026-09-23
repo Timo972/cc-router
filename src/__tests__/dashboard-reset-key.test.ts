@@ -288,6 +288,7 @@ describe("dashboard Ctrl+R Claude limit reset", () => {
       await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Claude Code version too old for resets"));
       expect(dash.lastFrame()).not.toContain("Redeem 1 reset");
       await dash.press("y");
+      await new Promise(r => setTimeout(r, 50)); // let any stray POST land before asserting none did
       expect(vi.mocked(globalThis.fetch).mock.calls.filter(([url]) => String(url).endsWith("/reset-usage"))).toHaveLength(0);
     } finally { await dash.cleanup(); }
   });
