@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { queryUsage } from "../usage/query.js";
 import type { UsageDelta, UsageSnapshot } from "../usage/types.js";
-import { totalTokens, zeroTokens } from "../usage/types.js";
+import { totalSpend, totalTokens, zeroSpend, zeroTokens } from "../usage/types.js";
 const p = "openai_subscription" as const;
 function snapshot(): UsageSnapshot { return { version: 1, trackingSince: "2023-01-01T00:00:00.000Z", observations: [], deltas: [], aggregates: [], accounts: [{ key: "a", alias: "personal", provider: p }], subscriptions: [{ accountKey: "a", provider: p, monthlyUsd: 31, from: "2023-01-01T00:00:00.000Z" }], warnings: [], health: { status: "ok", warnings: [] } }; }
 function delta(patch: Partial<UsageDelta> = {}): UsageDelta { return { attemptId: "a", ts: "2026-01-01T01:00:00.000Z", accountKey: "a", provider: p, model: "fixture", tokens: { ...zeroTokens(), input: 1e6, output: 1e6 }, rates: { input: 2, output: 8, source: "fixture", effectiveDate: "2026-01-01" }, ...patch }; }
@@ -15,6 +15,20 @@ describe("usage queries", () => {
     expect(report.buckets[1].tokens.input).toBe(1e6);
     expect(Object.values(report.buckets[1].series)[0].model).toBe("fixture");
     expect(report.costs.coverage.pricedTokens).toBe(2e6);
+  });
+  it("carries frozen spend per bucket, series and day, split by token category", () => {
+    const state = snapshot();
+    state.deltas = [delta(), delta({ attemptId: "b", model: "other", tokens: { ...zeroTokens(), cacheRead: 1e6, cacheWrite: 1e6 }, rates: { input: 2, output: 8, cacheRead: 0.5, source: "fixture", effectiveDate: "2026-01-01" } })];
+    const report = queryUsage(state, { period: "day", date: "2026-01-01" }, "2026-01-03");
+    // Unpriced cache creation contributes tokens but no spend; the split lets the dashboard show input/output/sum.
+    expect(report.buckets[1].usd).toEqual({ input: 2, output: 8, cacheRead: 0.5, cacheWrite: 0 });
+    expect(totalSpend(report.buckets[1].usd)).toBeCloseTo(report.costs.pricedApiUsd);
+    expect(report.buckets[0].usd).toEqual(zeroSpend());
+    const series = Object.values(report.buckets[1].series);
+    expect(series.find(s => s.model === "fixture")?.usd).toEqual({ input: 2, output: 8, cacheRead: 0, cacheWrite: 0 });
+    expect(series.find(s => s.model === "other")?.usd).toEqual({ input: 0, output: 0, cacheRead: 0.5, cacheWrite: 0 });
+    expect(report.days[0].usd).toEqual(report.buckets[1].usd);
+    expect(Object.values(report.days[0].series).find(s => s.model === "other")?.usd.cacheRead).toBe(0.5);
   });
   it("sums cache creation once and prices duration subsets and unknown remainder separately", () => {
     const state = snapshot(); state.deltas = [delta({ tokens: { ...zeroTokens(), cacheWrite: 1e6, cacheWrite5m: 400000, cacheWrite1h: 300000 }, rates: { input: 2, output: 8, cacheWrite5m: 3, cacheWrite1h: 4, source: "fixture", effectiveDate: "2026-01-01" } })];

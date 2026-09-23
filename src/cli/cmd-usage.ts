@@ -39,9 +39,10 @@ export function formatUsageText(report: UsageReport): string {
   const money = (n: number | null) => n === null ? "unavailable" : `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
   return [
     `Usage ${report.period}: ${report.start.slice(0, 10)} — ${report.end.slice(0, 10)} (UTC, end exclusive)`,
-    `Tokens: ${totalTokens(t).toLocaleString("en-US")} | input ${t.input + t.cacheRead + t.cacheWrite} (${t.input} uncached, ${t.cacheRead} cache read, ${t.cacheWrite} cache write) | output ${t.output}`,
+    // Same four categories the dashboard shows, so the two surfaces read alike.
+    `Tokens: ${totalTokens(t).toLocaleString("en-US")} | input ${t.input} | output ${t.output} | cache read ${t.cacheRead} | cache write ${t.cacheWrite}`,
     // Subscription cost and net savings are hidden for now; the API-equivalent
-    // value is the figure that stands on its own.
+    // value is the figure that stands on its own. Both remain in --json.
     `API equivalent: ${money(c.pricedApiUsd)}${c.coverage.pricingComplete ? "" : " (partial; unpriced tokens excluded)"}`,
     ...report.warnings.map(w => `Warning: ${w}`),
   ].join("\n");

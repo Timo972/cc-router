@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
 import { parseUsageOptions, registerUsage } from "../cli/cmd-usage.js";
-import { createUsageClient } from "../usage/client.js";
+import { createUsageClient, validateUsageReport } from "../usage/client.js";
+import { zeroSpend, zeroTokens } from "../usage/types.js";
 
 describe("usage command", () => {
   it("validates calendar dates, periods and provider selectors", () => {
@@ -83,9 +84,32 @@ it("refuses read-only offline history while an account transition needs recovery
     await expect(api.subscriptions()).rejects.toThrow(/transition.*recover/i);
     expect(readFileSync(file, "utf8")).toBe(pending);
   } finally { rmSync(directory, { recursive: true, force: true }); }
+
 });
 
-it("prints input as the sum of uncached, cache read and cache write, and only the API-equivalent cost", async () => {
+it("defaults missing bucket spend from an older router and rejects invalid spend", () => {
+  const tokens = zeroTokens(); const start = "2026-09-01T00:00:00.000Z"; const end = "2026-10-01T00:00:00.000Z";
+  const report = () => ({ period: "month", start, end, now: "2026-09-17T00:00:00.000Z",
+    buckets: [{ start, end, tokens, series: { a: { provider: "anthropic_subscription", model: "sonnet", tokens } } }],
+    days: [{ date: "2026-09-01", start, end, tokens, selected: true, coverage: "complete", series: {} }],
+    totals: tokens, accounts: [], warnings: [], costs: { pricedApiUsd: 0, subscriptionUsd: 0, savingsUsd: null, savingsPercent: null,
+      coverage: { pricedTokens: 0, unpricedTokens: 0, pricingComplete: true, configuredAccounts: 0, unconfiguredAccounts: 0, subscriptionComplete: true, trackingComplete: true, persistenceHealthy: true } } }) as unknown as Record<string, unknown>;
+  const validated = validateUsageReport(report());
+  expect(validated.buckets[0].usd).toEqual(zeroSpend()); expect(validated.days[0].usd).toEqual(zeroSpend());
+  expect(Object.values(validated.buckets[0].series)[0].usd).toEqual(zeroSpend());
+  // Zero is a placeholder here, not a measurement: the dashboard must be told so it can say "unavailable".
+  expect(validated.spendAvailable).toBe(false);
+  expect(validated.warnings.at(-1)).toMatch(/restart/i);
+  const current = report(); (current.buckets as Array<Record<string, unknown>>)[0].usd = zeroSpend(); (current.days as Array<Record<string, unknown>>)[0].usd = zeroSpend();
+  (((current.buckets as Array<Record<string, unknown>>)[0].series as Record<string, Record<string, unknown>>).a).usd = zeroSpend();
+  expect(validateUsageReport(current).spendAvailable).toBeUndefined();
+  const negative = report(); (negative.buckets as Array<Record<string, unknown>>)[0].usd = { ...zeroSpend(), input: -1 };
+  expect(() => validateUsageReport(negative)).toThrow(/spend/i);
+  const nan = report(); ((nan.buckets as Array<Record<string, unknown>>)[0].series as Record<string, Record<string, unknown>>).a.usd = { ...zeroSpend(), output: Number.NaN };
+  expect(() => validateUsageReport(nan)).toThrow(/spend/i);
+});
+
+it("prints the four token categories and only the API-equivalent cost", async () => {
   const { formatUsageText } = await import("../cli/cmd-usage.js");
   const { zeroTokens } = await import("../usage/types.js");
   const totals = { ...zeroTokens(), input: 1_800, output: 83_000, cacheRead: 11_900_000, cacheWrite: 45_000 };
@@ -95,7 +119,7 @@ it("prints input as the sum of uncached, cache read and cache write, and only th
     costs: { pricedApiUsd: 12.5, subscriptionUsd: 200, savingsUsd: -187.5, savingsPercent: -1500,
       coverage: { pricedTokens: 1, unpricedTokens: 0, pricingComplete: true, configuredAccounts: 1, unconfiguredAccounts: 0, subscriptionComplete: true, trackingComplete: true, persistenceHealthy: true } },
   });
-  expect(text).toContain("input 11946800 (1800 uncached, 11900000 cache read, 45000 cache write) | output 83000");
+  expect(text).toContain("input 1800 | output 83000 | cache read 11900000 | cache write 45000");
   expect(text).toContain("API equivalent: $12.50");
   expect(text).not.toMatch(/Subscription:|Net savings/);
 });

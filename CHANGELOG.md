@@ -10,15 +10,21 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- `cc-router usage` now shows input as the sum of uncached, cache-read and
-  cache-write tokens, with the three listed beside it, so the line reconciles
-  with the total (cache reads usually dominate). Token kinds and the
-  API-equivalent cost are coloured like the status dashboard's TOTALS line,
-  the view is indented by one column, and the week chart labels every other
-  day and names the axis unit instead of running the day numbers together.
+- `cc-router usage` charts and its daily grid switch between tokens and
+  estimated API spend (`s`) and narrow to input or output (`i`); every bucket,
+  model series and day in the report now carries frozen-rate USD per token
+  category. The model view (`l`) lists input, output, cache and spend per
+  model. Input, output and cache figures share one colour each across the
+  header, the cost line and the model view.
+- The usage view fills the terminal like `cc-router status`, is indented one
+  column, and quits on `Esc`. Chart columns scale to the available width and
+  the chart shares the daily grid's right edge; the axis names its unit
+  instead of running day numbers together. Warnings sit below the grid.
 - Subscription cost and net savings are no longer displayed in the usage
-  dashboard or the plain-text summary; the API-equivalent value stands alone.
-  Both remain in `--json` output and `usage subscription` still records costs.
+  dashboard or the plain-text summary; the API-equivalent value stands alone,
+  broken down by input, output and cache. Both remain in `--json` output and
+  `usage subscription` still records costs. A client talking to an older
+  router shows the per-category spend as unavailable rather than zero.
 
 ### ⚠️ Breaking
 

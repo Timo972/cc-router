@@ -73,15 +73,24 @@ export interface UsageSnapshot {
   warnings: string[];
   health: UsageHealth;
 }
+/** Frozen-rate USD per token category. Unpriced categories are zero here and counted in coverage. */
+export interface UsageSpend {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
 export interface UsageSeries {
   provider: UsageProvider;
   model: string;
   tokens: TokenCounts;
+  usd: UsageSpend;
 }
 export interface UsageBucket {
   start: string;
   end: string;
   tokens: TokenCounts;
+  usd: UsageSpend;
   /** Key is JSON.stringify([provider, model]); values also contain both labels. */
   series: Record<string, UsageSeries>;
 }
@@ -120,10 +129,25 @@ export interface UsageReport {
   costs: UsageCosts;
   accounts: UsageAccount[];
   warnings: string[];
+  /** Set to false by the client when a router omitted per-category spend, so zeros are shown as unavailable. */
+  spendAvailable?: false;
 }
 
 export const USAGE_PROVIDERS: readonly UsageProvider[] = ["anthropic_subscription", "openai_subscription", "xai_subscription"];
 export const TOKEN_KEYS = ["input", "output", "cacheRead", "cacheWrite", "cacheWrite5m", "cacheWrite1h"] as const;
+export const SPEND_KEYS = ["input", "output", "cacheRead", "cacheWrite"] as const;
+export function zeroSpend(): UsageSpend { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }; }
+export function totalSpend(usd: UsageSpend): number { return usd.input + usd.output + usd.cacheRead + usd.cacheWrite; }
+export function addSpend(target: UsageSpend, usd: UsageSpend): void { for (const key of SPEND_KEYS) target[key] += usd[key]; }
+export function validateSpend(value: unknown): UsageSpend {
+  const input = object(value, SPEND_KEYS); const result = zeroSpend();
+  for (const key of SPEND_KEYS) {
+    const amount = input[key] ?? 0;
+    if (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0) throw new Error(`Invalid ${key} spend`);
+    result[key] = amount;
+  }
+  return result;
+}
 export function zeroTokens(): TokenCounts { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite5m: 0, cacheWrite1h: 0 }; }
 export function totalTokens(tokens: TokenCounts): number { return tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite; }
 export function addTokens(target: TokenCounts, tokens: TokenCounts): void {
