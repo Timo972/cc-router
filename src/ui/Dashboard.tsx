@@ -382,12 +382,24 @@ export function resetCreditsColumnLabel(
   return resets?.eligible ? String(resets.available) : "—";
 }
 
-const RESET_WINDOW_LABELS: Record<string, string> = { five_hour: "5h", seven_day: "7d" };
+// Every window a grant can clear (LimitResetWindow): the operator must see
+// the whole scope of a spend before confirming it.
+const RESET_WINDOW_LABELS: Record<string, string> = {
+  five_hour: "5h",
+  seven_day: "7d",
+  seven_day_overage_included: "7d overage",
+  seven_day_opus: "7d Opus",
+  seven_day_sonnet: "7d Sonnet",
+};
 
-/** Why Ctrl+R cannot start a Claude reset, or undefined when it can. */
+/** Why Ctrl+R cannot start a NEW Claude reset, or undefined when it can. */
 export function claudeResetBlocker(account: Pick<AccountStat, "rateLimits">): string | undefined {
-  const resets = account.rateLimits?.usage?.limitResets;
+  const usage = account.rateLimits?.usage;
+  const resets = usage?.limitResets;
   if (!resets) return "Reset status unknown — reload with R";
+  // A failed poll keeps the last grant data but marks it stale; a new
+  // redemption must not be chosen from it.
+  if (usage.fetchStatus !== "fresh") return "Reset status is out of date — reload with R";
   if (!resets.eligible) {
     return resets.ineligibleReason === "cli_version"
       ? "Claude Code version too old for resets — update cc-router"
@@ -779,7 +791,9 @@ interface ProviderOperationalStatus {
 }
 
 type Focus = "logs" | "accounts" | "models";
-interface ResetSession { inFlight: boolean; pendingIds: Map<string, string> }
+/** A redemption id kept for retry; `maybeSubmitted` once an attempt with it had an unknown outcome. */
+interface PendingReset { requestId: string; maybeSubmitted: boolean }
+interface ResetSession { inFlight: boolean; pendingIds: Map<string, PendingReset> }
 
 type Mode = "view" | "editSession" | "editWeekly" | "confirmDelete" | "confirmReset";
 
@@ -1371,11 +1385,13 @@ function LiveDashboard({
   const doResetUsage = useCallback(async (id: string) => {
     if (resetSession.inFlight) return;
     resetSession.inFlight = true;
-    const requestId = resetSession.pendingIds.get(id) ?? randomUUID();
-    resetSession.pendingIds.set(id, requestId);
+    const pending = resetSession.pendingIds.get(id) ?? { requestId: randomUUID(), maybeSubmitted: false };
+    resetSession.pendingIds.set(id, pending);
     showBanner(`Redeeming usage reset for ${id}…`, "yellow", REFRESH_ALL_BANNER_MS);
     try {
-      const result = await api.resetUsage(id, requestId);
+      // Only a retry of a possibly-sent id may reuse its grant; the router
+      // refuses such a retry outright if it can no longer match it.
+      const result = await api.resetUsage(id, pending.requestId, { retry: pending.maybeSubmitted });
       resetSession.pendingIds.delete(id);
       const text = result.provider === "anthropic"
         ? ({
@@ -1412,9 +1428,13 @@ function LiveDashboard({
       // The pending id is kept even when the router refused before submitting:
       // an earlier attempt under the same id may still have an unknown outcome,
       // and a fresh id would let the next press spend a second reset.
+      // Only when the router says the id can never be matched again is it
+      // dropped, and then the next press has to pass the fresh-status blocker.
       if (error instanceof RouterRefusedResetError) {
+        if (error.abandon) resetSession.pendingIds.delete(id);
         showBanner(`${error.message} (${id})`, "yellow");
       } else {
+        pending.maybeSubmitted = true;
         showBanner(`Reset outcome unknown for ${id}; Ctrl+R retries the same redemption (keep dashboard open)`, "red");
       }
     } finally {

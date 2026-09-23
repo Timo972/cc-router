@@ -321,6 +321,39 @@ describe("dashboard Ctrl+R Claude limit reset", () => {
     } finally { await dash.cleanup(); }
   });
 
+  it("flags a same-id retry only after an unknown outcome, and drops an id the router abandons", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      const bodies: Array<{ redeemRequestId: string; retry: boolean }> = [];
+      const answers = [
+        () => Response.json({ error: "No reset available for this account" }, { status: 409 }), // never sent
+        () => Response.json({ error: "Reset outcome unknown" }, { status: 502 }),                // maybe sent
+        () => Response.json({ error: "Earlier reset attempt can't be matched", abandon: true }, { status: 409 }),
+        () => Response.json({ reset: { provider: "anthropic", code: "reset", usageRefreshed: true, replay: false } }),
+      ];
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) => {
+        if (String(url).endsWith("/reset-usage")) {
+          bodies.push(JSON.parse(init!.body as string));
+          return Promise.resolve(answers[bodies.length - 1]!());
+        }
+        return Promise.resolve(Response.json(claudeHealth()));
+      });
+      await dash.press("\t");
+      for (let press = 1; press <= 4; press++) {
+        await dash.press("\u0012");
+        await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "claude-1"'));
+        await dash.press("y");
+        await dash.waitUntil(() => expect(bodies).toHaveLength(press));
+        await dash.waitUntil(() => expect(dash.lastFrame()).not.toContain("Redeeming usage reset"));
+      }
+      expect(bodies.map(b => b.retry)).toEqual([false, false, true, false]);
+      expect(bodies[1]!.redeemRequestId).toBe(bodies[0]!.redeemRequestId);
+      expect(bodies[2]!.redeemRequestId).toBe(bodies[0]!.redeemRequestId);
+      expect(bodies[3]!.redeemRequestId).not.toBe(bodies[0]!.redeemRequestId); // abandoned id dropped
+    } finally { await dash.cleanup(); }
+  }, 15_000);
+
   it.each([
     [{ code: "already_used", replay: false }, "Reset already used elsewhere for claude-1 · nothing spent now"],
     [{ code: "not_limited", replay: true }, "claude-1 is not at a limit · an earlier attempt may have used a reset — check rst"],

@@ -168,9 +168,15 @@ example the Opus 5.5 launch reset). A reset refills the windows it names — the
 confirmation lists them, with the count left and the use-by date — and does not
 move your weekly reset day. Some resets can be used at any time; others only
 while the account is at a limit, and the dashboard says so instead of sending the
-request. Status comes from the same usage poll as the `5h`/`7d` columns, so press
-`R` if the count looks stale. If `rst` shows `—` and `Ctrl+R` reports an old
-Claude Code version, update cc-router.
+request. Status comes from the same usage poll as the `5h`/`7d` columns: a new
+redemption needs a fresh poll, so if `Ctrl+R` says the status is out of date,
+press `R` first. If `rst` shows `—` and `Ctrl+R` reports an old Claude Code
+version, update cc-router.
+
+A Claude retry after an unknown outcome is matched to the exact reset it first
+targeted. The router remembers that only while it runs: if it restarted in
+between, the retry is refused without sending anything — check `rst` (after
+`R`) to see whether the first attempt used the reset before redeeming again.
 
 > **⚠️ This uses the same undocumented endpoint as Claude Code's `/limit-reset`,
 > and may stop working if Anthropic changes it.**

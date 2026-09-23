@@ -240,9 +240,22 @@ describe("Claude limit resets in the dashboard", () => {
     expect(claudeResetBlocker(withResets({ ...ok, usableNow: false, requiresLimit: true }))).toBe("Reset only usable at a limit");
   });
 
-  it("names the refilled windows, count and deadline in the confirmation", () => {
+  it("refuses a new redemption on stale or unavailable reset status", () => {
+    const at = (fetchStatus: "stale" | "unavailable") => ({
+      ...claude("max-1"),
+      rateLimits: { ...claude("max-1").rateLimits!, usage: { modelLimits: [], fetchedAt: 1, fetchStatus, limitResets: ok } },
+    });
+    expect(claudeResetBlocker(at("stale"))).toBe("Reset status is out of date — reload with R");
+    expect(claudeResetBlocker(at("unavailable"))).toBe("Reset status is out of date — reload with R");
+  });
+
+  it("names every refilled window, count and deadline in the confirmation", () => {
     expect(claudeResetConfirmText("max-1", ok))
-      .toBe('Redeem 1 reset for "max-1"? Refills 5h + 7d limits · 1 left · use by 2026-10-22');
+      .toBe('Redeem 1 reset for "max-1"? Refills 5h + 7d + 7d overage limits · 1 left · use by 2026-10-22');
+    expect(claudeResetConfirmText("max-1", { ...ok, clears: ["seven_day_opus"] }))
+      .toBe('Redeem 1 reset for "max-1"? Refills 7d Opus limits · 1 left · use by 2026-10-22');
+    expect(claudeResetConfirmText("max-1", { ...ok, clears: ["five_hour", "seven_day_sonnet"] }))
+      .toBe('Redeem 1 reset for "max-1"? Refills 5h + 7d Sonnet limits · 1 left · use by 2026-10-22');
   });
 });
 

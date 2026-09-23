@@ -10,8 +10,24 @@ it("authenticates account redemption and URL-encodes the selected account ID", a
     .toEqual({ provider: "openai", code: "no_credit", usageRefreshed: true, replay: false });
   expect(fetch).toHaveBeenCalledWith("http://router.local/cc-router/accounts/account%20%2F1/reset-usage", expect.objectContaining({
     method: "POST", headers: { authorization: "Bearer secret", "content-type": "application/json" },
-    body: JSON.stringify({ redeemRequestId: "request-id" }),
+    body: JSON.stringify({ redeemRequestId: "request-id", retry: false }),
   }));
+});
+
+it("tells the router when the id is a retry of an unknown outcome", async () => {
+  const fetch = vi.fn().mockResolvedValue(Response.json({ reset: { provider: "anthropic", code: "reset", usageRefreshed: true } }));
+  vi.stubGlobal("fetch", fetch);
+  await createAccountsApi("http://router.local").resetUsage("claude", "request-id", { retry: true });
+  expect(JSON.parse(fetch.mock.calls[0]![1].body)).toEqual({ redeemRequestId: "request-id", retry: true });
+});
+
+it("marks a refusal the router says can never be retried", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "cannot match", abandon: true }, { status: 409 })));
+  const error = await createAccountsApi("http://router.local").resetUsage("claude", "request-id", { retry: true }).catch(e => e);
+  expect(error).toBeInstanceOf(RouterRefusedResetError);
+  expect(error.abandon).toBe(true);
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "No reset available" }, { status: 409 })));
+  expect((await createAccountsApi("http://router.local").resetUsage("claude", "request-id").catch(e => e)).abandon).toBe(false);
 });
 
 it.each([

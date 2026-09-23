@@ -96,10 +96,13 @@ const NOT_SUBMITTED_STATUSES: ReadonlySet<number> = new Set([400, 404, 409, 503]
  *  are never this type: their outcome is unknown. */
 export class RouterRefusedResetError extends Error {
   override name = "RouterRefusedResetError";
+  /** The router can never match this redemption id again; start over from fresh usage. */
+  constructor(message: string, readonly abandon = false) { super(message); }
 }
 
 export interface AccountsApi {
-  resetUsage(id: string, redeemRequestId: string): Promise<UsageResetResult>;
+  /** `retry`: this id was already sent once and its outcome is unknown. */
+  resetUsage(id: string, redeemRequestId: string, attempt?: { retry?: boolean }): Promise<UsageResetResult>;
   /** Read the authenticated, disclosure-safe account status view. */
   list(): Promise<AccountSafeView[]>;
   /** Ask the router to sweep cooldowns, re-try due tokens and re-fetch every
@@ -176,11 +179,11 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
         durationMs: publicInteger(r.durationMs),
       };
     },
-    async resetUsage(id, redeemRequestId) {
+    async resetUsage(id, redeemRequestId, attempt = {}) {
       const response = await fetch(`${base}/${encodeURIComponent(id)}/reset-usage`, {
         method: "POST",
         headers: { ...authHeaders, "content-type": "application/json" },
-        body: JSON.stringify({ redeemRequestId }),
+        body: JSON.stringify({ redeemRequestId, retry: attempt.retry === true }),
         signal: AbortSignal.timeout(REFRESH_ALL_TIMEOUT_MS),
       });
       if (!response.ok) {
@@ -188,7 +191,8 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
         if (!NOT_SUBMITTED_STATUSES.has(response.status)) throw new Error(fallback);
         const errorBody: unknown = await response.json().catch(() => undefined);
         const text = isRecord(errorBody) ? publicText(errorBody.error, 160, fallback) : fallback;
-        throw text === fallback ? new Error(fallback) : new RouterRefusedResetError(text);
+        throw text === fallback ? new Error(fallback)
+          : new RouterRefusedResetError(text, isRecord(errorBody) && errorBody.abandon === true);
       }
       const body: unknown = await response.json();
       const reset = isRecord(body) ? body.reset : undefined;
