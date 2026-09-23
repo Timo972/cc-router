@@ -7,6 +7,7 @@ import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createUsageResetHandler } from "../proxy/account-usage-reset.js";
 import { createOpenAIAccount } from "../providers/openai/account-state.js";
+import { ResetNotSubmittedError } from "../proxy/reset-errors.js";
 
 const servers: Server[] = [];
 afterEach(async () => { for (const s of servers.splice(0)) await new Promise<void>(resolve => s.close(() => resolve())); });
@@ -20,7 +21,9 @@ async function setup(overrides: Partial<Parameters<typeof createUsageResetHandle
   const refresh = vi.fn().mockResolvedValue({ ok: true, update: { buckets: [] } });
   const app = express();
   app.use(express.json());
-  app.post("/:id/reset-usage", createUsageResetHandler({ findAccount: id => id === a.id ? a : undefined, prepare: async () => true, consume, refresh, ...overrides }));
+  app.post("/:id/reset-usage", createUsageResetHandler({
+    provider: "openai", findAccount: id => id === a.id ? a : undefined, prepare: async () => true, consume, refresh, ...overrides,
+  }));
   const server = createServer(app); servers.push(server);
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as { port: number };
@@ -35,7 +38,7 @@ describe("account usage reset management route", () => {
     const { a, post, consume, refresh } = await setup();
     const response = await post();
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ reset: { code: "reset", usageRefreshed: true } });
+    expect(await response.json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: true } });
     expect(consume).toHaveBeenCalledWith(a, requestId);
     expect(refresh).toHaveBeenCalledWith(a);
     expect(a.rateLimits.resetCredits?.available).toBe(2); // no guessed local decrement
@@ -82,7 +85,7 @@ describe("account usage reset management route", () => {
   });
   it("does not confuse a usage refresh failure with a failed redemption", async () => {
     const { post } = await setup({ refresh: async () => { throw new Error("network"); } });
-    expect(await (await post()).json()).toEqual({ reset: { code: "reset", usageRefreshed: false } });
+    expect(await (await post()).json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: false } });
   });
   it("keeps limits unchanged and sanitizes errors on an uncertain outcome", async () => {
     const { post, a, refresh } = await setup({ consume: async () => { throw new Error("secret"); } });
@@ -96,6 +99,13 @@ describe("account usage reset management route", () => {
     const { post, consume } = await setup({ prepare: async () => false });
     expect((await post()).status).toBe(503);
     expect(consume).not.toHaveBeenCalled();
+  });
+  it("reports a provably unsent redemption with its own status, not as unknown", async () => {
+    const { post, refresh } = await setup({ consume: async () => { throw new ResetNotSubmittedError(409, "No reset available for this account"); } });
+    const response = await post();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "No reset available for this account" });
+    expect(refresh).not.toHaveBeenCalled();
   });
 });
 

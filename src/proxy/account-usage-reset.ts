@@ -1,21 +1,21 @@
-import type { CodexUsageFetchResult } from "../providers/openai/usage-fetch.js";
-import type { CodexRateLimitsUpdate } from "../providers/openai/usage.js";
 import type { RequestHandler } from "express";
-import type { OpenAIAccount } from "../providers/openai/account-state.js";
-import type { CodexResetResult } from "../providers/openai/usage-reset.js";
+import type { CodexRateLimitsUpdate } from "../providers/openai/usage.js";
+import { ResetNotSubmittedError, RESET_OUTCOME_UNKNOWN } from "./reset-errors.js";
 
-interface UsageResetOptions {
-  findAccount(id: string): OpenAIAccount | undefined;
-  prepare(account: OpenAIAccount): Promise<boolean>;
-  consume(account: OpenAIAccount, requestId: string): Promise<CodexResetResult>;
-  refresh(account: OpenAIAccount): Promise<CodexUsageFetchResult>;
-  captureReset?(account: OpenAIAccount): (update: CodexRateLimitsUpdate) => void;
+export interface UsageResetOptions<A extends object, R extends { code: string }> {
+  provider: "openai" | "anthropic";
+  findAccount(id: string): A | undefined;
+  prepare(account: A): Promise<boolean>;
+  consume(account: A, requestId: string): Promise<R>;
+  refresh(account: A): Promise<{ ok: boolean }>;
+  /** OpenAI only: reconcile quota cooldowns from the evidence captured before the spend. */
+  captureReset?(account: A): (update: CodexRateLimitsUpdate) => void;
 }
-export function createUsageResetHandler(options: UsageResetOptions): RequestHandler {
-  const inFlight = new WeakSet<OpenAIAccount>();
+export function createUsageResetHandler<A extends object, R extends { code: string }>(options: UsageResetOptions<A, R>): RequestHandler {
+  const inFlight = new WeakSet<A>();
   // One retained snapshot per account allows an uncertain retry to reconcile
   // using the ORIGINAL quota evidence, not quota learned after the first spend.
-  const snapshots = new WeakMap<OpenAIAccount, { id: string; reconcile?: (update: CodexRateLimitsUpdate) => void }>();
+  const snapshots = new WeakMap<A, { id: string; reconcile?: (update: CodexRateLimitsUpdate) => void }>();
   return async (req, res) => {
     const id = req.params.id;
     const requestId: unknown = req.body?.redeemRequestId;
@@ -25,7 +25,7 @@ export function createUsageResetHandler(options: UsageResetOptions): RequestHand
     }
     const account = options.findAccount(id);
     if (!account) {
-      res.status(404).json({ error: "ChatGPT account not found" });
+      res.status(404).json({ error: "Account not found" });
       return;
     }
     if (inFlight.has(account)) {
@@ -39,7 +39,7 @@ export function createUsageResetHandler(options: UsageResetOptions): RequestHand
         return;
       }
       if (options.findAccount(id) !== account) {
-        res.status(404).json({ error: "ChatGPT account changed; reset not submitted" });
+        res.status(404).json({ error: "Account changed; reset not submitted" });
         return;
       }
       const previous = snapshots.get(account);
@@ -60,13 +60,17 @@ export function createUsageResetHandler(options: UsageResetOptions): RequestHand
           const usage = await options.refresh(account);
           usageRefreshed = usage.ok;
           if (usage.ok && (result.code === "reset" || (result.code === "already_redeemed" && replay))) {
-            snapshot.reconcile?.(usage.update);
+            snapshot.reconcile?.((usage as { ok: true; update: CodexRateLimitsUpdate }).update);
           }
         } catch { /* retain confirmed redemption */ }
       }
-      res.json({ reset: { ...result, usageRefreshed } });
-    } catch {
-      res.status(502).json({ error: "Reset outcome unknown; retry with the same redemption ID" });
+      res.json({ reset: { provider: options.provider, ...result, usageRefreshed } });
+    } catch (error) {
+      if (error instanceof ResetNotSubmittedError) {
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
+      res.status(502).json({ error: RESET_OUTCOME_UNKNOWN });
     } finally {
       inFlight.delete(account);
     }

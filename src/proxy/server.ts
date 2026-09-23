@@ -2,7 +2,7 @@ import { finishUsageAttempt } from "./stats.js";
 import { startUsageRuntime } from "../usage/runtime.js";
 import { createUsageRouter } from "../usage/http.js";
 import { usageDirectoryForAccounts, withUsageRename } from "../usage/account-lifecycle.js";
-import { consumeCodexResetCredit } from "../providers/openai/usage-reset.js";
+import { consumeCodexResetCredit, type CodexResetResult } from "../providers/openai/usage-reset.js";
 import { createUsageResetHandler } from "./account-usage-reset.js";
 import express from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
@@ -979,7 +979,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // the SSE streaming on /v1/* is never touched (see comment at /v1 handler).
   const accountsRouter = express.Router();
   accountsRouter.use(express.json({ limit: "32kb" }));
-  accountsRouter.post("/:id/reset-usage", createUsageResetHandler({
+  accountsRouter.post("/:id/reset-usage", createUsageResetHandler<OpenAIAccount, CodexResetResult>({
+    provider: "openai",
     findAccount: id => openAIAccounts.find(account => account.id === id),
     prepare: account => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     consume: consumeCodexResetCredit,
