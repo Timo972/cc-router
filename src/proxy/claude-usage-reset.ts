@@ -15,7 +15,7 @@ export interface ClaudeResetAttempt {
 const MAX_PINNED_PER_ACCOUNT = 8;
 
 /**
- * Binds each redemption id to the grant it first targeted. A replay after an
+ * Binds each redemption id to the grant and organization it first targeted. A replay after an
  * unknown outcome must hit the same grant, or a moved `next_grant_id` would
  * turn "retry" into "spend a second reset".
  *
@@ -29,9 +29,10 @@ const MAX_PINNED_PER_ACCOUNT = 8;
  */
 export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
   const consume = deps.consume ?? consumeClaudeLimitReset;
-  const pinned = new Map<string /* account.id */, Map<string /* requestId */, string /* grantId */>>();
+  const pinned = new Map<string /* account.id */, Map<string /* requestId */, { grantId: string; org: string }>>();
   const run = async (account: Account, requestId: string, attempt: ClaudeResetAttempt = {}): Promise<ClaudeResetResult> => {
-    let grantId = pinned.get(account.id)?.get(requestId);
+    const pin = pinned.get(account.id)?.get(requestId);
+    let grantId = pin?.grantId;
     if (!grantId) {
       if (attempt.retry) {
         throw new ResetNotSubmittedError(409,
@@ -45,10 +46,17 @@ export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
     }
     const org = await deps.orgUuid(account);
     if (!org) throw new ResetNotSubmittedError(503, "Organization unknown; reset not submitted");
+    // Grant ids are shared across accounts: re-authenticating this id as a
+    // different Anthropic account must not aim the old claim at the new
+    // organization's reset. Only its own organization can settle it.
+    if (pin && pin.org !== org) {
+      throw new ResetNotSubmittedError(409,
+        "Account now signs in to a different organization than the earlier reset attempt — check rst before redeeming again; nothing sent", true);
+    }
     let pins = pinned.get(account.id);
     if (!pins) pinned.set(account.id, pins = new Map());
     if (!pins.has(requestId)) {
-      pins.set(requestId, grantId);
+      pins.set(requestId, { grantId, org });
       while (pins.size > MAX_PINNED_PER_ACCOUNT) pins.delete(pins.keys().next().value!);
     }
     return consume(account, org, grantId, requestId);

@@ -79,6 +79,24 @@ describe("Claude reset consumer", () => {
     expect(consume).not.toHaveBeenCalled();
   });
 
+  it("refuses a retry whose account now belongs to a different organization", async () => {
+    const OTHER_ORG = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+    let org = ORG;
+    const consume = vi.fn().mockRejectedValue(new Error("outcome unknown"));
+    const run = createClaudeResetConsumer({ orgUuid: async () => org, consume });
+    await expect(run(claude(state("grant-a")), R1)).rejects.toThrow("outcome unknown");
+    org = OTHER_ORG; // same account id re-authenticated as another Anthropic account
+    consume.mockClear();
+    const error = await run(claude(state("grant-a")), R1, { retry: true }).catch(e => e);
+    expect(error).toBeInstanceOf(ResetNotSubmittedError);
+    expect(error.status).toBe(409);
+    expect(error.abandon).toBe(true);
+    expect(consume).not.toHaveBeenCalled();
+    org = ORG; // back on the original organization, the retry goes through unchanged
+    await expect(run(claude(state("grant-b")), R1, { retry: true })).rejects.toThrow("outcome unknown");
+    expect(consume).toHaveBeenLastCalledWith(expect.anything(), ORG, "grant-a", R1);
+  });
+
   it("fails a retry closed when the router lost its pins (restart)", async () => {
     const consume = vi.fn();
     const restarted = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
