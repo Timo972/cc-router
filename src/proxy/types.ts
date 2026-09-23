@@ -101,11 +101,33 @@ export interface ExtraUsageState {
  *  member here: nothing in a snapshot can speak for them. */
 export type UsageWindowScope = "five_hour" | "seven_day";
 
+export type LimitResetWindow = "five_hour" | "seven_day" | "seven_day_overage_included" | "seven_day_opus" | "seven_day_sonnet";
+
+export interface LimitResetGrant {
+  id: string;
+  resetsLeft: number;
+  endsAt: number;
+  clears: LimitResetWindow[];
+  usableNow: boolean;
+  useRequiresLimit: boolean;
+  paused: boolean;
+}
+
+export interface LimitResetState {
+  eligible: boolean;
+  ineligibleReason?: string;
+  grants: LimitResetGrant[];
+  nextGrantId?: string;
+  cooldownUntil: number;
+}
+
 export interface AccountUsageSnapshot {
   fiveHour?: RateLimitWindow;
   sevenDay?: RateLimitWindow;
   modelLimits: ModelRateLimit[];
   extraUsage?: ExtraUsageState;
+  /** Banked usage-limit resets (cedar_ember). Absent means unknown. */
+  limitResets?: LimitResetState;
   /** Event-sequence token claimed when the refresh was *initiated* (see
    *  event-sequence.ts). `fetchedAt` is stamped after the response body is
    *  parsed, so it can post-date a limit the request never saw; and wall-clock
