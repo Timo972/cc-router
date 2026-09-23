@@ -24,7 +24,7 @@ describe("Claude reset redemption", () => {
     }));
   });
 
-  it.each(["already_used", "not_limited", "cooldown", "ineligible", "unavailable"])("preserves %s", async code => {
+  it.each(["already_used", "not_limited", "cooldown", "ineligible"])("preserves %s", async code => {
     const fetch = vi.fn().mockResolvedValue(Response.json({ result: code }));
     expect(await consumeClaudeLimitReset(account, ORG, GRANT, REQ, { fetch })).toEqual({ code });
   });
@@ -42,6 +42,9 @@ describe("Claude reset redemption", () => {
     () => new Response("secret", { status: 500 }),
     () => new Response("not json"),
     () => Response.json({ result: "surprise" }),
+    () => Response.json({ result: "unavailable" }),
+    () => Response.json({ result: "reset", reason: "reset_unconfirmed" }),
+    () => Response.json({ result: "ineligible", reason: "stamp_indeterminate" }),
   ])("treats unrecognised responses as outcome unknown", async make => {
     const fetch = vi.fn().mockResolvedValue(make());
     await expect(consumeClaudeLimitReset(account, ORG, GRANT, REQ, { fetch })).rejects.toThrow("outcome unknown");

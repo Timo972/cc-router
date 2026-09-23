@@ -38,10 +38,16 @@ describe("account usage reset management route", () => {
     const { a, post, consume, refresh } = await setup();
     const response = await post();
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: true } });
+    expect(await response.json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: true, replay: false } });
     expect(consume).toHaveBeenCalledWith(a, requestId);
     expect(refresh).toHaveBeenCalledWith(a);
     expect(a.rateLimits.resetCredits?.available).toBe(2); // no guessed local decrement
+  });
+  it("marks a second post of the same request id as a replay", async () => {
+    const { post, consume } = await setup();
+    expect(await (await post()).json()).toMatchObject({ reset: { replay: false } });
+    expect(await (await post()).json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: true, replay: true } });
+    expect(consume).toHaveBeenCalledTimes(2);
   });
   it("rejects unknown/non-ChatGPT accounts and invalid request IDs without redemption", async () => {
     const { post, consume } = await setup();
@@ -85,7 +91,7 @@ describe("account usage reset management route", () => {
   });
   it("does not confuse a usage refresh failure with a failed redemption", async () => {
     const { post } = await setup({ refresh: async () => { throw new Error("network"); } });
-    expect(await (await post()).json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: false } });
+    expect(await (await post()).json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: false, replay: false } });
   });
   it("keeps limits unchanged and sanitizes errors on an uncertain outcome", async () => {
     const { post, a, refresh } = await setup({ consume: async () => { throw new Error("secret"); } });

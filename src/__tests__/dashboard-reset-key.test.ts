@@ -302,7 +302,7 @@ describe("dashboard Ctrl+R Claude limit reset", () => {
           ids.push(JSON.parse(init!.body as string).redeemRequestId);
           return Promise.resolve(ids.length === 1
             ? Response.json({ error: "No reset available for this account" }, { status: 409 })
-            : Response.json({ reset: { provider: "anthropic", code: "already_used", usageRefreshed: true } }));
+            : Response.json({ reset: { provider: "anthropic", code: "already_used", usageRefreshed: true, replay: true } }));
         }
         return Promise.resolve(Response.json(claudeHealth()));
       });
@@ -317,6 +317,24 @@ describe("dashboard Ctrl+R Claude limit reset", () => {
       await dash.waitUntil(() => expect(ids).toHaveLength(2));
       expect(ids[1]).toBe(ids[0]);
       await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset already used for claude-1 · nothing more spent"));
+    } finally { await dash.cleanup(); }
+  });
+
+  it.each([
+    [{ code: "already_used", replay: false }, "Reset already used elsewhere for claude-1 · nothing spent now"],
+    [{ code: "not_limited", replay: true }, "claude-1 is not at a limit · an earlier attempt may have used a reset — check rst"],
+  ])("words %j by whether the router replayed the request id", async (reset, text) => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      vi.mocked(globalThis.fetch).mockImplementation((url) => Promise.resolve(String(url).endsWith("/reset-usage")
+        ? Response.json({ reset: { provider: "anthropic", usageRefreshed: true, ...reset } })
+        : Response.json(claudeHealth())));
+      await dash.press("\t");
+      await dash.press("\u0012");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "claude-1"'));
+      await dash.press("y");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain(text));
     } finally { await dash.cleanup(); }
   });
 

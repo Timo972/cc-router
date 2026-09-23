@@ -7,7 +7,7 @@ it("authenticates account redemption and URL-encodes the selected account ID", a
   const fetch = vi.fn().mockResolvedValue(Response.json({ reset: { provider: "openai", code: "no_credit", usageRefreshed: true } }));
   vi.stubGlobal("fetch", fetch);
   expect(await createAccountsApi("http://router.local/", "secret").resetUsage("account /1", "request-id"))
-    .toEqual({ provider: "openai", code: "no_credit", usageRefreshed: true });
+    .toEqual({ provider: "openai", code: "no_credit", usageRefreshed: true, replay: false });
   expect(fetch).toHaveBeenCalledWith("http://router.local/cc-router/accounts/account%20%2F1/reset-usage", expect.objectContaining({
     method: "POST", headers: { authorization: "Bearer secret", "content-type": "application/json" },
     body: JSON.stringify({ redeemRequestId: "request-id" }),
@@ -22,6 +22,7 @@ it.each([
   { code: "reset", usageRefreshed: true },
   { provider: "openai", code: "already_used", usageRefreshed: true },
   { provider: "anthropic", code: "no_credit", usageRefreshed: true },
+  { provider: "anthropic", code: "unavailable", usageRefreshed: true },
 ])
   ("rejects malformed redemption responses rather than confirming a spend", async reset => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ reset })));
@@ -30,10 +31,10 @@ it.each([
 
 it("parses a Claude redemption with the remaining count", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
-    reset: { provider: "anthropic", code: "reset", usageRefreshed: true, resetsLeft: 0 },
+    reset: { provider: "anthropic", code: "reset", usageRefreshed: true, resetsLeft: 0, replay: false },
   })));
   expect(await createAccountsApi("http://router.local").resetUsage("claude", "request-id"))
-    .toEqual({ provider: "anthropic", code: "reset", usageRefreshed: true, resetsLeft: 0 });
+    .toEqual({ provider: "anthropic", code: "reset", usageRefreshed: true, resetsLeft: 0, replay: false });
 });
 
 it("omits resetsLeft when the router does not report it", async () => {
@@ -41,7 +42,25 @@ it("omits resetsLeft when the router does not report it", async () => {
     reset: { provider: "anthropic", code: "cooldown", usageRefreshed: false },
   })));
   expect(await createAccountsApi("http://router.local").resetUsage("claude", "request-id"))
-    .toEqual({ provider: "anthropic", code: "cooldown", usageRefreshed: false });
+    .toEqual({ provider: "anthropic", code: "cooldown", usageRefreshed: false, replay: false });
+});
+
+it.each([
+  [true, true],
+  [false, false],
+  ["true", false],
+  [1, false],
+])("reads replay %j as %s", async (replay, expected) => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    reset: { provider: "anthropic", code: "already_used", usageRefreshed: true, replay },
+  })));
+  expect(await createAccountsApi("http://router.local").resetUsage("claude", "request-id"))
+    .toEqual({ provider: "anthropic", code: "already_used", usageRefreshed: true, replay: expected });
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    reset: { provider: "openai", code: "already_redeemed", usageRefreshed: true, replay },
+  })));
+  expect(await createAccountsApi("http://router.local").resetUsage("chatgpt", "request-id"))
+    .toEqual({ provider: "openai", code: "already_redeemed", usageRefreshed: true, replay: expected });
 });
 
 it.each([400, 404, 409, 503])("surfaces the router's error text for HTTP %i", async status => {

@@ -58,7 +58,7 @@ async function run(kind: "quota" | "overload") {
 describe("confirmed Claude reset routing recovery", () => {
   it("releases a five-hour quota cooldown once fresh usage shows headroom", async () => {
     const { a, pool, response, consume } = await run("quota");
-    expect(await response.json()).toEqual({ reset: { provider: "anthropic", code: "reset", resetsLeft: 0, usageRefreshed: true } });
+    expect(await response.json()).toEqual({ reset: { provider: "anthropic", code: "reset", resetsLeft: 0, usageRefreshed: true, replay: false } });
     expect(consume).toHaveBeenCalledWith(a, ORG, "grant-a", REQ);
     const lease = pool.tryAcquire(a.id);
     expect(lease).not.toBeNull();

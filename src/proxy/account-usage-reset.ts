@@ -64,7 +64,7 @@ export function createUsageResetHandler<A extends object, R extends { code: stri
           }
         } catch { /* retain confirmed redemption */ }
       }
-      res.json({ reset: { provider: options.provider, ...result, usageRefreshed } });
+      res.json({ reset: { provider: options.provider, ...result, usageRefreshed, replay } });
     } catch (error) {
       if (error instanceof ResetNotSubmittedError) {
         res.status(error.status).json({ error: error.message });

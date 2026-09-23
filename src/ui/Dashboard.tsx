@@ -1380,11 +1380,20 @@ function LiveDashboard({
       const text = result.provider === "anthropic"
         ? ({
             reset: `Limits reset for ${id}${result.resetsLeft !== undefined ? ` · ${result.resetsLeft} left` : ""}`,
-            already_used: `Reset already used for ${id} · nothing more spent`,
-            not_limited: `${id} is not at a limit · nothing used`,
-            cooldown: `Resets are cooling down for ${id} · try later`,
-            ineligible: `Reset unavailable for ${id} · nothing used`,
-            unavailable: `Reset unavailable for ${id} · nothing used`,
+            // A replayed id may have spent on the earlier, unconfirmed attempt:
+            // only a first attempt can promise that nothing was used.
+            already_used: result.replay
+              ? `Reset already used for ${id} · nothing more spent`
+              : `Reset already used elsewhere for ${id} · nothing spent now`,
+            not_limited: result.replay
+              ? `${id} is not at a limit · an earlier attempt may have used a reset — check rst`
+              : `${id} is not at a limit · nothing used`,
+            cooldown: result.replay
+              ? `Resets are cooling down for ${id} · an earlier attempt may have used a reset — check rst`
+              : `Resets are cooling down for ${id} · try later`,
+            ineligible: result.replay
+              ? `Reset unavailable for ${id} · an earlier attempt may have used a reset — check rst`
+              : `Reset unavailable for ${id} · nothing used`,
           })[result.code]
         : ({
             reset: `Usage reset redeemed for ${id}`,
@@ -1392,7 +1401,8 @@ function LiveDashboard({
             nothing_to_reset: `Nothing to reset for ${id}`,
             no_credit: `No reset credits available for ${id}`,
           })[result.code];
-      const confirmed = result.code === "reset" || result.code === "already_redeemed" || result.code === "already_used";
+      const confirmed = result.code === "reset" || result.code === "already_redeemed"
+        || (result.code === "already_used" && result.replay);
       showBanner(text + (result.usageRefreshed ? "" : " — usage refresh failed; reload with R"),
         result.usageRefreshed && confirmed ? "green" : "yellow");
       // Failure to poll the dashboard must not turn a confirmed spend into an

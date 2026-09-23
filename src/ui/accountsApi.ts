@@ -81,11 +81,11 @@ export interface AccountRefreshResult {
 }
 
 export type UsageResetResult =
-  | { provider: "openai"; code: CodexResetCode; usageRefreshed: boolean }
-  | { provider: "anthropic"; code: ClaudeResetCode; usageRefreshed: boolean; resetsLeft?: number };
+  | { provider: "openai"; code: CodexResetCode; usageRefreshed: boolean; replay: boolean }
+  | { provider: "anthropic"; code: ClaudeResetCode; usageRefreshed: boolean; replay: boolean; resetsLeft?: number };
 
 const OPENAI_RESET_CODES: readonly string[] = ["reset", "nothing_to_reset", "no_credit", "already_redeemed"];
-const CLAUDE_RESET_CODES: readonly string[] = ["reset", "already_used", "not_limited", "cooldown", "ineligible", "unavailable"];
+const CLAUDE_RESET_CODES: readonly string[] = ["reset", "already_used", "not_limited", "cooldown", "ineligible"];
 // Statuses where the router answered before submitting anything upstream, so
 // its error text is safe and useful to show. Every other status (notably 502,
 // "outcome unknown") stays a bare `HTTP <status>`.
@@ -193,14 +193,16 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
       const body: unknown = await response.json();
       const reset = isRecord(body) ? body.reset : undefined;
       if (!isRecord(reset) || typeof reset.code !== "string" || typeof reset.usageRefreshed !== "boolean") throw new Error("Invalid reset response");
+      // True only when the router re-submitted a request id it had already sent.
+      const replay = reset.replay === true;
       if (reset.provider === "anthropic" && CLAUDE_RESET_CODES.includes(reset.code)) {
         return {
-          provider: "anthropic", code: reset.code as ClaudeResetCode, usageRefreshed: reset.usageRefreshed,
+          provider: "anthropic", code: reset.code as ClaudeResetCode, usageRefreshed: reset.usageRefreshed, replay,
           ...(typeof reset.resetsLeft === "number" ? { resetsLeft: publicInteger(reset.resetsLeft) } : {}),
         };
       }
       if (reset.provider === "openai" && OPENAI_RESET_CODES.includes(reset.code)) {
-        return { provider: "openai", code: reset.code as CodexResetCode, usageRefreshed: reset.usageRefreshed };
+        return { provider: "openai", code: reset.code as CodexResetCode, usageRefreshed: reset.usageRefreshed, replay };
       }
       throw new Error("Invalid reset response");
     },
