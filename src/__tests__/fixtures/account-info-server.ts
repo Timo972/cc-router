@@ -17,7 +17,7 @@ globalThis.fetch = async input => {
       },
     });
   }
-  if (url === "https://api.anthropic.com/api/oauth/usage") return Response.json({});
+  if (url.startsWith("https://api.anthropic.com/api/oauth/usage")) return Response.json({});
   throw new Error("Unexpected upstream request in isolated metadata fixture");
 };
 

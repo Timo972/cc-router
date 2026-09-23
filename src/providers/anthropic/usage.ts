@@ -10,8 +10,11 @@ import type {
 } from "../../proxy/types.js";
 import { nextEventSequence } from "../../proxy/event-sequence.js";
 
-const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
-const OAUTH_BETA_HEADER = "oauth-2025-04-20";
+const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1";
+export const OAUTH_BETA_HEADER = "oauth-2025-04-20";
+/** Reset status is only offered to the Claude Code surface; bump when the server answers `cli_version`. */
+export const CLAUDE_CODE_UA_VERSION = "2.1.280";
+export const CLAUDE_CODE_USER_AGENT = `claude-cli/${CLAUDE_CODE_UA_VERSION} (external, cli)`;
 const DEFAULT_USAGE_TIMEOUT_MS = 5_000;
 
 export type UsageFetchFailureReason =
@@ -293,6 +296,7 @@ export async function fetchAnthropicUsage(
       headers: {
         Authorization: `Bearer ${account.tokens.accessToken}`,
         "anthropic-beta": OAUTH_BETA_HEADER,
+        "user-agent": CLAUDE_CODE_USER_AGENT,
       },
       signal: controller.signal,
     });
