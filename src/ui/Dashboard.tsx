@@ -3,7 +3,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Box, Text, useInput, useApp, useStdout, measureElement } from "ink";
 import type { DOMElement } from "ink";
 import type { LogEntry } from "../proxy/stats.js";
-import { createAccountsApi } from "./accountsApi.js";
+import { createAccountsApi, ResetNotSubmittedError } from "./accountsApi.js";
 import type { AccountsApi } from "./accountsApi.js";
 import { createModelsApi } from "./modelsApi.js";
 import type { ModelEntry, ModelsApi, ModelsStatus } from "./modelsApi.js";
@@ -65,6 +65,13 @@ interface AccountUsageView {
   extraUsage?: { enabled: boolean; spendLimitReached: boolean; usable: boolean };
   fetchedAt: number;
   fetchStatus: "fresh" | "stale" | "unavailable";
+  limitResets?: LimitResetsView;
+}
+
+/** Mirrors the router's public `PublicLimitResets`: counts, dates and flags only. */
+interface LimitResetsView {
+  eligible: boolean; ineligibleReason?: string; available: number;
+  usableNow: boolean; requiresLimit: boolean; useBy: number; clears: string[];
 }
 
 interface AccountModelLimitView {
@@ -364,12 +371,38 @@ export function isClaudeAccount(account: Pick<AccountStat, "provider">): boolean
   return !isOpenAIAccount(account) && !isXaiAccount(account);
 }
 
-/** Compact `rst` column: banked Codex usage-limit resets. Claude is an em dash. */
+/** Compact `rst` column: banked usage-limit resets. Grok and unknown or
+ *  ineligible Claude status are an em dash. */
 export function resetCreditsColumnLabel(
-  account: Pick<AccountStat, "provider" | "codexRateLimits">,
+  account: Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">,
 ): string {
-  if (!isOpenAIAccount(account)) return "—";
-  return String(account.codexRateLimits?.resetCredits?.available ?? 0);
+  if (isOpenAIAccount(account)) return String(account.codexRateLimits?.resetCredits?.available ?? 0);
+  if (!isClaudeAccount(account)) return "—";
+  const resets = account.rateLimits?.usage?.limitResets;
+  return resets?.eligible ? String(resets.available) : "—";
+}
+
+const RESET_WINDOW_LABELS: Record<string, string> = { five_hour: "5h", seven_day: "7d" };
+
+/** Why Ctrl+R cannot start a Claude reset, or undefined when it can. */
+export function claudeResetBlocker(account: Pick<AccountStat, "rateLimits">): string | undefined {
+  const resets = account.rateLimits?.usage?.limitResets;
+  if (!resets) return "Reset status unknown — reload with R";
+  if (!resets.eligible) {
+    return resets.ineligibleReason === "cli_version"
+      ? "Claude Code version too old for resets — update cc-router"
+      : `Resets unavailable for this account (${resets.ineligibleReason ?? "unknown"})`;
+  }
+  if (resets.available <= 0) return "No resets available";
+  if (!resets.usableNow) return resets.requiresLimit ? "Reset only usable at a limit" : "Reset not usable right now";
+  return undefined;
+}
+
+export function claudeResetConfirmText(id: string, resets: LimitResetsView): string {
+  const windows = resets.clears.map(window => RESET_WINDOW_LABELS[window]).filter(Boolean);
+  const refills = windows.length > 0 ? `Refills ${windows.join(" + ")} limits` : "Refills your limits";
+  const useBy = resets.useBy > 0 ? ` · use by ${new Date(resets.useBy * 1000).toISOString().slice(0, 10)}` : "";
+  return `Redeem 1 reset for "${id}"? ${refills} · ${resets.available} left${useBy}`;
 }
 
 export function isLimitedAccount(
@@ -1079,6 +1112,10 @@ function LiveDashboard({
     ? Math.max(0, orderedAccounts.findIndex(a => a.id === selectedAccountId))
     : 0;
   const selectedAccount = orderedAccounts[selectedAccountIndex] ?? null;
+  const resetTargetAccount = resetTarget ? orderedAccounts.find(a => a.id === resetTarget) : undefined;
+  const resetTargetClaudeResets = resetTargetAccount && isClaudeAccount(resetTargetAccount)
+    ? resetTargetAccount.rateLimits?.usage?.limitResets
+    : undefined;
   // Identity for the selected row: health never carries it, so it comes from
   // the authenticated /cc-router/accounts poll above. The detail line and the
   // re-auth intent must agree on which email they mean, so both read this.
@@ -1340,19 +1377,36 @@ function LiveDashboard({
     try {
       const result = await api.resetUsage(id, requestId);
       resetSession.pendingIds.delete(id);
-      const messages = {
-        reset: `Usage reset redeemed for ${id}`,
-        already_redeemed: `Usage reset already redeemed for ${id}`,
-        nothing_to_reset: `Nothing to reset for ${id}`,
-        no_credit: `No reset credits available for ${id}`,
-      };
-      showBanner(messages[result.code] + (result.usageRefreshed ? "" : " — usage refresh failed; reload with R"),
-        result.usageRefreshed && (result.code === "reset" || result.code === "already_redeemed") ? "green" : "yellow");
+      const text = result.provider === "anthropic"
+        ? ({
+            reset: `Limits reset for ${id}${result.resetsLeft !== undefined ? ` · ${result.resetsLeft} left` : ""}`,
+            already_used: `Reset already used for ${id} · nothing more spent`,
+            not_limited: `${id} is not at a limit · nothing used`,
+            cooldown: `Resets are cooling down for ${id} · try later`,
+            ineligible: `Reset unavailable for ${id} · nothing used`,
+            unavailable: `Reset unavailable for ${id} · nothing used`,
+          })[result.code]
+        : ({
+            reset: `Usage reset redeemed for ${id}`,
+            already_redeemed: `Usage reset already redeemed for ${id}`,
+            nothing_to_reset: `Nothing to reset for ${id}`,
+            no_credit: `No reset credits available for ${id}`,
+          })[result.code];
+      const confirmed = result.code === "reset" || result.code === "already_redeemed" || result.code === "already_used";
+      showBanner(text + (result.usageRefreshed ? "" : " — usage refresh failed; reload with R"),
+        result.usageRefreshed && confirmed ? "green" : "yellow");
       // Failure to poll the dashboard must not turn a confirmed spend into an
       // unknown outcome or encourage another redemption.
       try { await onRefreshAll?.(); } catch { /* the regular poll will retry */ }
-    } catch {
-      showBanner(`Reset outcome unknown for ${id}; Ctrl+R retries the same redemption (keep dashboard open)`, "red");
+    } catch (error) {
+      // The pending id is kept even when the router refused before submitting:
+      // an earlier attempt under the same id may still have an unknown outcome,
+      // and a fresh id would let the next press spend a second reset.
+      if (error instanceof ResetNotSubmittedError) {
+        showBanner(`${error.message} (${id})`, "yellow");
+      } else {
+        showBanner(`Reset outcome unknown for ${id}; Ctrl+R retries the same redemption (keep dashboard open)`, "red");
+      }
     } finally {
       resetSession.inFlight = false;
     }
@@ -1424,10 +1478,15 @@ function LiveDashboard({
     if (input === "r" && key.ctrl) {
       if (focus !== "accounts" || !selectedAccount) return;
       if (resetSession.inFlight) { showBanner("Reset already running", "yellow"); return; }
-      if (selectedAccount.provider !== "openai_subscription") {
-        showBanner("Usage resets are only available for ChatGPT accounts", "yellow"); return;
-      }
-      if (!resetSession.pendingIds.has(selectedAccount.id) && (selectedAccount.codexRateLimits?.resetCredits?.available ?? 0) <= 0) {
+      // A pending id means an earlier attempt's outcome is unknown: let the
+      // retry through so the router can deduplicate it under the same id.
+      const pending = resetSession.pendingIds.has(selectedAccount.id);
+      if (isClaudeAccount(selectedAccount)) {
+        const blocker = pending ? undefined : claudeResetBlocker(selectedAccount);
+        if (blocker) { showBanner(blocker, "yellow"); return; }
+      } else if (selectedAccount.provider !== "openai_subscription") {
+        showBanner("Usage resets are not available for Grok accounts", "yellow"); return;
+      } else if (!pending && (selectedAccount.codexRateLimits?.resetCredits?.available ?? 0) <= 0) {
         showBanner("No reset credits available", "yellow"); return;
       }
       setResetTarget(selectedAccount.id);
@@ -1623,7 +1682,9 @@ function LiveDashboard({
       )}
       {mode === "confirmReset" && resetTarget && (
         <Box paddingLeft={2}>
-          <Text color="yellow" bold>Redeem 1 reset for "{resetTarget}"?  [y] yes  [n/Esc] cancel</Text>
+          <Text color="yellow" bold>{resetTargetClaudeResets
+            ? `${claudeResetConfirmText(resetTarget, resetTargetClaudeResets)}  [y] yes  [n/Esc] cancel`
+            : `Redeem 1 reset for "${resetTarget}"?  [y] yes  [n/Esc] cancel`}</Text>
         </Box>
       )}
       {mode === "confirmDelete" && selectedAccount && (

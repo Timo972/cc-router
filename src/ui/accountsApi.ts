@@ -1,4 +1,5 @@
 import type { CodexResetCode } from "../providers/openai/usage-reset.js";
+import type { ClaudeResetCode } from "../providers/anthropic/usage-reset.js";
 import { sanitizeAccountInfo, type AccountInfo } from "../providers/account-info.js";
 /**
  * Tiny authenticated HTTP client for /cc-router/accounts.
@@ -79,7 +80,23 @@ export interface AccountRefreshResult {
   durationMs: number;
 }
 
-export interface UsageResetResult { code: CodexResetCode; usageRefreshed: boolean }
+export type UsageResetResult =
+  | { provider: "openai"; code: CodexResetCode; usageRefreshed: boolean }
+  | { provider: "anthropic"; code: ClaudeResetCode; usageRefreshed: boolean; resetsLeft?: number };
+
+const OPENAI_RESET_CODES: readonly string[] = ["reset", "nothing_to_reset", "no_credit", "already_redeemed"];
+const CLAUDE_RESET_CODES: readonly string[] = ["reset", "already_used", "not_limited", "cooldown", "ineligible", "unavailable"];
+// Statuses where the router answered before submitting anything upstream, so
+// its error text is safe and useful to show. Every other status (notably 502,
+// "outcome unknown") stays a bare `HTTP <status>`.
+const NOT_SUBMITTED_STATUSES: ReadonlySet<number> = new Set([400, 404, 409, 503]);
+
+/** The router refused a redemption before submitting it (its error text is
+ *  the message). Network failures, timeouts and bare `HTTP <status>` errors
+ *  are never this type: their outcome is unknown. */
+export class ResetNotSubmittedError extends Error {
+  override name = "ResetNotSubmittedError";
+}
 
 export interface AccountsApi {
   resetUsage(id: string, redeemRequestId: string): Promise<UsageResetResult>;
@@ -166,12 +183,26 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
         body: JSON.stringify({ redeemRequestId }),
         signal: AbortSignal.timeout(REFRESH_ALL_TIMEOUT_MS),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        const fallback = `HTTP ${response.status}`;
+        if (!NOT_SUBMITTED_STATUSES.has(response.status)) throw new Error(fallback);
+        const errorBody: unknown = await response.json().catch(() => undefined);
+        const text = isRecord(errorBody) ? publicText(errorBody.error, 160, fallback) : fallback;
+        throw text === fallback ? new Error(fallback) : new ResetNotSubmittedError(text);
+      }
       const body: unknown = await response.json();
       const reset = isRecord(body) ? body.reset : undefined;
-      if (!isRecord(reset) || typeof reset.code !== "string" || !["reset", "nothing_to_reset", "no_credit", "already_redeemed"].includes(reset.code)
-        || typeof reset.usageRefreshed !== "boolean") throw new Error("Invalid reset response");
-      return { code: reset.code as CodexResetCode, usageRefreshed: reset.usageRefreshed };
+      if (!isRecord(reset) || typeof reset.code !== "string" || typeof reset.usageRefreshed !== "boolean") throw new Error("Invalid reset response");
+      if (reset.provider === "anthropic" && CLAUDE_RESET_CODES.includes(reset.code)) {
+        return {
+          provider: "anthropic", code: reset.code as ClaudeResetCode, usageRefreshed: reset.usageRefreshed,
+          ...(typeof reset.resetsLeft === "number" ? { resetsLeft: publicInteger(reset.resetsLeft) } : {}),
+        };
+      }
+      if (reset.provider === "openai" && OPENAI_RESET_CODES.includes(reset.code)) {
+        return { provider: "openai", code: reset.code as CodexResetCode, usageRefreshed: reset.usageRefreshed };
+      }
+      throw new Error("Invalid reset response");
     },
     patch(id, patch) { return send("PATCH", `/${encodeURIComponent(id)}`, patch); },
     setProviderEnabled(provider, enabled) { return send("PATCH", `/providers/${encodeURIComponent(provider)}`, { enabled }); },

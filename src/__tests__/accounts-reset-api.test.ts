@@ -1,21 +1,66 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { createAccountsApi } from "../ui/accountsApi.js";
+import { createAccountsApi, ResetNotSubmittedError } from "../ui/accountsApi.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
 it("authenticates account redemption and URL-encodes the selected account ID", async () => {
-  const fetch = vi.fn().mockResolvedValue(Response.json({ reset: { code: "no_credit", usageRefreshed: true } }));
+  const fetch = vi.fn().mockResolvedValue(Response.json({ reset: { provider: "openai", code: "no_credit", usageRefreshed: true } }));
   vi.stubGlobal("fetch", fetch);
   expect(await createAccountsApi("http://router.local/", "secret").resetUsage("account /1", "request-id"))
-    .toEqual({ code: "no_credit", usageRefreshed: true });
+    .toEqual({ provider: "openai", code: "no_credit", usageRefreshed: true });
   expect(fetch).toHaveBeenCalledWith("http://router.local/cc-router/accounts/account%20%2F1/reset-usage", expect.objectContaining({
     method: "POST", headers: { authorization: "Bearer secret", "content-type": "application/json" },
     body: JSON.stringify({ redeemRequestId: "request-id" }),
   }));
 });
 
-it.each([undefined, { code: "unknown", usageRefreshed: true }, { code: ["reset"], usageRefreshed: true }, { code: "reset" }])
+it.each([
+  undefined,
+  { provider: "openai", code: "unknown", usageRefreshed: true },
+  { provider: "openai", code: ["reset"], usageRefreshed: true },
+  { provider: "openai", code: "reset" },
+  { code: "reset", usageRefreshed: true },
+  { provider: "openai", code: "already_used", usageRefreshed: true },
+  { provider: "anthropic", code: "no_credit", usageRefreshed: true },
+])
   ("rejects malformed redemption responses rather than confirming a spend", async reset => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ reset })));
     await expect(createAccountsApi("http://router.local").resetUsage("account", "request-id")).rejects.toThrow("Invalid reset response");
   });
+
+it("parses a Claude redemption with the remaining count", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    reset: { provider: "anthropic", code: "reset", usageRefreshed: true, resetsLeft: 0 },
+  })));
+  expect(await createAccountsApi("http://router.local").resetUsage("claude", "request-id"))
+    .toEqual({ provider: "anthropic", code: "reset", usageRefreshed: true, resetsLeft: 0 });
+});
+
+it("omits resetsLeft when the router does not report it", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    reset: { provider: "anthropic", code: "cooldown", usageRefreshed: false },
+  })));
+  expect(await createAccountsApi("http://router.local").resetUsage("claude", "request-id"))
+    .toEqual({ provider: "anthropic", code: "cooldown", usageRefreshed: false });
+});
+
+it.each([400, 404, 409, 503])("surfaces the router's error text for HTTP %i", async status => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "No reset available\u0007 for this account" }, { status })));
+  const attempt = createAccountsApi("http://router.local").resetUsage("claude", "request-id");
+  await expect(attempt).rejects.toThrow(/^No reset available for this account$/);
+  await expect(attempt).rejects.toBeInstanceOf(ResetNotSubmittedError);
+});
+
+it.each([500, 502, 504, 401])("keeps HTTP %i as a bare status even with an error body", async status => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "upstream said something" }, { status })));
+  const attempt = createAccountsApi("http://router.local").resetUsage("claude", "request-id");
+  await expect(attempt).rejects.toThrow(new RegExp(`^HTTP ${status}$`));
+  await expect(attempt).rejects.not.toBeInstanceOf(ResetNotSubmittedError);
+});
+
+it("falls back to the HTTP status when a 409 body is not JSON or has no error", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("<html>", { status: 409 })));
+  await expect(createAccountsApi("http://router.local").resetUsage("claude", "request-id")).rejects.toThrow(/^HTTP 409$/);
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: 42 }, { status: 409 })));
+  await expect(createAccountsApi("http://router.local").resetUsage("claude", "request-id")).rejects.toThrow(/^HTTP 409$/);
+});
