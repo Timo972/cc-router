@@ -112,9 +112,11 @@ Per-platform token extraction, Codex CLI, Docker and everything else lives in
 ## Usage history and savings
 
 Run `cc-router usage` for persistent token history, provider/model stacked bars,
-and a daily activity grid. Switch between day, week, month and year; history
-survives service restarts. Configure your monthly subscription costs to compare
-them with the estimated standard API token value:
+and a daily activity grid, each switchable between tokens and estimated API
+spend and narrowable to input or output. Switch between day, week, month and
+year; history survives service restarts. Configure your monthly subscription
+costs to compare them with the estimated standard API token value in the
+`--json` report and the plain-text summary:
 
 ```bash
 cc-router usage subscription set personal --monthly-usd 100 --from 2026-09-01

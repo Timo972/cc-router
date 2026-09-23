@@ -1,29 +1,29 @@
-import { addTokens, object, totalTokens, USAGE_PROVIDERS, utcTimestamp, usageProvider, zeroTokens } from "./types.js";
-import type { TokenCounts, UsageBucket, UsageDay, UsageDelta, UsageAggregate, UsageQuery, UsageReport, UsageSnapshot, Subscription } from "./types.js";
+import { addSpend, addTokens, object, totalSpend, totalTokens, USAGE_PROVIDERS, utcTimestamp, usageProvider, zeroSpend, zeroTokens } from "./types.js";
+import type { TokenCounts, UsageSpend, UsageBucket, UsageDay, UsageDelta, UsageAggregate, UsageQuery, UsageReport, UsageSnapshot, Subscription } from "./types.js";
 import { prorateSubscriptions } from "./subscriptions.js";
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
 const MODEL_LIMIT = 16; // Per provider, including Other. Bounds all chart/heatmap series.
 function iso(ms: number): string { return new Date(ms).toISOString(); }
-function newBucket(start: number, end: number): UsageBucket { return { start: iso(start), end: iso(end), tokens: zeroTokens(), series: {} }; }
-function addToBucket(bucket: UsageBucket, entry: UsageDelta | UsageAggregate, model: string): void {
-  addTokens(bucket.tokens, entry.tokens);
+function newBucket(start: number, end: number): UsageBucket { return { start: iso(start), end: iso(end), tokens: zeroTokens(), usd: zeroSpend(), series: {} }; }
+function addToBucket(bucket: UsageBucket, entry: UsageDelta | UsageAggregate, model: string, usd: UsageSpend): void {
+  addTokens(bucket.tokens, entry.tokens); addSpend(bucket.usd, usd);
   const key = JSON.stringify([entry.provider, model]);
-  const series = bucket.series[key] ??= { provider: entry.provider, model, tokens: zeroTokens() };
-  addTokens(series.tokens, entry.tokens);
+  const series = bucket.series[key] ??= { provider: entry.provider, model, tokens: zeroTokens(), usd: zeroSpend() };
+  addTokens(series.tokens, entry.tokens); addSpend(series.usd, usd);
 }
-function price(entry: UsageDelta | UsageAggregate): { usd: number; priced: number; unpriced: number } {
+function price(entry: UsageDelta | UsageAggregate): { usd: UsageSpend; priced: number; unpriced: number } {
   const { tokens, rates } = entry;
-  const categories: [number, number | undefined][] = [
-    [tokens.input, rates?.input], [tokens.output, rates?.output], [tokens.cacheRead, rates?.cacheRead],
-    [tokens.cacheWrite - tokens.cacheWrite5m - tokens.cacheWrite1h, rates?.cacheWrite],
-    [tokens.cacheWrite5m, rates?.cacheWrite5m], [tokens.cacheWrite1h, rates?.cacheWrite1h],
+  const categories: [keyof UsageSpend, number, number | undefined][] = [
+    ["input", tokens.input, rates?.input], ["output", tokens.output, rates?.output], ["cacheRead", tokens.cacheRead, rates?.cacheRead],
+    ["cacheWrite", tokens.cacheWrite - tokens.cacheWrite5m - tokens.cacheWrite1h, rates?.cacheWrite],
+    ["cacheWrite", tokens.cacheWrite5m, rates?.cacheWrite5m], ["cacheWrite", tokens.cacheWrite1h, rates?.cacheWrite1h],
   ];
-  let usd = 0; let priced = 0; let unpriced = 0;
-  for (const [count, rate] of categories) {
+  const usd = zeroSpend(); let priced = 0; let unpriced = 0;
+  for (const [category, count, rate] of categories) {
     if (rate === undefined) unpriced += count;
-    else { priced += count; usd += count * rate / 1e6; }
+    else { priced += count; usd[category] += count * rate / 1e6; }
   }
   return { usd, priced, unpriced };
 }
@@ -91,16 +91,17 @@ export function queryUsage(snapshot: UsageSnapshot, query: UsageQuery, now: Date
       else { model = "Other"; overflowModels = true; }
     }
     const incomplete = "attemptId" in entry && incompleteAttempts.has(entry.attemptId);
+    const cost = price(entry);
     if (ts >= yearStart && ts < yearEnd) {
-      const day = days[Math.floor((ts - yearStart) / DAY)]; addToBucket(day, entry, model);
+      const day = days[Math.floor((ts - yearStart) / DAY)]; addToBucket(day, entry, model, cost.usd);
       if (incomplete && day.coverage === "complete") day.coverage = "partial";
     }
     if (ts < start || ts >= elapsedEnd) continue;
     if (incomplete) incompleteInPeriod = true;
     observedAccounts.add(entry.accountKey); addTokens(totals, entry.tokens);
-    const cost = price(entry); pricedApiUsd += cost.usd; pricedTokens += cost.priced; unpricedTokens += cost.unpriced;
+    pricedApiUsd += totalSpend(cost.usd); pricedTokens += cost.priced; unpricedTokens += cost.unpriced;
     const bucket = buckets.find(candidate => candidate.start <= iso(ts) && candidate.end > iso(ts));
-    if (bucket) addToBucket(bucket, entry, model);
+    if (bucket) addToBucket(bucket, entry, model, cost.usd);
   }
   const subscriptions = snapshot.subscriptions.filter(entry => providers.has(entry.provider));
   const overlappingSubscriptions = subscriptions.filter(entry => Date.parse(entry.from) < elapsedEnd && (!entry.to || Date.parse(entry.to) > start));
