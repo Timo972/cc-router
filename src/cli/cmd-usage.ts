@@ -39,15 +39,16 @@ export function formatUsageText(report: UsageReport): string {
   const money = (n: number | null) => n === null ? "unavailable" : `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
   return [
     `Usage ${report.period}: ${report.start.slice(0, 10)} — ${report.end.slice(0, 10)} (UTC, end exclusive)`,
+    // Same four categories the dashboard shows, so the two surfaces read alike.
     `Tokens: ${totalTokens(t).toLocaleString("en-US")} | input ${t.input} | output ${t.output} | cache read ${t.cacheRead} | cache write ${t.cacheWrite}`,
+    // Subscription cost and net savings are hidden for now; the API-equivalent
+    // value is the figure that stands on its own. Both remain in --json.
     `API equivalent: ${money(c.pricedApiUsd)}${c.coverage.pricingComplete ? "" : " (partial; unpriced tokens excluded)"}`,
-    `Subscription: ${money(c.subscriptionUsd)}${c.coverage.subscriptionComplete ? "" : " (partial; configure missing costs)"}`,
-    `Net savings: ${money(c.savingsUsd)}${c.savingsPercent === null ? "" : ` (${c.savingsPercent.toFixed(1)}%)`}`,
     ...report.warnings.map(w => `Warning: ${w}`),
   ].join("\n");
 }
 export function registerUsage(program: Command): void {
-  const usage = program.command("usage").description("Persistent token usage and API-equivalent subscription savings")
+  const usage = program.command("usage").description("Persistent token usage and its API-equivalent cost")
     .option("--period <period>", "day, week, month or year", "month")
     .option("--date <date>", "Date within the selected period (YYYY-MM-DD, UTC)")
     .option("--provider <provider>", "Filter Claude, OpenAI or Grok (repeatable)", (value: string, previous: string[] = []) => [...previous, value])

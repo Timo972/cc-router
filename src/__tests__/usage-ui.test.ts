@@ -144,7 +144,7 @@ it("places warnings below the grid and lets the layout breathe on tall terminals
     await vi.waitFor(() => expect(ui.last()).toContain("Partial: Pricing"));
     const rows = ui.plain().split("\n");
     const warning = rows.findIndex(r => r.includes("Partial: Pricing"));
-    const sunday = rows.findIndex(r => r.startsWith("Su"));
+    const sunday = rows.findIndex(r => r.trimStart().startsWith("Su"));
     const tabs = rows.findIndex(r => r.includes("Month"));
     const totals = rows.findIndex(r => r.includes("tokens  Input"));
     expect(sunday).toBeGreaterThan(0);
@@ -176,7 +176,7 @@ it("widens week columns so the axis labels are not cramped", async () => {
   try {
     await vi.waitFor(() => expect(ui.plain()).toContain("└"));
     const axis = ui.plain().split("\n").find(row => row.includes("└"))!;
-    expect(axis).toMatch(/21\s+22\s+23\s+24\s+25\s+26\s+27/);
+    expect(axis).toMatch(/21\s+22\s+23\s+24\s+25\s+26\s+27\s+day$/);
     const bar = ui.plain().split("\n").find(row => /0 │/.test(row))!;
     // Seven buckets share the width: each column is many cells wide, not two.
     expect(bar.replace(/^.*│/, "").trim().length).toBeGreaterThan(40);
@@ -188,7 +188,7 @@ it("keeps the chart no wider than the grid on wide terminals", async () => {
     await vi.waitFor(() => expect(ui.plain()).toContain("└"));
     const rows = ui.plain().split("\n").map(r => r.trimEnd());
     const chartWidth = Math.max(...rows.filter(r => r.includes("│") || r.includes("└")).map(r => r.length));
-    const gridWidth = Math.max(...rows.filter(r => /^(Mo|Tu|We|Th|Fr|Sa|Su)\s/.test(r)).map(r => r.length));
+    const gridWidth = Math.max(...rows.filter(r => /^ ?(Mo|Tu|We|Th|Fr|Sa|Su)\s/.test(r)).map(r => r.length));
     // Cells are "■ ", so the trimmed grid row is one short of 4 + 53 weeks * 2.
     expect(gridWidth).toBeGreaterThanOrEqual(4 + 53 * 2 - 1);
     expect(chartWidth).toBeLessThanOrEqual(gridWidth + 1);
@@ -217,4 +217,13 @@ it("exits on Escape, but Escape first backs out of help and the model inspector"
   await vi.waitFor(() => expect(ui.plain()).toContain("API cost"));
   ui.key("\u001b");
   await expect(Promise.race([ui.exited, new Promise((_, reject) => setTimeout(() => reject(new Error("did not exit")), 2000))])).resolves.toBeUndefined();
+});
+it("indents every line by one column like the status dashboard", async () => {
+  const ui = mountUsage(async q => report(q), 100, 32);
+  try {
+    await vi.waitFor(() => expect(ui.plain()).toContain("API cost"));
+    const rows = ui.plain().split("\n").filter(row => row.trim().length > 0);
+    expect(rows.length).toBeGreaterThan(3);
+    for (const row of rows) expect(row).toMatch(/^ /);
+  } finally { await ui.close(); }
 });

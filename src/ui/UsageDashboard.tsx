@@ -125,7 +125,8 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
   const describe = (value: number) => `${spend ? money(value) : value.toLocaleString("en-US")} ${unit}`;
   // A fixed frame height, as the status dashboard uses, so the view always fills the terminal
   // and whatever was on screen before scrolls away instead of sitting above a short report.
-  if (helpOpen) return <Box width={width} height={height} flexDirection="column">{[
+  // One column of left padding, like the status dashboard; `width` already leaves room for it.
+  if (helpOpen) return <Box width={width} height={height} paddingLeft={1} flexDirection="column">{[
     "Usage controls (UTC)", "Esc  Back / quit", "Tab / Shift+Tab  Period tab", "← →  Previous / next period", "t  Current period", "1/2/3  Claude/OpenAI/Grok", "m  Model stacks", "s  Tokens / spend", "i  All / input / output", "l  Full model names", "g  Day focus / chart", "↑ ↓  Inspect day (grid)", "← →  Inspect week (grid)", "?  Return to usage", "q quit",
   ].slice(0, height).map((text, i) => line(text, `help${i}`))}</Box>;
   if (modelInspector) {
@@ -138,7 +139,7 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
         ? line(<Text dimColor>Spend unavailable until the router restarts</Text>, "model-spend")
         : line(<><Text bold>Spend {money(totalSpend(selected.usd))}</Text> · <Text color={CATEGORY_COLORS.input}>Input {money(selected.usd.input)}</Text> · <Text color={CATEGORY_COLORS.output}>Output {money(selected.usd.output)}</Text> · <Text color={CATEGORY_COLORS.cache}>Cache {money(selected.usd.cacheRead + selected.usd.cacheWrite)}</Text></>, "model-spend"),
     ] : [];
-    return <Box width={width} height={height} flexDirection="column">{line(`Model ${fullModels.length ? modelIndex % fullModels.length + 1 : 0}/${fullModels.length} · ${selected ? PROVIDER_LABELS[selected.provider] : ""}`, "model-title")}{chunks.slice(0, Math.max(1, height - 3 - detail.length)).map((text, i) => line(text, `model-name${i}`))}{detail}{line("↑↓ browse · l back · q quit", "model-help")}</Box>;
+    return <Box width={width} height={height} paddingLeft={1} flexDirection="column">{line(`Model ${fullModels.length ? modelIndex % fullModels.length + 1 : 0}/${fullModels.length} · ${selected ? PROVIDER_LABELS[selected.provider] : ""}`, "model-title")}{chunks.slice(0, Math.max(1, height - 3 - detail.length)).map((text, i) => line(text, `model-name${i}`))}{detail}{line("↑↓ browse · l back · q quit", "model-help")}</Box>;
   }
   // Spacer lines between sections whenever the viewport can afford them.
   const roomy = height >= 30;
@@ -193,7 +194,8 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
       const fill = columnWidth >= 3 ? columnWidth - 1 : columnWidth;
       for (let row = 0; row < chartHeight; row++) lines.push(line(<><Text dimColor>{(row === 0 ? formatMeasure(chart.max) : row === chartHeight - 1 ? "0" : "").padStart(6)} │</Text>{chart.columns.map((col, i) => <Text key={i} color={col.cells[row] ? colors.get(col.cells[row]!) : undefined}>{(col.cells[row] ? glyphs.get(col.cells[row]!)!.repeat(fill) : " ".repeat(fill)).padEnd(columnWidth)}</Text>)}</>, `bar${row}`));
       const labelStride = columnWidth >= 3 ? 1 : Math.max(1, Math.ceil(chart.columns.length / 8));
-      lines.push(line(<Text dimColor>{"       └"}{chart.columns.map((col, i) => i % labelStride === 0 ? col.label.padStart(2).slice(-2).padEnd(columnWidth) : " ".repeat(columnWidth)).join("")}</Text>, "axis"));
+      const axisUnit = query.period === "day" ? "hour" : query.period === "year" ? "month" : "day";
+      lines.push(line(<Text dimColor>{"       └"}{chart.columns.map((col, i) => i % labelStride === 0 ? col.label.padStart(2).slice(-2).padEnd(columnWidth) : " ".repeat(columnWidth)).join("").trimEnd()}  {axisUnit}</Text>, "axis"));
       const labelWidth = Math.max(5, Math.floor(width / Math.max(1, chart.legend.length)) - 4);
       lines.push(line(<>{chart.legend.map(s => <Text key={s.key} color={colors.get(s.key)}>{glyphs.get(s.key)} {s.label.length > labelWidth ? `${s.label.slice(0, Math.ceil((labelWidth - 1) / 2))}…${s.label.slice(-Math.floor((labelWidth - 1) / 2))}` : s.label}  </Text>)}</>, "legend"));
     }
@@ -229,5 +231,5 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
   if (!report && !loading && !error) lines.push(line("No usage history available.", "nohistory"));
   const help = width >= 96 ? "q quit · ? help · Tab period · ←→ move · t today · 1–3 · m models · s spend · i in/out · g grid · l names" : width >= 38 ? "q quit · ? help · Tab ←→ t 1–3 m s i g l" : "q quit · ? help";
   // Explicit viewport budget prevents Ink from scrolling controls offscreen on resize.
-  return <Box width={width} height={height} flexDirection="column">{lines.slice(0, height - 1)}{line(<Text dimColor>{help}</Text>, "help")}</Box>;
+  return <Box width={width} height={height} paddingLeft={1} flexDirection="column">{lines.slice(0, height - 1)}{line(<Text dimColor>{help}</Text>, "help")}</Box>;
 }

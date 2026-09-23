@@ -108,3 +108,18 @@ it("defaults missing bucket spend from an older router and rejects invalid spend
   const nan = report(); ((nan.buckets as Array<Record<string, unknown>>)[0].series as Record<string, Record<string, unknown>>).a.usd = { ...zeroSpend(), output: Number.NaN };
   expect(() => validateUsageReport(nan)).toThrow(/spend/i);
 });
+
+it("prints the four token categories and only the API-equivalent cost", async () => {
+  const { formatUsageText } = await import("../cli/cmd-usage.js");
+  const { zeroTokens } = await import("../usage/types.js");
+  const totals = { ...zeroTokens(), input: 1_800, output: 83_000, cacheRead: 11_900_000, cacheWrite: 45_000 };
+  const text = formatUsageText({
+    period: "month", start: "2026-09-01T00:00:00.000Z", end: "2026-10-01T00:00:00.000Z", now: "2026-09-21T00:00:00.000Z",
+    buckets: [], days: [], totals, accounts: [], warnings: [],
+    costs: { pricedApiUsd: 12.5, subscriptionUsd: 200, savingsUsd: -187.5, savingsPercent: -1500,
+      coverage: { pricedTokens: 1, unpricedTokens: 0, pricingComplete: true, configuredAccounts: 1, unconfiguredAccounts: 0, subscriptionComplete: true, trackingComplete: true, persistenceHealthy: true } },
+  });
+  expect(text).toContain("input 1800 | output 83000 | cache read 11900000 | cache write 45000");
+  expect(text).toContain("API equivalent: $12.50");
+  expect(text).not.toMatch(/Subscription:|Net savings/);
+});
