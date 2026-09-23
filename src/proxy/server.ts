@@ -4,6 +4,8 @@ import { createUsageRouter } from "../usage/http.js";
 import { usageDirectoryForAccounts, withUsageRename } from "../usage/account-lifecycle.js";
 import { consumeCodexResetCredit, type CodexResetResult } from "../providers/openai/usage-reset.js";
 import { createUsageResetHandler } from "./account-usage-reset.js";
+import { createClaudeResetConsumer } from "./claude-usage-reset.js";
+import { publicLimitResets, type PublicLimitResets } from "./public-limit-resets.js";
 import express from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
 import { ServerResponse } from "http";
@@ -203,6 +205,7 @@ export interface PublicUsageSnapshot {
   sevenDay?: PublicRateLimitWindow;
   modelLimits: PublicModelRateLimit[];
   extraUsage?: { enabled: boolean; spendLimitReached: boolean; usable: boolean };
+  limitResets?: PublicLimitResets;
   fetchedAt: number;
   fetchStatus: "fresh" | "stale" | "unavailable";
 }
@@ -434,6 +437,7 @@ function publicUsageSnapshot(usage: NonNullable<AccountRateLimits["usage"]>): Pu
         usable: usage.fetchStatus === "fresh" && canUseExtraUsage(usage.extraUsage),
       },
     } : {}),
+    ...(usage.limitResets ? { limitResets: publicLimitResets(usage.limitResets) } : {}),
     fetchedAt: publicTimestamp(usage.fetchedAt),
     fetchStatus: usage.fetchStatus,
   };
@@ -979,14 +983,42 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // the SSE streaming on /v1/* is never touched (see comment at /v1 handler).
   const accountsRouter = express.Router();
   accountsRouter.use(express.json({ limit: "32kb" }));
-  accountsRouter.post("/:id/reset-usage", createUsageResetHandler<OpenAIAccount, CodexResetResult>({
+  const openAIReset = createUsageResetHandler<OpenAIAccount, CodexResetResult>({
     provider: "openai",
     findAccount: id => openAIAccounts.find(account => account.id === id),
     prepare: account => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     consume: consumeCodexResetCredit,
     captureReset: account => openAIPool.captureUsageReset(account),
     refresh: account => openAIUsageRefresher.refreshAfterCurrent(account),
-  }));
+  });
+  // The org UUID is identity metadata the profile fetch already caches.
+  const claudeOrgUuid = async (account: Account): Promise<string | undefined> => {
+    const source = () => accountInfoSources().find(row => row.provider === "anthropic_subscription" && row.id === account.id);
+    const first = source();
+    if (!first) return undefined;
+    const cached = accountInfoCache.get(first).workspaceId;
+    if (cached) return cached;
+    await accountInfoCache.refreshOne({ id: account.id, provider: "anthropic_subscription" });
+    const again = source();
+    return again ? accountInfoCache.get(again).workspaceId : undefined;
+  };
+  const claudeReset = createUsageResetHandler({
+    provider: "anthropic",
+    findAccount: id => pool.findById(id) ?? undefined,
+    prepare: async account => {
+      if (account.authExpired) return false;
+      if (needsRefresh(account)) await refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts });
+      return !account.authExpired && account.tokens.expiresAt > Date.now();
+    },
+    consume: createClaudeResetConsumer({ orgUuid: claudeOrgUuid }),
+    refresh: account => usageRefresher.refreshAfterCurrent(account),
+  });
+  accountsRouter.post("/:id/reset-usage", (req, res, next) => {
+    const id = req.params.id;
+    if (openAIAccounts.some(account => account.id === id)) return openAIReset(req, res, next);
+    if (pool.findById(id)) return claudeReset(req, res, next);
+    res.status(404).json({ error: "Account not found" });
+  });
 
   // ─── Per-account refresh (authenticated) ──────────────────────────────────
   // The whole-pool reload above, narrowed to one row: the operator who just
