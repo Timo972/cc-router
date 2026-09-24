@@ -66,16 +66,27 @@ export function chartColumns(buckets: ChartBucket[], width: number, height: numb
   const max = Math.max(0, ...groups.map(g => sum(g.values)));
   const columns = groups.map(group => {
     const total = sum(group.values);
-    const filled = max > 0 ? Math.max(total > 0 ? 1 : 0, Math.round(total / max * rows)) : 0;
+    // Like the column total, every present series keeps at least one cell: a provider at a few
+    // percent of the bucket otherwise rounds to nothing and the bar reads as the other one alone.
+    const present = legend.filter(item => (group.values.get(item.key) ?? 0) > 0).length;
+    const filled = max > 0 ? Math.min(rows, Math.max(present, Math.round(total / max * rows))) : 0;
     const allocations = legend.map(item => {
       const exact = total > 0 ? (group.values.get(item.key) ?? 0) / total * filled : 0;
-      return { key: item.key, cells: Math.floor(exact), fraction: exact % 1 };
+      return { key: item.key, exact, cells: Math.floor(exact), fraction: exact % 1 };
     });
     let remaining = filled - allocations.reduce((n, a) => n + a.cells, 0);
+    for (const a of allocations) if (a.exact > 0 && a.cells === 0) { a.cells = 1; a.fraction = 0; remaining--; }
     for (const a of [...allocations].sort((a, b) => b.fraction - a.fraction)) {
-      if (remaining-- > 0) a.cells++;
+      if (remaining > 0 && a.fraction > 0) { a.cells++; remaining--; }
     }
-    const stack = allocations.flatMap(a => Array<string>(a.cells).fill(a.key));
+    // Minimum cells may overdraw the column; take the excess back from the largest series.
+    while (remaining < 0) {
+      const largest = allocations.reduce((a, b) => b.cells > a.cells ? b : a);
+      if (largest.cells <= 1) break;
+      largest.cells--; remaining++;
+    }
+    // More series than rows: a column never grows taller than the chart.
+    const stack = allocations.flatMap(a => Array<string>(a.cells).fill(a.key)).slice(0, filled);
     return { label: group.label, total, cells: [...Array<null>(rows - filled).fill(null), ...stack.reverse()] };
   });
   return { columns, legend, max };

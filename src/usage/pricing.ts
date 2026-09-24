@@ -6,18 +6,28 @@ import type { UsageProvider, UsageRates } from "./types.js";
  * Verified against these official pages on 2026-09-16. Never prefix-match models.
  * Unknown cache-write duration stays unpriced unless the user supplies a rate. */
 const VERIFIED = "2026-09-16";
+/** Opus 5.5 and the GPT-6 / GPT-5.6 families, verified against the same pages. */
+const VERIFIED_2026_09_24 = "2026-09-24";
 const ANTHROPIC = "https://platform.claude.com/docs/en/about-claude/pricing";
 const OPENAI = "https://developers.openai.com/api/docs/pricing";
 export interface PricingOverride extends UsageRates { provider: UsageProvider; model: string }
 
-const claude = (model: string, input: number, output: number, cacheRead = input / 10): PricingOverride => ({
+const claude = (model: string, input: number, output: number, cacheRead = input / 10, effectiveDate = VERIFIED): PricingOverride => ({
   provider: "anthropic_subscription", model, input, output, cacheRead,
-  cacheWrite5m: input * 1.25, cacheWrite1h: input * 2, source: ANTHROPIC, effectiveDate: VERIFIED,
+  cacheWrite5m: input * 1.25, cacheWrite1h: input * 2, source: ANTHROPIC, effectiveDate,
 });
-const codex = (model: string, input: number, output: number, source = OPENAI): PricingOverride => ({
-  provider: "openai_subscription", model, input, output, cacheRead: input / 10, source, effectiveDate: VERIFIED,
+const codex = (model: string, input: number, output: number, source = OPENAI, effectiveDate = VERIFIED): PricingOverride => ({
+  provider: "openai_subscription", model, input, output, cacheRead: input / 10, source, effectiveDate,
 });
+const modelPage = (model: string) => `https://developers.openai.com/api/docs/models/${model}`;
+/** Short-context (<=272K input) rates; longer prompts stay unpriced, see LONG_CONTEXT_272K. */
+const GPT_6_AND_5_6: ReadonlyArray<[string, number, number]> = [
+  ["gpt-6-astra", 10, 50], ["gpt-6-sol", 2, 10], ["gpt-6-luna", 0.1, 0.5],
+  ["gpt-5.6-sol", 4, 20], ["gpt-5.6-terra", 2, 12], ["gpt-5.6-luna", 0.2, 1.2],
+];
+const LONG_CONTEXT_272K = new Set(["gpt-5.4", "gpt-5.4-2026-03-05", "gpt-5.5", "gpt-5.5-2026-04-23", ...GPT_6_AND_5_6.map(([model]) => model)]);
 const CATALOG: readonly PricingOverride[] = [
+  claude("claude-opus-5-5", 4, 20, 0.2, VERIFIED_2026_09_24),
   ...["claude-fable-5-1", "claude-mythos-5-1"].map(model => claude(model, 10, 50, 0.25)),
   ...["claude-fable-5", "claude-mythos-5"].map(model => claude(model, 10, 50)),
   ...["claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-5-20251101"].map(model => claude(model, 5, 25)),
@@ -31,6 +41,8 @@ const CATALOG: readonly PricingOverride[] = [
   codex("gpt-5.3-codex", 1.75, 14),
   ...["gpt-5.5", "gpt-5.5-2026-04-23"].map(model => codex(model, 5, 30, "https://developers.openai.com/api/docs/models/gpt-5.5")),
   ...["gpt-5.4", "gpt-5.4-2026-03-05"].map(model => codex(model, 2.5, 15, "https://developers.openai.com/api/docs/models/gpt-5.4")),
+  ...GPT_6_AND_5_6.map(([model, input, output]) => codex(model, input, output, modelPage(model), VERIFIED_2026_09_24)),
+  codex("gpt-5.6-cyber", 12.5, 75, OPENAI, VERIFIED_2026_09_24),
 ];
 
 export function lookupUsageRates(
@@ -40,7 +52,7 @@ export function lookupUsageRates(
   const rate = override ?? CATALOG.find(rate => rate.provider === provider && rate.model === model);
   if (!rate) return undefined;
   // Never use short-context rates for a prompt that might have tiered pricing.
-  const threshold = provider === "openai_subscription" && ["gpt-5.4", "gpt-5.4-2026-03-05", "gpt-5.5", "gpt-5.5-2026-04-23"].includes(model) ? 272_000
+  const threshold = provider === "openai_subscription" && LONG_CONTEXT_272K.has(model) ? 272_000
     : provider === "anthropic_subscription" && ["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"].includes(model) ? 200_000 : undefined;
   if (inputContext !== undefined && (!Number.isSafeInteger(inputContext) || inputContext < 0)) return undefined;
   if (!override && threshold !== undefined && (inputContext === undefined || inputContext > threshold)) return undefined;

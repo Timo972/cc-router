@@ -18,6 +18,18 @@ describe("usage pricing", () => {
     expect(lookupUsageRates("openai_subscription", "gpt-5.4", 272_000)?.input).toBe(2.5);
     expect(lookupUsageRates("openai_subscription", "gpt-5.4", 272_001)).toBeUndefined();
     expect(lookupUsageRates("anthropic_subscription", "claude-sonnet-4-5", 200_001)).toBeUndefined();
+    expect(lookupUsageRates("openai_subscription", "gpt-6-sol", 272_001)).toBeUndefined();
+    expect(lookupUsageRates("openai_subscription", "gpt-6-astra")).toBeUndefined();
+  });
+  it("prices the Opus 5.5, GPT-6 and GPT-5.6 models the router sees today", () => {
+    expect(lookupUsageRates("anthropic_subscription", "claude-opus-5-5")).toMatchObject({ input: 4, output: 20, cacheRead: 0.2, cacheWrite5m: 5, cacheWrite1h: 8 });
+    expect(lookupUsageRates("openai_subscription", "gpt-6-astra", 100)).toMatchObject({ input: 10, output: 50, cacheRead: 1 });
+    expect(lookupUsageRates("openai_subscription", "gpt-6-sol", 272_000)).toMatchObject({ input: 2, output: 10, cacheRead: 0.2 });
+    expect(lookupUsageRates("openai_subscription", "gpt-6-luna", 100)).toMatchObject({ input: 0.1, output: 0.5, cacheRead: 0.01 });
+    expect(lookupUsageRates("openai_subscription", "gpt-5.6-sol", 100)).toMatchObject({ input: 4, output: 20, cacheRead: 0.4 });
+    expect(lookupUsageRates("openai_subscription", "gpt-5.6-terra", 100)).toMatchObject({ input: 2, output: 12, cacheRead: 0.2 });
+    expect(lookupUsageRates("openai_subscription", "gpt-5.6-luna", 100)).toMatchObject({ input: 0.2, output: 1.2, cacheRead: 0.02 });
+    expect(lookupUsageRates("openai_subscription", "gpt-5.6-cyber", 900_000)).toMatchObject({ input: 12.5, output: 75, cacheRead: 1.25 });
   });
   it("keeps supported long-context rates and rejects invalid tier context", () => {
     expect(lookupUsageRates("anthropic_subscription", "claude-sonnet-4-6", 900_000)?.input).toBe(3);

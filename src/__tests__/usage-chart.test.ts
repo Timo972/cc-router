@@ -53,3 +53,27 @@ it("gives colliding model colors distinct stack glyphs", () => {
   const two = { key: "anthropic_subscription:claude-haiku-4-5", label: "haiku", provider: "anthropic_subscription" };
   expect(legendGlyph(one, 0, true)).not.toBe(legendGlyph(two, 1, true));
 });
+
+it("keeps a small provider visible in the stack instead of rounding it away", () => {
+  const hour = (claude: number, openai: number) => ({ label: "13", series: [
+    { provider: "anthropic_subscription", model: "claude", tokens: claude },
+    { provider: "openai_subscription", model: "gpt", tokens: openai },
+  ] });
+  // Real hourly shape: OpenAI at ~2% of Claude used to get zero of eight cells.
+  const { columns } = chartColumns([hour(115_900_000, 4_200_000), hour(52_100_000, 1_100_000)], 2, 8, false);
+  for (const column of columns) {
+    const cells = column.cells.filter(Boolean);
+    expect(cells).toContain("openai_subscription");
+    expect(cells.filter(key => key === "anthropic_subscription").length).toBeGreaterThan(1);
+  }
+  // A one-cell column still shows both series rather than only the larger one.
+  const tiny = chartColumns([hour(1_000_000, 10), hour(100_000_000, 0)], 2, 8, false).columns[0].cells.filter(Boolean);
+  expect(new Set(tiny)).toEqual(new Set(["anthropic_subscription", "openai_subscription"]));
+  // Bars still stack bottom-up in legend order: the first series sits at the base.
+  expect(columns[0].cells.at(-1)).toBe("anthropic_subscription");
+});
+
+it("never draws a column taller than the chart when series outnumber rows", () => {
+  const series = Array.from({ length: 6 }, (_, i) => ({ provider: "anthropic_subscription", model: `m${i}`, tokens: 1000 * (i + 1) }));
+  for (const column of chartColumns([{ label: "01", series }], 1, 2, true).columns) expect(column.cells).toHaveLength(2);
+});
