@@ -69,12 +69,22 @@ export function chartColumns(buckets: ChartBucket[], width: number, height: numb
     const filled = max > 0 ? Math.max(total > 0 ? 1 : 0, Math.round(total / max * rows)) : 0;
     const allocations = legend.map(item => {
       const exact = total > 0 ? (group.values.get(item.key) ?? 0) / total * filled : 0;
-      return { key: item.key, cells: Math.floor(exact), fraction: exact % 1 };
+      return { key: item.key, exact, cells: Math.floor(exact), fraction: exact % 1 };
     });
+    // Height stays tied to the total. Within it every series keeps at least one cell, so a provider
+    // at a few percent of the bucket no longer rounds to nothing and leaves the other one alone;
+    // when series outnumber the cells, the largest contributors get them.
+    const visible = new Set(allocations.filter(a => a.exact > 0).sort((a, b) => b.exact - a.exact).slice(0, filled));
+    for (const a of allocations) if (!visible.has(a)) a.fraction = 0;
     let remaining = filled - allocations.reduce((n, a) => n + a.cells, 0);
+    for (const a of visible) if (a.cells === 0) { a.cells = 1; a.fraction = 0; remaining--; }
     for (const a of [...allocations].sort((a, b) => b.fraction - a.fraction)) {
-      if (remaining-- > 0) a.cells++;
+      if (remaining > 0 && a.fraction > 0) { a.cells++; remaining--; }
     }
+    // Minimum cells may overdraw the column, or dropped fractions underfill it: settle on the largest series.
+    const largest = () => allocations.reduce((a, b) => b.cells > a.cells ? b : a);
+    while (remaining < 0 && largest().cells > 1) { largest().cells--; remaining++; }
+    while (remaining > 0) { largest().cells++; remaining--; }
     const stack = allocations.flatMap(a => Array<string>(a.cells).fill(a.key));
     return { label: group.label, total, cells: [...Array<null>(rows - filled).fill(null), ...stack.reverse()] };
   });
