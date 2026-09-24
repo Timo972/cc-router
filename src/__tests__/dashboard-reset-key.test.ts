@@ -325,6 +325,66 @@ describe("dashboard Ctrl+R Claude limit reset", () => {
     } finally { await dash.cleanup(); }
   });
 
+  it("keeps the reviewed offer fixed and sends nothing if the grant changes while confirming", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      let changed = false;
+      let healthPolls = 0;
+      vi.mocked(globalThis.fetch).mockImplementation((url) => {
+        if (String(url).endsWith("/reset-usage")) {
+          return Promise.resolve(Response.json({ reset: { provider: "anthropic", code: "reset", usageRefreshed: true } }));
+        }
+        if (changed) healthPolls++;
+        return Promise.resolve(Response.json(changed
+          ? claudeHealth({ ...OK_RESETS, useBy: 1_795_000_000, clears: ["seven_day_opus"] })
+          : claudeHealth()));
+      });
+      await dash.press("\t");
+      await dash.press("\u0012");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Refills 5h + 7d limits"));
+      changed = true;
+      await dash.waitUntil(() => expect(healthPolls).toBeGreaterThan(1));
+      expect(dash.lastFrame()).toContain("Refills 5h + 7d limits"); // what the operator is reviewing
+      expect(dash.lastFrame()).not.toContain("7d Opus");
+      await dash.press("y");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset offer changed while you were confirming"));
+      await new Promise(r => setTimeout(r, 50));
+      expect(vi.mocked(globalThis.fetch).mock.calls.filter(([u]) => String(u).endsWith("/reset-usage"))).toHaveLength(0);
+    } finally { await dash.cleanup(); }
+  }, 15_000);
+
+  it("still sends a retry of a possibly-spent id after the grant moved", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      const bodies: Array<{ retry: boolean }> = [];
+      let moved = false;
+      let healthPolls = 0;
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) => {
+        if (String(url).endsWith("/reset-usage")) {
+          bodies.push(JSON.parse(init!.body as string));
+          return Promise.resolve(bodies.length === 1
+            ? Response.json({ error: "Reset outcome unknown" }, { status: 502 })
+            : Response.json({ reset: { provider: "anthropic", code: "already_used", usageRefreshed: true, replay: true } }));
+        }
+        if (moved) healthPolls++;
+        return Promise.resolve(Response.json(moved ? claudeHealth({ ...OK_RESETS, useBy: 1_795_000_000 }) : claudeHealth()));
+      });
+      await dash.press("\t");
+      await dash.press("\u0012");
+      await dash.press("y");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset outcome unknown for claude-1"));
+      await dash.press("\u0012");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "claude-1"'));
+      moved = true; // e.g. the first attempt spent this grant and the next one differs
+      await dash.waitUntil(() => expect(healthPolls).toBeGreaterThan(1));
+      await dash.press("y");
+      await dash.waitUntil(() => expect(bodies).toHaveLength(2));
+      expect(bodies[1]!.retry).toBe(true);
+    } finally { await dash.cleanup(); }
+  }, 15_000);
+
   it("flags a same-id retry only after an unknown outcome, and drops an id the router abandons", async () => {
     const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
     try {

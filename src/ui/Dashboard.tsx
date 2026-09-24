@@ -412,6 +412,12 @@ export function claudeResetBlocker(account: Pick<AccountStat, "rateLimits">): st
   return undefined;
 }
 
+/** Whether two Claude offers carry the same terms the confirmation shows. */
+export function sameResetOffer(a: LimitResetsView, b: LimitResetsView): boolean {
+  return a.useBy === b.useBy && a.clearsOther === b.clearsOther
+    && a.clears.length === b.clears.length && a.clears.every((window, i) => window === b.clears[i]);
+}
+
 export function claudeResetConfirmText(id: string, resets: LimitResetsView): string {
   const windows = resets.clears.map(window => RESET_WINDOW_LABELS[window]).filter(Boolean);
   if (resets.clearsOther) windows.push("other");
@@ -1013,6 +1019,9 @@ function LiveDashboard({
   const [focus, setFocus] = useState<Focus>("logs");
   const [mode, setMode] = useState<Mode>("view");
   const [resetTarget, setResetTarget] = useState<string | null>(null);
+  // The Claude offer as it stood when the confirmation opened: what is shown
+  // and what is sent, however polls move the live grant meanwhile.
+  const [resetOffer, setResetOffer] = useState<LimitResetsView | null>(null);
   // Compact ("zen") view: hides TOTALS + RECENT ACTIVITY so the account list
   // gets the whole vertical budget — the fix for a short terminal starving a
   // long fleet (e.g. showing 1 of 11 accounts). Toggled with [z], view-only,
@@ -1480,9 +1489,18 @@ function LiveDashboard({
     }
 
     if (mode === "confirmReset") {
-      if ((input === "y" || input === "Y") && resetTarget) void doResetUsage(resetTarget, resetTargetClaudeResets);
-      else showBanner("Reset cancelled", "gray");
+      if ((input === "y" || input === "Y") && resetTarget) {
+        // A retry of a possibly-sent id must go out to learn its outcome; an
+        // earlier spend may well have moved the next grant.
+        const retrying = resetSession.pendingIds.get(resetTarget)?.maybeSubmitted === true;
+        if (resetOffer && !retrying && (!resetTargetClaudeResets || !sameResetOffer(resetOffer, resetTargetClaudeResets))) {
+          showBanner("Reset offer changed while you were confirming — press Ctrl+R to review it; nothing sent", "yellow");
+        } else {
+          void doResetUsage(resetTarget, resetOffer ?? undefined);
+        }
+      } else showBanner("Reset cancelled", "gray");
       setResetTarget(null);
+      setResetOffer(null);
       setMode("view");
       return;
     }
@@ -1526,6 +1544,7 @@ function LiveDashboard({
         showBanner("No reset credits available", "yellow"); return;
       }
       setResetTarget(selectedAccount.id);
+      setResetOffer(isClaudeAccount(selectedAccount) ? selectedAccount.rateLimits?.usage?.limitResets ?? null : null);
       setMode("confirmReset");
       return;
     }
@@ -1718,8 +1737,8 @@ function LiveDashboard({
       )}
       {mode === "confirmReset" && resetTarget && (
         <Box paddingLeft={2}>
-          <Text color="yellow" bold>{resetTargetClaudeResets
-            ? `${claudeResetConfirmText(resetTarget, resetTargetClaudeResets)}  [y] yes  [n/Esc] cancel`
+          <Text color="yellow" bold>{resetOffer
+            ? `${claudeResetConfirmText(resetTarget, resetOffer)}  [y] yes  [n/Esc] cancel`
             : `Redeem 1 reset for "${resetTarget}"?  [y] yes  [n/Esc] cancel`}</Text>
         </Box>
       )}
