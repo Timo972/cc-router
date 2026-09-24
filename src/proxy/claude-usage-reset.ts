@@ -3,9 +3,12 @@ import { ResetNotSubmittedError } from "./reset-errors.js";
 import { consumeClaudeLimitReset, type ClaudeResetResult } from "../providers/anthropic/usage-reset.js";
 
 export interface ClaudeResetConsumerDeps {
-  orgUuid(account: Account): Promise<string | undefined>;
+  /** Who the account's credentials currently sign in as: organization and Anthropic account UUIDs. */
+  identity(account: Account): Promise<ClaudeResetIdentity | undefined>;
   consume?: typeof consumeClaudeLimitReset;
 }
+
+export interface ClaudeResetIdentity { org: string; principal: string }
 
 export interface ClaudeResetAttempt {
   /** The client already sent this id once and never learned the outcome. */
@@ -30,13 +33,13 @@ function offerMatches(offer: unknown, grant: LimitResetGrant): boolean {
 const MAX_PINNED_PER_ACCOUNT = 8;
 
 /**
- * Binds each redemption id to the grant and organization it first targeted. A replay after an
- * unknown outcome must hit the same grant, or a moved `next_grant_id` would
- * turn "retry" into "spend a second reset".
+ * Binds each redemption id to the grant and account holder it first
+ * targeted. A replay after an unknown outcome must hit the same grant, or a
+ * moved `next_grant_id` would turn "retry" into "spend a second reset".
  *
  * Pins are keyed by account id, not the Account object, so a re-auth that
- * replaces the object keeps them. They live in memory only, and each account
- * keeps its 8 most recent ids. A retry whose pin is gone (router restart,
+ * replaces the object keeps them, and a rename moves them. They live in
+ * memory only, and each account keeps its 8 most recent ids. A retry whose pin is gone (router restart,
  * eviction) is refused before sending rather than re-derived: its original
  * grant can no longer be named, and only fresh usage can tell whether it was
  * spent. A pin is written only right before the claim is sent, and dropped
@@ -48,7 +51,7 @@ const MAX_PINNED_PER_ACCOUNT = 8;
  */
 export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
   const consume = deps.consume ?? consumeClaudeLimitReset;
-  const pinned = new Map<string /* account.id */, Map<string /* requestId */, { grantId: string; org: string }>>();
+  const pinned = new Map<string /* account.id */, Map<string /* requestId */, { grantId: string } & ClaudeResetIdentity>>();
   const run = async (account: Account, requestId: string, attempt: ClaudeResetAttempt = {}): Promise<ClaudeResetResult> => {
     const pin = pinned.get(account.id)?.get(requestId);
     let grantId = pin?.grantId;
@@ -70,20 +73,22 @@ export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
       }
       grantId = next.id;
     }
-    const org = await deps.orgUuid(account);
-    if (!org) throw new ResetNotSubmittedError(503, "Organization unknown; reset not submitted");
-    // Grant ids are shared across accounts: re-authenticating this id as a
-    // different Anthropic account must not aim the old claim at the new
-    // organization's reset. Only its own organization can settle it.
-    if (pin && pin.org !== org) {
+    const who = await deps.identity(account);
+    if (!who?.org || !who.principal) throw new ResetNotSubmittedError(503, "Account identity unknown; reset not submitted");
+    const { org, principal } = who;
+    // Grant ids are shared across accounts (and teammates): re-authenticating
+    // this id as anyone else — another organization, or another member of the
+    // same one — must not aim the old claim at their reset. Only the
+    // original account holder can settle it.
+    if (pin && (pin.org !== org || pin.principal !== principal)) {
       throw new ResetNotSubmittedError(409,
-        "Account now signs in to a different organization than the earlier reset attempt — check rst before redeeming again; nothing sent", true);
+        "Account now signs in as someone other than the earlier reset attempt — check rst before redeeming again; nothing sent", true);
     }
     let pins = pinned.get(account.id);
     if (!pins) pinned.set(account.id, pins = new Map());
     const firstAttempt = !pins.has(requestId);
     if (firstAttempt) {
-      pins.set(requestId, { grantId, org });
+      pins.set(requestId, { grantId, org, principal });
       while (pins.size > MAX_PINNED_PER_ACCOUNT) pins.delete(pins.keys().next().value!);
     }
     // Other grants are untouched by this claim; summing them with the
@@ -105,5 +110,12 @@ export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
   };
   /** Whether this id was already sent for this account id — survives re-auth, unlike per-object state. */
   const isReplay = (account: Account, requestId: string): boolean => pinned.get(account.id)?.has(requestId) === true;
-  return Object.assign(run, { isReplay });
+  /** Called by the rename transaction (and its rollback): pins follow the router id. */
+  const renameAccount = (oldId: string, newId: string): void => {
+    const pins = pinned.get(oldId);
+    if (!pins) return;
+    pinned.delete(oldId);
+    pinned.set(newId, pins);
+  };
+  return Object.assign(run, { isReplay, renameAccount });
 }

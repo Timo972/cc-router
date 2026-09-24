@@ -11,6 +11,7 @@ import { DEFAULT_RATE_LIMITS, type Account } from "../proxy/types.js";
 const servers: Server[] = [];
 afterEach(async () => { for (const s of servers.splice(0)) await new Promise<void>(r => s.close(() => r())); });
 const ORG = "0f1e2d3c-4b5a-4968-8776-5a4b3c2d1e0f";
+const USER = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
 const REQ = "12345678-1234-4234-8234-123456789abc";
 const START = 1_000_000_000_000;
 const block = { eligible: true, grants: [{ id: "grant-a", resets_left: 1, clears: ["five_hour", "seven_day"], usable_now: true, use_requires_limit: false }], next_grant_id: "grant-a" };
@@ -43,7 +44,7 @@ async function run(kind: "quota" | "overload") {
     provider: "anthropic",
     findAccount: id => pool.findById(id) ?? undefined,
     prepare: async () => true,
-    consume: createClaudeResetConsumer({ orgUuid: async () => ORG, consume }),
+    consume: createClaudeResetConsumer({ identity: async () => ({ org: ORG, principal: USER }), consume }),
     refresh: account => refresher.refreshAfterCurrent(account),
   }));
   const server = createServer(app); servers.push(server);

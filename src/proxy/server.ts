@@ -991,20 +991,22 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     captureReset: account => openAIPool.captureUsageReset(account),
     refresh: account => openAIUsageRefresher.refreshAfterCurrent(account),
   });
-  // The org UUID is identity metadata the profile fetch already caches.
-  const claudeOrgUuid = async (account: Account): Promise<string | undefined> => {
-    const source = () => accountInfoSources().find(row => row.provider === "anthropic_subscription" && row.id === account.id);
-    const first = source();
-    if (!first) return undefined;
-    const cached = accountInfoCache.get(first).workspaceId;
+  // Org and account UUIDs are identity metadata the profile fetch already
+  // caches (keyed to the current token, so a re-auth reads the new holder).
+  const claudeIdentity = async (account: Account): Promise<{ org: string; principal: string } | undefined> => {
+    const read = () => {
+      const source = accountInfoSources().find(row => row.provider === "anthropic_subscription" && row.id === account.id);
+      const info = source ? accountInfoCache.get(source) : undefined;
+      return info?.workspaceId && info.accountId ? { org: info.workspaceId, principal: info.accountId } : undefined;
+    };
+    const cached = read();
     if (cached) return cached;
     // Nothing is submitted yet: a failed profile fetch must read as "not
     // submitted" (the consumer's 503), never as an unknown outcome.
     try { await accountInfoCache.refreshOne({ id: account.id, provider: "anthropic_subscription" }); } catch { /* re-read below */ }
-    const again = source();
-    return again ? accountInfoCache.get(again).workspaceId : undefined;
+    return read();
   };
-  const claudeResetConsumer = createClaudeResetConsumer({ orgUuid: claudeOrgUuid });
+  const claudeResetConsumer = createClaudeResetConsumer({ identity: claudeIdentity });
   const claudeReset = createUsageResetHandler({
     provider: "anthropic",
     findAccount: id => pool.findById(id) ?? undefined,
@@ -1250,7 +1252,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         renameAccountTransaction(id, newId, takenIds, inAnthropic
           ? {
               rename: (oldId, nextId) => pool.renameAccount(oldId, nextId) !== null,
-              renameSessions: (oldId, nextId) => { sessionRouter.renameAccount(oldId, nextId); },
+              // Reset pins follow the id too (and back again on rollback), so an
+              // unknown-outcome redemption stays retryable under the new name.
+              renameSessions: (oldId, nextId) => {
+                sessionRouter.renameAccount(oldId, nextId);
+                claudeResetConsumer.renameAccount(oldId, nextId);
+              },
               persist: () => withUsageRename(accountsFile, id, newId, () => persistAnthropicAccounts(pool.getAll())),
             }
           : {
