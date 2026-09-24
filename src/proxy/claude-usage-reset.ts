@@ -39,8 +39,12 @@ const MAX_PINNED_PER_ACCOUNT = 8;
  * keeps its 8 most recent ids. A retry whose pin is gone (router restart,
  * eviction) is refused before sending rather than re-derived: its original
  * grant can no longer be named, and only fresh usage can tell whether it was
- * spent. A pin is written only right before the claim is sent: a refusal
- * before submission (409/503) leaves nothing pinned.
+ * spent. A pin is written only right before the claim is sent, and dropped
+ * again if that first claim provably never left (409/503): a refusal before
+ * submission leaves nothing pinned.
+ *
+ * The returned `resetsLeft` is account-wide (the redeemed grant's count plus
+ * the other non-paused grants), matching the rst column.
  */
 export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
   const consume = deps.consume ?? consumeClaudeLimitReset;
@@ -77,11 +81,27 @@ export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
     }
     let pins = pinned.get(account.id);
     if (!pins) pinned.set(account.id, pins = new Map());
-    if (!pins.has(requestId)) {
+    const firstAttempt = !pins.has(requestId);
+    if (firstAttempt) {
       pins.set(requestId, { grantId, org });
       while (pins.size > MAX_PINNED_PER_ACCOUNT) pins.delete(pins.keys().next().value!);
     }
-    return consume(account, org, grantId, requestId);
+    // Other grants are untouched by this claim; summing them with the
+    // returned per-grant count matches the rst column (non-paused grants).
+    const othersLeft = (account.rateLimits.usage?.limitResets?.grants ?? [])
+      .filter(grant => grant.id !== grantId && !grant.paused)
+      .reduce((sum, grant) => sum + grant.resetsLeft, 0);
+    let result: ClaudeResetResult;
+    try {
+      result = await consume(account, org, grantId, requestId);
+    } catch (error) {
+      // A first claim that provably never left must not bind this id: the
+      // next press may confirm a different offer. A pin from an earlier,
+      // possibly-sent attempt stays — that one still needs its own grant.
+      if (firstAttempt && error instanceof ResetNotSubmittedError) pinned.get(account.id)?.delete(requestId);
+      throw error;
+    }
+    return result.resetsLeft === undefined ? result : { ...result, resetsLeft: othersLeft + result.resetsLeft };
   };
   /** Whether this id was already sent for this account id — survives re-auth, unlike per-object state. */
   const isReplay = (account: Account, requestId: string): boolean => pinned.get(account.id)?.has(requestId) === true;

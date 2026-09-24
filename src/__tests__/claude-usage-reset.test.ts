@@ -125,6 +125,50 @@ describe("Claude reset consumer", () => {
     expect(consume).not.toHaveBeenCalled();
   });
 
+  it("forgets a pin whose first claim was provably never sent", async () => {
+    const consume = vi.fn()
+      .mockRejectedValueOnce(new ResetNotSubmittedError(503, "Account credentials rejected; reset not submitted"))
+      .mockResolvedValue({ code: "reset" });
+    const a = claude(state("grant-a"));
+    const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
+    await expect(run(a, R1, { offer: OFFER })).rejects.toBeInstanceOf(ResetNotSubmittedError);
+    expect(run.isReplay(a, R1)).toBe(false);
+    a.rateLimits.usage!.limitResets = state("grant-b"); // credentials repaired, a new offer confirmed
+    await run(a, R1, { offer: OFFER });
+    expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-b", R1);
+  });
+
+  it("keeps an earlier unknown attempt's pin when a later retry is refused unsent", async () => {
+    const consume = vi.fn()
+      .mockRejectedValueOnce(new Error("outcome unknown"))
+      .mockRejectedValueOnce(new ResetNotSubmittedError(503, "Account credentials rejected; reset not submitted"))
+      .mockResolvedValue({ code: "already_used" });
+    const a = claude(state("grant-a"));
+    const run = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
+    await expect(run(a, R1, { offer: OFFER })).rejects.toThrow("outcome unknown");
+    await expect(run(a, R1, { retry: true })).rejects.toBeInstanceOf(ResetNotSubmittedError);
+    a.rateLimits.usage!.limitResets = state("grant-b");
+    await run(a, R1, { retry: true });
+    expect(consume).toHaveBeenLastCalledWith(a, ORG, "grant-a", R1);
+  });
+
+  it("reports the account-wide count left, not just the redeemed grant's", async () => {
+    const two: LimitResetState = {
+      ...state("grant-a"),
+      grants: [
+        state("grant-a").grants[0]!,
+        { ...state("grant-b").grants[0]!, resetsLeft: 2 },
+        { ...state("grant-c").grants[0]!, resetsLeft: 5, paused: true }, // rst ignores paused grants too
+      ],
+    };
+    const consume = vi.fn().mockResolvedValue({ code: "reset", resetsLeft: 0 });
+    const result = await createClaudeResetConsumer({ orgUuid: async () => ORG, consume })(claude(two), R1, { offer: OFFER });
+    expect(result).toEqual({ code: "reset", resetsLeft: 2 });
+    consume.mockResolvedValue({ code: "not_limited" }); // no count reported → none invented
+    expect(await createClaudeResetConsumer({ orgUuid: async () => ORG, consume })(claude(two), R2, { offer: OFFER }))
+      .toEqual({ code: "not_limited" });
+  });
+
   it("fails a retry closed when the router lost its pins (restart)", async () => {
     const consume = vi.fn();
     const restarted = createClaudeResetConsumer({ orgUuid: async () => ORG, consume });
