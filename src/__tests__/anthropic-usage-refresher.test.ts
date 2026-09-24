@@ -71,14 +71,21 @@ describe("fetchAnthropicUsage", () => {
         fetchStatus: "fresh",
       },
     });
-    expect(fetch).toHaveBeenCalledWith("https://api.anthropic.com/api/oauth/usage", expect.objectContaining({
+    expect(fetch).toHaveBeenCalledWith("https://api.anthropic.com/api/oauth/usage?cedar_ember=1", expect.objectContaining({
       method: "GET",
-      headers: {
+      headers: expect.objectContaining({
         Authorization: "Bearer secret-access-a",
         "anthropic-beta": "oauth-2025-04-20",
-      },
+        "user-agent": "claude-cli/2.1.280 (external, cli)",
+      }),
       signal: expect.any(AbortSignal),
     }));
+  });
+
+  it("never asks the usage endpoint to skip spend data (router reads extra_usage)", async () => {
+    const fetch = vi.fn().mockResolvedValue(Response.json({ five_hour: { utilization: 1 } }));
+    await fetchAnthropicUsage(account("a"), { fetch });
+    expect(String(fetch.mock.calls[0]?.[0])).not.toContain("skip_spend");
   });
 
   it("claims its ordering token before the request goes out", async () => {

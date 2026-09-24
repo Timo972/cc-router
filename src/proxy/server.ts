@@ -2,8 +2,10 @@ import { finishUsageAttempt } from "./stats.js";
 import { startUsageRuntime } from "../usage/runtime.js";
 import { createUsageRouter } from "../usage/http.js";
 import { usageDirectoryForAccounts, withUsageRename } from "../usage/account-lifecycle.js";
-import { consumeCodexResetCredit } from "../providers/openai/usage-reset.js";
+import { consumeCodexResetCredit, type CodexResetResult } from "../providers/openai/usage-reset.js";
 import { createUsageResetHandler } from "./account-usage-reset.js";
+import { createClaudeResetConsumer } from "./claude-usage-reset.js";
+import { publicLimitResets, type PublicLimitResets } from "./public-limit-resets.js";
 import express from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
 import { ServerResponse } from "http";
@@ -203,6 +205,7 @@ export interface PublicUsageSnapshot {
   sevenDay?: PublicRateLimitWindow;
   modelLimits: PublicModelRateLimit[];
   extraUsage?: { enabled: boolean; spendLimitReached: boolean; usable: boolean };
+  limitResets?: PublicLimitResets;
   fetchedAt: number;
   fetchStatus: "fresh" | "stale" | "unavailable";
 }
@@ -434,6 +437,7 @@ function publicUsageSnapshot(usage: NonNullable<AccountRateLimits["usage"]>): Pu
         usable: usage.fetchStatus === "fresh" && canUseExtraUsage(usage.extraUsage),
       },
     } : {}),
+    ...(usage.limitResets ? { limitResets: publicLimitResets(usage.limitResets) } : {}),
     fetchedAt: publicTimestamp(usage.fetchedAt),
     fetchStatus: usage.fetchStatus,
   };
@@ -979,13 +983,53 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // the SSE streaming on /v1/* is never touched (see comment at /v1 handler).
   const accountsRouter = express.Router();
   accountsRouter.use(express.json({ limit: "32kb" }));
-  accountsRouter.post("/:id/reset-usage", createUsageResetHandler({
+  const openAIReset = createUsageResetHandler<OpenAIAccount, CodexResetResult>({
+    provider: "openai",
     findAccount: id => openAIAccounts.find(account => account.id === id),
     prepare: account => prepareOpenAIAccountForRequest(account, openAIAccounts, persistOpenAIAccounts),
     consume: consumeCodexResetCredit,
     captureReset: account => openAIPool.captureUsageReset(account),
     refresh: account => openAIUsageRefresher.refreshAfterCurrent(account),
-  }));
+  });
+  // Org and account UUIDs are identity metadata the profile fetch already
+  // caches (keyed to the current token, so a re-auth reads the new holder).
+  const claudeIdentity = async (account: Account): Promise<{ org: string; principal: string } | undefined> => {
+    const read = () => {
+      const source = accountInfoSources().find(row => row.provider === "anthropic_subscription" && row.id === account.id);
+      const info = source ? accountInfoCache.get(source) : undefined;
+      return info?.workspaceId && info.accountId ? { org: info.workspaceId, principal: info.accountId } : undefined;
+    };
+    const cached = read();
+    if (cached) return cached;
+    // Nothing is submitted yet: a failed profile fetch must read as "not
+    // submitted" (the consumer's 503), never as an unknown outcome.
+    try { await accountInfoCache.refreshOne({ id: account.id, provider: "anthropic_subscription" }); } catch { /* re-read below */ }
+    return read();
+  };
+  const claudeResetConsumer = createClaudeResetConsumer({ identity: claudeIdentity });
+  const claudeReset = createUsageResetHandler({
+    provider: "anthropic",
+    findAccount: id => pool.findById(id) ?? undefined,
+    prepare: async account => {
+      if (account.authExpired) return false;
+      if (needsRefresh(account)) {
+        // A throw here would surface as "outcome unknown"; nothing was sent.
+        try { await refreshAccountIfCurrent(account, pool, { persist: persistAnthropicAccounts }); } catch { return false; }
+      }
+      return !account.authExpired && account.tokens.expiresAt > Date.now();
+    },
+    consume: claudeResetConsumer,
+    // The grant pin, not the per-object snapshot, knows a replay across re-auth.
+    isReplay: claudeResetConsumer.isReplay,
+    refresh: account => usageRefresher.refreshAfterCurrent(account),
+  });
+  accountsRouter.post("/:id/reset-usage", (req, res, next) => {
+    const id = req.params.id;
+    // Anthropic first, matching the /:id/refresh runner.
+    if (pool.findById(id)) return claudeReset(req, res, next);
+    if (openAIAccounts.some(account => account.id === id)) return openAIReset(req, res, next);
+    res.status(404).json({ error: "Account not found", notSubmitted: true });
+  });
 
   // ─── Per-account refresh (authenticated) ──────────────────────────────────
   // The whole-pool reload above, narrowed to one row: the operator who just
@@ -1208,7 +1252,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         renameAccountTransaction(id, newId, takenIds, inAnthropic
           ? {
               rename: (oldId, nextId) => pool.renameAccount(oldId, nextId) !== null,
-              renameSessions: (oldId, nextId) => { sessionRouter.renameAccount(oldId, nextId); },
+              // Reset pins follow the id too (and back again on rollback), so an
+              // unknown-outcome redemption stays retryable under the new name.
+              renameSessions: (oldId, nextId) => {
+                sessionRouter.renameAccount(oldId, nextId);
+                claudeResetConsumer.renameAccount(oldId, nextId);
+              },
               persist: () => withUsageRename(accountsFile, id, newId, () => persistAnthropicAccounts(pool.getAll())),
             }
           : {

@@ -7,6 +7,7 @@ import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createUsageResetHandler } from "../proxy/account-usage-reset.js";
 import { createOpenAIAccount } from "../providers/openai/account-state.js";
+import { ResetNotSubmittedError } from "../proxy/reset-errors.js";
 
 const servers: Server[] = [];
 afterEach(async () => { for (const s of servers.splice(0)) await new Promise<void>(resolve => s.close(() => resolve())); });
@@ -20,14 +21,17 @@ async function setup(overrides: Partial<Parameters<typeof createUsageResetHandle
   const refresh = vi.fn().mockResolvedValue({ ok: true, update: { buckets: [] } });
   const app = express();
   app.use(express.json());
-  app.post("/:id/reset-usage", createUsageResetHandler({ findAccount: id => id === a.id ? a : undefined, prepare: async () => true, consume, refresh, ...overrides }));
+  app.post("/:id/reset-usage", createUsageResetHandler({
+    provider: "openai", findAccount: id => id === a.id ? a : undefined, prepare: async () => true, consume, refresh, ...overrides,
+  }));
   const server = createServer(app); servers.push(server);
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as { port: number };
-  const post = (id = a.id, redeemRequestId: unknown = requestId) => fetch(`http://127.0.0.1:${address.port}/${id}/reset-usage`, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redeemRequestId }),
+  const post = (id = a.id, redeemRequestId: unknown = requestId, retry?: boolean) => fetch(`http://127.0.0.1:${address.port}/${id}/reset-usage`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(retry === undefined ? { redeemRequestId } : { redeemRequestId, retry }),
   });
-  return { a, post, consume, refresh };
+  return { a, post, consume, refresh, port: address.port };
 }
 
 describe("account usage reset management route", () => {
@@ -35,10 +39,16 @@ describe("account usage reset management route", () => {
     const { a, post, consume, refresh } = await setup();
     const response = await post();
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ reset: { code: "reset", usageRefreshed: true } });
-    expect(consume).toHaveBeenCalledWith(a, requestId);
+    expect(await response.json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: true, replay: false } });
+    expect(consume).toHaveBeenCalledWith(a, requestId, { retry: false });
     expect(refresh).toHaveBeenCalledWith(a);
     expect(a.rateLimits.resetCredits?.available).toBe(2); // no guessed local decrement
+  });
+  it("marks a second post of the same request id as a replay", async () => {
+    const { post, consume } = await setup();
+    expect(await (await post()).json()).toMatchObject({ reset: { replay: false } });
+    expect(await (await post()).json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: true, replay: true } });
+    expect(consume).toHaveBeenCalledTimes(2);
   });
   it("rejects unknown/non-ChatGPT accounts and invalid request IDs without redemption", async () => {
     const { post, consume } = await setup();
@@ -82,7 +92,7 @@ describe("account usage reset management route", () => {
   });
   it("does not confuse a usage refresh failure with a failed redemption", async () => {
     const { post } = await setup({ refresh: async () => { throw new Error("network"); } });
-    expect(await (await post()).json()).toEqual({ reset: { code: "reset", usageRefreshed: false } });
+    expect(await (await post()).json()).toEqual({ reset: { provider: "openai", code: "reset", usageRefreshed: false, replay: false } });
   });
   it("keeps limits unchanged and sanitizes errors on an uncertain outcome", async () => {
     const { post, a, refresh } = await setup({ consume: async () => { throw new Error("secret"); } });
@@ -96,6 +106,53 @@ describe("account usage reset management route", () => {
     const { post, consume } = await setup({ prepare: async () => false });
     expect((await post()).status).toBe(503);
     expect(consume).not.toHaveBeenCalled();
+  });
+  it("reports a provably unsent redemption with its own status, not as unknown", async () => {
+    const { post, refresh } = await setup({ consume: async () => { throw new ResetNotSubmittedError(409, "No reset available for this account"); } });
+    const response = await post();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "No reset available for this account", notSubmitted: true });
+    expect(refresh).not.toHaveBeenCalled();
+  });
+  it("tells the client to abandon an unrecoverable redemption id", async () => {
+    const { post } = await setup({ consume: async () => { throw new ResetNotSubmittedError(409, "cannot match", true); } });
+    const response = await post();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "cannot match", notSubmitted: true, abandon: true });
+  });
+  it("hands the client an unresolved redemption id to retry", async () => {
+    const pending = "12345678-1234-4234-8234-123456789aaa";
+    const { post } = await setup({ consume: async () => { throw new ResetNotSubmittedError(409, "retry it", false, pending); } });
+    expect(await (await post()).json()).toEqual({ error: "retry it", notSubmitted: true, pendingRedemption: pending });
+  });
+  it("marks every pre-submission refusal explicitly, so a gateway error cannot pass for one", async () => {
+    const { post } = await setup({ prepare: async () => false });
+    expect(await (await post()).json()).toMatchObject({ notSubmitted: true });
+    expect(await (await post("nobody")).json()).toMatchObject({ notSubmitted: true });
+    expect(await (await post("chatgpt-1", "not-a-uuid")).json()).toMatchObject({ notSubmitted: true });
+    const unknown = await setup({ consume: async () => { throw new Error("lost"); } });
+    expect(await (await unknown.post()).json()).not.toHaveProperty("notSubmitted");
+  });
+  it("forwards the client's retry flag to the consumer", async () => {
+    const { post, consume, a } = await setup();
+    await post();
+    expect(consume).toHaveBeenLastCalledWith(a, requestId, { retry: false });
+    await post(a.id, requestId, true);
+    expect(consume).toHaveBeenLastCalledWith(a, requestId, { retry: true });
+  });
+  it("forwards the confirmed offer untouched for the provider to check", async () => {
+    const { a, consume, port } = await setup();
+    await fetch(`http://127.0.0.1:${port}/${a.id}/reset-usage`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redeemRequestId: requestId, offer: { useBy: 5, clears: ["five_hour"], clearsOther: false } }),
+    });
+    expect(consume).toHaveBeenLastCalledWith(a, requestId, { retry: false, offer: { useBy: 5, clears: ["five_hour"], clearsOther: false } });
+  });
+  it("lets a provider decide replay from its own binding instead of the per-object snapshot", async () => {
+    const isReplay = vi.fn().mockReturnValue(true);
+    const { post } = await setup({ isReplay });
+    expect(await (await post()).json()).toMatchObject({ reset: { replay: true } }); // first post on this object
+    expect(isReplay).toHaveBeenCalledWith(expect.objectContaining({ id: "chatgpt-1" }), requestId);
   });
 });
 

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   resetCreditsColumnLabel,
+  claudeResetBlocker,
+  claudeResetConfirmText,
   earliestWeeklyReset,
   grokQuotaNote,
   isClaudeAccount,
@@ -211,6 +213,56 @@ describe("resetCreditsColumnLabel", () => {
       },
     };
     expect(resetCreditsColumnLabel(billingOnly)).toBe("0");
+  });
+});
+
+describe("Claude limit resets in the dashboard", () => {
+  const withResets = (limitResets: object) => ({
+    ...claude("max-1"),
+    rateLimits: { ...claude("max-1").rateLimits!, usage: { modelLimits: [], fetchedAt: 1, fetchStatus: "fresh" as const, limitResets } },
+  });
+  const ok = { eligible: true, available: 1, usableNow: true, requiresLimit: false, useBy: 1_792_684_800, clears: ["five_hour", "seven_day", "seven_day_overage_included"], clearsOther: false };
+
+  it("shows the banked count, or an em dash when unknown or ineligible", () => {
+    expect(resetCreditsColumnLabel(withResets(ok))).toBe("1");
+    expect(resetCreditsColumnLabel(withResets({ ...ok, available: 0 }))).toBe("0");
+    expect(resetCreditsColumnLabel(withResets({ ...ok, eligible: false, ineligibleReason: "surface", available: 0 }))).toBe("—");
+    expect(resetCreditsColumnLabel(claude("no-usage"))).toBe("—");
+  });
+
+  it("explains why a reset cannot start", () => {
+    expect(claudeResetBlocker(withResets(ok))).toBeUndefined();
+    expect(claudeResetBlocker(claude("no-usage"))).toBe("Reset status unknown — reload with R");
+    expect(claudeResetBlocker(withResets({ ...ok, eligible: false, ineligibleReason: "cli_version" })))
+      .toBe("Claude Code version too old for resets — update cc-router");
+    expect(claudeResetBlocker(withResets({ ...ok, eligible: false, ineligibleReason: "tier" }))).toBe("Resets unavailable for this account (tier)");
+    expect(claudeResetBlocker(withResets({ ...ok, available: 0 }))).toBe("No resets available");
+    expect(claudeResetBlocker(withResets({ ...ok, usableNow: false, requiresLimit: true }))).toBe("Reset only usable at a limit");
+  });
+
+  it("refuses a grant whose refill scope cannot be named", () => {
+    expect(claudeResetBlocker(withResets({ ...ok, clears: [], clearsOther: true })))
+      .toBe("Reset refill scope unknown — update cc-router");
+  });
+
+  it("refuses a new redemption on stale or unavailable reset status", () => {
+    const at = (fetchStatus: "stale" | "unavailable") => ({
+      ...claude("max-1"),
+      rateLimits: { ...claude("max-1").rateLimits!, usage: { modelLimits: [], fetchedAt: 1, fetchStatus, limitResets: ok } },
+    });
+    expect(claudeResetBlocker(at("stale"))).toBe("Reset status is out of date — reload with R");
+    expect(claudeResetBlocker(at("unavailable"))).toBe("Reset status is out of date — reload with R");
+  });
+
+  it("names every refilled window, count and deadline in the confirmation", () => {
+    expect(claudeResetConfirmText("max-1", ok))
+      .toBe('Redeem 1 reset for "max-1"? Refills 5h + 7d + 7d overage limits · 1 left · use by 2026-10-22');
+    expect(claudeResetConfirmText("max-1", { ...ok, clears: ["seven_day_opus"] }))
+      .toBe('Redeem 1 reset for "max-1"? Refills 7d Opus limits · 1 left · use by 2026-10-22');
+    expect(claudeResetConfirmText("max-1", { ...ok, clears: ["five_hour", "seven_day_sonnet"] }))
+      .toBe('Redeem 1 reset for "max-1"? Refills 5h + 7d Sonnet limits · 1 left · use by 2026-10-22');
+    expect(claudeResetConfirmText("max-1", { ...ok, clears: ["five_hour"], clearsOther: true }))
+      .toBe('Redeem 1 reset for "max-1"? Refills 5h + other limits · 1 left · use by 2026-10-22');
   });
 });
 

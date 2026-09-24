@@ -53,6 +53,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `POST /cc-router/accounts/:id/refresh` refreshes one account. The
   dashboard's `R` uses it when an account is selected and reloads the whole
   pool otherwise.
+- Dashboard `rst` column and `Ctrl+R` now cover Claude accounts: banked
+  usage-limit resets (e.g. the Opus 5.5 launch reset) are shown and can be
+  redeemed after confirmation. Claude usage polls now identify as Claude Code,
+  which Anthropic requires before offering resets. The redemption endpoint is
+  undocumented and may change.
 
 ### Fixed
 

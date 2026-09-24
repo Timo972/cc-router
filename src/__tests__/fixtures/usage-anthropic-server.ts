@@ -33,7 +33,7 @@ https.request = ((input: string | URL | RequestOptions, second?: RequestOptions 
 syncBuiltinESMExports();
 globalThis.fetch = async input => {
   const url = String(input);
-  if (url === "https://api.anthropic.com/api/oauth/usage") return Response.json({});
+  if (url.startsWith("https://api.anthropic.com/api/oauth/usage")) return Response.json({});
   if (url === "https://api.anthropic.com/api/oauth/profile") return Response.json({ account: { uuid: "private-user", email: "private@example.com" }, organization: { uuid: "private-org", organization_type: "claude_max" } });
   if (url.includes("/models")) return Response.json({ data: [] });
   throw new Error("Unexpected fetch egress in Anthropic fixture");

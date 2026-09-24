@@ -69,6 +69,49 @@ function health() {
   };
 }
 
+const OK_RESETS = {
+  eligible: true, available: 1, usableNow: true, requiresLimit: false,
+  useBy: 1_792_684_800, clears: ["five_hour", "seven_day"], clearsOther: false,
+};
+
+function claudeHealth(limitResets: object = OK_RESETS) {
+  const h = health();
+  h.operational.providers.anthropic = { configured: true, accounts: 1, healthy: 1, enabled: 1 };
+  h.operational.providers.openai = { configured: false, accounts: 0, healthy: 0, enabled: 0 };
+  h.accounts = [{
+    id: "claude-1",
+    provider: "anthropic_subscription",
+    healthy: true,
+    busy: false,
+    inFlightRequests: 0,
+    activeSessions: 0,
+    requestCount: 0,
+    errorCount: 0,
+    expiresInMs: 3_600_000,
+    lastUsedMs: 0,
+    lastRefreshMs: 0,
+    enabled: true,
+    rateLimits: {
+      status: "allowed",
+      fiveHourUtil: 0,
+      fiveHourReset: 0,
+      sevenDayUtil: 0,
+      sevenDayReset: 0,
+      claim: "",
+      plan: "max",
+      requestsLimit: 0,
+      lastUpdated: 1,
+      usage: {
+        modelLimits: [],
+        fetchedAt: 1,
+        fetchStatus: "fresh",
+        limitResets,
+      },
+    },
+  }] as unknown as typeof h.accounts;
+  return h;
+}
+
 describe("dashboard Ctrl+R account reset", () => {
   it("requires account focus and confirmation, then spends once for the selected account", async () => {
     const dash = renderDashboard(health(), {}, { rows: 40, columns: 240 });
@@ -101,8 +144,9 @@ describe("dashboard Ctrl+R account reset", () => {
       await dash.press("y");
       expect(requests).toHaveLength(1);
       expect(requests[0].method).toBe("POST");
+      expect(JSON.parse(requests[0].body as string).offer).toBeUndefined(); // ChatGPT has no grant terms
       expect(JSON.parse(requests[0].body as string).redeemRequestId).toMatch(/^[a-f0-9-]{36}$/);
-      finish(Response.json({ reset: { code: "reset", usageRefreshed: true } }));
+      finish(Response.json({ reset: { provider: "openai", code: "reset", usageRefreshed: true } }));
       await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Usage reset redeemed for chatgpt-1"));
     } finally { await dash.cleanup(); }
   });
@@ -117,7 +161,7 @@ describe("dashboard Ctrl+R account reset", () => {
         if (String(url).endsWith("/reset-usage")) {
           ids.push(JSON.parse(init!.body as string).redeemRequestId);
           return ids.length === 1 ? Promise.reject(new Error("connection lost"))
-            : Promise.resolve(Response.json({ reset: { code: "already_redeemed", usageRefreshed: true } }));
+            : Promise.resolve(Response.json({ reset: { provider: "openai", code: "already_redeemed", usageRefreshed: true } }));
         }
         if (offline) return Promise.reject(new Error("offline"));
         return Promise.resolve(Response.json(health()));
@@ -182,7 +226,7 @@ it("keeps in-flight redemption ownership through a health reconnect", async () =
     await dash.press("y");
     expect(requests).toBe(1);
   } finally {
-    finish?.(Response.json({ reset: { code: "reset", usageRefreshed: true } }));
+    finish?.(Response.json({ reset: { provider: "openai", code: "reset", usageRefreshed: true } }));
     await dash.cleanup();
   }
 }, 10_000);
@@ -197,7 +241,7 @@ it("redeems the focused account rather than the first account", async () => {
     vi.mocked(globalThis.fetch).mockImplementation((url, init) => {
       if (init?.method === "POST") {
         targets.push(String(url));
-        return Promise.resolve(Response.json({ reset: { code: "reset", usageRefreshed: true } }));
+        return Promise.resolve(Response.json({ reset: { provider: "openai", code: "reset", usageRefreshed: true } }));
       }
       return Promise.resolve(Response.json(data));
     });
@@ -208,4 +252,230 @@ it("redeems the focused account rather than the first account", async () => {
     await dash.press("y");
     await dash.waitUntil(() => expect(targets).toEqual(["http://localhost:3456/cc-router/accounts/chatgpt-2/reset-usage"]));
   } finally { await dash.cleanup(); }
+});
+
+describe("dashboard Ctrl+R Claude limit reset", () => {
+  it("confirms the refilled windows and reports the remaining count", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      const requests: RequestInit[] = [];
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) => {
+        if (String(url).endsWith("/accounts/claude-1/reset-usage")) {
+          requests.push(init!);
+          return Promise.resolve(Response.json({ reset: { provider: "anthropic", code: "reset", resetsLeft: 0, usageRefreshed: true } }));
+        }
+        return Promise.resolve(Response.json(claudeHealth()));
+      });
+      await dash.press("\t");
+      await dash.press("\u0012");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Refills 5h + 7d limits"));
+      expect(dash.lastFrame()).toContain('Redeem 1 reset for "claude-1"');
+      expect(requests).toHaveLength(0);
+      await dash.press("y");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Limits reset for claude-1 · 0 left"));
+      expect(requests).toHaveLength(1);
+      expect(requests[0].method).toBe("POST");
+      // The terms on screen at confirmation bind the spend to that offer.
+      expect(JSON.parse(requests[0].body as string).offer)
+        .toEqual({ useBy: 1_792_684_800, clears: ["five_hour", "seven_day"], clearsOther: false });
+    } finally { await dash.cleanup(); }
+  });
+
+  it("explains an outdated Claude Code surface and sends nothing", async () => {
+    const data = claudeHealth({ ...OK_RESETS, eligible: false, ineligibleReason: "cli_version" });
+    const dash = renderDashboard(data, {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      await dash.press("\t");
+      await dash.press("\u0012");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Claude Code version too old for resets"));
+      expect(dash.lastFrame()).not.toContain("Redeem 1 reset");
+      await dash.press("y");
+      await new Promise(r => setTimeout(r, 50)); // let any stray POST land before asserting none did
+      expect(vi.mocked(globalThis.fetch).mock.calls.filter(([url]) => String(url).endsWith("/reset-usage"))).toHaveLength(0);
+    } finally { await dash.cleanup(); }
+  });
+
+  it("shows a not-submitted router refusal and keeps the redemption id for the retry", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      const ids: string[] = [];
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) => {
+        if (String(url).endsWith("/reset-usage")) {
+          ids.push(JSON.parse(init!.body as string).redeemRequestId);
+          return Promise.resolve(ids.length === 1
+            ? Response.json({ error: "No reset available for this account", notSubmitted: true }, { status: 409 })
+            : Response.json({ reset: { provider: "anthropic", code: "already_used", usageRefreshed: true, replay: true } }));
+        }
+        return Promise.resolve(Response.json(claudeHealth()));
+      });
+      await dash.press("\t");
+      await dash.press("\u0012");
+      await dash.press("y");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("No reset available for this account (claude-1)"));
+      expect(dash.lastFrame()).not.toContain("Reset outcome unknown");
+      await dash.press("\u0012");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "claude-1"'));
+      await dash.press("y");
+      await dash.waitUntil(() => expect(ids).toHaveLength(2));
+      expect(ids[1]).toBe(ids[0]);
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset already used for claude-1 · nothing more spent"));
+    } finally { await dash.cleanup(); }
+  });
+
+  it("keeps the reviewed offer fixed and sends nothing if the grant changes while confirming", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      let changed = false;
+      let healthPolls = 0;
+      vi.mocked(globalThis.fetch).mockImplementation((url) => {
+        if (String(url).endsWith("/reset-usage")) {
+          return Promise.resolve(Response.json({ reset: { provider: "anthropic", code: "reset", usageRefreshed: true } }));
+        }
+        if (changed) healthPolls++;
+        return Promise.resolve(Response.json(changed
+          ? claudeHealth({ ...OK_RESETS, useBy: 1_795_000_000, clears: ["seven_day_opus"] })
+          : claudeHealth()));
+      });
+      await dash.press("\t");
+      await dash.press("\u0012");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Refills 5h + 7d limits"));
+      changed = true;
+      await dash.waitUntil(() => expect(healthPolls).toBeGreaterThan(1));
+      expect(dash.lastFrame()).toContain("Refills 5h + 7d limits"); // what the operator is reviewing
+      expect(dash.lastFrame()).not.toContain("7d Opus");
+      await dash.press("y");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset offer changed while you were confirming"));
+      await new Promise(r => setTimeout(r, 50));
+      expect(vi.mocked(globalThis.fetch).mock.calls.filter(([u]) => String(u).endsWith("/reset-usage"))).toHaveLength(0);
+    } finally { await dash.cleanup(); }
+  }, 15_000);
+
+  it("still sends a retry of a possibly-spent id after the grant moved", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      const bodies: Array<{ retry: boolean }> = [];
+      let moved = false;
+      let healthPolls = 0;
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) => {
+        if (String(url).endsWith("/reset-usage")) {
+          bodies.push(JSON.parse(init!.body as string));
+          return Promise.resolve(bodies.length === 1
+            ? Response.json({ error: "Reset outcome unknown" }, { status: 502 })
+            : Response.json({ reset: { provider: "anthropic", code: "already_used", usageRefreshed: true, replay: true } }));
+        }
+        if (moved) healthPolls++;
+        return Promise.resolve(Response.json(moved ? claudeHealth({ ...OK_RESETS, useBy: 1_795_000_000 }) : claudeHealth()));
+      });
+      await dash.press("\t");
+      await dash.press("\u0012");
+      await dash.press("y");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset outcome unknown for claude-1"));
+      await dash.press("\u0012");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "claude-1"'));
+      moved = true; // e.g. the first attempt spent this grant and the next one differs
+      await dash.waitUntil(() => expect(healthPolls).toBeGreaterThan(1));
+      await dash.press("y");
+      await dash.waitUntil(() => expect(bodies).toHaveLength(2));
+      expect(bodies[1]!.retry).toBe(true);
+    } finally { await dash.cleanup(); }
+  }, 15_000);
+
+  it("adopts an unresolved redemption the router hands back and retries it", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      const pending = "12345678-1234-4234-8234-123456789aaa";
+      const bodies: Array<{ redeemRequestId: string; retry: boolean }> = [];
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) => {
+        if (String(url).endsWith("/reset-usage")) {
+          bodies.push(JSON.parse(init!.body as string));
+          return Promise.resolve(bodies.length === 1
+            ? Response.json({ error: "An earlier reset attempt on this account never confirmed", notSubmitted: true, pendingRedemption: pending }, { status: 409 })
+            : Response.json({ reset: { provider: "anthropic", code: "already_used", usageRefreshed: true, replay: true } }));
+        }
+        return Promise.resolve(Response.json(claudeHealth()));
+      });
+      await dash.press("\t");
+      for (let press = 1; press <= 2; press++) {
+        await dash.press("\u0012");
+        await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "claude-1"'));
+        await dash.press("y");
+        await dash.waitUntil(() => expect(bodies).toHaveLength(press));
+        await dash.waitUntil(() => expect(dash.lastFrame()).not.toContain("Redeeming usage reset"));
+      }
+      expect(bodies[1]).toMatchObject({ redeemRequestId: pending, retry: true });
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset already used for claude-1 · nothing more spent"));
+    } finally { await dash.cleanup(); }
+  }, 15_000);
+
+  it("flags a same-id retry only after an unknown outcome, and drops an id the router abandons", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      const bodies: Array<{ redeemRequestId: string; retry: boolean }> = [];
+      const answers = [
+        () => Response.json({ error: "No reset available for this account", notSubmitted: true }, { status: 409 }), // never sent
+        () => Response.json({ error: "Reset outcome unknown" }, { status: 502 }),                // maybe sent
+        () => Response.json({ error: "Earlier reset attempt can't be matched", notSubmitted: true, abandon: true }, { status: 409 }),
+        () => Response.json({ reset: { provider: "anthropic", code: "reset", usageRefreshed: true, replay: false } }),
+      ];
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) => {
+        if (String(url).endsWith("/reset-usage")) {
+          bodies.push(JSON.parse(init!.body as string));
+          return Promise.resolve(answers[bodies.length - 1]!());
+        }
+        return Promise.resolve(Response.json(claudeHealth()));
+      });
+      await dash.press("\t");
+      for (let press = 1; press <= 4; press++) {
+        await dash.press("\u0012");
+        await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "claude-1"'));
+        await dash.press("y");
+        await dash.waitUntil(() => expect(bodies).toHaveLength(press));
+        await dash.waitUntil(() => expect(dash.lastFrame()).not.toContain("Redeeming usage reset"));
+      }
+      expect(bodies.map(b => b.retry)).toEqual([false, false, true, false]);
+      expect(bodies[1]!.redeemRequestId).toBe(bodies[0]!.redeemRequestId);
+      expect(bodies[2]!.redeemRequestId).toBe(bodies[0]!.redeemRequestId);
+      expect(bodies[3]!.redeemRequestId).not.toBe(bodies[0]!.redeemRequestId); // abandoned id dropped
+    } finally { await dash.cleanup(); }
+  }, 15_000);
+
+  it.each([
+    [{ code: "already_used", replay: false }, "Reset already used elsewhere for claude-1 · nothing spent now"],
+    [{ code: "not_limited", replay: true }, "claude-1 is not at a limit · an earlier attempt may have used a reset — check rst"],
+  ])("words %j by whether the router replayed the request id", async (reset, text) => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      vi.mocked(globalThis.fetch).mockImplementation((url) => Promise.resolve(String(url).endsWith("/reset-usage")
+        ? Response.json({ reset: { provider: "anthropic", usageRefreshed: true, ...reset } })
+        : Response.json(claudeHealth())));
+      await dash.press("\t");
+      await dash.press("\u0012");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "claude-1"'));
+      await dash.press("y");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain(text));
+    } finally { await dash.cleanup(); }
+  });
+
+  it("treats a 502 as an unknown outcome", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      vi.mocked(globalThis.fetch).mockImplementation((url) => Promise.resolve(String(url).endsWith("/reset-usage")
+        ? Response.json({ error: "upstream detail" }, { status: 502 })
+        : Response.json(claudeHealth())));
+      await dash.press("\t");
+      await dash.press("\u0012");
+      await dash.press("y");
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset outcome unknown for claude-1"));
+      expect(dash.lastFrame()).not.toContain("upstream detail");
+    } finally { await dash.cleanup(); }
+  });
 });

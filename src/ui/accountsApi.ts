@@ -1,4 +1,5 @@
 import type { CodexResetCode } from "../providers/openai/usage-reset.js";
+import type { ClaudeResetCode } from "../providers/anthropic/usage-reset.js";
 import { sanitizeAccountInfo, type AccountInfo } from "../providers/account-info.js";
 /**
  * Tiny authenticated HTTP client for /cc-router/accounts.
@@ -79,10 +80,38 @@ export interface AccountRefreshResult {
   durationMs: number;
 }
 
-export interface UsageResetResult { code: CodexResetCode; usageRefreshed: boolean }
+export type UsageResetResult =
+  | { provider: "openai"; code: CodexResetCode; usageRefreshed: boolean; replay: boolean }
+  | { provider: "anthropic"; code: ClaudeResetCode; usageRefreshed: boolean; replay: boolean; resetsLeft?: number };
+
+const OPENAI_RESET_CODES: readonly string[] = ["reset", "nothing_to_reset", "no_credit", "already_redeemed"];
+const CLAUDE_RESET_CODES: readonly string[] = ["reset", "already_used", "not_limited", "cooldown", "ineligible"];
+// Statuses where the router answered before submitting anything upstream, so
+// its error text is safe and useful to show. Every other status (notably 502,
+// "outcome unknown") stays a bare `HTTP <status>`.
+const NOT_SUBMITTED_STATUSES: ReadonlySet<number> = new Set([400, 404, 409, 503]);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The Claude reset terms the operator saw when confirming. */
+export interface ResetOffer { useBy: number; clears: string[]; clearsOther: boolean }
+
+/** The router refused a redemption before submitting it (its error text is
+ *  the message). Network failures, timeouts and bare `HTTP <status>` errors
+ *  are never this type: their outcome is unknown. */
+export class RouterRefusedResetError extends Error {
+  override name = "RouterRefusedResetError";
+  /** The router can never match this redemption id again; start over from fresh usage. */
+  constructor(
+    message: string,
+    readonly abandon = false,
+    /** An earlier unresolved redemption id the router wants retried instead. */
+    readonly pendingRedemption?: string,
+  ) { super(message); }
+}
 
 export interface AccountsApi {
-  resetUsage(id: string, redeemRequestId: string): Promise<UsageResetResult>;
+  /** `retry`: this id was already sent once and its outcome is unknown. `offer`: the Claude terms confirmed. */
+  resetUsage(id: string, redeemRequestId: string, attempt?: { retry?: boolean; offer?: ResetOffer }): Promise<UsageResetResult>;
   /** Read the authenticated, disclosure-safe account status view. */
   list(): Promise<AccountSafeView[]>;
   /** Ask the router to sweep cooldowns, re-try due tokens and re-fetch every
@@ -159,19 +188,42 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
         durationMs: publicInteger(r.durationMs),
       };
     },
-    async resetUsage(id, redeemRequestId) {
+    async resetUsage(id, redeemRequestId, attempt = {}) {
       const response = await fetch(`${base}/${encodeURIComponent(id)}/reset-usage`, {
         method: "POST",
         headers: { ...authHeaders, "content-type": "application/json" },
-        body: JSON.stringify({ redeemRequestId }),
+        body: JSON.stringify({ redeemRequestId, retry: attempt.retry === true, ...(attempt.offer ? { offer: attempt.offer } : {}) }),
         signal: AbortSignal.timeout(REFRESH_ALL_TIMEOUT_MS),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        const fallback = `HTTP ${response.status}`;
+        if (!NOT_SUBMITTED_STATUSES.has(response.status)) throw new Error(fallback);
+        const errorBody: unknown = await response.json().catch(() => undefined);
+        // Only the router's explicit marker proves nothing was sent: a gateway
+        // in between can answer with the same status and an `error` string
+        // after the claim already went out.
+        if (!isRecord(errorBody) || errorBody.notSubmitted !== true) throw new Error(fallback);
+        const text = publicText(errorBody.error, 160, fallback);
+        if (text === fallback) throw new Error(fallback);
+        const pending = typeof errorBody.pendingRedemption === "string" && UUID.test(errorBody.pendingRedemption)
+          ? errorBody.pendingRedemption : undefined;
+        throw new RouterRefusedResetError(text, errorBody.abandon === true, pending);
+      }
       const body: unknown = await response.json();
       const reset = isRecord(body) ? body.reset : undefined;
-      if (!isRecord(reset) || typeof reset.code !== "string" || !["reset", "nothing_to_reset", "no_credit", "already_redeemed"].includes(reset.code)
-        || typeof reset.usageRefreshed !== "boolean") throw new Error("Invalid reset response");
-      return { code: reset.code as CodexResetCode, usageRefreshed: reset.usageRefreshed };
+      if (!isRecord(reset) || typeof reset.code !== "string" || typeof reset.usageRefreshed !== "boolean") throw new Error("Invalid reset response");
+      // True only when the router re-submitted a request id it had already sent.
+      const replay = reset.replay === true;
+      if (reset.provider === "anthropic" && CLAUDE_RESET_CODES.includes(reset.code)) {
+        return {
+          provider: "anthropic", code: reset.code as ClaudeResetCode, usageRefreshed: reset.usageRefreshed, replay,
+          ...(typeof reset.resetsLeft === "number" ? { resetsLeft: publicInteger(reset.resetsLeft) } : {}),
+        };
+      }
+      if (reset.provider === "openai" && OPENAI_RESET_CODES.includes(reset.code)) {
+        return { provider: "openai", code: reset.code as CodexResetCode, usageRefreshed: reset.usageRefreshed, replay };
+      }
+      throw new Error("Invalid reset response");
     },
     patch(id, patch) { return send("PATCH", `/${encodeURIComponent(id)}`, patch); },
     setProviderEnabled(provider, enabled) { return send("PATCH", `/providers/${encodeURIComponent(provider)}`, { enabled }); },

@@ -2,13 +2,19 @@ import type {
   Account,
   AccountUsageSnapshot,
   ExtraUsageState,
+  LimitResetGrant,
+  LimitResetState,
+  LimitResetWindow,
   ModelRateLimit,
   RateLimitWindow,
 } from "../../proxy/types.js";
 import { nextEventSequence } from "../../proxy/event-sequence.js";
 
-const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
-const OAUTH_BETA_HEADER = "oauth-2025-04-20";
+const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1";
+export const OAUTH_BETA_HEADER = "oauth-2025-04-20";
+/** Reset status is only offered to the Claude Code surface; bump when the server answers `cli_version`. */
+export const CLAUDE_CODE_UA_VERSION = "2.1.280";
+export const CLAUDE_CODE_USER_AGENT = `claude-cli/${CLAUDE_CODE_UA_VERSION} (external, cli)`;
 const DEFAULT_USAGE_TIMEOUT_MS = 5_000;
 
 export type UsageFetchFailureReason =
@@ -157,6 +163,58 @@ function parseExtraUsage(value: unknown): ExtraUsageState | undefined {
   return parsed;
 }
 
+const GRANT_ID = /^[a-z0-9_-]{1,40}$/;
+const RESET_WINDOWS: readonly LimitResetWindow[] = [
+  "five_hour", "seven_day", "seven_day_overage_included", "seven_day_opus", "seven_day_sonnet",
+];
+const INELIGIBLE_REASONS = new Set([
+  "config_off", "tier", "seat", "mobile", "surface", "cli_version", "no_grant",
+  "tenure", "other_experiment", "unavailable",
+]);
+
+function parseResetGrant(value: unknown): LimitResetGrant | undefined {
+  if (!isRecord(value)) return undefined;
+  const id = typeof value.id === "string" && GRANT_ID.test(value.id) ? value.id : undefined;
+  const left = value.resets_left;
+  if (!id || typeof left !== "number" || !Number.isInteger(left) || left < 0) return undefined;
+  const reported = Array.isArray(value.clears) ? value.clears : undefined;
+  const clears = reported ? RESET_WINDOWS.filter(window => reported.includes(window)) : [];
+  // Anything not named here would be refilled without the operator seeing it.
+  const clearsOther = !reported || reported.some(window => !RESET_WINDOWS.includes(window as LimitResetWindow));
+  return {
+    id,
+    resetsLeft: left,
+    endsAt: resetAt(value.ends_at),
+    clears,
+    clearsOther,
+    usableNow: value.usable_now === true,
+    useRequiresLimit: value.use_requires_limit !== false,
+    paused: value.paused === true,
+  };
+}
+
+/** Parse the cedar_ember block. Unknown or malformed → undefined, never "zero resets". */
+export function parseLimitResets(value: unknown): LimitResetState | undefined {
+  if (!isRecord(value) || typeof value.eligible !== "boolean") return undefined;
+  // An eligible account's count is only established by an actual list; an
+  // explicit [] is a real zero. Ineligible blocks may omit it.
+  if (value.eligible && !Array.isArray(value.grants)) return undefined;
+  const grants = (Array.isArray(value.grants) ? value.grants : [])
+    .map(parseResetGrant)
+    .filter((grant): grant is LimitResetGrant => grant !== undefined);
+  const next = typeof value.next_grant_id === "string" && grants.some(grant => grant.id === value.next_grant_id)
+    ? value.next_grant_id
+    : undefined;
+  const reason = stringValue(value.ineligible_reason);
+  return {
+    eligible: value.eligible,
+    ...(reason ? { ineligibleReason: INELIGIBLE_REASONS.has(reason) ? reason : "unknown" } : {}),
+    grants,
+    ...(next ? { nextGrantId: next } : {}),
+    cooldownUntil: resetAt(value.cooldown_until),
+  };
+}
+
 function legacyModelLimit(family: string, value: unknown): ModelRateLimit | undefined {
   const window = parseWindow(value);
   if (!window) return undefined;
@@ -196,9 +254,11 @@ export function parseAnthropicUsage(
   const fiveHour = parseWindow(value.five_hour);
   const sevenDay = parseWindow(value.seven_day);
   const extraUsage = parseExtraUsage(value.extra_usage);
+  const limitResets = parseLimitResets(value.cedar_ember);
   if (fiveHour) snapshot.fiveHour = fiveHour;
   if (sevenDay) snapshot.sevenDay = sevenDay;
   if (extraUsage) snapshot.extraUsage = extraUsage;
+  if (limitResets) snapshot.limitResets = limitResets;
   return snapshot;
 }
 
@@ -241,6 +301,7 @@ export async function fetchAnthropicUsage(
       headers: {
         Authorization: `Bearer ${account.tokens.accessToken}`,
         "anthropic-beta": OAUTH_BETA_HEADER,
+        "user-agent": CLAUDE_CODE_USER_AGENT,
       },
       signal: controller.signal,
     });

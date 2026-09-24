@@ -3,7 +3,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Box, Text, useInput, useApp, useStdout, measureElement } from "ink";
 import type { DOMElement } from "ink";
 import type { LogEntry } from "../proxy/stats.js";
-import { createAccountsApi } from "./accountsApi.js";
+import { createAccountsApi, RouterRefusedResetError } from "./accountsApi.js";
 import type { AccountsApi } from "./accountsApi.js";
 import { createModelsApi } from "./modelsApi.js";
 import type { ModelEntry, ModelsApi, ModelsStatus } from "./modelsApi.js";
@@ -65,6 +65,13 @@ interface AccountUsageView {
   extraUsage?: { enabled: boolean; spendLimitReached: boolean; usable: boolean };
   fetchedAt: number;
   fetchStatus: "fresh" | "stale" | "unavailable";
+  limitResets?: LimitResetsView;
+}
+
+/** Mirrors the router's public `PublicLimitResets`: counts, dates and flags only. */
+interface LimitResetsView {
+  eligible: boolean; ineligibleReason?: string; available: number;
+  usableNow: boolean; requiresLimit: boolean; useBy: number; clears: string[]; clearsOther: boolean;
 }
 
 interface AccountModelLimitView {
@@ -364,12 +371,59 @@ export function isClaudeAccount(account: Pick<AccountStat, "provider">): boolean
   return !isOpenAIAccount(account) && !isXaiAccount(account);
 }
 
-/** Compact `rst` column: banked Codex usage-limit resets. Claude is an em dash. */
+/** Compact `rst` column: banked usage-limit resets. Grok and unknown or
+ *  ineligible Claude status are an em dash. */
 export function resetCreditsColumnLabel(
-  account: Pick<AccountStat, "provider" | "codexRateLimits">,
+  account: Pick<AccountStat, "provider" | "codexRateLimits" | "rateLimits">,
 ): string {
-  if (!isOpenAIAccount(account)) return "—";
-  return String(account.codexRateLimits?.resetCredits?.available ?? 0);
+  if (isOpenAIAccount(account)) return String(account.codexRateLimits?.resetCredits?.available ?? 0);
+  if (!isClaudeAccount(account)) return "—";
+  const resets = account.rateLimits?.usage?.limitResets;
+  return resets?.eligible ? String(resets.available) : "—";
+}
+
+// Every window a grant can clear (LimitResetWindow): the operator must see
+// the whole scope of a spend before confirming it.
+const RESET_WINDOW_LABELS: Record<string, string> = {
+  five_hour: "5h",
+  seven_day: "7d",
+  seven_day_overage_included: "7d overage",
+  seven_day_opus: "7d Opus",
+  seven_day_sonnet: "7d Sonnet",
+};
+
+/** Why Ctrl+R cannot start a NEW Claude reset, or undefined when it can. */
+export function claudeResetBlocker(account: Pick<AccountStat, "rateLimits">): string | undefined {
+  const usage = account.rateLimits?.usage;
+  const resets = usage?.limitResets;
+  if (!resets) return "Reset status unknown — reload with R";
+  // A failed poll keeps the last grant data but marks it stale; a new
+  // redemption must not be chosen from it.
+  if (usage.fetchStatus !== "fresh") return "Reset status is out of date — reload with R";
+  if (!resets.eligible) {
+    return resets.ineligibleReason === "cli_version"
+      ? "Claude Code version too old for resets — update cc-router"
+      : `Resets unavailable for this account (${resets.ineligibleReason ?? "unknown"})`;
+  }
+  if (resets.available <= 0) return "No resets available";
+  // Never spend a reset whose effect cannot be shown in the confirmation.
+  if (resets.clears.length === 0) return "Reset refill scope unknown — update cc-router";
+  if (!resets.usableNow) return resets.requiresLimit ? "Reset only usable at a limit" : "Reset not usable right now";
+  return undefined;
+}
+
+/** Whether two Claude offers carry the same terms the confirmation shows. */
+export function sameResetOffer(a: LimitResetsView, b: LimitResetsView): boolean {
+  return a.useBy === b.useBy && a.clearsOther === b.clearsOther
+    && a.clears.length === b.clears.length && a.clears.every((window, i) => window === b.clears[i]);
+}
+
+export function claudeResetConfirmText(id: string, resets: LimitResetsView): string {
+  const windows = resets.clears.map(window => RESET_WINDOW_LABELS[window]).filter(Boolean);
+  if (resets.clearsOther) windows.push("other");
+  const refills = windows.length > 0 ? `Refills ${windows.join(" + ")} limits` : "Refills your limits";
+  const useBy = resets.useBy > 0 ? ` · use by ${new Date(resets.useBy * 1000).toISOString().slice(0, 10)}` : "";
+  return `Redeem 1 reset for "${id}"? ${refills} · ${resets.available} left${useBy}`;
 }
 
 export function isLimitedAccount(
@@ -746,7 +800,9 @@ interface ProviderOperationalStatus {
 }
 
 type Focus = "logs" | "accounts" | "models";
-interface ResetSession { inFlight: boolean; pendingIds: Map<string, string> }
+/** A redemption id kept for retry; `maybeSubmitted` once an attempt with it had an unknown outcome. */
+interface PendingReset { requestId: string; maybeSubmitted: boolean }
+interface ResetSession { inFlight: boolean; pendingIds: Map<string, PendingReset> }
 
 type Mode = "view" | "editSession" | "editWeekly" | "confirmDelete" | "confirmReset";
 
@@ -963,6 +1019,9 @@ function LiveDashboard({
   const [focus, setFocus] = useState<Focus>("logs");
   const [mode, setMode] = useState<Mode>("view");
   const [resetTarget, setResetTarget] = useState<string | null>(null);
+  // The Claude offer as it stood when the confirmation opened: what is shown
+  // and what is sent, however polls move the live grant meanwhile.
+  const [resetOffer, setResetOffer] = useState<LimitResetsView | null>(null);
   // Compact ("zen") view: hides TOTALS + RECENT ACTIVITY so the account list
   // gets the whole vertical budget — the fix for a short terminal starving a
   // long fleet (e.g. showing 1 of 11 accounts). Toggled with [z], view-only,
@@ -1079,6 +1138,10 @@ function LiveDashboard({
     ? Math.max(0, orderedAccounts.findIndex(a => a.id === selectedAccountId))
     : 0;
   const selectedAccount = orderedAccounts[selectedAccountIndex] ?? null;
+  const resetTargetAccount = resetTarget ? orderedAccounts.find(a => a.id === resetTarget) : undefined;
+  const resetTargetClaudeResets = resetTargetAccount && isClaudeAccount(resetTargetAccount)
+    ? resetTargetAccount.rateLimits?.usage?.limitResets
+    : undefined;
   // Identity for the selected row: health never carries it, so it comes from
   // the authenticated /cc-router/accounts poll above. The detail line and the
   // re-auth intent must agree on which email they mean, so both read this.
@@ -1331,28 +1394,69 @@ function LiveDashboard({
     }
   }, [modelsApi, selectedModel, showBanner]);
 
-  const doResetUsage = useCallback(async (id: string) => {
+  const doResetUsage = useCallback(async (id: string, shownOffer?: LimitResetsView) => {
     if (resetSession.inFlight) return;
     resetSession.inFlight = true;
-    const requestId = resetSession.pendingIds.get(id) ?? randomUUID();
-    resetSession.pendingIds.set(id, requestId);
+    const pending = resetSession.pendingIds.get(id) ?? { requestId: randomUUID(), maybeSubmitted: false };
+    resetSession.pendingIds.set(id, pending);
     showBanner(`Redeeming usage reset for ${id}…`, "yellow", REFRESH_ALL_BANNER_MS);
     try {
-      const result = await api.resetUsage(id, requestId);
+      // Only a retry of a possibly-sent id may reuse its grant; the router
+      // refuses such a retry outright if it can no longer match it.
+      // The terms shown at confirmation: the router refuses if the grant it
+      // would spend no longer matches them.
+      const offer = shownOffer ? { useBy: shownOffer.useBy, clears: shownOffer.clears, clearsOther: shownOffer.clearsOther } : undefined;
+      const result = await api.resetUsage(id, pending.requestId, { retry: pending.maybeSubmitted, ...(offer ? { offer } : {}) });
       resetSession.pendingIds.delete(id);
-      const messages = {
-        reset: `Usage reset redeemed for ${id}`,
-        already_redeemed: `Usage reset already redeemed for ${id}`,
-        nothing_to_reset: `Nothing to reset for ${id}`,
-        no_credit: `No reset credits available for ${id}`,
-      };
-      showBanner(messages[result.code] + (result.usageRefreshed ? "" : " — usage refresh failed; reload with R"),
-        result.usageRefreshed && (result.code === "reset" || result.code === "already_redeemed") ? "green" : "yellow");
+      const text = result.provider === "anthropic"
+        ? ({
+            reset: `Limits reset for ${id}${result.resetsLeft !== undefined ? ` · ${result.resetsLeft} left` : ""}`,
+            // A replayed id may have spent on the earlier, unconfirmed attempt:
+            // only a first attempt can promise that nothing was used.
+            already_used: result.replay
+              ? `Reset already used for ${id} · nothing more spent`
+              : `Reset already used elsewhere for ${id} · nothing spent now`,
+            not_limited: result.replay
+              ? `${id} is not at a limit · an earlier attempt may have used a reset — check rst`
+              : `${id} is not at a limit · nothing used`,
+            cooldown: result.replay
+              ? `Resets are cooling down for ${id} · an earlier attempt may have used a reset — check rst`
+              : `Resets are cooling down for ${id} · try later`,
+            ineligible: result.replay
+              ? `Reset unavailable for ${id} · an earlier attempt may have used a reset — check rst`
+              : `Reset unavailable for ${id} · nothing used`,
+          })[result.code]
+        : ({
+            reset: `Usage reset redeemed for ${id}`,
+            already_redeemed: `Usage reset already redeemed for ${id}`,
+            nothing_to_reset: `Nothing to reset for ${id}`,
+            no_credit: `No reset credits available for ${id}`,
+          })[result.code];
+      const confirmed = result.code === "reset" || result.code === "already_redeemed"
+        || (result.code === "already_used" && result.replay);
+      showBanner(text + (result.usageRefreshed ? "" : " — usage refresh failed; reload with R"),
+        result.usageRefreshed && confirmed ? "green" : "yellow");
       // Failure to poll the dashboard must not turn a confirmed spend into an
       // unknown outcome or encourage another redemption.
       try { await onRefreshAll?.(); } catch { /* the regular poll will retry */ }
-    } catch {
-      showBanner(`Reset outcome unknown for ${id}; Ctrl+R retries the same redemption (keep dashboard open)`, "red");
+    } catch (error) {
+      // The pending id is kept even when the router refused before submitting:
+      // an earlier attempt under the same id may still have an unknown outcome,
+      // and a fresh id would let the next press spend a second reset.
+      // Only when the router says the id can never be matched again is it
+      // dropped, and then the next press has to pass the fresh-status blocker.
+      if (error instanceof RouterRefusedResetError) {
+        if (error.abandon) resetSession.pendingIds.delete(id);
+        // The router still holds an unresolved claim for this account (e.g.
+        // it was renamed, or this dashboard restarted): retry that one next.
+        if (error.pendingRedemption) {
+          resetSession.pendingIds.set(id, { requestId: error.pendingRedemption, maybeSubmitted: true });
+        }
+        showBanner(`${error.message} (${id})`, "yellow");
+      } else {
+        pending.maybeSubmitted = true;
+        showBanner(`Reset outcome unknown for ${id}; Ctrl+R retries the same redemption (keep dashboard open)`, "red");
+      }
     } finally {
       resetSession.inFlight = false;
     }
@@ -1390,9 +1494,18 @@ function LiveDashboard({
     }
 
     if (mode === "confirmReset") {
-      if ((input === "y" || input === "Y") && resetTarget) void doResetUsage(resetTarget);
-      else showBanner("Reset cancelled", "gray");
+      if ((input === "y" || input === "Y") && resetTarget) {
+        // A retry of a possibly-sent id must go out to learn its outcome; an
+        // earlier spend may well have moved the next grant.
+        const retrying = resetSession.pendingIds.get(resetTarget)?.maybeSubmitted === true;
+        if (resetOffer && !retrying && (!resetTargetClaudeResets || !sameResetOffer(resetOffer, resetTargetClaudeResets))) {
+          showBanner("Reset offer changed while you were confirming — press Ctrl+R to review it; nothing sent", "yellow");
+        } else {
+          void doResetUsage(resetTarget, resetOffer ?? undefined);
+        }
+      } else showBanner("Reset cancelled", "gray");
       setResetTarget(null);
+      setResetOffer(null);
       setMode("view");
       return;
     }
@@ -1424,13 +1537,19 @@ function LiveDashboard({
     if (input === "r" && key.ctrl) {
       if (focus !== "accounts" || !selectedAccount) return;
       if (resetSession.inFlight) { showBanner("Reset already running", "yellow"); return; }
-      if (selectedAccount.provider !== "openai_subscription") {
-        showBanner("Usage resets are only available for ChatGPT accounts", "yellow"); return;
-      }
-      if (!resetSession.pendingIds.has(selectedAccount.id) && (selectedAccount.codexRateLimits?.resetCredits?.available ?? 0) <= 0) {
+      // A pending id means an earlier attempt's outcome is unknown: let the
+      // retry through so the router can deduplicate it under the same id.
+      const pending = resetSession.pendingIds.has(selectedAccount.id);
+      if (isClaudeAccount(selectedAccount)) {
+        const blocker = pending ? undefined : claudeResetBlocker(selectedAccount);
+        if (blocker) { showBanner(blocker, "yellow"); return; }
+      } else if (selectedAccount.provider !== "openai_subscription") {
+        showBanner("Usage resets are not available for Grok accounts", "yellow"); return;
+      } else if (!pending && (selectedAccount.codexRateLimits?.resetCredits?.available ?? 0) <= 0) {
         showBanner("No reset credits available", "yellow"); return;
       }
       setResetTarget(selectedAccount.id);
+      setResetOffer(isClaudeAccount(selectedAccount) ? selectedAccount.rateLimits?.usage?.limitResets ?? null : null);
       setMode("confirmReset");
       return;
     }
@@ -1623,7 +1742,9 @@ function LiveDashboard({
       )}
       {mode === "confirmReset" && resetTarget && (
         <Box paddingLeft={2}>
-          <Text color="yellow" bold>Redeem 1 reset for "{resetTarget}"?  [y] yes  [n/Esc] cancel</Text>
+          <Text color="yellow" bold>{resetOffer
+            ? `${claudeResetConfirmText(resetTarget, resetOffer)}  [y] yes  [n/Esc] cancel`
+            : `Redeem 1 reset for "${resetTarget}"?  [y] yes  [n/Esc] cancel`}</Text>
         </Box>
       )}
       {mode === "confirmDelete" && selectedAccount && (
