@@ -66,9 +66,10 @@ it("keeps a small provider visible in the stack instead of rounding it away", ()
     expect(cells).toContain("openai_subscription");
     expect(cells.filter(key => key === "anthropic_subscription").length).toBeGreaterThan(1);
   }
-  // A one-cell column still shows both series rather than only the larger one.
+  // Height still encodes the total: a near-idle bucket stays one cell and shows its larger series,
+  // rather than growing to fit every series and reading like a busy one.
   const tiny = chartColumns([hour(1_000_000, 10), hour(100_000_000, 0)], 2, 8, false).columns[0].cells.filter(Boolean);
-  expect(new Set(tiny)).toEqual(new Set(["anthropic_subscription", "openai_subscription"]));
+  expect(tiny).toEqual(["anthropic_subscription"]);
   // Bars still stack bottom-up in legend order: the first series sits at the base.
   expect(columns[0].cells.at(-1)).toBe("anthropic_subscription");
 });
@@ -79,4 +80,11 @@ it("never draws a column taller than the chart when series outnumber rows", () =
   expect(column.cells).toHaveLength(2);
   // The rows that fit go to the largest contributors, not the first legend entries.
   expect(new Set(column.cells)).toEqual(new Set(["anthropic_subscription:m5", "anthropic_subscription:m4"]));
+});
+
+it("does not raise a low-usage bar to fit all of its series", () => {
+  const busy = { label: "01", series: [{ provider: "anthropic_subscription", model: "a", tokens: 1_000_000 }] };
+  const quiet = { label: "02", series: [{ provider: "anthropic_subscription", model: "a", tokens: 1 }, { provider: "openai_subscription", model: "b", tokens: 1 }] };
+  const [, low] = chartColumns([busy, quiet], 2, 2, true).columns;
+  expect(low.cells.filter(Boolean)).toHaveLength(1);
 });

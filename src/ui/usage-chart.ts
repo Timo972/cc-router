@@ -66,15 +66,14 @@ export function chartColumns(buckets: ChartBucket[], width: number, height: numb
   const max = Math.max(0, ...groups.map(g => sum(g.values)));
   const columns = groups.map(group => {
     const total = sum(group.values);
-    // Like the column total, every present series keeps at least one cell: a provider at a few
-    // percent of the bucket otherwise rounds to nothing and the bar reads as the other one alone.
-    const present = legend.filter(item => (group.values.get(item.key) ?? 0) > 0).length;
-    const filled = max > 0 ? Math.min(rows, Math.max(present, Math.round(total / max * rows))) : 0;
+    const filled = max > 0 ? Math.max(total > 0 ? 1 : 0, Math.round(total / max * rows)) : 0;
     const allocations = legend.map(item => {
       const exact = total > 0 ? (group.values.get(item.key) ?? 0) / total * filled : 0;
       return { key: item.key, exact, cells: Math.floor(exact), fraction: exact % 1 };
     });
-    // With more series than rows, only the largest contributors that fit get a cell.
+    // Height stays tied to the total. Within it every series keeps at least one cell, so a provider
+    // at a few percent of the bucket no longer rounds to nothing and leaves the other one alone;
+    // when series outnumber the cells, the largest contributors get them.
     const visible = new Set(allocations.filter(a => a.exact > 0).sort((a, b) => b.exact - a.exact).slice(0, filled));
     for (const a of allocations) if (!visible.has(a)) a.fraction = 0;
     let remaining = filled - allocations.reduce((n, a) => n + a.cells, 0);
