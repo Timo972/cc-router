@@ -75,5 +75,8 @@ it("keeps a small provider visible in the stack instead of rounding it away", ()
 
 it("never draws a column taller than the chart when series outnumber rows", () => {
   const series = Array.from({ length: 6 }, (_, i) => ({ provider: "anthropic_subscription", model: `m${i}`, tokens: 1000 * (i + 1) }));
-  for (const column of chartColumns([{ label: "01", series }], 1, 2, true).columns) expect(column.cells).toHaveLength(2);
+  const [column] = chartColumns([{ label: "01", series }], 1, 2, true, 8).columns;
+  expect(column.cells).toHaveLength(2);
+  // The rows that fit go to the largest contributors, not the first legend entries.
+  expect(new Set(column.cells)).toEqual(new Set(["anthropic_subscription:m5", "anthropic_subscription:m4"]));
 });
