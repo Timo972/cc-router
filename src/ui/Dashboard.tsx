@@ -1447,6 +1447,11 @@ function LiveDashboard({
       // dropped, and then the next press has to pass the fresh-status blocker.
       if (error instanceof RouterRefusedResetError) {
         if (error.abandon) resetSession.pendingIds.delete(id);
+        // The router still holds an unresolved claim for this account (e.g.
+        // it was renamed, or this dashboard restarted): retry that one next.
+        if (error.pendingRedemption) {
+          resetSession.pendingIds.set(id, { requestId: error.pendingRedemption, maybeSubmitted: true });
+        }
         showBanner(`${error.message} (${id})`, "yellow");
       } else {
         pending.maybeSubmitted = true;

@@ -39,19 +39,22 @@ const MAX_PINNED_PER_ACCOUNT = 8;
  *
  * Pins are keyed by account id, not the Account object, so a re-auth that
  * replaces the object keeps them, and a rename moves them. They live in
- * memory only, and each account keeps its 8 most recent ids. A retry whose pin is gone (router restart,
- * eviction) is refused before sending rather than re-derived: its original
- * grant can no longer be named, and only fresh usage can tell whether it was
- * spent. A pin is written only right before the claim is sent, and dropped
- * again if that first claim provably never left (409/503): a refusal before
- * submission leaves nothing pinned.
+ * memory only, and each account keeps its 8 most recent ids. While one of an
+ * account's claims is unsettled (no definite answer yet), new ids for that
+ * account are refused and pointed at it, so eviction only ever drops settled
+ * pins. A retry whose pin is gone (router restart) is refused before sending
+ * rather than re-derived: its original grant can no longer be named, and only
+ * fresh usage can tell whether it was spent. A pin is written only right
+ * before the claim is sent, and dropped again if that first claim provably
+ * never left (409/503): a refusal before submission leaves nothing pinned.
  *
  * The returned `resetsLeft` is account-wide (the redeemed grant's count plus
  * the other non-paused grants), matching the rst column.
  */
 export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
   const consume = deps.consume ?? consumeClaudeLimitReset;
-  const pinned = new Map<string /* account.id */, Map<string /* requestId */, { grantId: string } & ClaudeResetIdentity>>();
+  // `settled`: a definite upstream answer came back for this id.
+  const pinned = new Map<string /* account.id */, Map<string /* requestId */, { grantId: string; settled: boolean } & ClaudeResetIdentity>>();
   const run = async (account: Account, requestId: string, attempt: ClaudeResetAttempt = {}): Promise<ClaudeResetResult> => {
     const pin = pinned.get(account.id)?.get(requestId);
     let grantId = pin?.grantId;
@@ -59,6 +62,14 @@ export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
       if (attempt.retry) {
         throw new ResetNotSubmittedError(409,
           "Earlier reset attempt can't be matched any more (router restarted?) — check rst before redeeming again; nothing sent", true);
+      }
+      // One unresolved claim per account: a client that lost track of it
+      // (renamed row, restarted dashboard) is handed its id to retry instead
+      // of starting a claim that could spend another grant.
+      const unresolved = [...(pinned.get(account.id) ?? [])].find(([, entry]) => !entry.settled)?.[0];
+      if (unresolved) {
+        throw new ResetNotSubmittedError(409,
+          "An earlier reset attempt on this account never confirmed — press Ctrl+R again to retry it; nothing sent", false, unresolved);
       }
       const usage = account.rateLimits.usage;
       if (usage?.fetchStatus !== "fresh") throw new ResetNotSubmittedError(409, "Reset status is stale — reload with R; nothing sent");
@@ -81,6 +92,8 @@ export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
     // same one — must not aim the old claim at their reset. Only the
     // original account holder can settle it.
     if (pin && (pin.org !== org || pin.principal !== principal)) {
+      // Abandoned for good: it must not hold this account's new redemptions.
+      pinned.get(account.id)?.delete(requestId);
       throw new ResetNotSubmittedError(409,
         "Account now signs in as someone other than the earlier reset attempt — check rst before redeeming again; nothing sent", true);
     }
@@ -88,7 +101,7 @@ export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
     if (!pins) pinned.set(account.id, pins = new Map());
     const firstAttempt = !pins.has(requestId);
     if (firstAttempt) {
-      pins.set(requestId, { grantId, org, principal });
+      pins.set(requestId, { grantId, org, principal, settled: false });
       while (pins.size > MAX_PINNED_PER_ACCOUNT) pins.delete(pins.keys().next().value!);
     }
     // Other grants are untouched by this claim; summing them with the
@@ -106,6 +119,8 @@ export function createClaudeResetConsumer(deps: ClaudeResetConsumerDeps) {
       if (firstAttempt && error instanceof ResetNotSubmittedError) pinned.get(account.id)?.delete(requestId);
       throw error;
     }
+    const entry = pinned.get(account.id)?.get(requestId);
+    if (entry) entry.settled = true;
     return result.resetsLeft === undefined ? result : { ...result, resetsLeft: othersLeft + result.resetsLeft };
   };
   /** Whether this id was already sent for this account id — survives re-auth, unlike per-object state. */

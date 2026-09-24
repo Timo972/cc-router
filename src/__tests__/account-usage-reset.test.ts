@@ -111,14 +111,27 @@ describe("account usage reset management route", () => {
     const { post, refresh } = await setup({ consume: async () => { throw new ResetNotSubmittedError(409, "No reset available for this account"); } });
     const response = await post();
     expect(response.status).toBe(409);
-    expect(await response.json()).toEqual({ error: "No reset available for this account" });
+    expect(await response.json()).toEqual({ error: "No reset available for this account", notSubmitted: true });
     expect(refresh).not.toHaveBeenCalled();
   });
   it("tells the client to abandon an unrecoverable redemption id", async () => {
     const { post } = await setup({ consume: async () => { throw new ResetNotSubmittedError(409, "cannot match", true); } });
     const response = await post();
     expect(response.status).toBe(409);
-    expect(await response.json()).toEqual({ error: "cannot match", abandon: true });
+    expect(await response.json()).toEqual({ error: "cannot match", notSubmitted: true, abandon: true });
+  });
+  it("hands the client an unresolved redemption id to retry", async () => {
+    const pending = "12345678-1234-4234-8234-123456789aaa";
+    const { post } = await setup({ consume: async () => { throw new ResetNotSubmittedError(409, "retry it", false, pending); } });
+    expect(await (await post()).json()).toEqual({ error: "retry it", notSubmitted: true, pendingRedemption: pending });
+  });
+  it("marks every pre-submission refusal explicitly, so a gateway error cannot pass for one", async () => {
+    const { post } = await setup({ prepare: async () => false });
+    expect(await (await post()).json()).toMatchObject({ notSubmitted: true });
+    expect(await (await post("nobody")).json()).toMatchObject({ notSubmitted: true });
+    expect(await (await post("chatgpt-1", "not-a-uuid")).json()).toMatchObject({ notSubmitted: true });
+    const unknown = await setup({ consume: async () => { throw new Error("lost"); } });
+    expect(await (await unknown.post()).json()).not.toHaveProperty("notSubmitted");
   });
   it("forwards the client's retry flag to the consumer", async () => {
     const { post, consume, a } = await setup();

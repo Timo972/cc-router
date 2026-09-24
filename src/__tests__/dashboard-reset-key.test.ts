@@ -306,7 +306,7 @@ describe("dashboard Ctrl+R Claude limit reset", () => {
         if (String(url).endsWith("/reset-usage")) {
           ids.push(JSON.parse(init!.body as string).redeemRequestId);
           return Promise.resolve(ids.length === 1
-            ? Response.json({ error: "No reset available for this account" }, { status: 409 })
+            ? Response.json({ error: "No reset available for this account", notSubmitted: true }, { status: 409 })
             : Response.json({ reset: { provider: "anthropic", code: "already_used", usageRefreshed: true, replay: true } }));
         }
         return Promise.resolve(Response.json(claudeHealth()));
@@ -385,15 +385,43 @@ describe("dashboard Ctrl+R Claude limit reset", () => {
     } finally { await dash.cleanup(); }
   }, 15_000);
 
+  it("adopts an unresolved redemption the router hands back and retries it", async () => {
+    const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
+    try {
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
+      const pending = "12345678-1234-4234-8234-123456789aaa";
+      const bodies: Array<{ redeemRequestId: string; retry: boolean }> = [];
+      vi.mocked(globalThis.fetch).mockImplementation((url, init) => {
+        if (String(url).endsWith("/reset-usage")) {
+          bodies.push(JSON.parse(init!.body as string));
+          return Promise.resolve(bodies.length === 1
+            ? Response.json({ error: "An earlier reset attempt on this account never confirmed", notSubmitted: true, pendingRedemption: pending }, { status: 409 })
+            : Response.json({ reset: { provider: "anthropic", code: "already_used", usageRefreshed: true, replay: true } }));
+        }
+        return Promise.resolve(Response.json(claudeHealth()));
+      });
+      await dash.press("\t");
+      for (let press = 1; press <= 2; press++) {
+        await dash.press("\u0012");
+        await dash.waitUntil(() => expect(dash.lastFrame()).toContain('Redeem 1 reset for "claude-1"'));
+        await dash.press("y");
+        await dash.waitUntil(() => expect(bodies).toHaveLength(press));
+        await dash.waitUntil(() => expect(dash.lastFrame()).not.toContain("Redeeming usage reset"));
+      }
+      expect(bodies[1]).toMatchObject({ redeemRequestId: pending, retry: true });
+      await dash.waitUntil(() => expect(dash.lastFrame()).toContain("Reset already used for claude-1 · nothing more spent"));
+    } finally { await dash.cleanup(); }
+  }, 15_000);
+
   it("flags a same-id retry only after an unknown outcome, and drops an id the router abandons", async () => {
     const dash = renderDashboard(claudeHealth(), {}, { rows: 40, columns: 240 });
     try {
       await dash.waitUntil(() => expect(dash.lastFrame()).toContain("[R] reload"));
       const bodies: Array<{ redeemRequestId: string; retry: boolean }> = [];
       const answers = [
-        () => Response.json({ error: "No reset available for this account" }, { status: 409 }), // never sent
+        () => Response.json({ error: "No reset available for this account", notSubmitted: true }, { status: 409 }), // never sent
         () => Response.json({ error: "Reset outcome unknown" }, { status: 502 }),                // maybe sent
-        () => Response.json({ error: "Earlier reset attempt can't be matched", abandon: true }, { status: 409 }),
+        () => Response.json({ error: "Earlier reset attempt can't be matched", notSubmitted: true, abandon: true }, { status: 409 }),
         () => Response.json({ reset: { provider: "anthropic", code: "reset", usageRefreshed: true, replay: false } }),
       ];
       vi.mocked(globalThis.fetch).mockImplementation((url, init) => {

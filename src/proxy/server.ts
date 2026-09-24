@@ -1028,7 +1028,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // Anthropic first, matching the /:id/refresh runner.
     if (pool.findById(id)) return claudeReset(req, res, next);
     if (openAIAccounts.some(account => account.id === id)) return openAIReset(req, res, next);
-    res.status(404).json({ error: "Account not found" });
+    res.status(404).json({ error: "Account not found", notSubmitted: true });
   });
 
   // ─── Per-account refresh (authenticated) ──────────────────────────────────

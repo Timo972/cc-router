@@ -177,7 +177,10 @@ that refills none it can name is not offered until cc-router is updated. If `rst
 version, update cc-router.
 
 A Claude retry after an unknown outcome is matched to the exact reset it first
-targeted. The router remembers that only while it runs: if it restarted in
+targeted. While such an attempt is unresolved, the router will not start a new
+one on that account — even after a rename or a dashboard restart, `Ctrl+R`
+retries the unresolved attempt instead. The router remembers that only while
+it runs: if it restarted in
 between, the retry is refused without sending anything — check `rst` (after
 `R`) to see whether the first attempt used the reset before redeeming again.
 

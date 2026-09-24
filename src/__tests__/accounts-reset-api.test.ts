@@ -22,11 +22,11 @@ it("tells the router when the id is a retry of an unknown outcome", async () => 
 });
 
 it("marks a refusal the router says can never be retried", async () => {
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "cannot match", abandon: true }, { status: 409 })));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "cannot match", notSubmitted: true, abandon: true }, { status: 409 })));
   const error = await createAccountsApi("http://router.local").resetUsage("claude", "request-id", { retry: true }).catch(e => e);
   expect(error).toBeInstanceOf(RouterRefusedResetError);
   expect(error.abandon).toBe(true);
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "No reset available" }, { status: 409 })));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "No reset available", notSubmitted: true }, { status: 409 })));
   expect((await createAccountsApi("http://router.local").resetUsage("claude", "request-id").catch(e => e)).abandon).toBe(false);
 });
 
@@ -79,8 +79,23 @@ it.each([
     .toEqual({ provider: "openai", code: "already_redeemed", usageRefreshed: true, replay: expected });
 });
 
+it("treats an unmarked error body as an unknown outcome (e.g. a gateway 503)", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "Service Unavailable" }, { status: 503 })));
+  const attempt = createAccountsApi("http://router.local").resetUsage("claude", "request-id");
+  await expect(attempt).rejects.toThrow(/^HTTP 503$/);
+  await expect(attempt).rejects.not.toBeInstanceOf(RouterRefusedResetError);
+});
+
+it("passes on an unresolved redemption id the router wants retried", async () => {
+  const pending = "12345678-1234-4234-8234-123456789aaa";
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "retry it", notSubmitted: true, pendingRedemption: pending }, { status: 409 })));
+  expect((await createAccountsApi("http://router.local").resetUsage("claude", "request-id").catch(e => e)).pendingRedemption).toBe(pending);
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "retry it", notSubmitted: true, pendingRedemption: "junk" }, { status: 409 })));
+  expect((await createAccountsApi("http://router.local").resetUsage("claude", "request-id").catch(e => e)).pendingRedemption).toBeUndefined();
+});
+
 it.each([400, 404, 409, 503])("surfaces the router's error text for HTTP %i", async status => {
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "No reset available\u0007 for this account" }, { status })));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "No reset available\u0007 for this account", notSubmitted: true }, { status })));
   const attempt = createAccountsApi("http://router.local").resetUsage("claude", "request-id");
   await expect(attempt).rejects.toThrow(/^No reset available for this account$/);
   await expect(attempt).rejects.toBeInstanceOf(RouterRefusedResetError);
@@ -96,6 +111,6 @@ it.each([500, 502, 504, 401])("keeps HTTP %i as a bare status even with an error
 it("falls back to the HTTP status when a 409 body is not JSON or has no error", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("<html>", { status: 409 })));
   await expect(createAccountsApi("http://router.local").resetUsage("claude", "request-id")).rejects.toThrow(/^HTTP 409$/);
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: 42 }, { status: 409 })));
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: 42, notSubmitted: true }, { status: 409 })));
   await expect(createAccountsApi("http://router.local").resetUsage("claude", "request-id")).rejects.toThrow(/^HTTP 409$/);
 });

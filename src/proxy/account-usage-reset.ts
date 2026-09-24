@@ -1,4 +1,4 @@
-import type { RequestHandler } from "express";
+import type { RequestHandler, Response } from "express";
 import type { CodexRateLimitsUpdate } from "../providers/openai/usage.js";
 import { ResetNotSubmittedError, RESET_OUTCOME_UNKNOWN } from "./reset-errors.js";
 
@@ -14,6 +14,15 @@ export interface UsageResetOptions<A extends object, R extends { code: string }>
   /** OpenAI only: reconcile quota cooldowns from the evidence captured before the spend. */
   captureReset?(account: A): (update: CodexRateLimitsUpdate) => void;
 }
+/**
+ * Answer with a refusal that provably sent nothing upstream. The explicit
+ * `notSubmitted` marker is what lets a client tell it apart from an error a
+ * gateway in between may synthesize after the claim did go out.
+ */
+function refuse(res: Response, status: number, error: string, extra: Record<string, unknown> = {}): void {
+  res.status(status).json({ error, notSubmitted: true, ...extra });
+}
+
 export function createUsageResetHandler<A extends object, R extends { code: string }>(options: UsageResetOptions<A, R>): RequestHandler {
   const inFlight = new WeakSet<A>();
   // One retained snapshot per account allows an uncertain retry to reconcile
@@ -23,26 +32,26 @@ export function createUsageResetHandler<A extends object, R extends { code: stri
     const id = req.params.id;
     const requestId: unknown = req.body?.redeemRequestId;
     if (typeof requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) {
-      res.status(400).json({ error: "redeemRequestId must be a UUID" });
+      refuse(res, 400, "redeemRequestId must be a UUID");
       return;
     }
     const account = options.findAccount(id);
     if (!account) {
-      res.status(404).json({ error: "Account not found" });
+      refuse(res, 404, "Account not found");
       return;
     }
     if (inFlight.has(account)) {
-      res.status(409).json({ error: "Reset already running for this account" });
+      refuse(res, 409, "Reset already running for this account");
       return;
     }
     inFlight.add(account);
     try {
       if (!await options.prepare(account)) {
-        res.status(503).json({ error: "Account credentials unavailable; reset not submitted" });
+        refuse(res, 503, "Account credentials unavailable; reset not submitted");
         return;
       }
       if (options.findAccount(id) !== account) {
-        res.status(404).json({ error: "Account changed; reset not submitted" });
+        refuse(res, 404, "Account changed; reset not submitted");
         return;
       }
       const previous = snapshots.get(account);
@@ -72,7 +81,10 @@ export function createUsageResetHandler<A extends object, R extends { code: stri
       res.json({ reset: { provider: options.provider, ...result, usageRefreshed, replay } });
     } catch (error) {
       if (error instanceof ResetNotSubmittedError) {
-        res.status(error.status).json({ error: error.message, ...(error.abandon ? { abandon: true } : {}) });
+        refuse(res, error.status, error.message, {
+          ...(error.abandon ? { abandon: true } : {}),
+          ...(error.pendingRedemption ? { pendingRedemption: error.pendingRedemption } : {}),
+        });
         return;
       }
       res.status(502).json({ error: RESET_OUTCOME_UNKNOWN });

@@ -90,6 +90,7 @@ const CLAUDE_RESET_CODES: readonly string[] = ["reset", "already_used", "not_lim
 // its error text is safe and useful to show. Every other status (notably 502,
 // "outcome unknown") stays a bare `HTTP <status>`.
 const NOT_SUBMITTED_STATUSES: ReadonlySet<number> = new Set([400, 404, 409, 503]);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** The Claude reset terms the operator saw when confirming. */
 export interface ResetOffer { useBy: number; clears: string[]; clearsOther: boolean }
@@ -100,7 +101,12 @@ export interface ResetOffer { useBy: number; clears: string[]; clearsOther: bool
 export class RouterRefusedResetError extends Error {
   override name = "RouterRefusedResetError";
   /** The router can never match this redemption id again; start over from fresh usage. */
-  constructor(message: string, readonly abandon = false) { super(message); }
+  constructor(
+    message: string,
+    readonly abandon = false,
+    /** An earlier unresolved redemption id the router wants retried instead. */
+    readonly pendingRedemption?: string,
+  ) { super(message); }
 }
 
 export interface AccountsApi {
@@ -193,9 +199,15 @@ export function createAccountsApi(baseUrl: string, authToken?: string): Accounts
         const fallback = `HTTP ${response.status}`;
         if (!NOT_SUBMITTED_STATUSES.has(response.status)) throw new Error(fallback);
         const errorBody: unknown = await response.json().catch(() => undefined);
-        const text = isRecord(errorBody) ? publicText(errorBody.error, 160, fallback) : fallback;
-        throw text === fallback ? new Error(fallback)
-          : new RouterRefusedResetError(text, isRecord(errorBody) && errorBody.abandon === true);
+        // Only the router's explicit marker proves nothing was sent: a gateway
+        // in between can answer with the same status and an `error` string
+        // after the claim already went out.
+        if (!isRecord(errorBody) || errorBody.notSubmitted !== true) throw new Error(fallback);
+        const text = publicText(errorBody.error, 160, fallback);
+        if (text === fallback) throw new Error(fallback);
+        const pending = typeof errorBody.pendingRedemption === "string" && UUID.test(errorBody.pendingRedemption)
+          ? errorBody.pendingRedemption : undefined;
+        throw new RouterRefusedResetError(text, errorBody.abandon === true, pending);
       }
       const body: unknown = await response.json();
       const reset = isRecord(body) ? body.reset : undefined;

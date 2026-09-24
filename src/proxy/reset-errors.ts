@@ -4,8 +4,15 @@ export class ResetNotSubmittedError extends Error {
    * @param abandon The client's pending redemption id can never be retried
    *   safely (its grant binding is gone); the client should drop it and look
    *   at fresh usage before starting a new redemption.
+   * @param pendingRedemption An earlier, unresolved redemption id for this
+   *   account that the client should retry instead of starting a new one.
    */
-  constructor(readonly status: 409 | 503, message: string, readonly abandon = false) {
+  constructor(
+    readonly status: 409 | 503,
+    message: string,
+    readonly abandon = false,
+    readonly pendingRedemption?: string,
+  ) {
     super(message);
     this.name = "ResetNotSubmittedError";
   }
