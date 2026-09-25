@@ -182,20 +182,28 @@ export function UsageDashboard({ load, initialQuery = { period: "month" }, onExi
     if (showBoth || !gridFocus) {
       gap("gap-chart");
       // Few buckets (a week has seven) get wide columns so the bars fill the row and every label has room.
-      const plotWidth = Math.max(2, Math.min(width, gridWidth) - 8);
-      const columnWidth = Math.max(2, Math.min(MAX_COLUMN_WIDTH, Math.floor(plotWidth / Math.max(1, report.buckets.length))));
-      const chart = chartColumns(report.buckets.map(b => ({
+      const buckets = report.buckets.map(b => ({
         label: query.period === "day" ? b.start.slice(11, 13) : query.period === "year" ? b.start.slice(5, 7) : b.start.slice(8, 10),
         series: Object.values(b.series).map(s => ({ ...s, tokens: measure(s.tokens, s.usd) })),
-      })), Math.max(1, Math.floor(plotWidth / columnWidth)), chartHeight, models, models ? Math.max(2, Math.floor(width / 24)) : 3);
+      }));
+      // The y-axis gutter fits its widest label: a spend peak like $945.61 is seven characters, and a
+      // fixed six-character gutter pushed that row one column off the axis line.
+      const layout = (gutter: number) => {
+        const plotWidth = Math.max(2, Math.min(width, gridWidth) - gutter - 2);
+        const columnWidth = Math.max(2, Math.min(MAX_COLUMN_WIDTH, Math.floor(plotWidth / Math.max(1, report.buckets.length))));
+        const chart = chartColumns(buckets, Math.max(1, Math.floor(plotWidth / columnWidth)), chartHeight, models, models ? Math.max(2, Math.floor(width / 24)) : 3);
+        return { columnWidth, chart, gutter: Math.max(gutter, formatMeasure(chart.max).length) };
+      };
+      const first = layout(6);
+      const { columnWidth, chart, gutter } = first.gutter > 6 ? layout(first.gutter) : first;
       const colors = new Map(chart.legend.map((s, i) => [s.key, legendColor(s, i, models)]));
       const glyphs = new Map(chart.legend.map((s, i) => [s.key, legendGlyph(s, i, models)]));
       // Wide columns keep one blank cell between bars; two-cell columns stay flush as before.
       const fill = columnWidth >= 3 ? columnWidth - 1 : columnWidth;
-      for (let row = 0; row < chartHeight; row++) lines.push(line(<><Text dimColor>{(row === 0 ? formatMeasure(chart.max) : row === chartHeight - 1 ? "0" : "").padStart(6)} │</Text>{chart.columns.map((col, i) => <Text key={i} color={col.cells[row] ? colors.get(col.cells[row]!) : undefined}>{(col.cells[row] ? glyphs.get(col.cells[row]!)!.repeat(fill) : " ".repeat(fill)).padEnd(columnWidth)}</Text>)}</>, `bar${row}`));
+      for (let row = 0; row < chartHeight; row++) lines.push(line(<><Text dimColor>{(row === 0 ? formatMeasure(chart.max) : row === chartHeight - 1 ? "0" : "").padStart(gutter)} │</Text>{chart.columns.map((col, i) => <Text key={i} color={col.cells[row] ? colors.get(col.cells[row]!) : undefined}>{(col.cells[row] ? glyphs.get(col.cells[row]!)!.repeat(fill) : " ".repeat(fill)).padEnd(columnWidth)}</Text>)}</>, `bar${row}`));
       const labelStride = columnWidth >= 3 ? 1 : Math.max(1, Math.ceil(chart.columns.length / 8));
       const axisUnit = query.period === "day" ? "hour" : query.period === "year" ? "month" : "day";
-      lines.push(line(<Text dimColor>{"       └"}{chart.columns.map((col, i) => i % labelStride === 0 ? col.label.padStart(2).slice(-2).padEnd(columnWidth) : " ".repeat(columnWidth)).join("").trimEnd()}  {axisUnit}</Text>, "axis"));
+      lines.push(line(<Text dimColor>{`${" ".repeat(gutter + 1)}└`}{chart.columns.map((col, i) => i % labelStride === 0 ? col.label.padStart(2).slice(-2).padEnd(columnWidth) : " ".repeat(columnWidth)).join("").trimEnd()}  {axisUnit}</Text>, "axis"));
       const labelWidth = Math.max(5, Math.floor(width / Math.max(1, chart.legend.length)) - 4);
       lines.push(line(<>{chart.legend.map(s => <Text key={s.key} color={colors.get(s.key)}>{glyphs.get(s.key)} {s.label.length > labelWidth ? `${s.label.slice(0, Math.ceil((labelWidth - 1) / 2))}…${s.label.slice(-Math.floor((labelWidth - 1) / 2))}` : s.label}  </Text>)}</>, "legend"));
     }

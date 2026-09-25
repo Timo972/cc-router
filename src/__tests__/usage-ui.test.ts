@@ -227,3 +227,19 @@ it("indents every line by one column like the status dashboard", async () => {
     for (const row of rows) expect(row).toMatch(/^ /);
   } finally { await ui.close(); }
 });
+it("widens the axis gutter so a $945.61 spend label does not push its row off the axis", async () => {
+  const wide = (q: UsageQuery) => {
+    const r = report(q); const usd = { ...zeroSpend(), input: 945.61 };
+    r.buckets = r.buckets.map(b => ({ ...b, usd, series: { a: { ...b.series.a, usd } } }));
+    return r;
+  };
+  const ui = mountUsage(async q => wide(q), 100, 32);
+  try {
+    await vi.waitFor(() => expect(ui.last()).toContain("[daily tokens]"));
+    ui.key("s");
+    await vi.waitFor(() => expect(ui.plain()).toContain("$945.61 │"));
+    const rows = ui.plain().split("\n").filter(row => /[│└]/.test(row));
+    expect(rows.length).toBeGreaterThan(2);
+    expect(new Set(rows.map(row => row.search(/[│└]/))).size).toBe(1);
+  } finally { await ui.close(); }
+});
