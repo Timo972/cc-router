@@ -307,6 +307,62 @@ describe("SessionRouter", () => {
     expect(router.getActiveSessionCount("a")).toBe(0);
   });
 
+  it("resolves one normalized active binding without exposing mutable state", () => {
+    let now = 100;
+    const pool = new TokenPool([makeAccount("a")], { now: () => now });
+    const router = new SessionRouter(pool, { now: () => now });
+    router.acquire("session-a").release();
+
+    now = 200;
+    const binding = router.resolve("  session-a  ");
+
+    expect(binding).toEqual({
+      accountId: "a",
+      lastSeenAt: 100,
+    });
+    expect(binding).not.toBe(router.resolve("session-a"));
+  });
+
+  it("does not resolve malformed, oversized, or unknown session IDs", () => {
+    const pool = new TokenPool([makeAccount("a")]);
+    const router = new SessionRouter(pool);
+    router.acquire("session-a").release();
+
+    expect(router.resolve(undefined)).toBeUndefined();
+    expect(router.resolve(["session-a"])).toBeUndefined();
+    expect(router.resolve(" ".repeat(10))).toBeUndefined();
+    expect(router.resolve("a".repeat(257))).toBeUndefined();
+    expect(router.resolve("unknown")).toBeUndefined();
+  });
+
+  it("sweeps an expired binding during lookup", () => {
+    let now = 0;
+    const pool = new TokenPool([makeAccount("a")], { now: () => now });
+    const router = new SessionRouter(pool, { now: () => now, ttlMs: 10 });
+    router.acquire("session-a").release();
+
+    now = 10;
+
+    expect(router.resolve("session-a")).toBeUndefined();
+    expect(router.getBindingCount()).toBe(0);
+  });
+
+  it("does not extend a binding's expiry when resolving it", () => {
+    let now = 0;
+    const pool = new TokenPool([makeAccount("a")], { now: () => now });
+    const router = new SessionRouter(pool, { now: () => now, ttlMs: 10 });
+    router.acquire("session-a").release();
+
+    now = 9;
+    expect(router.resolve("session-a")).toEqual({
+      accountId: "a",
+      lastSeenAt: 0,
+    });
+
+    now = 10;
+    expect(router.resolve("session-a")).toBeUndefined();
+  });
+
   it("returns one aggregate account snapshot after a single expiry sweep", () => {
     let now = 0;
     let clockReads = 0;
