@@ -2022,23 +2022,51 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  const server = app.listen(port, host);
-  await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => {
-      server.off("listening", onListening);
-      usageRefresher.stop();
-      openAIUsageRefresher.stop();
-      accountInfoCache.stop();
-      usageRuntime.close();
-      reject(error);
-    };
-    const onListening = () => {
-      server.off("error", onError);
-      resolve();
-    };
-    server.once("error", onError);
-    server.once("listening", onListening);
-  });
+  // Default loopback must answer on BOTH IPv4 and IPv6 loopback. On Windows
+  // (and anywhere getaddrinfo lists ::1 before 127.0.0.1) a client resolving
+  // "localhost" reaches ::1 first; if we listen only on 127.0.0.1 that
+  // connection is never accepted and the client hangs until it times out —
+  // which is exactly why every Claude request "times out" once the proxy is
+  // running. Binding both loopback addresses keeps us localhost-only (unlike
+  // :: / 0.0.0.0) while accepting whichever family the client picks. An
+  // explicit HOST is honoured verbatim.
+  const bindAddresses = host === "127.0.0.1" ? ["127.0.0.1", "::1"] : [host];
+
+  const listenOn = (addr: string, p: number): Promise<ReturnType<typeof app.listen>> =>
+    new Promise((resolve, reject) => {
+      const s = app.listen(p, addr);
+      const onError = (error: Error) => { s.off("listening", onListening); reject(error); };
+      const onListening = () => { s.off("error", onError); resolve(s); };
+      s.once("error", onError);
+      s.once("listening", onListening);
+    });
+
+  // The primary bind (IPv4 loopback, or the explicit HOST) must succeed.
+  let server: ReturnType<typeof app.listen>;
+  try {
+    server = await listenOn(bindAddresses[0]!, port);
+  } catch (error) {
+    usageRefresher.stop();
+    openAIUsageRefresher.stop();
+    accountInfoCache.stop();
+    usageRuntime.close();
+    throw error;
+  }
+
+  // Secondary loopback binds are best-effort: a host with IPv6 disabled, or
+  // something already holding [::1]:<port>, must not block startup. Reuse the
+  // port the primary actually bound so `port: 0` still pairs both families.
+  const boundPort = (server.address() as { port: number } | null)?.port ?? port;
+  const extraServers: Array<ReturnType<typeof app.listen>> = [];
+  for (const addr of bindAddresses.slice(1)) {
+    try {
+      extraServers.push(await listenOn(addr, boundPort));
+    } catch (error) {
+      const reason = (error as NodeJS.ErrnoException).code ?? (error as Error).message;
+      console.log(chalk.gray(`  (note: additional loopback bind ${addr}:${boundPort} skipped — ${reason})`));
+    }
+  }
+  server.once("close", () => { for (const s of extraServers) s.close(); });
 
   process.on("SIGTERM", () => { void shutdown(); });
   process.on("SIGINT", () => { void shutdown(); });
