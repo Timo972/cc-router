@@ -66,6 +66,7 @@ import type { ModelRoutingConfig } from "../protocol/model-ref.js";
 import chalk from "chalk";
 import { SessionRouter } from "./session-router.js";
 import type { RoutedAccountLease } from "./session-router.js";
+import { registerSessionResolveRoute } from "./session-resolve.js";
 import { createAnthropicProxy } from "./anthropic-proxy.js";
 import { AnthropicUsageRefresher } from "../providers/anthropic/usage-refresher.js";
 import { OpenAIUsageRefresher } from "../providers/openai/usage-fetch.js";
@@ -975,6 +976,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     const details = `manual refresh — ${describeRefreshAll(summary)}`;
     stats.addLog({ ts: Date.now(), accountId: "proxy", model: "-", type: "refresh", details });
     res.json({ refresh: summary });
+  });
+
+  registerSessionResolveRoute(app, {
+    anthropicRouter: sessionRouter,
+    openAIRouter,
   });
 
   // ─── Account management endpoints (authenticated) ─────────────────────────
