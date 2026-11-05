@@ -61,6 +61,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The background daemon and the OS service no longer die on startup when npm
+  has a newer version. They run `start --foreground` with stdin ignored, so
+  the "Update now?" prompt could not be answered and the process exited before
+  it bound the port. Only an interactive terminal start offers the update now.
 - Escape or Ctrl-C at any prompt of the dashboard's `n` / `l` flows returns
   to the dashboard with a quiet "Cancelled." instead of a red failure line.
 - Pressing `n` (and now `l`) in the dashboard no longer kills the process
