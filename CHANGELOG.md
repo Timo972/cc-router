@@ -66,8 +66,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resolves to `::1` first, so a client (Claude Code, the CLI, the mitmproxy
   addon) reaching the IPv6 loopback while the server listened only on IPv4
   got no response and every API/chat request hung until it timed out. The
-  second bind is best-effort, so hosts without an IPv6 stack still start. An
-  explicit `HOST` is still honoured verbatim.
+  second bind never blocks startup: hosts without an IPv6 stack skip it, and
+  a busy `[::1]:<port>` (for example a stale process) is retried every 2s
+  until it binds, instead of leaving `localhost` clients hanging for the
+  life of the process. An explicit `HOST` is still honoured verbatim.
 - Escape or Ctrl-C at any prompt of the dashboard's `n` / `l` flows returns
   to the dashboard with a quiet "Cancelled." instead of a red failure line.
 - Pressing `n` (and now `l`) in the dashboard no longer kills the process

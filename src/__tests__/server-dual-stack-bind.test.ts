@@ -80,3 +80,82 @@ it("answers on both IPv4 and IPv6 loopback so `localhost` reaches the proxy ever
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+/** A port that is free on both loopback families right now. */
+async function freeDualStackPort(): Promise<number> {
+  for (;;) {
+    const port = await new Promise<number>(resolve => {
+      const probe = createServer();
+      probe.listen(0, "127.0.0.1", () => {
+        const { port } = probe.address() as { port: number };
+        probe.close(() => resolve(port));
+      });
+    });
+    const freeOnV6 = await new Promise<boolean>(resolve => {
+      const probe = createServer();
+      probe.once("error", () => resolve(false));
+      probe.listen(port, "::1", () => probe.close(() => resolve(true)));
+    });
+    if (freeOnV6) return port;
+  }
+}
+
+it("keeps retrying the IPv6 loopback bind while [::1]:<port> is taken, then answers there", async () => {
+  if (!(await hasIpv6Loopback())) return;
+  const home = mkdtempSync(join(tmpdir(), "cc-router-dualstack-retry-"));
+  mkdirSync(join(home, ".cc-router"));
+  const accountsPath = join(home, ".cc-router", "accounts.json");
+  const configPath = join(home, ".cc-router", "config.json");
+  writeFileSync(accountsPath, JSON.stringify([{
+    id: "fixture", provider: "anthropic_subscription",
+    accessToken: "fixture-access-secret", refreshToken: "fixture-refresh-secret",
+    expiresAt: Date.now() + 86_400_000, scopes: ["user:profile", "user:inference"],
+  }]));
+  writeFileSync(configPath, JSON.stringify({ proxySecret: "fixture-router-secret" }));
+
+  // Something else holds [::1]:<port> when the proxy starts (a stale instance,
+  // another tool). Before the retry, the proxy skipped ::1 for good, so
+  // `localhost` on Windows kept hanging even after that port was free again.
+  const port = await freeDualStackPort();
+  const sockets = new Set<import("node:net").Socket>();
+  const squatter = createServer(socket => { sockets.add(socket); });
+  await new Promise<void>(resolve => squatter.listen(port, "::1", () => resolve()));
+
+  const child = fork(fileURLToPath(new URL("./fixtures/account-info-server.ts", import.meta.url)), [], {
+    execArgv: ["--import", "tsx"],
+    env: {
+      ...process.env, HOME: home, USERPROFILE: home, GROK_HOME: join(home, ".grok"),
+      ACCOUNTS_PATH: accountsPath, CONFIG_PATH: configPath, FIXTURE_PORT: String(port),
+      CC_ROUTER_TELEMETRY: "0", DO_NOT_TRACK: "1",
+      CC_ROUTER_DAEMON: "0", CC_ROUTER_SERVICE: "0", CC_ROUTER_NO_AUTO_UPDATE: "1",
+    },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  let output = "";
+  child.stdout?.on("data", chunk => { output += String(chunk); });
+  child.stderr?.on("data", chunk => { output += String(chunk); });
+  const exited = once(child, "exit");
+  try {
+    await Promise.race([
+      once(child, "message"),
+      exited.then(() => { throw new Error(`Dual-stack retry fixture exited: ${output}`); }),
+    ]);
+    expect((await health(`http://127.0.0.1:${port}/cc-router/health`)).status).toEqual(expect.any(String));
+
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => squatter.close(() => resolve()));
+
+    const deadline = Date.now() + 10_000;
+    let status: unknown;
+    while (Date.now() < deadline && status === undefined) {
+      try { status = (await health(`http://[::1]:${port}/cc-router/health`)).status; }
+      catch { await new Promise(r => setTimeout(r, 250)); }
+    }
+    expect(status).toEqual(expect.any(String));
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    squatter.close();
+    child.kill();
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 30_000);

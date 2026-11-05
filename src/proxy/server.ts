@@ -101,6 +101,9 @@ import { loadXaiAccounts } from "../config/manager.js";
 /** Upper bound on how long a shutdown may wait for telemetry to drain. */
 const TELEMETRY_SHUTDOWN_DEADLINE_MS = 1_000;
 
+/** How often a busy secondary loopback bind ([::1]:<port>) is retried. */
+const SECONDARY_BIND_RETRY_MS = 2_000;
+
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
   interface Request {
@@ -2053,20 +2056,46 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     throw error;
   }
 
-  // Secondary loopback binds are best-effort: a host with IPv6 disabled, or
-  // something already holding [::1]:<port>, must not block startup. Reuse the
-  // port the primary actually bound so `port: 0` still pairs both families.
+  // Secondary loopback binds must not block startup. A host without IPv6
+  // (EAFNOSUPPORT / EADDRNOTAVAIL) skips them for good. Anything else, usually
+  // EADDRINUSE from a stale process still holding [::1]:<port>, is retried in
+  // the background: giving up would leave `localhost` clients on Windows
+  // hanging for the whole life of this process. Reuse the port the primary
+  // actually bound so `port: 0` still pairs both families.
   const boundPort = (server.address() as { port: number } | null)?.port ?? port;
   const extraServers: Array<ReturnType<typeof app.listen>> = [];
-  for (const addr of bindAddresses.slice(1)) {
+  const retryTimers = new Set<NodeJS.Timeout>();
+  let primaryClosed = false;
+  const bindSecondary = async (addr: string, attempt: number): Promise<void> => {
+    if (primaryClosed) return;
     try {
-      extraServers.push(await listenOn(addr, boundPort));
+      const s = await listenOn(addr, boundPort);
+      if (primaryClosed) { s.close(); return; }
+      extraServers.push(s);
+      if (attempt > 0) console.log(chalk.gray(`  (loopback ${addr}:${boundPort} is bound now)`));
     } catch (error) {
-      const reason = (error as NodeJS.ErrnoException).code ?? (error as Error).message;
-      console.log(chalk.gray(`  (note: additional loopback bind ${addr}:${boundPort} skipped — ${reason})`));
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL") {
+        console.log(chalk.gray(`  (note: loopback ${addr} is not available on this host, skipped)`));
+        return;
+      }
+      if (attempt === 0) {
+        console.log(chalk.yellow(`  ⚠ loopback ${addr}:${boundPort} is busy (${code ?? (error as Error).message}), retrying every ${SECONDARY_BIND_RETRY_MS / 1000}s`));
+      }
+      const timer = setTimeout(() => {
+        retryTimers.delete(timer);
+        void bindSecondary(addr, attempt + 1);
+      }, SECONDARY_BIND_RETRY_MS);
+      timer.unref();
+      retryTimers.add(timer);
     }
-  }
-  server.once("close", () => { for (const s of extraServers) s.close(); });
+  };
+  for (const addr of bindAddresses.slice(1)) await bindSecondary(addr, 0);
+  server.once("close", () => {
+    primaryClosed = true;
+    for (const timer of retryTimers) clearTimeout(timer);
+    for (const s of extraServers) s.close();
+  });
 
   process.on("SIGTERM", () => { void shutdown(); });
   process.on("SIGINT", () => { void shutdown(); });
