@@ -12,7 +12,7 @@ import {
 import { writeClaudeSettings } from "../utils/claude-config.js";
 import { checkForUpdate, performUpdate, PKG_NAME } from "../utils/self-update.js";
 import { launchDaemon, waitForHealth } from "../daemon/launcher.js";
-import { isProxyRunning } from "../daemon/pid.js";
+import { isProxyRunning, managesPidFile } from "../daemon/pid.js";
 import { installService } from "../daemon/service.js";
 import { getLocalIPs } from "../utils/network.js";
 
@@ -249,7 +249,23 @@ async function ensureClaudeCodeConfigured(
 
 // ─── Update check ────────────────────────────────────────────────────────────
 
+/**
+ * Whether this start may ask "Update now?". The background daemon and the OS
+ * service run `start --foreground` with stdin ignored, so the prompt cannot be
+ * answered: inquirer rejects on the closed stdin and the process exits before
+ * it binds, which kept the proxy down whenever npm had a newer version. Only an
+ * interactive terminal start offers the update; the managed instance still
+ * logs the notify-only update notice from the server.
+ */
+export function canPromptForUpdate(
+  env: NodeJS.ProcessEnv = process.env,
+  stdinIsTTY: boolean | undefined = process.stdin.isTTY,
+): boolean {
+  return stdinIsTTY === true && !managesPidFile(env);
+}
+
 async function maybeUpdate(): Promise<void> {
+  if (!canPromptForUpdate()) return;
   let check;
   try {
     check = await checkForUpdate(true);  // force fresh check, skip disk cache

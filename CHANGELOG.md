@@ -61,6 +61,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The background daemon and the OS service no longer die on startup when npm
+  has a newer version. They run `start --foreground` with stdin ignored, so
+  the "Update now?" prompt could not be answered and the process exited before
+  it bound the port. Only an interactive terminal start offers the update now.
 - The proxy now binds both the IPv4 (`127.0.0.1`) and IPv6 (`::1`) loopback
   addresses by default, instead of IPv4 only. On Windows `localhost` usually
   resolves to `::1` first, so a client (Claude Code, the CLI, the mitmproxy
