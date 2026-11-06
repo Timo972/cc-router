@@ -102,6 +102,9 @@ import { loadXaiAccounts } from "../config/manager.js";
 /** Upper bound on how long a shutdown may wait for telemetry to drain. */
 const TELEMETRY_SHUTDOWN_DEADLINE_MS = 1_000;
 
+/** How often a busy secondary loopback bind ([::1]:<port>) is retried. */
+const SECONDARY_BIND_RETRY_MS = 2_000;
+
 // Augment Request to carry the selected account and pending log entry
 declare module "express-serve-static-core" {
   interface Request {
@@ -2023,27 +2026,81 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       `  anyone who can reach it use your Claude/OpenAI accounts.\n` +
       `  Fix: run 'cc-router start' and set a password when asked, or add a\n` +
       `  "proxySecret" to ~/.cc-router/config.json. To bind localhost only,\n` +
-      `  unset HOST (or set HOST=127.0.0.1).\n`,
+      `  unset HOST.\n`,
     ));
     process.exit(1);
   }
 
-  const server = app.listen(port, host);
-  await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => {
-      server.off("listening", onListening);
-      usageRefresher.stop();
-      openAIUsageRefresher.stop();
-      accountInfoCache.stop();
-      usageRuntime.close();
-      reject(error);
-    };
-    const onListening = () => {
-      server.off("error", onError);
-      resolve();
-    };
-    server.once("error", onError);
-    server.once("listening", onListening);
+  // Default loopback must answer on BOTH IPv4 and IPv6 loopback. On Windows
+  // (and anywhere getaddrinfo lists ::1 before 127.0.0.1) a client resolving
+  // "localhost" reaches ::1 first; if we listen only on 127.0.0.1 that
+  // connection is never accepted and the client hangs until it times out —
+  // which is exactly why every Claude request "times out" once the proxy is
+  // running. Binding both loopback addresses keeps us localhost-only (unlike
+  // :: / 0.0.0.0) while accepting whichever family the client picks. An
+  // explicit HOST, including HOST=127.0.0.1, is honoured verbatim.
+  const bindAddresses = process.env["HOST"] === undefined ? ["127.0.0.1", "::1"] : [host];
+
+  const listenOn = (addr: string, p: number): Promise<ReturnType<typeof app.listen>> =>
+    new Promise((resolve, reject) => {
+      const s = app.listen(p, addr);
+      const onError = (error: Error) => { s.off("listening", onListening); reject(error); };
+      const onListening = () => { s.off("error", onError); resolve(s); };
+      s.once("error", onError);
+      s.once("listening", onListening);
+    });
+
+  // The primary bind (IPv4 loopback, or the explicit HOST) must succeed.
+  let server: ReturnType<typeof app.listen>;
+  try {
+    server = await listenOn(bindAddresses[0]!, port);
+  } catch (error) {
+    usageRefresher.stop();
+    openAIUsageRefresher.stop();
+    accountInfoCache.stop();
+    usageRuntime.close();
+    throw error;
+  }
+
+  // Secondary loopback binds must not block startup. A host without IPv6
+  // (EAFNOSUPPORT / EADDRNOTAVAIL) skips them for good. Anything else, usually
+  // EADDRINUSE from a stale process still holding [::1]:<port>, is retried in
+  // the background: giving up would leave `localhost` clients on Windows
+  // hanging for the whole life of this process. Reuse the port the primary
+  // actually bound so `port: 0` still pairs both families.
+  const boundPort = (server.address() as { port: number } | null)?.port ?? port;
+  const extraServers: Array<ReturnType<typeof app.listen>> = [];
+  const retryTimers = new Set<NodeJS.Timeout>();
+  let primaryClosed = false;
+  const bindSecondary = async (addr: string, attempt: number): Promise<void> => {
+    if (primaryClosed) return;
+    try {
+      const s = await listenOn(addr, boundPort);
+      if (primaryClosed) { s.close(); return; }
+      extraServers.push(s);
+      if (attempt > 0) console.log(chalk.gray(`  (loopback ${addr}:${boundPort} is bound now)`));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL") {
+        console.log(chalk.gray(`  (note: loopback ${addr} is not available on this host, skipped)`));
+        return;
+      }
+      if (attempt === 0) {
+        console.log(chalk.yellow(`  ⚠ loopback ${addr}:${boundPort} is busy (${code ?? (error as Error).message}), retrying every ${SECONDARY_BIND_RETRY_MS / 1000}s`));
+      }
+      const timer = setTimeout(() => {
+        retryTimers.delete(timer);
+        void bindSecondary(addr, attempt + 1);
+      }, SECONDARY_BIND_RETRY_MS);
+      timer.unref();
+      retryTimers.add(timer);
+    }
+  };
+  for (const addr of bindAddresses.slice(1)) await bindSecondary(addr, 0);
+  server.once("close", () => {
+    primaryClosed = true;
+    for (const timer of retryTimers) clearTimeout(timer);
+    for (const s of extraServers) s.close();
   });
 
   process.on("SIGTERM", () => { void shutdown(); });
