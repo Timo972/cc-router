@@ -65,6 +65,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   has a newer version. They run `start --foreground` with stdin ignored, so
   the "Update now?" prompt could not be answered and the process exited before
   it bound the port. Only an interactive terminal start offers the update now.
+- The proxy now binds both the IPv4 (`127.0.0.1`) and IPv6 (`::1`) loopback
+  addresses by default, instead of IPv4 only. On Windows `localhost` usually
+  resolves to `::1` first, so a client (Claude Code, the CLI, the mitmproxy
+  addon) reaching the IPv6 loopback while the server listened only on IPv4
+  got no response and every API/chat request hung until it timed out. The
+  second bind never blocks startup: hosts without an IPv6 stack skip it, and
+  a busy `[::1]:<port>` (for example a stale process) is retried every 2s
+  until it binds, instead of leaving `localhost` clients hanging for the
+  life of the process. An explicit `HOST` is still honoured verbatim.
+- The Windows login service now sets its environment without trailing
+  spaces. `set VAR=value && …` stored `"1 "` and `"0.0.0.0 "`, so the service
+  was never recognised as the service (no PID file, wrong runtime mode in
+  telemetry), and in server mode it failed to bind (`ENOTFOUND`). The next
+  `cc-router start` rewrites the registry entry.
 - Escape or Ctrl-C at any prompt of the dashboard's `n` / `l` flows returns
   to the dashboard with a quiet "Cancelled." instead of a red failure line.
 - Pressing `n` (and now `l`) in the dashboard no longer kills the process

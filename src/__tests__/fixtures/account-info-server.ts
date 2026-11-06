@@ -28,4 +28,4 @@ express.application.listen = function (...args: Parameters<typeof listen>) {
   return server;
 } as typeof listen;
 
-await startServer({ port: 0, accountsPath: process.env.ACCOUNTS_PATH });
+await startServer({ port: Number(process.env.FIXTURE_PORT ?? 0), accountsPath: process.env.ACCOUNTS_PATH });
