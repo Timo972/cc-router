@@ -71,6 +71,25 @@ vi.mock("../cli/cmd-accounts.js", () => ({
   }),
 }));
 
+// Never read the developer's real Claude credentials: on Linux/Windows with
+// Claude Code logged in, ~/.claude/.credentials.json exists and the
+// "file extraction fails" path would load real tokens instead of failing.
+vi.mock("../utils/token-extractor.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../utils/token-extractor.js")>();
+  const { SetupDiagnosticError } = await import("../telemetry/setup-diagnostics.js");
+  const notFound = (what: string) => ({
+    ok: false as const,
+    error: new SetupDiagnosticError(`${what} was not found`, {
+      stage: "credential_read", reason: "not_found", expected: true,
+    }),
+  });
+  return {
+    ...actual,
+    extractFromKeychainDetailed: async () => notFound("Claude Keychain entry"),
+    extractFromCredentialsFileDetailed: () => notFound("Claude credentials file"),
+  };
+});
+
 const { runSetupWizard } = await import("../cli/cmd-setup.js");
 const { collectClaudeAccount } = await import("../cli/account-flows.js");
 const prompts = await import("@inquirer/prompts");

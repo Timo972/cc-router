@@ -41,6 +41,11 @@ interface SessionBinding {
   generation: number;
 }
 
+export interface SessionBindingView {
+  accountId: string;
+  lastSeenAt: number;
+}
+
 /**
  * Normalize Claude Code's session header without retaining malformed or
  * unexpectedly large values. Arrays are rejected rather than choosing one
@@ -112,6 +117,21 @@ export class SessionRouter<TAccount extends PoolAccount = Account> {
       binding.generation,
       modelFamily,
     );
+  }
+
+  resolve(sessionHeader: unknown): SessionBindingView | undefined {
+    const sessionId = normalizeSessionId(sessionHeader);
+    if (!sessionId) return undefined;
+
+    const now = this.now();
+    this.sweepExpiredBindings(now);
+    const binding = this.bindings.get(sessionId);
+    if (!binding) return undefined;
+
+    return {
+      accountId: binding.accountId,
+      lastSeenAt: binding.lastSeen,
+    };
   }
 
   /**

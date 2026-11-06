@@ -286,6 +286,30 @@ OpenAI account rows show:
 
 ---
 
+## Resolving a caller-known session binding
+
+Local integrations can ask which account currently owns a session they already
+know:
+
+```http
+POST /cc-router/sessions/resolve
+Content-Type: application/json
+
+{"provider":"anthropic","sessionId":"<caller-known-session-id>"}
+```
+
+`provider` is `anthropic` or `openai`. A live binding returns its `accountId`,
+provider, and `lastSeenAt`; an unknown or expired binding returns `404`. The
+request is subject to the router's normal global authentication middleware.
+
+The endpoint intentionally performs a single lookup only. It does not list or
+export the affinity table, does not echo the session ID, does not refresh the
+binding TTL, and rejects malformed or oversized bodies. This makes it suitable
+for local status tools that need exact attribution without widening access to
+other sessions.
+
+---
+
 ## Troubleshooting
 
 **Cache hit rates look worse than expected.**
