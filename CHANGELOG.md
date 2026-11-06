@@ -8,23 +8,46 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
+---
 
-- `cc-router usage` charts and its daily grid switch between tokens and
-  estimated API spend (`s`) and narrow to input or output (`i`); every bucket,
-  model series and day in the report now carries frozen-rate USD per token
-  category. The model view (`l`) lists input, output, cache and spend per
-  model. Input, output and cache figures share one colour each across the
-  header, the cost line and the model view.
-- The usage view fills the terminal like `cc-router status`, is indented one
-  column, and quits on `Esc`. Chart columns scale to the available width and
-  the chart shares the daily grid's right edge; the axis names its unit
-  instead of running day numbers together. Warnings sit below the grid.
-- Subscription cost and net savings are no longer displayed in the usage
-  dashboard or the plain-text summary; the API-equivalent value stands alone,
-  broken down by input, output and cache. Both remain in `--json` output and
-  `usage subscription` still records costs. A client talking to an older
-  router shows the per-category spend as unavailable rather than zero.
+## [0.13.1] — 2026-11-06
+
+### Added
+
+- `POST /cc-router/sessions/resolve` returns the account that currently owns a
+  caller-known session (`{"provider":"anthropic"|"openai","sessionId":…}`),
+  with its provider and `lastSeenAt`, or `404` for an unknown or expired
+  binding. It looks up exactly one session: it does not list the affinity
+  table, echo the session ID or refresh the binding TTL, and it uses the
+  router's normal authentication. See
+  [session routing](docs/session-routing.md#resolving-a-caller-known-session-binding).
+
+### Fixed
+
+- The background daemon and the OS service no longer die on startup when npm
+  has a newer version. They run `start --foreground` with stdin ignored, so
+  the "Update now?" prompt could not be answered and the process exited before
+  it bound the port. Only an interactive terminal start offers the update now.
+- The proxy now binds both the IPv4 (`127.0.0.1`) and IPv6 (`::1`) loopback
+  addresses by default, instead of IPv4 only. On Windows `localhost` usually
+  resolves to `::1` first, so a client (Claude Code, the CLI, the mitmproxy
+  addon) reaching the IPv6 loopback while the server listened only on IPv4
+  got no response and every API/chat request hung until it timed out. The
+  second bind never blocks startup: hosts without an IPv6 stack skip it, and
+  a busy `[::1]:<port>` (for example a stale process) is retried every 2s
+  until it binds, instead of leaving `localhost` clients hanging for the
+  life of the process. An explicit `HOST`, including `HOST=127.0.0.1`, is
+  honoured verbatim, so the refusal message for a non-loopback `HOST` without
+  a proxy secret now says to unset `HOST`.
+- The Windows login service now sets its environment without trailing
+  spaces. `set VAR=value && …` stored `"1 "` and `"0.0.0.0 "`, so the service
+  was never recognised as the service (no PID file, wrong runtime mode in
+  telemetry), and in server mode it failed to bind (`ENOTFOUND`). The next
+  `cc-router start` rewrites the registry entry.
+
+---
+
+## [0.13.0] — 2026-10-18
 
 ### ⚠️ Breaking
 
@@ -38,6 +61,17 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `cc-router usage` records token usage persistently, across restarts, and
+  shows it per provider and model as stacked bars and a daily activity grid
+  for a day, week, month or year. Charts and grid switch between tokens and
+  estimated API-equivalent spend (`s`) and narrow to input or output (`i`);
+  the model view (`l`) lists input, output, cache and spend per model. Spend
+  uses frozen per-category API rates, and missing prices are marked
+  incomplete. The view fills the terminal and quits on `Esc`. `--json` prints
+  the report without the terminal UI, and `usage subscription set|end|list`
+  records effective-dated monthly subscription costs, which appear in the
+  `--json` report. See the
+  [usage reference](docs/cli-reference.md#persistent-token-usage-and-savings).
 - `cc-router accounts login claude` drives `claude auth login --claudeai`
   (with `--email` prefill) and imports the new credentials; `--long-lived`
   drives `claude setup-token` for a one-year, refresh-less token.
@@ -61,24 +95,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- The background daemon and the OS service no longer die on startup when npm
-  has a newer version. They run `start --foreground` with stdin ignored, so
-  the "Update now?" prompt could not be answered and the process exited before
-  it bound the port. Only an interactive terminal start offers the update now.
-- The proxy now binds both the IPv4 (`127.0.0.1`) and IPv6 (`::1`) loopback
-  addresses by default, instead of IPv4 only. On Windows `localhost` usually
-  resolves to `::1` first, so a client (Claude Code, the CLI, the mitmproxy
-  addon) reaching the IPv6 loopback while the server listened only on IPv4
-  got no response and every API/chat request hung until it timed out. The
-  second bind never blocks startup: hosts without an IPv6 stack skip it, and
-  a busy `[::1]:<port>` (for example a stale process) is retried every 2s
-  until it binds, instead of leaving `localhost` clients hanging for the
-  life of the process. An explicit `HOST` is still honoured verbatim.
-- The Windows login service now sets its environment without trailing
-  spaces. `set VAR=value && …` stored `"1 "` and `"0.0.0.0 "`, so the service
-  was never recognised as the service (no PID file, wrong runtime mode in
-  telemetry), and in server mode it failed to bind (`ENOTFOUND`). The next
-  `cc-router start` rewrites the registry entry.
 - Escape or Ctrl-C at any prompt of the dashboard's `n` / `l` flows returns
   to the dashboard with a quiet "Cancelled." instead of a red failure line.
 - Pressing `n` (and now `l`) in the dashboard no longer kills the process
@@ -921,6 +937,9 @@ cache-aware session routing and a round of security hardening.
 - `http-proxy-middleware` 3.0.5 → 3.0.7 for GHSA-gcq2-9pq2-cxqm (high). The
   affected APIs are not used here.
 
+[Unreleased]: https://github.com/Timo972/cc-router/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/Timo972/cc-router/releases/tag/v0.13.1
+[0.13.0]: https://github.com/Timo972/cc-router/releases/tag/v0.13.0
 [0.12.4]: https://github.com/Timo972/cc-router/releases/tag/v0.12.4
 [0.12.3]: https://github.com/Timo972/cc-router/releases/tag/v0.12.3
 [0.12.2]: https://github.com/Timo972/cc-router/releases/tag/v0.12.2
