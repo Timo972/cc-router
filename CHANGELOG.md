@@ -61,6 +61,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The Windows login service now sets its environment without trailing
+  spaces. `set VAR=value && …` stored `"1 "` and `"0.0.0.0 "`, so the service
+  was never recognised as the service (no PID file, wrong runtime mode in
+  telemetry), and in server mode it failed to bind (`ENOTFOUND`). The next
+  `cc-router start` rewrites the registry entry.
 - Escape or Ctrl-C at any prompt of the dashboard's `n` / `l` flows returns
   to the dashboard with a quiet "Cancelled." instead of a red failure line.
 - Pressing `n` (and now `l`) in the dashboard no longer kills the process
