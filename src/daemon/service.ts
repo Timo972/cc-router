@@ -298,10 +298,22 @@ function buildWindowsCommand(): string {
   return `"${process.execPath}" "${CLI_ENTRY}" start --foreground`;
 }
 
+/**
+ * The Run-key command that starts the proxy at login. `set VAR=value && …`
+ * would store the space before `&&` in the value ("1 ", "0.0.0.0 "): the
+ * service then never recognised CC_ROUTER_SERVICE=1 (no PID file) and server
+ * mode failed to bind with ENOTFOUND. So `&&` follows the value directly.
+ */
+export function buildWindowsAutostartCommand(
+  serverMode: boolean,
+  command: string = buildWindowsCommand(),
+): string {
+  const env = serverMode ? "set HOST=0.0.0.0&& set CC_ROUTER_SERVICE=1&& " : "set CC_ROUTER_SERVICE=1&& ";
+  return `cmd /c "${env}${command}"`;
+}
+
 async function installWindows(serverMode: boolean): Promise<void> {
-  const cmd = serverMode
-    ? `cmd /c "set HOST=0.0.0.0 && set CC_ROUTER_SERVICE=1 && ${buildWindowsCommand()}"`
-    : `cmd /c "set CC_ROUTER_SERVICE=1 && ${buildWindowsCommand()}"`;
+  const cmd = buildWindowsAutostartCommand(serverMode);
 
   try {
     await execFileAsync("reg", [
