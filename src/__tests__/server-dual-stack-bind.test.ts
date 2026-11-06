@@ -77,6 +77,7 @@ it("answers on both IPv4 and IPv6 loopback so `localhost` reaches the proxy ever
     }
   } finally {
     child.kill();
+    await exited;
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -156,6 +157,55 @@ it("keeps retrying the IPv6 loopback bind while [::1]:<port> is taken, then answ
     for (const socket of sockets) socket.destroy();
     squatter.close();
     child.kill();
+    await exited;
     rmSync(home, { recursive: true, force: true });
   }
 }, 30_000);
+
+it("honours an explicit HOST=127.0.0.1 verbatim and leaves [::1]:<port> alone", async () => {
+  if (!(await hasIpv6Loopback())) return;
+  const home = mkdtempSync(join(tmpdir(), "cc-router-explicit-host-"));
+  mkdirSync(join(home, ".cc-router"));
+  const accountsPath = join(home, ".cc-router", "accounts.json");
+  const configPath = join(home, ".cc-router", "config.json");
+  writeFileSync(accountsPath, JSON.stringify([{
+    id: "fixture", provider: "anthropic_subscription",
+    accessToken: "fixture-access-secret", refreshToken: "fixture-refresh-secret",
+    expiresAt: Date.now() + 86_400_000, scopes: ["user:profile", "user:inference"],
+  }]));
+  writeFileSync(configPath, JSON.stringify({ proxySecret: "fixture-router-secret" }));
+
+  const child = fork(fileURLToPath(new URL("./fixtures/account-info-server.ts", import.meta.url)), [], {
+    execArgv: ["--import", "tsx"],
+    env: {
+      ...process.env, HOME: home, USERPROFILE: home, GROK_HOME: join(home, ".grok"),
+      ACCOUNTS_PATH: accountsPath, CONFIG_PATH: configPath, HOST: "127.0.0.1",
+      CC_ROUTER_TELEMETRY: "0", DO_NOT_TRACK: "1",
+      CC_ROUTER_DAEMON: "0", CC_ROUTER_SERVICE: "0", CC_ROUTER_NO_AUTO_UPDATE: "1",
+    },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  let output = "";
+  child.stdout?.on("data", chunk => { output += String(chunk); });
+  child.stderr?.on("data", chunk => { output += String(chunk); });
+  const exited = once(child, "exit");
+  try {
+    const [{ port }] = await Promise.race([
+      once(child, "message"),
+      exited.then(() => { throw new Error(`Explicit-HOST fixture exited: ${output}`); }),
+    ]) as [{ port: number }];
+    expect((await health(`http://127.0.0.1:${port}/cc-router/health`)).status).toEqual(expect.any(String));
+
+    // The proxy must not have claimed the IPv6 loopback: we can bind it ourselves.
+    const freeOnV6 = await new Promise<boolean>(resolve => {
+      const probe = createServer();
+      probe.once("error", () => resolve(false));
+      probe.listen(port, "::1", () => probe.close(() => resolve(true)));
+    });
+    expect(freeOnV6).toBe(true);
+  } finally {
+    child.kill();
+    await exited;
+    rmSync(home, { recursive: true, force: true });
+  }
+});

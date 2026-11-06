@@ -2020,7 +2020,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       `  anyone who can reach it use your Claude/OpenAI accounts.\n` +
       `  Fix: run 'cc-router start' and set a password when asked, or add a\n` +
       `  "proxySecret" to ~/.cc-router/config.json. To bind localhost only,\n` +
-      `  unset HOST (or set HOST=127.0.0.1).\n`,
+      `  unset HOST.\n`,
     ));
     process.exit(1);
   }
@@ -2032,8 +2032,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // which is exactly why every Claude request "times out" once the proxy is
   // running. Binding both loopback addresses keeps us localhost-only (unlike
   // :: / 0.0.0.0) while accepting whichever family the client picks. An
-  // explicit HOST is honoured verbatim.
-  const bindAddresses = host === "127.0.0.1" ? ["127.0.0.1", "::1"] : [host];
+  // explicit HOST, including HOST=127.0.0.1, is honoured verbatim.
+  const bindAddresses = process.env["HOST"] === undefined ? ["127.0.0.1", "::1"] : [host];
 
   const listenOn = (addr: string, p: number): Promise<ReturnType<typeof app.listen>> =>
     new Promise((resolve, reject) => {
