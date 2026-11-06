@@ -1,4 +1,4 @@
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { buildWindowsAutostartCommand } from "../daemon/service.js";
@@ -16,11 +16,19 @@ describe("buildWindowsAutostartCommand", () => {
   });
 
   it.runIf(process.platform === "win32")("passes exact values through cmd.exe", async () => {
-    const probe = `"${process.execPath}" -p "[process.env.HOST, process.env.CC_ROUTER_SERVICE].join('|') + '|'"`;
+    // Run it the way the Run key does: cmd.exe gets everything after `cmd /c`
+    // verbatim, with no extra shell around it. The probe has no cmd metacharacters.
+    const probe = `"${process.execPath}" -p "process.env.HOST + '/' + process.env.CC_ROUTER_SERVICE + '/'"`;
     const env = { ...process.env, HOST: undefined, CC_ROUTER_SERVICE: undefined };
-    const run = async (serverMode: boolean) =>
-      (await promisify(exec)(buildWindowsAutostartCommand(serverMode, probe), { env })).stdout.trim();
-    expect(await run(true)).toBe("0.0.0.0|1|");
-    expect(await run(false)).toBe("|1|");
+    const run = async (serverMode: boolean) => {
+      const command = buildWindowsAutostartCommand(serverMode, probe);
+      expect(command.startsWith("cmd /c ")).toBe(true);
+      const { stdout } = await promisify(execFile)("cmd.exe", ["/c", command.slice("cmd /c ".length)], {
+        env, windowsVerbatimArguments: true,
+      });
+      return stdout.trim();
+    };
+    expect(await run(true)).toBe("0.0.0.0/1/");
+    expect(await run(false)).toBe("undefined/1/");
   });
 });
